@@ -1,239 +1,240 @@
-# TM Vault Backend - Python FastAPI
+# TM Vault Backend - Microservices Architecture
 
-Simplified Python backend for the TM Vault application, built with FastAPI.
+Python FastAPI backend built with a microservices architecture for the TM Vault M365/Azure backup platform.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│              API Gateway (8000)             │
+└──────────────┬──────────────────────────────┘
+               │ Routes requests to:
+    ┌──────────┼──────────┬─────────┬──────────┐
+    │          │          │         │          │
+┌───▼───┐ ┌──▼───┐ ┌───▼───┐ ┌──▼───┐ ┌──▼───┐
+│ Auth  │ │Tenant│ │Resource│ │ Job  │ │Snapshot│
+│ :8001 │ │:8002 │ │ :8003 │ │:8004 │ │ :8005 │
+└───────┘ └──────┘ └───────┘ └──────┘ └───────┘
+                                             │
+    ┌────────────────────────────────────────┘
+    │
+┌───▼────────┐  ┌────────────┐
+│ Dashboard  │  │  Alert     │
+│  :8006     │  │  :8007     │
+└────────────┘  └────────────┘
+```
+
+### Services
+
+| Service | Port | Responsibility |
+|---------|------|----------------|
+| **API Gateway** | 8000 | Request routing, CORS, health checks |
+| **Auth Service** | 8001 | OAuth2, JWT, user management |
+| **Tenant Service** | 8002 | Tenants, organizations, discovery |
+| **Resource Service** | 8003 | Resources, SLA policies |
+| **Job Service** | 8004 | Jobs, backup triggers, restore, export |
+| **Snapshot Service** | 8005 | Snapshots, snapshot items browsing |
+| **Dashboard Service** | 8006 | Metrics, aggregated statistics |
+| **Alert Service** | 8007 | Alerts, notifications, access groups |
+
+### Infrastructure
+
+| Component | Purpose |
+|-----------|---------|
+| **PostgreSQL 16** | Shared database for all services |
+| **RabbitMQ** | Async job queue (backup, restore, discovery) |
+| **Redis** | Caching (optional) |
 
 ## Quick Start
 
-### Option 1: Docker (Recommended)
+### Docker Compose (Recommended)
 
 ```bash
-# Copy and configure environment
+cd tm_backend
+
+# Copy environment file
 cp .env.example .env
 
-# Start backend + PostgreSQL
+# Start all services
 docker-compose up -d
 
 # View logs
-docker-compose logs -f backend
+docker-compose logs -f api-gateway
 
 # Stop
 docker-compose down
 ```
 
-### Option 2: Local Development
-
-#### 1. Install Dependencies
+### Manual Development
 
 ```bash
+# Start PostgreSQL first
+# Then run each service:
+cd services/auth-service
 pip install -r requirements.txt
+PYTHONPATH=../.. uvicorn main:app --reload --port 8001
 ```
 
-### 2. Configure Environment
+## API Endpoints
 
-```bash
-cp .env.example .env
-# Edit .env with your configuration values
+All endpoints are accessible through the API Gateway at `http://localhost:8000/api/v1/`
+
+### Authentication
+- `GET /auth/microsoft/url` - Get Microsoft OAuth2 URL
+- `POST /auth/callback` - Exchange code for tokens
+- `POST /auth/refresh` - Refresh access token
+- `POST /auth/logout` - Logout
+- `GET /auth/me` - Get current user
+
+### Dashboard
+- `GET /dashboard/overview` - Overview metrics
+- `GET /dashboard/status/24hour` - 24h backup status
+- `GET /dashboard/status/7day` - 7-day trends
+- `GET /dashboard/protection/status` - Protection coverage
+- `GET /dashboard/backup/size` - Storage consumption
+
+### Tenants
+- `GET /tenants` - List tenants
+- `POST /tenants` - Create tenant
+- `PUT /tenants/{id}` - Update tenant
+- `DELETE /tenants/{id}` - Delete tenant
+- `POST /tenants/{id}/discover-m365` - Trigger M365 discovery
+- `POST /tenants/{id}/discover-azure` - Trigger Azure discovery
+
+### Resources
+- `GET /resources` - List resources (paginated)
+- `GET /resources/users` - Get users with workloads
+- `POST /resources/{id}/assign-policy` - Assign SLA
+- `DELETE /resources/{id}` - Delete resource
+
+### Jobs
+- `GET /jobs` - List jobs
+- `GET /jobs/{id}/progress` - SSE progress stream
+- `POST /jobs/{id}/cancel` - Cancel job
+- `POST /backups/trigger` - Trigger backup
+
+### Snapshots
+- `GET /resources/{id}/snapshots` - List snapshots
+- `GET /resources/snapshots/{id}/items` - List items
+
+### SLA Policies
+- `GET /policies` - List policies
+- `POST /policies` - Create policy
+- `PUT /policies/{id}` - Update policy
+- `DELETE /policies/{id}` - Delete policy
+
+### Alerts
+- `GET /alerts` - List alerts
+- `POST /alerts/{id}/resolve` - Resolve alert
+
+## Configuration
+
+Copy `.env.example` to `.env` and configure:
+
+```env
+# Database
+DB_HOST=postgres
+DB_PORT=5432
+DB_NAME=tm_vault_db
+DB_USERNAME=tm_vault_admin
+DB_PASSWORD=admin123
+
+# JWT
+JWT_SECRET=your-secret-key
+
+# Microsoft OAuth
+MICROSOFT_CLIENT_ID=your-client-id
+MICROSOFT_CLIENT_SECRET=your-client-secret
+MICROSOFT_TENANT_ID=common
+
+# RabbitMQ (optional)
+RABBITMQ_ENABLED=false
+
+# Redis (optional)
+REDIS_ENABLED=false
 ```
-
-### 3. Run the Server
-
-```bash
-uvicorn main:app --reload --port 8000
-```
-
-The API will be available at `http://localhost:8000/api/v1`
-
-## API Documentation
-
-Once running, view interactive API docs at:
-- Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
 
 ## Project Structure
 
 ```
 tm_backend/
-├── main.py                 # FastAPI application entry point
-├── requirements.txt        # Python dependencies
-├── .env.example           # Environment configuration template
-├── app/
-│   ├── __init__.py
-│   ├── config.py          # Application settings
-│   ├── schemas.py         # Pydantic request/response models
-│   ├── security.py        # Authentication & authorization
-│   ├── db/
-│   │   ├── __init__.py
-│   │   ├── database.py    # Database connection
-│   │   └── models.py      # SQLAlchemy ORM models
-│   └── api/
-│       ├── __init__.py
-│       ├── routes.py      # Route aggregation
-│       ├── auth.py        # Authentication endpoints
-│       ├── dashboard.py   # Dashboard metrics
-│       ├── tenants.py     # Tenant management
-│       ├── resources.py   # Resource management
-│       ├── jobs.py        # Job management
-│       ├── snapshots.py   # Snapshot browsing
-│       ├── restore.py     # Restore/Export
-│       ├── alerts.py      # Alerts & notifications
-│       ├── policies.py    # SLA policies
-│       └── access_control.py  # Access groups
+├── shared/                    # Shared library
+│   ├── config.py             # Configuration
+│   ├── database.py           # Database connection
+│   ├── models.py             # SQLAlchemy models
+│   ├── schemas.py            # Pydantic schemas
+│   ├── security.py           # Auth utilities
+│   └── message_bus.py        # RabbitMQ client
+│
+├── api-gateway/              # API Gateway
+│   ├── Dockerfile
+│   ├── main.py
+│   └── requirements.txt
+│
+├── services/
+│   ├── auth-service/         # Authentication
+│   ├── tenant-service/       # Tenant management
+│   ├── resource-service/     # Resources & SLA
+│   ├── job-service/          # Jobs & triggers
+│   ├── snapshot-service/     # Snapshots
+│   ├── dashboard-service/    # Metrics
+│   └── alert-service/        # Alerts & access
+│
+├── workers/
+│   └── backup-worker/        # Async backup processor
+│
+├── docker-compose.yml
+├── .env.example
+├── .gitignore
+└── README.md
 ```
 
-## Configuration
+## Inter-Service Communication
 
-### Required Environment Variables
+- **Synchronous**: HTTP calls via API Gateway routing
+- **Asynchronous**: RabbitMQ for job processing
+  - `backup.urgent` / `backup.normal` - Backup jobs
+  - `restore.urgent` - Restore jobs
+  - `discovery.m365` / `discovery.azure` - Discovery jobs
+  - `notification` - Email/webhook alerts
+  - `delete.low` - Delayed deletion
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DB_HOST` | PostgreSQL host | localhost |
-| `DB_PORT` | PostgreSQL port | 5432 |
-| `DB_NAME` | Database name | tm_vault_db |
-| `DB_USERNAME` | Database user | tm_vault_admin |
-| `DB_PASSWORD` | Database password | admin123 |
-| `JWT_SECRET` | JWT signing secret | (change in production!) |
-| `MICROSOFT_CLIENT_ID` | Azure AD app client ID | |
-| `MICROSOFT_CLIENT_SECRET` | Azure AD app client secret | |
-| `MICROSOFT_TENANT_ID` | Azure AD tenant ID | common |
+## Scaling
 
-### Optional Environment Variables
+Each service runs independently and can be scaled horizontally:
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `SERVER_PORT` | HTTP port | 8000 |
-| `CORS_ORIGINS` | Allowed CORS origins | ["http://localhost:4200"] |
-| `REDIS_ENABLED` | Enable Redis caching | false |
-| `RABBITMQ_ENABLED` | Enable RabbitMQ | false |
-| `ELASTICSEARCH_ENABLED` | Enable Elasticsearch | false |
-
-## API Endpoints
-
-### Authentication
-- `GET /api/v1/auth/microsoft/url` - Get Microsoft OAuth2 login URL
-- `POST /api/v1/auth/callback` - Exchange OAuth code for tokens
-- `POST /api/v1/auth/refresh` - Refresh access token
-- `POST /api/v1/auth/logout` - Logout
-- `GET /api/v1/auth/me` - Get current user profile
-
-### Dashboard
-- `GET /api/v1/dashboard/overview` - Dashboard overview metrics
-- `GET /api/v1/dashboard/status/24hour` - 24h backup status
-- `GET /api/v1/dashboard/status/7day` - 7-day backup trends
-- `GET /api/v1/dashboard/protection/status` - Protection coverage
-- `GET /api/v1/dashboard/backup/size` - Storage consumption
-
-### Tenants
-- `GET /api/v1/tenants` - List tenants
-- `POST /api/v1/tenants` - Create tenant
-- `PUT /api/v1/tenants/{id}` - Update tenant
-- `DELETE /api/v1/tenants/{id}` - Delete tenant
-- `POST /api/v1/tenants/{id}/discover-m365` - Trigger M365 discovery
-- `POST /api/v1/tenants/{id}/discover-azure` - Trigger Azure discovery
-
-### Resources
-- `GET /api/v1/resources` - List resources (paginated)
-- `GET /api/v1/resources/{id}` - Get resource details
-- `GET /api/v1/resources/users` - Get users with workloads
-- `POST /api/v1/resources/{id}/assign-policy` - Assign SLA policy
-- `DELETE /api/v1/resources/{id}` - Delete resource
-
-### Jobs
-- `GET /api/v1/jobs` - List jobs (paginated)
-- `GET /api/v1/jobs/{id}/progress` - SSE job progress stream
-- `POST /api/v1/jobs/{id}/cancel` - Cancel job
-- `POST /api/v1/backups/trigger` - Trigger backup
-
-### Snapshots
-- `GET /api/v1/resources/{id}/snapshots` - List snapshots
-- `GET /api/v1/resources/snapshots/{id}/items` - List snapshot items
-
-### SLA Policies
-- `GET /api/v1/policies` - List policies
-- `POST /api/v1/policies` - Create policy
-- `PUT /api/v1/policies/{id}` - Update policy
-- `DELETE /api/v1/policies/{id}` - Delete policy
-
-## Database
-
-The application uses PostgreSQL with SQLAlchemy ORM. Tables are auto-created on startup.
-
-### Seed Data
-
-To seed initial data (run in psql):
-
-```sql
--- Create default organization
-INSERT INTO organizations (id, name, slug, created_at, updated_at)
-VALUES ('00000000-0000-0000-0000-000000000001', 'Taylor Morrison', 'taylor-morrison', NOW(), NOW());
-
--- Create sample tenant
-INSERT INTO tenants (id, org_id, type, display_name, status, created_at, updated_at)
-VALUES (gen_random_uuid(), '00000000-0000-0000-0000-000000000001', 'M365', 'Sample Tenant', 'ACTIVE', NOW(), NOW());
+```bash
+# Scale a specific service
+docker-compose up -d --scale resource-service=3
 ```
 
 ## Development
 
-### Running with Hot Reload
+### Adding a New Service
 
+1. Create directory: `services/new-service/`
+2. Add `main.py`, `Dockerfile`, `requirements.txt`
+3. Import shared models: `from shared.models import ...`
+4. Add to `docker-compose.yml`
+5. Add routes to `api-gateway/main.py`
+
+### Health Checks
+
+Each service exposes `/health` endpoint:
 ```bash
-uvicorn main:app --reload --port 8000
-```
-
-## Production
-
-### Using Docker
-
-```bash
-# Build and run
-docker build -t tm-vault-backend .
-docker run -p 8000:8000 --env-file .env tm-vault-backend
-```
-
-### Using Docker Compose
-
-```bash
-# From project root
-docker-compose up -d
-```
-
-### Manual Production Deploy
-
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+curl http://localhost:8001/health  # Auth
+curl http://localhost:8002/health  # Tenant
+curl http://localhost:8000/health  # Gateway
 ```
 
 ## Frontend Integration
 
-Update the frontend API base URL in your Angular environment file:
+Frontend connects to API Gateway at `http://localhost:8000/api/v1/`
 
+Update frontend environment:
 ```typescript
-// src/environments/environment.ts
+// environment.ts
 export const environment = {
   apiUrl: 'http://localhost:8000/api/v1'
 };
 ```
-
-## Features Implemented
-
-✅ Authentication (Microsoft OAuth2 + JWT)
-✅ Tenant Management
-✅ Resource Management  
-✅ Dashboard Metrics
-✅ Job Management (list, cancel, retry, progress SSE)
-✅ Snapshot Browsing
-✅ SLA Policies
-✅ Alerts
-✅ Access Control
-✅ Restore/Export Endpoints
-
-## Features Simplified/Stubbed
-
-- **Backup Jobs**: Returns stub responses (no actual Graph API/Azure integration)
-- **RabbitMQ**: Not integrated (jobs stored in DB only)
-- **Redis**: Not integrated (caching disabled by default)
-- **Elasticsearch**: Not integrated (search returns empty results)
-- **Azure Storage**: Not integrated (no actual backup storage)
-- **Encryption**: Not implemented
-- **Email Notifications**: Not implemented
-
-To add these features, integrate the respective services and enable them via environment variables.

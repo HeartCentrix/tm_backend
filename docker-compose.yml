@@ -1,78 +1,184 @@
 version: '3.8'
 
 services:
-  # PostgreSQL Database
   postgres:
     image: postgres:16-alpine
     container_name: tm_vault_db
     environment:
       POSTGRES_DB: tm_vault_db
       POSTGRES_USER: tm_vault_admin
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-admin123}
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: admin123
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tm_vault_admin"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 5
     restart: unless-stopped
+    networks:
+      - tm-network
 
-  # Backend API
-  backend:
+  api-gateway:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: tm_vault_backend
+      dockerfile: api-gateway/Dockerfile
+    container_name: tm_vault_gateway
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_NAME: tm_vault_db
       DB_USERNAME: tm_vault_admin
-      DB_PASSWORD: ${DB_PASSWORD:-admin123}
-      JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production}
-      MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID:-}
-      MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET:-}
-      MICROSOFT_TENANT_ID: ${MICROSOFT_TENANT_ID:-common}
-      CORS_ORIGINS: '["http://localhost:4200", "http://localhost:3000", "http://localhost:5173"]'
+      DB_PASSWORD: admin123
+      JWT_SECRET: tm-vault-secret-key-change-in-production
+      CORS_ORIGINS: '["http://localhost:4200","http://localhost:3000","http://localhost:5173"]'
     ports:
       - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - tm-network
 
-  # Redis (optional - for caching)
-  redis:
-    image: redis:7-alpine
-    container_name: tm_vault_redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-    profiles:
-      - full
-
-  # RabbitMQ (optional - for job queue)
-  rabbitmq:
-    image: rabbitmq:3-management-alpine
-    container_name: tm_vault_rabbitmq
+  auth-service:
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    container_name: tm_vault_auth
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: tm_vault_db
+      DB_USERNAME: tm_vault_admin
+      DB_PASSWORD: admin123
+      JWT_SECRET: tm-vault-secret-key-change-in-production
+      MICROSOFT_CLIENT_ID: placeholder
+      MICROSOFT_CLIENT_SECRET: placeholder
+      MICROSOFT_TENANT_ID: common
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
-    profiles:
-      - full
+    networks:
+      - tm-network
+
+  tenant-service:
+    build:
+      context: .
+      dockerfile: services/tenant-service/Dockerfile
+    container_name: tm_vault_tenant
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: tm_vault_db
+      DB_USERNAME: tm_vault_admin
+      DB_PASSWORD: admin123
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  resource-service:
+    build:
+      context: .
+      dockerfile: services/resource-service/Dockerfile
+    container_name: tm_vault_resource
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: tm_vault_db
+      DB_USERNAME: tm_vault_admin
+      DB_PASSWORD: admin123
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  job-service:
+    build:
+      context: .
+      dockerfile: services/job-service/Dockerfile
+    container_name: tm_vault_job
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: tm_vault_db
+      DB_USERNAME: tm_vault_admin
+      DB_PASSWORD: admin123
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+      RABBITMQ_ENABLED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  snapshot-service:
+    build:
+      context: .
+      dockerfile: services/snapshot-service/Dockerfile
+    container_name: tm_vault_snapshot
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: tm_vault_db
+      DB_USERNAME: tm_vault_admin
+      DB_PASSWORD: admin123
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  dashboard-service:
+    build:
+      context: .
+      dockerfile: services/dashboard-service/Dockerfile
+    container_name: tm_vault_dashboard
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: tm_vault_db
+      DB_USERNAME: tm_vault_admin
+      DB_PASSWORD: admin123
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  alert-service:
+    build:
+      context: .
+      dockerfile: services/alert-service/Dockerfile
+    container_name: tm_vault_alert
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: tm_vault_db
+      DB_USERNAME: tm_vault_admin
+      DB_PASSWORD: admin123
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
 
 volumes:
   postgres_data:
-  redis_data:
-  rabbitmq_data:
+
+networks:
+  tm-network:
+    driver: bridge
