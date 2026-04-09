@@ -87,7 +87,7 @@ async def resolve_alert(alert_id: str, db: AsyncSession = Depends(get_db)):
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
     alert.resolved = True
-    alert.resolved_at = datetime.now(timezone.utc)
+    alert.resolved_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.flush()
 
 

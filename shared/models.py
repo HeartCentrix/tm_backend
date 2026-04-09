@@ -1,15 +1,18 @@
 """Shared database models"""
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import (
     Column, String, DateTime, Boolean, Integer, BigInteger, 
-    Text, ForeignKey, Enum as SAEnum, JSON, ARRAY
+    Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import relationship
 import enum
 
 from shared.database import Base
+
+
+def utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class UserRole(str, enum.Enum):
@@ -106,7 +109,6 @@ class SnapshotStatus(str, enum.Enum):
 
 class Organization(Base):
     __tablename__ = "organizations"
-    
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String, nullable=False)
     slug = Column(String, unique=True, nullable=False)
@@ -114,13 +116,12 @@ class Organization(Base):
     encryption_mode = Column(String, default="TMVAULT_MANAGED")
     storage_quota_bytes = Column(BigInteger, default=500 * 1024**3)
     storage_bytes_used = Column(BigInteger, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class Tenant(Base):
     __tablename__ = "tenants"
-    
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
     type = Column(SAEnum(TenantType), default=TenantType.M365)
@@ -132,14 +133,13 @@ class Tenant(Base):
     status = Column(SAEnum(TenantStatus), default=TenantStatus.PENDING)
     storage_region = Column(String)
     last_discovery_at = Column(DateTime)
-    graph_delta_tokens = Column(JSON, default={})
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    graph_delta_tokens = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class PlatformUser(Base):
     __tablename__ = "platform_users"
-    
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String, unique=True, nullable=False, index=True)
     name = Column(String, nullable=False)
@@ -148,43 +148,40 @@ class PlatformUser(Base):
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"))
     mfa_enabled = Column(Boolean, default=False)
     last_login_at = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class UserRoleMapping(Base):
     __tablename__ = "user_roles"
-    
     user_id = Column(UUID(as_uuid=True), ForeignKey("platform_users.id"), primary_key=True)
     role = Column(SAEnum(UserRole), primary_key=True)
 
 
 class Resource(Base):
     __tablename__ = "resources"
-    
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
     type = Column(SAEnum(ResourceType), nullable=False)
     external_id = Column(String, nullable=False)
     display_name = Column(String, nullable=False)
     email = Column(String)
-    metadata = Column(JSON, default={})
+    extra_data = Column("metadata", JSON, default=dict)
     sla_policy_id = Column(UUID(as_uuid=True), ForeignKey("sla_policies.id"))
     status = Column(SAEnum(ResourceStatus), default=ResourceStatus.DISCOVERED)
     last_backup_job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id"))
     last_backup_at = Column(DateTime)
     last_backup_status = Column(String)
     storage_bytes = Column(BigInteger, default=0)
-    discovered_at = Column(DateTime, default=datetime.utcnow)
+    discovered_at = Column(DateTime, default=utcnow)
     archived_at = Column(DateTime)
     deletion_queued_at = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class SlaPolicy(Base):
     __tablename__ = "sla_policies"
-    
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
     name = Column(String, nullable=False)
@@ -206,13 +203,12 @@ class SlaPolicy(Base):
     retention_versions = Column(Integer)
     enabled = Column(Boolean, default=True)
     is_default = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class Job(Base):
     __tablename__ = "jobs"
-    
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     type = Column(SAEnum(JobType), nullable=False)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
@@ -226,22 +222,21 @@ class Job(Base):
     progress_pct = Column(Integer, default=0)
     items_processed = Column(BigInteger, default=0)
     bytes_processed = Column(BigInteger, default=0)
-    result = Column(JSON, default={})
-    spec = Column(JSON, default={})
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    result = Column(JSON, default=dict)
+    spec = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     completed_at = Column(DateTime)
 
 
 class Snapshot(Base):
     __tablename__ = "snapshots"
-    
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id"), nullable=False, index=True)
     job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id"))
     type = Column(SAEnum(SnapshotType), default=SnapshotType.INCREMENTAL)
     status = Column(SAEnum(SnapshotStatus), default=SnapshotStatus.RUNNING)
-    started_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, default=utcnow)
     completed_at = Column(DateTime)
     duration_secs = Column(Integer)
     item_count = Column(Integer, default=0)
@@ -250,12 +245,11 @@ class Snapshot(Base):
     bytes_total = Column(BigInteger, default=0)
     delta_token = Column(String)
     snapshot_label = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
 
 class SnapshotItem(Base):
     __tablename__ = "snapshot_items"
-    
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id"), nullable=False, index=True)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
@@ -265,18 +259,17 @@ class SnapshotItem(Base):
     folder_path = Column(String)
     content_hash = Column(String, index=True)
     content_size = Column(BigInteger, default=0)
-    metadata = Column(JSON, default={})
+    extra_data = Column("metadata", JSON, default=dict)
     is_deleted = Column(Boolean, default=False)
     indexed_at = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
 
 class JobLog(Base):
     __tablename__ = "job_logs"
-    
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id"), nullable=False, index=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=utcnow)
     level = Column(String, default="INFO")
     message = Column(Text, nullable=False)
     details = Column(Text)
@@ -284,7 +277,6 @@ class JobLog(Base):
 
 class Alert(Base):
     __tablename__ = "alerts"
-    
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"))
@@ -299,23 +291,22 @@ class Alert(Base):
     resolved_at = Column(DateTime)
     resolved_by = Column(UUID(as_uuid=True))
     resolution_note = Column(Text)
-    details = Column(JSON, default={})
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    details = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class AccessGroup(Base):
     __tablename__ = "access_groups"
-    
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"))
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"))
     name = Column(String, nullable=False)
     description = Column(String)
     scope = Column(String, default="TENANT")
-    resource_ids = Column(ARRAY(UUID(as_uuid=True)), default=[])
-    permissions = Column(JSON, default={})
-    member_ids = Column(ARRAY(UUID(as_uuid=True)), default=[])
+    resource_ids = Column(ARRAY(UUID(as_uuid=True)), default=list)
+    permissions = Column(JSON, default=dict)
+    member_ids = Column(ARRAY(UUID(as_uuid=True)), default=list)
     active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)

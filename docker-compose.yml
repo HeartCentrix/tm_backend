@@ -2,14 +2,15 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: tm_vault_db
+    env_file: .env
     environment:
-      POSTGRES_DB: tm_vault_db
-      POSTGRES_USER: tm_vault_admin
-      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tm_vault_admin"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME}"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -22,14 +23,11 @@ services:
       context: .
       dockerfile: api-gateway/Dockerfile
     container_name: tm_vault_gateway
+    env_file: .env
     environment:
       DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: tm_vault_db
-      DB_USERNAME: tm_vault_admin
-      DB_PASSWORD: admin123
-      JWT_SECRET: tm-vault-secret-key-change-in-production
-      CORS_ORIGINS: '["http://localhost:4200","http://localhost:3000","http://localhost:5173"]'
+      JWT_SECRET: ${JWT_SECRET}
+      CORS_ORIGINS: ${CORS_ALLOWED_ORIGINS}
     ports:
       - "8080:8000"
     depends_on:
@@ -44,16 +42,10 @@ services:
       context: .
       dockerfile: services/auth-service/Dockerfile
     container_name: tm_vault_auth
+    env_file: .env
     environment:
       DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: tm_vault_db
-      DB_USERNAME: tm_vault_admin
-      DB_PASSWORD: admin123
-      JWT_SECRET: tm-vault-secret-key-change-in-production
-      MICROSOFT_CLIENT_ID: placeholder
-      MICROSOFT_CLIENT_SECRET: placeholder
-      MICROSOFT_TENANT_ID: common
+      JWT_SECRET: ${JWT_SECRET}
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,12 +58,9 @@ services:
       context: .
       dockerfile: services/tenant-service/Dockerfile
     container_name: tm_vault_tenant
+    env_file: .env
     environment:
       DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: tm_vault_db
-      DB_USERNAME: tm_vault_admin
-      DB_PASSWORD: admin123
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,12 +73,9 @@ services:
       context: .
       dockerfile: services/resource-service/Dockerfile
     container_name: tm_vault_resource
+    env_file: .env
     environment:
       DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: tm_vault_db
-      DB_USERNAME: tm_vault_admin
-      DB_PASSWORD: admin123
     depends_on:
       postgres:
         condition: service_healthy
@@ -102,17 +88,9 @@ services:
       context: .
       dockerfile: services/job-service/Dockerfile
     container_name: tm_vault_job
+    env_file: .env
     environment:
       DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: tm_vault_db
-      DB_USERNAME: tm_vault_admin
-      DB_PASSWORD: admin123
-      RABBITMQ_HOST: rabbitmq
-      RABBITMQ_PORT: 5672
-      RABBITMQ_USER: guest
-      RABBITMQ_PASSWORD: guest
-      RABBITMQ_ENABLED: "false"
     depends_on:
       postgres:
         condition: service_healthy
@@ -125,12 +103,9 @@ services:
       context: .
       dockerfile: services/snapshot-service/Dockerfile
     container_name: tm_vault_snapshot
+    env_file: .env
     environment:
       DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: tm_vault_db
-      DB_USERNAME: tm_vault_admin
-      DB_PASSWORD: admin123
     depends_on:
       postgres:
         condition: service_healthy
@@ -143,12 +118,9 @@ services:
       context: .
       dockerfile: services/dashboard-service/Dockerfile
     container_name: tm_vault_dashboard
+    env_file: .env
     environment:
       DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: tm_vault_db
-      DB_USERNAME: tm_vault_admin
-      DB_PASSWORD: admin123
     depends_on:
       postgres:
         condition: service_healthy
@@ -161,12 +133,9 @@ services:
       context: .
       dockerfile: services/alert-service/Dockerfile
     container_name: tm_vault_alert
+    env_file: .env
     environment:
       DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: tm_vault_db
-      DB_USERNAME: tm_vault_admin
-      DB_PASSWORD: admin123
     depends_on:
       postgres:
         condition: service_healthy

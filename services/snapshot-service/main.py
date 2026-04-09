@@ -96,7 +96,7 @@ async def list_snapshot_items(
             SnapshotItemResponse(
                 id=str(i.id), snapshotId=str(i.snapshot_id), externalId=i.external_id,
                 itemType=i.item_type, name=i.name, folderPath=i.folder_path,
-                contentSize=i.content_size or 0, metadata=i.metadata or {},
+                contentSize=i.content_size or 0, metadata=i.extra_data or {},
                 isDeleted=i.is_deleted or False,
                 createdAt=i.created_at.isoformat() if i.created_at else "",
             )
@@ -136,7 +136,7 @@ async def browse_snapshot_items(
             SnapshotItemResponse(
                 id=str(i.id), snapshotId=str(i.snapshot_id), externalId=i.external_id,
                 itemType=i.item_type, name=i.name, folderPath=i.folder_path,
-                contentSize=i.content_size or 0, metadata=i.metadata or {},
+                contentSize=i.content_size or 0, metadata=i.extra_data or {},
                 isDeleted=i.is_deleted or False,
                 createdAt=i.created_at.isoformat() if i.created_at else "",
             )

@@ -1,11 +1,10 @@
 """API Gateway - Routes requests to microservices"""
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 import httpx
 
 from shared.config import settings
-from shared.database import init_db, close_db
 
 # Service URLs
 SERVICES = {
@@ -19,14 +18,7 @@ SERVICES = {
 }
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await init_db()
-    yield
-    await close_db()
-
-
-app = FastAPI(title="TM Vault API Gateway", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="TM Vault API Gateway", version="1.0.0")
 
 # CORS
 app.add_middleware(
@@ -40,17 +32,21 @@ app.add_middleware(
 
 async def proxy_request(service: str, path: str, request: Request):
     """Forward request to microservice"""
+    from fastapi.responses import Response
+    
     service_url = SERVICES.get(service)
     if not service_url:
         raise HTTPException(status_code=502, detail="Service not found")
-    
+
     url = f"{service_url}{path}"
-    
+
     # Build headers (forward auth)
     headers = {}
     if "authorization" in request.headers:
         headers["Authorization"] = request.headers["authorization"]
-    
+    if "content-type" in request.headers:
+        headers["Content-Type"] = request.headers["content-type"]
+
     async with httpx.AsyncClient() as client:
         response = await client.request(
             method=request.method,
@@ -61,7 +57,11 @@ async def proxy_request(service: str, path: str, request: Request):
             timeout=30.0,
         )
         
-        return response.content, response.status_code, dict(response.headers)
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            media_type=response.headers.get("content-type", "application/json"),
+        )
 
 
 # Auth routes
@@ -69,8 +69,7 @@ async def proxy_request(service: str, path: str, request: Request):
 @app.get("/api/v1/auth/microsoft/datasource/url")
 @app.get("/api/v1/auth/azure/datasource/url")
 async def auth_get(request: Request):
-    content, status, headers = await proxy_request("auth", request.url.path, request)
-    return content
+    return await proxy_request("auth", request.url.path, request)
 
 
 @app.post("/api/v1/auth/callback")
@@ -79,21 +78,18 @@ async def auth_get(request: Request):
 @app.post("/api/v1/auth/microsoft/datasource/callback")
 @app.post("/api/v1/auth/azure/datasource/callback")
 async def auth_post(request: Request):
-    content, status, headers = await proxy_request("auth", request.url.path, request)
-    return content
+    return await proxy_request("auth", request.url.path, request)
 
 
 @app.get("/api/v1/auth/me")
 async def auth_me(request: Request):
-    content, status, headers = await proxy_request("auth", request.url.path, request)
-    return content
+    return await proxy_request("auth", request.url.path, request)
 
 
 # Dashboard routes
 @app.get("/api/v1/dashboard/{rest:path}")
 async def dashboard(request: Request):
-    content, status, headers = await proxy_request("dashboard", request.url.path, request)
-    return content
+    return await proxy_request("dashboard", request.url.path, request)
 
 
 # Tenant routes
@@ -111,8 +107,7 @@ async def dashboard(request: Request):
 @app.get("/api/v1/organizations")
 @app.get("/api/v1/organizations/{org_id}")
 async def tenant(request: Request):
-    content, status, headers = await proxy_request("tenant", request.url.path, request)
-    return content
+    return await proxy_request("tenant", request.url.path, request)
 
 
 # Resource routes
@@ -130,8 +125,7 @@ async def tenant(request: Request):
 @app.post("/api/v1/resources/bulk-assign-policy")
 @app.post("/api/v1/resources/bulk-archive")
 async def resource(request: Request):
-    content, status, headers = await proxy_request("resource", request.url.path, request)
-    return content
+    return await proxy_request("resource", request.url.path, request)
 
 
 # Job routes
@@ -148,8 +142,7 @@ async def resource(request: Request):
 @app.post("/api/v1/dlq/{dlq_name}/purge")
 @app.post("/api/v1/dlq/{dlq_name}/requeue")
 async def job(request: Request):
-    content, status, headers = await proxy_request("job", request.url.path, request)
-    return content
+    return await proxy_request("job", request.url.path, request)
 
 
 # Snapshot routes
@@ -165,8 +158,7 @@ async def job(request: Request):
 @app.get("/api/v1/resources/{resource_id}/snapshots/{snapshot_id}/items")
 @app.get("/api/v1/resources/{resource_id}/snapshots/changes")
 async def snapshot(request: Request):
-    content, status, headers = await proxy_request("snapshot", request.url.path, request)
-    return content
+    return await proxy_request("snapshot", request.url.path, request)
 
 
 # Restore routes
@@ -181,8 +173,7 @@ async def snapshot(request: Request):
 @app.get("/api/v1/jobs/export/{job_id}/status")
 @app.get("/api/v1/jobs/export/{job_id}/download")
 async def restore(request: Request):
-    content, status, headers = await proxy_request("job", request.url.path, request)
-    return content
+    return await proxy_request("job", request.url.path, request)
 
 
 # Alert routes
@@ -196,8 +187,7 @@ async def restore(request: Request):
 @app.delete("/api/v1/alerts/webhooks/{webhook_id}")
 @app.post("/api/v1/alerts/webhooks/{webhook_id}/test")
 async def alert(request: Request):
-    content, status, headers = await proxy_request("alert", request.url.path, request)
-    return content
+    return await proxy_request("alert", request.url.path, request)
 
 
 # SLA Policy routes
@@ -209,8 +199,7 @@ async def alert(request: Request):
 @app.get("/api/v1/policies/{policy_id}/resources")
 @app.post("/api/v1/policies/{policy_id}/auto-assign")
 async def policy(request: Request):
-    content, status, headers = await proxy_request("resource", request.url.path, request)
-    return content
+    return await proxy_request("resource", request.url.path, request)
 
 
 # Access Control routes
@@ -225,8 +214,7 @@ async def policy(request: Request):
 @app.get("/api/v1/access-groups/ip-restrictions")
 @app.put("/api/v1/access-groups/ip-restrictions")
 async def access_control(request: Request):
-    content, status, headers = await proxy_request("alert", request.url.path, request)
-    return content
+    return await proxy_request("alert", request.url.path, request)
 
 
 @app.get("/health")

@@ -105,7 +105,7 @@ async def update_tenant(tenant_id: str, request: dict, db: AsyncSession = Depend
         tenant.display_name = request["name"]
     if request.get("status"):
         tenant.status = TenantStatus(request["status"])
-    tenant.updated_at = datetime.now(timezone.utc)
+    tenant.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.flush()
     return TenantResponse(
         id=str(tenant.id),

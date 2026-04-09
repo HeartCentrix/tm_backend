@@ -268,6 +268,12 @@ class SnapshotItemListResponse(BaseModel):
     number: int
 
 
+class SnapshotDiff(BaseModel):
+    added: List[SnapshotItemResponse]
+    removed: List[SnapshotItemResponse]
+    modified: List[SnapshotItemResponse]
+
+
 # ============ SLA Policy ============
 
 class SlaPolicyResponse(BaseModel):

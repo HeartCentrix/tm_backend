@@ -106,6 +106,7 @@ async def oauth_callback(callback: OAuthCallbackRequest, db: AsyncSession = Depe
     email = profile.get("mail") or profile.get("userPrincipalName")
     name = profile.get("displayName", email.split("@")[0])
     external_id = profile.get("id")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     
     stmt = select(PlatformUser).where(PlatformUser.email == email)
     result = await db.execute(stmt)
@@ -136,7 +137,8 @@ async def oauth_callback(callback: OAuthCallbackRequest, db: AsyncSession = Depe
         db.add(UserRoleMapping(user_id=user.id, role=UserRole.USER))
         await db.flush()
     
-    user.last_login_at = datetime.now(timezone.utc)
+    user.last_login_at = now
+    user.updated_at = now
     await db.flush()
     
     roles_stmt = select(UserRoleMapping).where(UserRoleMapping.user_id == user.id)

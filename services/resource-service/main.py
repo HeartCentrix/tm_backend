@@ -256,7 +256,7 @@ async def update_policy(policy_id: str, request: dict, db: AsyncSession = Depend
     for key, value in request.items():
         if hasattr(policy, key):
             setattr(policy, key, value)
-    policy.updated_at = datetime.now(timezone.utc)
+    policy.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.flush()
     return SlaPolicyResponse(
         id=str(policy.id), tenantId=str(policy.tenant_id), name=policy.name,
