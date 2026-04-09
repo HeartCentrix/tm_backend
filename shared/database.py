@@ -43,6 +43,169 @@ async def init_db():
         # Create schema if not exists
         await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {settings.DB_SCHEMA}"))
         await conn.execute(text(f"SET search_path TO {settings.DB_SCHEMA}"))
+        
+        # Create tables if they don't exist
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS organizations (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                name VARCHAR NOT NULL,
+                slug VARCHAR UNIQUE NOT NULL,
+                storage_region VARCHAR,
+                encryption_mode VARCHAR DEFAULT 'TMVAULT_MANAGED',
+                storage_quota_bytes BIGINT DEFAULT 536870912000,
+                storage_bytes_used BIGINT DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS tenants (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                org_id UUID REFERENCES organizations(id),
+                type VARCHAR DEFAULT 'M365',
+                display_name VARCHAR NOT NULL,
+                external_tenant_id VARCHAR,
+                subscription_id VARCHAR,
+                client_id VARCHAR,
+                client_secret_ref VARCHAR,
+                status VARCHAR DEFAULT 'PENDING',
+                storage_region VARCHAR,
+                last_discovery_at TIMESTAMP,
+                graph_delta_tokens JSON DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS platform_users (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                email VARCHAR UNIQUE NOT NULL,
+                name VARCHAR NOT NULL,
+                external_user_id VARCHAR,
+                org_id UUID REFERENCES organizations(id),
+                tenant_id UUID REFERENCES tenants(id),
+                mfa_enabled BOOLEAN DEFAULT FALSE,
+                last_login_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS user_roles (
+                user_id UUID REFERENCES platform_users(id),
+                role VARCHAR,
+                PRIMARY KEY (user_id, role)
+            )
+        """))
+        
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS sla_policies (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tenant_id UUID REFERENCES tenants(id),
+                name VARCHAR NOT NULL,
+                tier VARCHAR DEFAULT 'BRONZE',
+                frequency VARCHAR DEFAULT 'DAILY',
+                retention_type VARCHAR DEFAULT 'INDEFINITE',
+                enabled BOOLEAN DEFAULT TRUE,
+                is_default BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS resources (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tenant_id UUID REFERENCES tenants(id),
+                type VARCHAR NOT NULL,
+                external_id VARCHAR NOT NULL,
+                display_name VARCHAR NOT NULL,
+                email VARCHAR,
+                metadata JSON DEFAULT '{}',
+                sla_policy_id UUID REFERENCES sla_policies(id),
+                status VARCHAR DEFAULT 'DISCOVERED',
+                storage_bytes BIGINT DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                type VARCHAR NOT NULL,
+                tenant_id UUID REFERENCES tenants(id),
+                resource_id UUID REFERENCES resources(id),
+                snapshot_id UUID,
+                status VARCHAR DEFAULT 'QUEUED',
+                priority INTEGER DEFAULT 5,
+                progress_pct INTEGER DEFAULT 0,
+                result JSON DEFAULT '{}',
+                spec JSON DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """))
+        
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                resource_id UUID REFERENCES resources(id),
+                job_id UUID REFERENCES jobs(id),
+                type VARCHAR DEFAULT 'INCREMENTAL',
+                status VARCHAR DEFAULT 'COMPLETED',
+                item_count INTEGER DEFAULT 0,
+                bytes_total BIGINT DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS snapshot_items (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                snapshot_id UUID REFERENCES snapshots(id),
+                tenant_id UUID REFERENCES tenants(id),
+                external_id VARCHAR NOT NULL,
+                item_type VARCHAR NOT NULL,
+                name VARCHAR NOT NULL,
+                folder_path VARCHAR,
+                content_size BIGINT DEFAULT 0,
+                metadata JSON DEFAULT '{}',
+                is_deleted BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tenant_id UUID REFERENCES tenants(id),
+                org_id UUID REFERENCES organizations(id),
+                type VARCHAR NOT NULL,
+                severity VARCHAR DEFAULT 'MEDIUM',
+                message TEXT NOT NULL,
+                resolved BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS access_groups (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                org_id UUID REFERENCES organizations(id),
+                tenant_id UUID REFERENCES tenants(id),
+                name VARCHAR NOT NULL,
+                description VARCHAR,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        
         await conn.run_sync(Base.metadata.create_all)
 
 

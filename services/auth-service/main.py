@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import PlatformUser, UserRoleMapping, Organization, UserRole
+from shared.models import PlatformUser, UserRoleMapping, Organization, UserRole, Tenant, TenantType, TenantStatus
 from shared.security import create_access_token, create_refresh_token, decode_token, get_current_user_from_token
 from shared.schemas import (
     UserResponse, LoginResponse, RefreshTokenRequest, RefreshTokenResponse,
@@ -173,13 +173,76 @@ async def oauth_callback(callback: OAuthCallbackRequest, db: AsyncSession = Depe
 
 
 @app.post("/api/v1/auth/microsoft/datasource/callback")
-async def datasource_callback(callback: OAuthCallbackRequest):
-    return {"tenantId": str(uuid4()), "tenantName": "New Tenant"}
+async def datasource_callback(
+    callback: OAuthCallbackRequest,
+    current_user: dict = Depends(get_current_user_from_token),
+    db: AsyncSession = Depends(get_db),
+):
+    # Exchange code for tokens
+    async with httpx.AsyncClient() as client:
+        token_response = await client.post(
+            settings.MICROSOFT_TOKEN_URL,
+            data={
+                "client_id": settings.MICROSOFT_CLIENT_ID,
+                "client_secret": settings.MICROSOFT_CLIENT_SECRET,
+                "code": callback.code,
+                "redirect_uri": "http://localhost:4200/datasource-callback",
+                "grant_type": "authorization_code",
+            },
+        )
+        token_response.raise_for_status()
+        tokens = token_response.json()
+        
+        # Get tenant info from Graph API
+        graph_response = await client.get(
+            "https://graph.microsoft.com/v1.0/organization",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        )
+        graph_response.raise_for_status()
+        org_data = graph_response.json()
+    
+    external_tenant_id = org_data["value"][0]["id"] if org_data.get("value") else None
+    display_name = org_data["value"][0]["displayName"] if org_data.get("value") else "New Tenant"
+    
+    # Check if tenant already exists
+    stmt = select(Tenant).where(Tenant.external_tenant_id == external_tenant_id)
+    result = await db.execute(stmt)
+    tenant = result.scalar_one_or_none()
+    
+    if tenant is None:
+        org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
+        tenant = Tenant(
+            id=uuid4(),
+            org_id=org_id,
+            type=TenantType.M365,
+            display_name=display_name,
+            external_tenant_id=external_tenant_id,
+            status=TenantStatus.ACTIVE,
+        )
+        db.add(tenant)
+        await db.flush()
+    
+    return {"tenantId": str(tenant.id), "tenantName": tenant.display_name}
 
 
 @app.post("/api/v1/auth/azure/datasource/callback")
-async def azure_datasource_callback(callback: OAuthCallbackRequest):
-    return {"tenantId": str(uuid4()), "tenantName": "Azure Tenant"}
+async def azure_datasource_callback(
+    callback: OAuthCallbackRequest,
+    current_user: dict = Depends(get_current_user_from_token),
+    db: AsyncSession = Depends(get_db),
+):
+    # For Azure - similar flow with ARM API
+    display_name = "Azure Tenant"
+    tenant = Tenant(
+        id=uuid4(),
+        org_id=UUID(current_user["org_id"]) if current_user.get("org_id") else None,
+        type=TenantType.AZURE,
+        display_name=display_name,
+        status=TenantStatus.ACTIVE,
+    )
+    db.add(tenant)
+    await db.flush()
+    return {"tenantId": str(tenant.id), "tenantName": tenant.display_name}
 
 
 @app.post("/api/v1/auth/refresh", response_model=RefreshTokenResponse)
