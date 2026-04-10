@@ -328,3 +328,31 @@ class AccessGroup(Base):
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), index=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
+
+    # Actor who triggered the action
+    actor_id = Column(UUID(as_uuid=True))
+    actor_email = Column(String)
+    actor_type = Column(String, default="SYSTEM")  # USER | SYSTEM | WORKER
+
+    # Action details
+    action = Column(String, nullable=False, index=True)  # BACKUP_COMPLETED, etc.
+    resource_id = Column(UUID(as_uuid=True))
+    resource_type = Column(String)  # MAILBOX, ONEDRIVE, etc.
+    resource_name = Column(String)
+    outcome = Column(String, default="SUCCESS")  # SUCCESS | FAILURE | PARTIAL
+
+    # Job/snapshot references
+    job_id = Column(UUID(as_uuid=True))
+    snapshot_id = Column(UUID(as_uuid=True))
+
+    # Extended details (JSONB for flexibility)
+    details = Column(JSON, default=dict)
+
+    occurred_at = Column(DateTime, default=utcnow, index=True, nullable=False)

@@ -15,9 +15,6 @@ class Settings:
         self.JWT_ALGORITHM = "HS256"
         self.JWT_EXPIRATION_HOURS = 8
         self.JWT_REFRESH_EXPIRATION_DAYS = 7
-        self.MICROSOFT_CLIENT_ID = os.getenv("MICROSOFT_CLIENT_ID") or os.getenv("AZURE_AD_CLIENT_ID", "")
-        self.MICROSOFT_CLIENT_SECRET = os.getenv("MICROSOFT_CLIENT_SECRET") or os.getenv("AZURE_AD_CLIENT_SECRET", "")
-        self.MICROSOFT_TENANT_ID = os.getenv("MICROSOFT_TENANT_ID") or os.getenv("AZURE_AD_TENANT_ID", "common")
         self.REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
         self.REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
         self.REDIS_DB = int(os.getenv("REDIS_DB", "0"))
@@ -34,17 +31,65 @@ class Settings:
         origins = os.getenv("CORS_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:4200,http://localhost:3000,http://localhost:5173")
         self.CORS_ORIGINS = [o.strip() for o in origins.split(",")]
 
+        # Multi-app registration for Microsoft Graph API
+        # Parse from env: APP_1_CLIENT_ID, APP_1_CLIENT_SECRET, APP_1_TENANT_ID, etc.
+        self.GRAPH_APPS = self._parse_graph_apps()
+
+    def _parse_graph_apps(self) -> List[dict]:
+        """Parse multiple Graph app registrations from env vars."""
+        apps = []
+        for i in range(1, 11):  # Support up to 10 app registrations
+            client_id = os.getenv(f"APP_{i}_CLIENT_ID") or os.getenv("AZURE_AD_CLIENT_ID", "")
+            client_secret = os.getenv(f"APP_{i}_CLIENT_SECRET") or os.getenv("AZURE_AD_CLIENT_SECRET", "")
+            tenant_id = os.getenv(f"APP_{i}_TENANT_ID") or os.getenv("AZURE_AD_TENANT_ID", "common")
+
+            if client_id and client_secret:
+                apps.append({
+                    "index": i,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "tenant_id": tenant_id,
+                })
+
+            # If using single app config (legacy), stop after first
+            if not os.getenv(f"APP_{i}_CLIENT_ID") and not os.getenv(f"APP_{i}_CLIENT_SECRET"):
+                if i == 1 and client_id and client_secret:
+                    # Legacy single app mode
+                    apps.append({
+                        "index": 1,
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "tenant_id": tenant_id,
+                    })
+                break
+
+        return apps or [{
+            "index": 1,
+            "client_id": "",
+            "client_secret": "",
+            "tenant_id": "common",
+        }]
+
+    @property
+    def GRAPH_APP_COUNT(self) -> int:
+        return len(self.GRAPH_APPS)
+
+    # Backward compatibility properties for auth-service
+    @property
+    def MICROSOFT_CLIENT_ID(self) -> str:
+        return self.GRAPH_APPS[0]["client_id"] if self.GRAPH_APPS else ""
+
+    @property
+    def MICROSOFT_CLIENT_SECRET(self) -> str:
+        return self.GRAPH_APPS[0]["client_secret"] if self.GRAPH_APPS else ""
+
+    @property
+    def MICROSOFT_TENANT_ID(self) -> str:
+        return self.GRAPH_APPS[0]["tenant_id"] if self.GRAPH_APPS else "common"
+
     @property
     def DATABASE_URL(self) -> str:
         return f"postgresql+asyncpg://{self.DB_USERNAME}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
-
-    @property
-    def MICROSOFT_AUTH_URL(self) -> str:
-        return f"https://login.microsoftonline.com/{self.MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize"
-
-    @property
-    def MICROSOFT_TOKEN_URL(self) -> str:
-        return f"https://login.microsoftonline.com/{self.MICROSOFT_TENANT_ID}/oauth2/v2.0/token"
 
     @property
     def RABBITMQ_URL(self) -> str:

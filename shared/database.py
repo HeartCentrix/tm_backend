@@ -220,7 +220,32 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        
+
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                org_id UUID REFERENCES organizations(id),
+                tenant_id UUID REFERENCES tenants(id),
+                actor_id UUID,
+                actor_email VARCHAR,
+                actor_type VARCHAR DEFAULT 'SYSTEM',
+                action VARCHAR NOT NULL,
+                resource_id UUID,
+                resource_type VARCHAR,
+                resource_name VARCHAR,
+                outcome VARCHAR DEFAULT 'SUCCESS',
+                job_id UUID,
+                snapshot_id UUID,
+                details JSONB DEFAULT '{}',
+                occurred_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_tenant ON audit_events(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_occurred ON audit_events(occurred_at DESC)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_org ON audit_events(org_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_resource ON audit_events(resource_id)"))
+
         await conn.run_sync(Base.metadata.create_all)
 
 

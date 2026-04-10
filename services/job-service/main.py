@@ -1,6 +1,6 @@
 """Job Service - Manages jobs, backup triggers, restore, and exports"""
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Dict, List
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 import json
@@ -12,7 +12,7 @@ from sqlalchemy import select, func
 
 from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Job, JobLog, JobType, JobStatus
+from shared.models import Job, JobLog, JobType, JobStatus, Resource
 from shared.schemas import (
     JobResponse, JobListResponse, TriggerBackupRequest, TriggerBulkBackupRequest
 )
@@ -156,22 +156,51 @@ async def get_job_logs(job_id: str, page: int = Query(1), size: int = Query(50),
 
 @app.post("/api/v1/backups/trigger", response_model=JobResponse)
 async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depends(get_db)):
+    # Fetch resource to get tenant info
+    resource_stmt = select(Resource).where(Resource.id == UUID(request.resourceId))
+    resource_result = await db.execute(resource_stmt)
+    resource = resource_result.scalar_one_or_none()
+    if not resource:
+        raise HTTPException(status_code=404, detail="Resource not found")
+
     job = Job(
-        id=uuid4(), type=JobType.BACKUP, resource_id=UUID(request.resourceId),
+        id=uuid4(), type=JobType.BACKUP,
+        tenant_id=resource.tenant_id,
+        resource_id=UUID(request.resourceId),
         status=JobStatus.QUEUED, priority=request.priority or 1,
-        spec={"fullBackup": request.fullBackup, "note": request.note},
+        progress_pct=0, items_processed=0, bytes_processed=0,
+        spec={"fullBackup": request.fullBackup, "note": request.note, "triggered_by": "MANUAL"},
     )
     db.add(job)
     await db.flush()
-    
+
     # Publish to RabbitMQ
     if settings.RABBITMQ_ENABLED:
-        routing_key = "backup.urgent" if (request.priority or 1) == 1 else "backup.normal"
+        routing_key = "backup.urgent"
         await message_bus.publish(routing_key, create_backup_message(
             job_id=str(job.id), resource_id=request.resourceId,
-            tenant_id="", full_backup=request.fullBackup or False
-        ), priority=request.priority or 5)
-    
+            tenant_id=str(resource.tenant_id), full_backup=request.fullBackup or False
+        ), priority=request.priority or 1)
+
+    # Log audit event: BACKUP_TRIGGERED
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post("http://audit-service:8012/api/v1/audit/log", json={
+                "action": "BACKUP_TRIGGERED",
+                "tenant_id": str(resource.tenant_id),
+                "org_id": None,  # Would need tenant org lookup
+                "actor_type": "USER",
+                "resource_id": request.resourceId,
+                "resource_type": resource.type.value if hasattr(resource.type, 'value') else resource.type,
+                "resource_name": resource.display_name,
+                "outcome": "SUCCESS",
+                "job_id": str(job.id),
+                "details": {"fullBackup": request.fullBackup, "note": request.note},
+            })
+    except Exception:
+        pass  # Don't fail the trigger if audit logging fails
+
     return JobResponse(
         id=str(job.id), type="BACKUP", status="QUEUED", progress=0,
         resourceId=request.resourceId,
@@ -184,14 +213,106 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
 @app.post("/api/v1/backups/trigger-bulk")
 async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBackupRequest = None, db: AsyncSession = Depends(get_db)):
     if request and request.resourceIds:
-        jobs = []
+        # Fetch all resources with tenant info
+        resources_map = {}
         for rid in request.resourceIds:
-            job = Job(id=uuid4(), type=JobType.BACKUP, resource_id=UUID(rid), status=JobStatus.QUEUED, priority=request.priority or 5)
+            res_stmt = select(Resource).where(Resource.id == UUID(rid))
+            res_result = await db.execute(res_stmt)
+            res = res_result.scalar_one_or_none()
+            if res:
+                resources_map[rid] = res
+
+        if not resources_map:
+            raise HTTPException(status_code=404, detail="No valid resources found")
+
+        # Group resources by tenant for batch processing
+        tenant_groups: Dict[uuid.UUID, List[str]] = {}
+        for rid, res in resources_map.items():
+            tenant_groups.setdefault(res.tenant_id, []).append(rid)
+
+        jobs_created = []
+
+        # For each tenant, create a single mass backup job
+        for tenant_id, resource_ids in tenant_groups.items():
+            # Create single mass backup job
+            job = Job(
+                id=uuid4(), type=JobType.BACKUP,
+                tenant_id=tenant_id,
+                resource_id=None,  # Mass backup
+                batch_resource_ids=[UUID(rid) for rid in resource_ids],
+                status=JobStatus.QUEUED, priority=1,
+                progress_pct=0, items_processed=0, bytes_processed=0,
+                spec={"triggered_by": "MANUAL_BATCH", "resource_count": len(resource_ids)},
+            )
             db.add(job)
-            jobs.append(job)
+
+            # Publish mass backup message to RabbitMQ
+            if settings.RABBITMQ_ENABLED:
+                from shared.message_bus import create_mass_backup_message
+                # Get first resource to determine resource type
+                first_res = resources_map[resource_ids[0]]
+                resource_type = first_res.type.value if hasattr(first_res.type, 'value') else str(first_res.type)
+
+                await message_bus.publish("backup.urgent", create_mass_backup_message(
+                    job_id=str(job.id),
+                    tenant_id=str(tenant_id),
+                    resource_type=resource_type,
+                    resource_ids=resource_ids,
+                    sla_tier="MANUAL",
+                    full_backup=False
+                ), priority=1)
+
+            jobs_created.append({"jobId": str(job.id), "status": "QUEUED", "resourceId": "BATCH", "resourceCount": len(resource_ids)})
+
         await db.flush()
-        return [{"jobId": str(j.id), "status": "QUEUED", "resourceId": str(j.resource_id)} for j in jobs]
-    return [{"jobId": str(uuid4()), "status": "QUEUED", "resourceId": resource_id}]
+
+        # Log audit event
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post("http://audit-service:8012/api/v1/audit/log", json={
+                    "action": "BACKUP_TRIGGERED",
+                    "tenant_id": str(list(tenant_groups.keys())[0]),
+                    "org_id": None,
+                    "actor_type": "USER",
+                    "resource_id": None,
+                    "resource_type": "BATCH",
+                    "resource_name": f"Batch backup: {len(resources_map)} resources",
+                    "outcome": "SUCCESS",
+                    "job_id": jobs_created[0]["jobId"] if jobs_created else None,
+                    "details": {"resourceCount": len(resources_map), "batch": True},
+                })
+        except Exception:
+            pass
+
+        return jobs_created
+
+    elif resource_id:
+        res_stmt = select(Resource).where(Resource.id == UUID(resource_id))
+        res_result = await db.execute(res_stmt)
+        res = res_result.scalar_one_or_none()
+        if not res:
+            raise HTTPException(status_code=404, detail="Resource not found")
+
+        job = Job(
+            id=uuid4(), type=JobType.BACKUP,
+            tenant_id=res.tenant_id,
+            resource_id=UUID(resource_id),
+            status=JobStatus.QUEUED, priority=1,
+            progress_pct=0, items_processed=0, bytes_processed=0,
+            spec={"triggered_by": "MANUAL"},
+        )
+        db.add(job)
+        await db.flush()
+
+        if settings.RABBITMQ_ENABLED:
+            await message_bus.publish("backup.urgent", create_backup_message(
+                job_id=str(job.id), resource_id=resource_id,
+                tenant_id=str(res.tenant_id), full_backup=False
+            ), priority=1)
+
+        return {"jobId": str(job.id), "status": "QUEUED", "resourceId": resource_id}
+    return {"error": "No resources provided"}
 
 
 @app.post("/api/v1/jobs/restore")

@@ -297,21 +297,59 @@ async def delete_resource(resource_id: str, db: AsyncSession = Depends(get_db)):
 async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depends(get_db)):
     """
     Assign an SLA policy to multiple resources at once.
-    
+
     Body:
     {
         "resourceIds": ["uuid1", "uuid2", ...],
         "policyId": "uuid-of-policy"
     }
-    
+
     Returns:
     {
         "assigned": 10,
         "not_found": ["uuid-of-missing-resource", ...]
     }
     """
-    resource_ids = [UUID(rid) for rid in request.resourceIds]
-    policy_id = UUID(request.policyId)
+    print(f"[BULK_ASSIGN] Received policyId: '{request.policyId}', resourceIds: {request.resourceIds}")
+
+    # Validate policyId
+    if not request.policyId or request.policyId.strip() == "":
+        # If policyId is empty, unassign policy from resources
+        resource_ids = []
+        for rid in request.resourceIds:
+            try:
+                resource_ids.append(UUID(rid))
+            except ValueError:
+                print(f"[BULK_ASSIGN] Skipping invalid resource ID: {rid}")
+                continue
+
+        stmt = select(Resource).where(Resource.id.in_(resource_ids))
+        result = await db.execute(stmt)
+        resources = result.scalars().all()
+
+        for resource in resources:
+            resource.sla_policy_id = None
+        await db.commit()
+
+        return {
+            "assigned": 0,
+            "unassigned": len(resources),
+            "not_found": [],
+        }
+
+    try:
+        policy_id = UUID(request.policyId)
+    except ValueError:
+        print(f"[BULK_ASSIGN] ERROR: Invalid policy ID format: '{request.policyId}'")
+        raise HTTPException(status_code=400, detail=f"Invalid policy ID format: '{request.policyId}'. Must be a valid UUID.")
+
+    resource_ids = []
+    for rid in request.resourceIds:
+        try:
+            resource_ids.append(UUID(rid))
+        except ValueError:
+            print(f"[BULK_ASSIGN] Skipping invalid resource ID: {rid}")
+            continue
     
     # Fetch all matching resources in one query
     stmt = select(Resource).where(Resource.id.in_(resource_ids))
@@ -400,7 +438,9 @@ def build_schedule(policy):
 
 def policy_to_dict(p):
     """Convert policy to API response format"""
-    return SlaPolicyResponse.model_validate(p).model_dump()
+    result = SlaPolicyResponse.model_validate(p).model_dump()
+    print(f"[POLICY] Converted policy: id={result.get('id')}, name={result.get('name')}")
+    return result
 
 
 @app.get("/api/v1/policies")

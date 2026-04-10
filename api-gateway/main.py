@@ -15,6 +15,11 @@ SERVICES = {
     "snapshot": "http://snapshot-service:8005",
     "dashboard": "http://dashboard-service:8006",
     "alert": "http://alert-service:8007",
+    "scheduler": "http://backup-scheduler:8008",
+    "graph-proxy": "http://graph-proxy:8009",
+    "delta-token": "http://delta-token:8010",
+    "progress": "http://progress-tracker:8011",
+    "audit": "http://audit-service:8012",
 }
 
 
@@ -215,6 +220,30 @@ async def policy(request: Request):
 @app.put("/api/v1/access-groups/ip-restrictions")
 async def access_control(request: Request):
     return await proxy_request("alert", request.url.path, request)
+
+
+# ============ Progress Tracking ============
+
+@app.get("/api/v1/progress/resource/{resource_id}")
+@app.get("/api/v1/progress/resources")
+@app.post("/api/v1/progress/update")
+@app.post("/api/v1/progress/estimate/{resource_id}")
+async def progress_proxy(request: Request):
+    return await proxy_request("progress", request.url.path, request)
+
+
+# ============ Audit Log ============
+
+@app.get("/api/v1/audit/events")
+@app.get("/api/v1/audit/resource/{resource_id}")
+@app.get("/api/v1/audit/export")
+@app.get("/api/v1/audit/actions")
+@app.get("/api/v1/audit/stats")
+@app.get("/api/v1/audit/graph-apps")
+@app.post("/api/v1/audit/log")
+@app.post("/api/v1/audit/ingest/graph/{tenant_id}")
+async def audit_proxy(request: Request):
+    return await proxy_request("audit", request.url.path, request)
 
 
 @app.get("/health")

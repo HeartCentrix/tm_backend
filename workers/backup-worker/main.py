@@ -41,6 +41,42 @@ from shared.models import (
 from shared.message_bus import message_bus
 from shared.config import settings
 from shared.graph_client import GraphClient
+from shared.multi_app_manager import multi_app_manager
+
+
+class ProgressReporter:
+    """Reports backup progress to the progress-tracker service"""
+
+    def __init__(self):
+        self.progress_url = "http://progress-tracker:8011/api/v1/progress/update"
+
+    async def report(self, resource_id: str, job_id: str, **kwargs):
+        """Send progress update to progress-tracker"""
+        payload = {
+            "resource_id": resource_id,
+            "job_id": job_id,
+            **kwargs
+        }
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(self.progress_url, json=payload)
+        except Exception as e:
+            print(f"[ProgressReporter] Failed to report progress: {e}")
+
+
+class AuditLogger:
+    """Logs backup events to the audit service"""
+
+    def __init__(self):
+        self.audit_url = "http://audit-service:8012/api/v1/audit/log"
+
+    async def log(self, **kwargs):
+        """Send audit event"""
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(self.audit_url, json=kwargs)
+        except Exception as e:
+            print(f"[AuditLogger] Failed to log audit event: {e}")
 
 
 class BackupWorker:
@@ -52,6 +88,8 @@ class BackupWorker:
         self.blob_service_client: Optional[BlobServiceClient] = None
         self.semaphore = asyncio.Semaphore(50)  # Max 50 concurrent backups
         self.throttle_tracker: Dict[str, Dict] = {}  # Track API calls per tenant
+        self.progress_reporter = ProgressReporter()
+        self.audit_logger = AuditLogger()
         
     async def initialize(self):
         """Initialize connections and clients"""
@@ -153,6 +191,16 @@ class BackupWorker:
                     backup_result = await self.execute_backup(
                         graph_client, resource, snapshot, tenant, message
                     )
+
+                    # Report progress (100% complete)
+                    await self.progress_reporter.report(
+                        resource_id=resource_id,
+                        job_id=str(job_id),
+                        status="COMPLETED",
+                        progress_pct=100,
+                        processed_items=backup_result.get("item_count", 0),
+                        processed_bytes=backup_result.get("bytes_added", 0),
+                    )
                     
                     # Complete snapshot
                     await self.complete_snapshot(
@@ -171,12 +219,46 @@ class BackupWorker:
                     )
                     
                     await session.commit()
-                    
+
+                    # Log audit event: BACKUP_COMPLETED
+                    await self.audit_logger.log(
+                        action="BACKUP_COMPLETED",
+                        tenant_id=tenant_id,
+                        org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
+                        actor_type="WORKER",
+                        resource_id=resource_id,
+                        resource_type=resource.type.value if hasattr(resource.type, 'value') else resource.type,
+                        resource_name=resource.display_name or resource.email,
+                        outcome="SUCCESS",
+                        job_id=str(job_id),
+                        snapshot_id=str(snapshot.id),
+                        details={
+                            "item_count": backup_result.get("item_count", 0),
+                            "bytes_added": backup_result.get("bytes_added", 0),
+                            "delta_token": "present" if backup_result.get("new_delta_token") else "none",
+                        },
+                    )
+
                     print(f"[{self.worker_id}] Completed backup for {resource_id}")
                     
                 except Exception as e:
                     await session.rollback()
                     await self.handle_backup_failure(session, job_id, e)
+
+                    # Log audit event: BACKUP_FAILED
+                    await self.audit_logger.log(
+                        action="BACKUP_FAILED",
+                        tenant_id=tenant_id,
+                        org_id=str(tenant.org_id) if 'tenant' in dir() and hasattr(tenant, 'org_id') and tenant.org_id else None,
+                        actor_type="WORKER",
+                        resource_id=resource_id,
+                        resource_type=resource.type.value if 'resource' in dir() and hasattr(resource, 'type') and hasattr(resource.type, 'value') else None,
+                        resource_name=resource.display_name if 'resource' in dir() and hasattr(resource, 'display_name') else None,
+                        outcome="FAILURE",
+                        job_id=str(job_id),
+                        details={"error": str(e)},
+                    )
+
                     print(f"[{self.worker_id}] Backup failed for {resource_id}: {e}")
                     raise
     
@@ -251,7 +333,26 @@ class BackupWorker:
                     )
                     
                     await session.commit()
-                    
+
+                    # Log audit event: BACKUP_COMPLETED (mass)
+                    outcome = "PARTIAL" if failed_count > 0 and completed_count > 0 else "SUCCESS"
+                    await self.audit_logger.log(
+                        action="BACKUP_COMPLETED",
+                        tenant_id=tenant_id,
+                        org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
+                        actor_type="WORKER",
+                        resource_type=resource_type,
+                        resource_name=f"Mass backup: {resource_type}",
+                        outcome=outcome,
+                        job_id=str(job_id),
+                        details={
+                            "total": len(resources),
+                            "completed": completed_count,
+                            "failed": failed_count,
+                            "batch": True,
+                        },
+                    )
+
                     print(f"[{self.worker_id}] Mass backup completed: {completed_count} succeeded, {failed_count} failed")
                     
                 except Exception as e:
@@ -304,17 +405,16 @@ class BackupWorker:
         return results
     
     async def get_graph_client(self, tenant: Tenant) -> GraphClient:
-        """Get or create Graph client for a tenant"""
-        tenant_key = str(tenant.id)
-        
-        if tenant_key not in self.graph_clients:
-            self.graph_clients[tenant_key] = GraphClient(
-                client_id=tenant.client_id,
-                client_secret=None,  # Would use Key Vault in production
-                tenant_id=tenant.external_tenant_id
-            )
-        
-        return self.graph_clients[tenant_key]
+        """Get Graph client for a tenant using next available app registration"""
+        # Get next app from multi-app manager (round-robin + load balancing)
+        app = multi_app_manager.get_next_app()
+
+        # Use tenant's external tenant ID with the app's credentials
+        return GraphClient(
+            client_id=app.client_id,
+            client_secret=app.client_secret,
+            tenant_id=tenant.external_tenant_id,
+        )
     
     async def create_snapshot(self, session: AsyncSession, resource: Resource, message: Dict) -> Snapshot:
         """Create a snapshot record for backup"""

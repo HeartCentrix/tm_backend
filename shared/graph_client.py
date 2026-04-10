@@ -2,25 +2,32 @@
 import httpx
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+import hashlib
+import time
 
 
 class GraphClient:
-    """Client for Microsoft Graph API calls"""
-    
+    """Client for Microsoft Graph API calls with multi-app support"""
+
     GRAPH_URL = "https://graph.microsoft.com/v1.0"
     TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-    
+
     SCOPES = [
         "https://graph.microsoft.com/.default"
     ]
-    
+
     def __init__(self, client_id: str, client_secret: str, tenant_id: str):
         self.client_id = client_id
         self.client_secret = client_secret
         self.tenant_id = tenant_id
         self._access_token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
-    
+
+    @property
+    def app_client_id(self) -> str:
+        """Return the app client ID for tracking purposes"""
+        return self.client_id
+
     async def _get_token(self) -> str:
         """Get or refresh access token using client credentials"""
         if self._access_token and self._token_expiry and datetime.utcnow() < self._token_expiry:
@@ -45,21 +52,36 @@ class GraphClient:
             return self._access_token
     
     async def _get(self, url: str, params: Optional[Dict] = None) -> Dict[str, Any]:
-        """Make authenticated GET request with pagination support"""
+        """Make authenticated GET request with pagination and throttling support"""
         token = await self._get_token()
         all_items = []
         next_url = url
-        
+        max_retries = 3
+        retry_count = 0
+
         while next_url:
             async with httpx.AsyncClient() as client:
                 headers = {"Authorization": f"Bearer {token}", "ConsistencyLevel": "eventual"}
                 resp = await client.get(next_url, headers=headers, params=params if not next_url.startswith("http") else None)
+
+                # Handle 429 throttling
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", "30"))
+                    from shared.multi_app_manager import multi_app_manager
+                    multi_app_manager.mark_throttled(self.client_id, retry_after)
+                    if retry_count < max_retries:
+                        retry_count += 1
+                        await __import__('asyncio').sleep(retry_after)
+                        continue
+                    resp.raise_for_status()
+
                 resp.raise_for_status()
                 data = resp.json()
                 all_items.extend(data.get("value", []))
                 next_url = data.get("@odata.nextLink")
                 params = None  # params only on first request
-        
+                retry_count = 0  # Reset on success
+
         return {"value": all_items, "@odata.count": data.get("@odata.count", len(all_items))}
     
     async def discover_users(self) -> List[Dict[str, Any]]:
@@ -241,3 +263,27 @@ class GraphClient:
                 unique.append(r)
         
         return unique
+
+    async def get_directory_audit_logs(self, filter_expr: str = None, top: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get Microsoft Entra directory audit logs.
+        Graph API: GET /auditLogs/directoryAudits
+        Permission: AuditLog.Read.All
+        """
+        params = {"$top": min(top, 999)}
+        if filter_expr:
+            params["$filter"] = filter_expr
+
+        return await self._paginated_get("/auditLogs/directoryAudits", params=params)
+
+    async def get_sign_in_logs(self, filter_expr: str = None, top: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get sign-in logs.
+        Graph API: GET /auditLogs/signIns
+        Permission: AuditLog.Read.All
+        """
+        params = {"$top": min(top, 999)}
+        if filter_expr:
+            params["$filter"] = filter_expr
+
+        return await self._paginated_get("/auditLogs/signIns", params=params)
