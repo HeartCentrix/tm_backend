@@ -188,6 +188,17 @@ class BulkOperationRequest(BaseModel):
     resourceIds: List[str]
 
 
+class BulkAssignRequest(BaseModel):
+    """Request to assign an SLA policy to multiple resources"""
+    resourceIds: List[str]
+    policyId: str
+
+
+class BulkUnassignRequest(BaseModel):
+    """Request to remove SLA policy from multiple resources"""
+    resourceIds: List[str]
+
+
 # ============ Job ============
 
 class JobResponse(BaseModel):

@@ -185,10 +185,9 @@ class SlaPolicy(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
     name = Column(String, nullable=False)
-    tier = Column(String, default="CUSTOM")  # GOLD | SILVER | BRONZE | MANUAL | CUSTOM
     frequency = Column(String, default="DAILY")
     backup_window_start = Column(String)
-    backup_window_end = Column(String)  # NEW: end of backup window
+    backup_window_end = Column(String)
     backup_exchange = Column(Boolean, default=True)
     backup_exchange_archive = Column(Boolean, default=False)
     backup_exchange_recoverable = Column(Boolean, default=False)
@@ -204,10 +203,10 @@ class SlaPolicy(Base):
     tasks = Column(Boolean, default=False)
     group_mailbox = Column(Boolean, default=True)
     planner = Column(Boolean, default=False)
-    resource_types = Column(ARRAY(String), default=[])  # NEW: explicit resource type list
-    batch_size = Column(Integer, default=20)  # NEW: Graph $batch size
-    max_concurrent_backups = Column(Integer, default=50)  # NEW: max parallel backups
-    sla_violation_alert = Column(Boolean, default=True)  # NEW: alert on violations
+    resource_types = Column(ARRAY(String), default=[])
+    batch_size = Column(Integer, default=20)
+    max_concurrent_backups = Column(Integer, default=50)
+    sla_violation_alert = Column(Boolean, default=True)
     retention_type = Column(String, default="INDEFINITE")
     retention_days = Column(Integer)
     retention_versions = Column(Integer)

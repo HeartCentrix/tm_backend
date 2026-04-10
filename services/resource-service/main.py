@@ -14,6 +14,7 @@ from shared.models import Resource, SlaPolicy, ResourceType, ResourceStatus
 from shared.schemas import (
     ResourceResponse, ResourceListResponse, UserResourceResponse,
     AssignPolicyRequest, BulkOperationRequest,
+    BulkAssignRequest, BulkUnassignRequest,
     SlaPolicyResponse, SlaPolicyCreateRequest
 )
 
@@ -292,10 +293,81 @@ async def delete_resource(resource_id: str, db: AsyncSession = Depends(get_db)):
     await db.flush()
 
 
-@app.post("/api/v1/resources/bulk-assign-policy", status_code=204)
-@app.post("/api/v1/resources/bulk-archive", status_code=204)
-async def bulk_action(request: BulkOperationRequest, db: AsyncSession = Depends(get_db)):
-    pass
+@app.post("/api/v1/resources/bulk-assign-policy", status_code=200)
+async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Assign an SLA policy to multiple resources at once.
+    
+    Body:
+    {
+        "resourceIds": ["uuid1", "uuid2", ...],
+        "policyId": "uuid-of-policy"
+    }
+    
+    Returns:
+    {
+        "assigned": 10,
+        "not_found": ["uuid-of-missing-resource", ...]
+    }
+    """
+    resource_ids = [UUID(rid) for rid in request.resourceIds]
+    policy_id = UUID(request.policyId)
+    
+    # Fetch all matching resources in one query
+    stmt = select(Resource).where(Resource.id.in_(resource_ids))
+    result = await db.execute(stmt)
+    resources = result.scalars().all()
+    found_ids = {str(r.id) for r in resources}
+    not_found = [rid for rid in request.resourceIds if rid not in found_ids]
+    
+    # Bulk update
+    updated_count = 0
+    for resource in resources:
+        resource.sla_policy_id = policy_id
+        resource.status = ResourceStatus.ACTIVE
+        updated_count += 1
+    
+    await db.commit()
+    
+    return {
+        "assigned": updated_count,
+        "not_found": not_found,
+    }
+
+
+@app.post("/api/v1/resources/bulk-unassign-policy", status_code=200)
+async def bulk_unassign_policy(request: BulkUnassignRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Remove SLA policy from multiple resources at once.
+    
+    Body:
+    {
+        "resourceIds": ["uuid1", "uuid2", ...]
+    }
+    
+    Returns:
+    {
+        "unassigned": 10,
+        "not_found": ["uuid-of-missing-resource", ...]
+    }
+    """
+    resource_ids = [UUID(rid) for rid in request.resourceIds]
+    
+    stmt = select(Resource).where(Resource.id.in_(resource_ids))
+    result = await db.execute(stmt)
+    resources = result.scalars().all()
+    found_ids = {str(r.id) for r in resources}
+    not_found = [rid for rid in request.resourceIds if rid not in found_ids]
+    
+    for resource in resources:
+        resource.sla_policy_id = None
+    
+    await db.commit()
+    
+    return {
+        "unassigned": len(resources),
+        "not_found": not_found,
+    }
 
 
 # ============ SLA Policies ============
