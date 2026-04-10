@@ -240,10 +240,10 @@ class BackupWorker:
                     )
 
                     print(f"[{self.worker_id}] Completed backup for {resource_id}")
-                    
+
                 except Exception as e:
                     await session.rollback()
-                    await self.handle_backup_failure(session, job_id, e)
+                    await self.handle_backup_failure(session, job_id, e, uuid.UUID(resource_id))
 
                     # Log audit event: BACKUP_FAILED
                     await self.audit_logger.log(
@@ -357,7 +357,7 @@ class BackupWorker:
                     
                 except Exception as e:
                     await session.rollback()
-                    await self.handle_backup_failure(session, job_id, e)
+                    await self.handle_backup_failure(session, job_id, e)  # Mass backup - no single resource to update
                     print(f"[{self.worker_id}] Mass backup failed: {e}")
                     raise
     
@@ -719,17 +719,26 @@ class BackupWorker:
         self,
         session: AsyncSession,
         job_id: uuid.UUID,
-        error: Exception
+        error: Exception,
+        resource_id: Optional[uuid.UUID] = None
     ):
         """Handle backup job failure"""
         job = await session.get(Job, job_id)
         if job:
             job.attempts += 1
             job.error_message = str(error)
-            
+
             if job.attempts >= job.max_attempts:
                 job.status = JobStatus.FAILED
                 job.completed_at = datetime.utcnow()
+
+                # Update resource status to FAILED
+                if resource_id:
+                    resource = await session.get(Resource, resource_id)
+                    if resource:
+                        resource.last_backup_at = datetime.utcnow()
+                        resource.last_backup_status = "FAILED"
+                        session.add(resource)
             else:
                 job.status = JobStatus.RETRYING
     

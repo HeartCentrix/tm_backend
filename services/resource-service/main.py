@@ -52,9 +52,9 @@ async def list_resources(
 ):
     status_clause = "AND status = :rstatus" if status else ""
     query = text(f"""
-        SELECT id, tenant_id, type, external_id, display_name, email, metadata, sla_policy_id, 
-               status, storage_bytes, last_backup_at, created_at
-        FROM resources 
+        SELECT id, tenant_id, type, external_id, display_name, email, metadata, sla_policy_id,
+               status, storage_bytes, last_backup_at, last_backup_status, created_at
+        FROM resources
         WHERE tenant_id = :rtenant {status_clause}
         ORDER BY created_at DESC
         LIMIT :rlimit OFFSET :roffset
@@ -107,6 +107,7 @@ async def list_resources(
             "status": map_status(r[8]),
             "sla": policies.get(str(r[7])) if r[7] else None,
             "last_backup": r[10].isoformat() if r[10] else None,
+            "last_backup_status": r[11] if r[11] else None,
             "group_ids": [],
         })
 
@@ -133,7 +134,7 @@ async def search_resources(query: str = Query(...), type: Optional[str] = Query(
 async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] = Query(None), page: int = Query(1, ge=1), size: int = Query(50, ge=1), db: AsyncSession = Depends(get_db)):
     query = text(f"""
         SELECT id, tenant_id, type, external_id, display_name, email, metadata, sla_policy_id,
-               status, storage_bytes, last_backup_at, created_at
+               status, storage_bytes, last_backup_at, last_backup_status, created_at
         FROM resources
         WHERE type = :rtype
         {'AND tenant_id = :rtenant' if tenantId else ''}
@@ -176,6 +177,7 @@ async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] 
                       "size": row[9] or 0, "size_delta_year": 0, "size_delta_month": 0, "size_delta_week": 0},
             "status": "protected" if row[8] == "ACTIVE" else "discovered",
             "sla": None, "last_backup": row[10].isoformat() if row[10] else None,
+            "last_backup_status": row[11] if row[11] else None,
             "group_ids": [],
         })
 
