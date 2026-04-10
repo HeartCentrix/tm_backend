@@ -67,18 +67,41 @@ class ProgressReporter:
 
 
 class AuditLogger:
-    """Logs backup events to the audit service"""
+    """Logs backup events to the audit service via HTTP POST and RabbitMQ"""
 
     def __init__(self):
         self.audit_url = "http://audit-service:8012/api/v1/audit/log"
 
     async def log(self, **kwargs):
-        """Send audit event"""
+        """Send audit event via HTTP POST (fallback) and publish to RabbitMQ"""
+        # Fallback: HTTP POST to audit service
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 await client.post(self.audit_url, json=kwargs)
         except Exception as e:
-            print(f"[AuditLogger] Failed to log audit event: {e}")
+            print(f"[AuditLogger] Failed to log audit event via HTTP: {e}")
+
+        # Primary: Publish to RabbitMQ queue for reliable delivery
+        try:
+            from shared.message_bus import message_bus, create_audit_event_message
+            message = create_audit_event_message(
+                action=kwargs.get("action", "UNKNOWN"),
+                tenant_id=kwargs.get("tenant_id", ""),
+                org_id=kwargs.get("org_id"),
+                actor_type=kwargs.get("actor_type", "SYSTEM"),
+                actor_id=kwargs.get("actor_id"),
+                actor_email=kwargs.get("actor_email"),
+                resource_id=kwargs.get("resource_id"),
+                resource_type=kwargs.get("resource_type"),
+                resource_name=kwargs.get("resource_name"),
+                outcome=kwargs.get("outcome", "SUCCESS"),
+                job_id=kwargs.get("job_id"),
+                snapshot_id=kwargs.get("snapshot_id"),
+                details=kwargs.get("details", {}),
+            )
+            await message_bus.publish("audit.events", message, priority=5)
+        except Exception as e:
+            print(f"[AuditLogger] Failed to publish audit event to queue: {e}")
 
 
 class BackupWorker:

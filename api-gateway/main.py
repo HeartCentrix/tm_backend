@@ -234,11 +234,18 @@ async def progress_proxy(request: Request):
 
 # ============ Audit Log ============
 
+@app.get("/api/v1/activity")
+@app.get("/api/v1/activity/export")
 @app.get("/api/v1/audit/events")
+@app.get("/api/v1/audit/events/{event_id}")
+@app.get("/api/v1/audit/risk-signals")
 @app.get("/api/v1/audit/resource/{resource_id}")
 @app.get("/api/v1/audit/export")
 @app.get("/api/v1/audit/actions")
 @app.get("/api/v1/audit/stats")
+@app.get("/api/v1/audit/siem/stream")
+@app.post("/api/v1/audit/siem/webhook")
+@app.post("/api/v1/audit/siem/webhook/{webhook_id}/test")
 @app.get("/api/v1/audit/graph-apps")
 @app.post("/api/v1/audit/log")
 @app.post("/api/v1/audit/ingest/graph/{tenant_id}")

@@ -48,6 +48,7 @@ class MessageBus:
                 await self._declare_queue("delete.low", routing_key="delete.low")
                 await self._declare_queue("sla.monitor", routing_key="sla.monitor")
                 await self._declare_queue("report.normal", routing_key="report.normal")
+                await self._declare_queue("audit.events", routing_key="audit.events")
 
                 # Set channel QoS (per-consumer prefetch)
                 await self.channel.set_qos(prefetch_count=50)
@@ -209,5 +210,39 @@ def create_notification_message(alert_id: str, severity: str, message: str) -> d
         "alertId": alert_id,
         "severity": severity,
         "message": message,
+        "createdAt": datetime.utcnow().isoformat(),
+    }
+
+
+def create_audit_event_message(
+    action: str,
+    tenant_id: str,
+    org_id: str = None,
+    actor_type: str = "SYSTEM",
+    actor_id: str = None,
+    actor_email: str = None,
+    resource_id: str = None,
+    resource_type: str = None,
+    resource_name: str = None,
+    outcome: str = "SUCCESS",
+    job_id: str = None,
+    snapshot_id: str = None,
+    details: dict = None,
+) -> dict:
+    """Create an audit event message for the audit.events queue"""
+    return {
+        "action": action,
+        "tenantId": tenant_id,
+        "orgId": org_id,
+        "actorType": actor_type,
+        "actorId": actor_id,
+        "actorEmail": actor_email,
+        "resourceId": resource_id,
+        "resourceType": resource_type,
+        "resourceName": resource_name,
+        "outcome": outcome,
+        "jobId": job_id,
+        "snapshotId": snapshot_id,
+        "details": details or {},
         "createdAt": datetime.utcnow().isoformat(),
     }

@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from shared.database import async_session_factory
 from shared.models import (
     Resource, SlaPolicy, Tenant, Job, Organization, Snapshot,
-    ResourceType, ResourceStatus, JobType, JobStatus, SnapshotType, TenantStatus
+    ResourceType, ResourceStatus, JobType, JobStatus, SnapshotType, TenantStatus, TenantType
 )
 from shared.message_bus import message_bus, create_mass_backup_message, create_backup_message
 from shared.config import settings
@@ -49,6 +49,9 @@ async def startup():
 
     # Schedule pre-emptive backup check every 15 minutes (ransomware/anomaly detection)
     scheduler.add_job(check_preemptive_backup_triggers, 'interval', minutes=15)
+
+    # Schedule M365 audit log ingestion every hour
+    scheduler.add_job(ingest_m365_audit_logs, 'interval', hours=1)
 
     # Schedule daily backup report (email/Slack/Teams)
     scheduler.add_job(send_daily_backup_report, 'cron', hour=8, minute=0, timezone='UTC')
@@ -519,6 +522,56 @@ async def trigger_preemptive_backup(session: AsyncSession, tenant: Tenant, reaso
         await message_bus.publish("backup.urgent", message, priority=1)
 
     await session.commit()
+
+
+# ==================== M365 Audit Log Ingestion ====================
+
+async def ingest_m365_audit_logs():
+    """
+    Periodically pull Microsoft 365 audit logs from Graph API
+    and store them in the audit_events table.
+    Pulls both directory audit logs and sign-in logs for all active tenants.
+    """
+    print("[AUDIT_INGEST] Starting M365 audit log ingestion...")
+
+    async with async_session_factory() as session:
+        # Get all active M365 tenants
+        tenants_result = await session.execute(
+            select(Tenant).where(
+                and_(
+                    Tenant.status == TenantStatus.ACTIVE,
+                    Tenant.type.in_([TenantType.M365, TenantType.BOTH]),
+                    Tenant.client_id.isnot(None),
+                    Tenant.external_tenant_id.isnot(None),
+                )
+            )
+        )
+        tenants = tenants_result.scalars().all()
+
+    ingested_total = 0
+    audit_service_url = "http://audit-service:8012"
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for tenant in tenants:
+            for log_type in ["directory", "signin"]:
+                try:
+                    # Pull last 1 day of logs (running hourly, so this catches any gaps)
+                    resp = await client.post(
+                        f"{audit_service_url}/api/v1/audit/ingest/graph/{tenant.id}",
+                        params={"days": 1, "log_type": log_type},
+                    )
+                    if resp.status_code == 200:
+                        result = resp.json()
+                        count = result.get("ingested", 0)
+                        ingested_total += count
+                        if count > 0:
+                            print(f"[AUDIT_INGEST] Ingested {count} {log_type} logs for tenant {tenant.display_name}")
+                    else:
+                        print(f"[AUDIT_INGEST] Failed to ingest {log_type} for tenant {tenant.display_name}: {resp.status_code}")
+                except Exception as e:
+                    print(f"[AUDIT_INGEST] Error ingesting {log_type} for tenant {tenant.display_name}: {e}")
+
+    print(f"[AUDIT_INGEST] Completed. Total ingested: {ingested_total} events")
 
 
 # ==================== Scheduled Reporting ====================

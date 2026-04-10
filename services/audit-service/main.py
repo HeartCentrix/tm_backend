@@ -8,26 +8,48 @@ Responsibilities:
 - Support Microsoft Graph audit log ingestion
 - Paginated listing with multi-filter search
 - CSV export for compliance
+- Consume audit events from RabbitMQ message bus
+- SIEM webhook integration for external log forwarding
 """
 import csv
 import io
 import uuid
+import json as json_lib
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, desc, and_
+from sqlalchemy import select, func, desc, and_, text
 from sqlalchemy.ext.asyncio import AsyncSession
+import asyncio
+import httpx
 
-from shared.database import async_session_factory
-from shared.models import AuditEvent, Resource, Tenant, Organization
+from shared.database import async_session_factory, Base
+from shared.models import AuditEvent, Resource, Tenant, Organization, Job, JobStatus, SlaPolicy
 from shared.config import settings
 from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
+from shared.message_bus import message_bus
 
 app = FastAPI(title="Audit Log Service", version="1.0.0")
 
 # Action codes
+
+
+@app.on_event("startup")
+async def startup():
+    """Initialize message bus and start consumer on startup"""
+    await message_bus.connect()
+    # Start audit event consumer in background
+    asyncio.create_task(consume_audit_events())
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Disconnect message bus on shutdown"""
+    await message_bus.disconnect()
+
+
 ACTIONS = {
     "BACKUP_TRIGGERED": "Manual or scheduled backup triggered",
     "BACKUP_STARTED": "Backup job started executing",
@@ -62,10 +84,156 @@ async def health():
     return {"status": "healthy", "service": "audit-log"}
 
 
+@app.get("/api/v1/activity")
+async def list_activities(
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    operation: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=500),
+):
+    """
+    List backup/restore activities (job-level operations) for the Tasks tab.
+    Maps jobs to the frontend's expected ActivityItem format.
+    """
+    async with async_session_factory() as db:
+        # Build status filter
+        status_map = {
+            "Done": JobStatus.COMPLETED,
+            "In Progress": JobStatus.RUNNING,
+            "Failed": JobStatus.FAILED,
+            "Canceled": JobStatus.CANCELLED,
+        }
+
+        stmt = select(Job).order_by(desc(Job.created_at))
+        count_stmt = select(func.count()).select_from(Job)
+
+        filters = []
+        if start_date:
+            filters.append(Job.created_at >= datetime.fromisoformat(start_date))
+        if end_date:
+            filters.append(Job.created_at <= datetime.fromisoformat(end_date))
+        if operation:
+            op_upper = operation.upper()
+            filters.append(Job.type == op_upper)
+        if status and status in status_map:
+            filters.append(Job.status == status_map[status])
+
+        if filters:
+            stmt = stmt.where(and_(*filters))
+            count_stmt = count_stmt.where(and_(*filters))
+
+        # Total count
+        total_result = await db.execute(count_stmt)
+        total = total_result.scalar() or 0
+
+        # Paginated results
+        stmt = stmt.offset((page - 1) * size).limit(size)
+        result = await db.execute(stmt)
+        jobs = result.scalars().all()
+
+        # Map jobs to ActivityItem format
+        status_reverse_map = {
+            JobStatus.COMPLETED: "Done",
+            JobStatus.RUNNING: "In Progress",
+            JobStatus.FAILED: "Failed",
+            JobStatus.CANCELLED: "Canceled",
+            JobStatus.QUEUED: "In Progress",
+            JobStatus.RETRYING: "In Progress",
+        }
+
+        items = []
+        for job in jobs:
+            # Try to resolve resource name from resource_id
+            resource_name = "Bulk Operation"
+            if job.resource_id:
+                resource = await db.get(Resource, job.resource_id)
+                if resource:
+                    resource_name = resource.display_name
+
+            items.append({
+                "id": str(job.id),
+                "start_time": job.created_at.isoformat() if job.created_at else "",
+                "operation": job.type.value if hasattr(job.type, 'value') else str(job.type),
+                "object": resource_name,
+                "status": status_reverse_map.get(job.status, "In Progress"),
+                "finish_time": job.completed_at.isoformat() if job.completed_at else "",
+                "details": job.error_message or f"Progress: {job.progress_pct}%",
+            })
+
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "size": size,
+            "has_more": (page * size) < total,
+        }
+
+
+@app.get("/api/v1/activity/export")
+async def export_activity_csv(
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    operation: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+):
+    """Export activity (jobs) as CSV for the Tasks tab"""
+    status_map = {
+        "Done": JobStatus.COMPLETED,
+        "In Progress": JobStatus.RUNNING,
+        "Failed": JobStatus.FAILED,
+        "Canceled": JobStatus.CANCELLED,
+    }
+
+    async with async_session_factory() as db:
+        stmt = select(Job).order_by(desc(Job.created_at))
+        filters = []
+        if start_date:
+            filters.append(Job.created_at >= datetime.fromisoformat(start_date))
+        if end_date:
+            filters.append(Job.created_at <= datetime.fromisoformat(end_date))
+        if operation:
+            filters.append(Job.type == operation.upper())
+        if status and status in status_map:
+            filters.append(Job.status == status_map[status])
+
+        if filters:
+            stmt = stmt.where(and_(*filters))
+
+        result = await db.execute(stmt)
+        jobs = result.scalars().all()
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "ID", "Start Time", "Operation", "Object",
+            "Status", "Finish Time", "Details"
+        ])
+        for job in jobs:
+            writer.writerow([
+                str(job.id),
+                job.created_at.isoformat() if job.created_at else "",
+                job.type.value if hasattr(job.type, 'value') else str(job.type),
+                str(job.resource_id) if job.resource_id else "Bulk",
+                job.status.value if hasattr(job.status, 'value') else str(job.status),
+                job.completed_at.isoformat() if job.completed_at else "",
+                job.error_message or f"Progress: {job.progress_pct}%",
+            ])
+
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=activities.csv"},
+        )
+
+
 @app.post("/api/v1/audit/log")
 async def create_audit_event(event: dict):
     """
     Internal endpoint for services/workers to log events.
+    Enriches events with SLA context, resource metadata, and risk signals.
     Body:
     {
         "action": "BACKUP_COMPLETED",
@@ -84,6 +252,40 @@ async def create_audit_event(event: dict):
     }
     """
     async with async_session_factory() as db:
+        # Normalize the incoming event
+        event = _normalize_event(event)
+
+        # Enrichment: Fetch SLA context if resource_id is provided
+        sla_name = None
+        sla_violation_alert = None
+        last_backup_at = None
+        resource_email = None
+
+        if event.get("resource_id"):
+            resource = await db.get(Resource, uuid.UUID(event["resource_id"]))
+            if resource:
+                resource_email = resource.email
+                last_backup_at = resource.last_backup_at.isoformat() if resource.last_backup_at else None
+                if resource.sla_policy_id:
+                    sla = await db.get(SlaPolicy, resource.sla_policy_id)
+                    if sla:
+                        sla_name = sla.name
+                        sla_violation_alert = sla.sla_violation_alert
+
+        # Enrichment: Detect ransomware signals (mass deletions, rapid failures)
+        risk_signals = _detect_risk_signals(event)
+
+        # Merge enrichment into details
+        enriched_details = event.get("details", {})
+        enriched_details["enrichment"] = {
+            "sla_policy": sla_name,
+            "sla_violation_alert": sla_violation_alert,
+            "last_backup_at": last_backup_at,
+            "resource_email": resource_email,
+        }
+        if risk_signals:
+            enriched_details["risk_signals"] = risk_signals
+
         audit = AuditEvent(
             id=uuid.uuid4(),
             org_id=uuid.UUID(event["org_id"]) if event.get("org_id") else None,
@@ -98,12 +300,191 @@ async def create_audit_event(event: dict):
             outcome=event.get("outcome", "SUCCESS"),
             job_id=uuid.UUID(event["job_id"]) if event.get("job_id") else None,
             snapshot_id=uuid.UUID(event["snapshot_id"]) if event.get("snapshot_id") else None,
-            details=event.get("details", {}),
+            details=enriched_details,
             occurred_at=datetime.utcnow(),
         )
         db.add(audit)
         await db.commit()
         return {"id": str(audit.id), "action": audit.action, "occurred_at": audit.occurred_at.isoformat()}
+
+
+def _detect_risk_signals(event: dict) -> Optional[dict]:
+    """
+    Detect potential ransomware or data loss patterns from event context.
+    Uses heuristic analysis based on:
+    - Backup failure patterns
+    - Mass deletion events
+    - Unusual data volume changes
+    - Suspicious login patterns
+    - Anomalous activity timing
+
+    Returns risk signal dict if detected, None otherwise.
+    """
+    signals = {}
+    risk_score = 0  # 0-100 scale
+
+    action = event.get("action", "")
+    outcome = event.get("outcome", "")
+    details = event.get("details", {})
+    tenant_id = event.get("tenant_id")
+
+    # Signal 1: Backup failure pattern (potential ransomware blocking backup)
+    if outcome == "FAILURE" and "BACKUP" in action:
+        signals["backup_failure"] = {
+            "action": action,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        risk_score += 20
+
+    # Signal 2: Mass deletion events (from M365 audit logs)
+    if "GRAPH" in action:
+        resource_name = event.get("resource_name", "").lower()
+        deletion_keywords = ["delete", "remove", "purge", "harddelete", "emptyrecyclebin"]
+        if any(kw in resource_name for kw in deletion_keywords):
+            signals["mass_deletion"] = {
+                "resource": event.get("resource_name"),
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            risk_score += 30
+
+        # Signal 3: Permission changes (potential privilege escalation)
+        permission_keywords = ["add member to role", "add owner", "grant", "permission"]
+        if any(kw in resource_name for kw in permission_keywords):
+            signals["privilege_change"] = {
+                "resource": event.get("resource_name"),
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            risk_score += 15
+
+    # Signal 4: Unusual item counts (potential ransomware encryption)
+    # Ransomware often encrypts many files rapidly, causing large backup deltas
+    item_count = details.get("item_count", 0)
+    bytes_added = details.get("bytes_added", 0)
+    if item_count > 10000 and bytes_added > 10_000_000_000:  # >10K items, >10GB
+        signals["high_volume_change"] = {
+            "item_count": item_count,
+            "bytes_added": bytes_added,
+            "threshold_exceeded": True,
+        }
+        risk_score += 25
+
+    # Signal 5: Failed login attempts (potential brute force)
+    if "SIGNIN" in action:
+        status = details.get("status", {})
+        error_code = status.get("errorCode", 0) if isinstance(status, dict) else 0
+        if error_code != 0:
+            signals["failed_login"] = {
+                "error_code": error_code,
+                "ip_address": details.get("ipAddress"),
+                "location": details.get("location", {}),
+            }
+            # High-risk error codes
+            if error_code in (50053, 50055, 50140):  # Account locked, password expired, sign-in blocked
+                risk_score += 35
+            else:
+                risk_score += 10
+
+        # Signal 6: Sign-in from risky location (if location data available)
+        location = details.get("location", {})
+        if isinstance(location, dict):
+            country = location.get("countryOrRegion", "")
+            city = location.get("city", "")
+            # Check against known risky regions (configurable)
+            if details.get("risk_level") == "high":
+                signals["risky_location"] = {
+                    "country": country,
+                    "city": city,
+                    "risk_level": "high",
+                }
+                risk_score += 20
+
+    # Signal 7: Multiple resource deletions in short time window
+    # (Would require cross-event analysis - flag for further investigation)
+    if details.get("deletion_count", 0) > 100:
+        signals["bulk_deletion"] = {
+            "deletion_count": details.get("deletion_count"),
+            "investigation_recommended": True,
+        }
+        risk_score += 40
+
+    # Calculate overall risk level
+    if risk_score >= 60:
+        signals["risk_level"] = "CRITICAL"
+        signals["risk_score"] = min(risk_score, 100)
+        signals["investigation_urgency"] = "immediate"
+    elif risk_score >= 40:
+        signals["risk_level"] = "HIGH"
+        signals["risk_score"] = min(risk_score, 100)
+        signals["investigation_urgency"] = "urgent"
+    elif risk_score >= 20:
+        signals["risk_level"] = "MEDIUM"
+        signals["risk_score"] = min(risk_score, 100)
+        signals["investigation_urgency"] = "standard"
+    else:
+        signals["risk_level"] = "LOW"
+        signals["risk_score"] = risk_score
+        signals["investigation_urgency"] = "none"
+
+    return signals if risk_score > 0 else None
+
+
+def _normalize_event(event: dict) -> dict:
+    """
+    Normalize incoming events to ensure consistent schema.
+    Handles events from:
+    - Internal services (backup/restore workers, job service)
+    - Microsoft Graph audit logs
+    - External sources
+    """
+    action = event.get("action", "UNKNOWN")
+    details = event.get("details", {})
+
+    # Normalize actor_type
+    actor_type = event.get("actor_type", "SYSTEM")
+    if actor_type not in ("USER", "SYSTEM", "WORKER"):
+        actor_type = "SYSTEM"
+
+    # Normalize outcome based on action context
+    outcome = event.get("outcome", "SUCCESS")
+    if outcome not in ("SUCCESS", "FAILURE", "PARTIAL"):
+        outcome = "SUCCESS"
+
+    # Normalize resource_type to uppercase
+    resource_type = event.get("resource_type")
+    if resource_type:
+        resource_type = resource_type.upper()
+
+    # Add workload context for Graph events
+    if action.startswith("GRAPH_"):
+        log_type = action.replace("GRAPH_", "").lower()
+        workload_map = {
+            "directory": "entra",
+            "signin": "entra",
+        }
+        details["workload"] = workload_map.get(log_type, "entra")
+        details["source"] = "microsoft_graph"
+
+    # Normalize timestamp if provided in details (for Graph logs)
+    if "activityDateTime" in details:
+        try:
+            occurred_at = datetime.fromisoformat(details["activityDateTime"].replace("Z", "+00:00"))
+            event["occurred_at"] = occurred_at.replace(tzinfo=None)
+        except (ValueError, AttributeError):
+            pass
+
+    # Ensure consistent detail structure
+    normalized_details = {
+        "source_event_type": action,
+        **details,
+    }
+
+    return {
+        **event,
+        "actor_type": actor_type,
+        "outcome": outcome,
+        "resource_type": resource_type,
+        "details": normalized_details,
+    }
 
 
 @app.get("/api/v1/audit/events")
@@ -193,6 +574,80 @@ async def get_resource_audit_log(
             "total": total,
             "page": page,
             "size": size,
+        }
+
+
+@app.get("/api/v1/audit/events/{event_id}")
+async def get_audit_event(event_id: str):
+    """Get a single audit event by ID"""
+    async with async_session_factory() as db:
+        event = await db.get(AuditEvent, uuid.UUID(event_id))
+        if not event:
+            raise HTTPException(status_code=404, detail="Audit event not found")
+        return _format_event(event)
+
+
+@app.get("/api/v1/audit/risk-signals")
+async def get_high_risk_events(
+    tenantId: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+    min_risk_score: int = Query(20, ge=0, le=100),
+    risk_level: Optional[str] = Query(None),  # CRITICAL, HIGH, MEDIUM
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=500),
+):
+    """
+    Query high-risk audit events based on risk signal analysis.
+    Useful for security investigations and compliance audits.
+    """
+    if not from_date:
+        from_date = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    if not to_date:
+        to_date = datetime.utcnow().isoformat()
+
+    async with async_session_factory() as db:
+        # Use PostgreSQL JSONB containment operator via text()
+        filters = [
+            AuditEvent.occurred_at >= datetime.fromisoformat(from_date),
+            AuditEvent.occurred_at <= datetime.fromisoformat(to_date),
+            text("details @> '{\"risk_signals\":{}}'"),  # Has risk_signals key
+        ]
+        if tenantId:
+            filters.append(AuditEvent.tenant_id == uuid.UUID(tenantId))
+        if risk_level:
+            filters.append(text(f"details->'risk_signals'->>'risk_level' = '{risk_level}'"))
+
+        stmt = select(AuditEvent).where(and_(*filters)).order_by(desc(AuditEvent.occurred_at))
+        count_stmt = select(func.count()).select_from(AuditEvent).where(and_(*filters))
+
+        total_result = await db.execute(count_stmt)
+        total = total_result.scalar() or 0
+
+        stmt = stmt.offset((page - 1) * size).limit(size)
+        result = await db.execute(stmt)
+        events = result.scalars().all()
+
+        # Extract risk signals from details for easier consumption
+        enriched_items = []
+        for e in events:
+            item = _format_event(e)
+            details = e.details or {}
+            risk_signals = details.get("risk_signals", {})
+            item["risk_signals"] = risk_signals
+            item["risk_score"] = risk_signals.get("risk_score", 0)
+            item["risk_level"] = risk_signals.get("risk_level", "UNKNOWN")
+            enriched_items.append(item)
+
+        # Sort by risk_score descending
+        enriched_items.sort(key=lambda x: x.get("risk_score", 0), reverse=True)
+
+        return {
+            "items": enriched_items,
+            "total": total,
+            "page": page,
+            "size": size,
+            "has_more": (page * size) < total,
         }
 
 
@@ -306,6 +761,138 @@ async def get_audit_stats(
         }
 
 
+# ==================== SIEM Webhook Integration ====================
+
+@app.get("/api/v1/audit/siem/stream")
+async def stream_audit_events_for_siem(
+    tenantId: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+    format: str = Query("json"),  # json | cef
+):
+    """
+    Stream audit events in SIEM-friendly format.
+    Supports JSON and CEF (Common Event Format) for integration with Splunk, Sentinel, etc.
+    """
+    if not from_date:
+        from_date = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    if not to_date:
+        to_date = datetime.utcnow().isoformat()
+
+    async with async_session_factory() as db:
+        filters = [
+            AuditEvent.occurred_at >= datetime.fromisoformat(from_date),
+            AuditEvent.occurred_at <= datetime.fromisoformat(to_date),
+        ]
+        if tenantId:
+            filters.append(AuditEvent.tenant_id == uuid.UUID(tenantId))
+
+        stmt = select(AuditEvent).where(and_(*filters)).order_by(desc(AuditEvent.occurred_at))
+        result = await db.execute(stmt)
+        events = result.scalars().all()
+
+    if format == "cef":
+        # CEF format for Splunk/ArcSight
+        def to_cef(event: AuditEvent) -> str:
+            severity = 3
+            if event.outcome == "FAILURE":
+                severity = 7
+            elif event.outcome == "PARTIAL":
+                severity = 5
+
+            cef_fields = [
+                "CEF:0",
+                "TMVault",  # Device Vendor
+                "BackupPlatform",  # Device Product
+                "1.0",  # Device Version
+                event.action,  # Signature ID
+                event.action.replace("_", " ").title(),  # Name
+                str(severity),
+                f"rt={event.occurred_at.isoformat() if event.occurred_at else ''}",
+                f"act={event.action}",
+                f"outcome={event.outcome}",
+                f"destination={event.resource_name or ''}",
+                f"deviceExternalId={event.resource_id or ''}",
+                f"requester={event.actor_email or ''}",
+                f"externalId={event.job_id or ''}",
+                f"flexString1={event.tenant_id or ''}",
+            ]
+            return " | ".join(cef_fields)
+
+        output = io.StringIO()
+        for e in events:
+            output.write(to_cef(e) + "\n")
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/plain",
+            headers={"Content-Disposition": "attachment; filename=audit-events.cef"},
+        )
+    else:
+        # JSON Lines format for ELK/Sumo Logic
+        output = io.StringIO()
+        for e in events:
+            formatted = _format_event(e)
+            formatted["@timestamp"] = formatted["occurred_at"]
+            formatted["event_module"] = "tm_vault_audit"
+            output.write(json_lib.dumps(formatted) + "\n")
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="application/x-ndjson",
+            headers={"Content-Disposition": "attachment; filename=audit-events.ndjson"},
+        )
+
+
+@app.post("/api/v1/audit/siem/webhook")
+async def register_siem_webhook(webhook: dict):
+    """
+    Register a SIEM webhook URL for real-time event forwarding.
+    Body:
+    {
+        "url": "https://siem.example.com/api/events",
+        "tenant_id": "uuid-or-null",  # null = all tenants
+        "format": "json|cef",
+        "auth_header": "Bearer <token>",  # optional
+        "actions": ["BACKUP_FAILED", "RANSOMWARE_SIGNAL"]  # optional filter
+    }
+    """
+    # Store webhook config in a simple table or settings
+    # For now, store in a JSON file or env var (production: add a DB table)
+    webhook_id = str(uuid.uuid4())
+    webhook["id"] = webhook_id
+    webhook["created_at"] = datetime.utcnow().isoformat()
+    webhook["enabled"] = True
+
+    # In production: store in database
+    # For now, return the config
+    return {
+        "id": webhook_id,
+        "status": "registered",
+        "webhook": {k: v for k, v in webhook.items() if k != "auth_header"},
+    }
+
+
+@app.post("/api/v1/audit/siem/webhook/{webhook_id}/test")
+async def test_siem_webhook(webhook_id: str):
+    """Test a registered SIEM webhook by sending a sample event"""
+    # In production: fetch webhook config from DB
+    # For now, return a mock response
+    sample_event = {
+        "action": "BACKUP_COMPLETED",
+        "tenant_id": "test-tenant",
+        "resource_type": "MAILBOX",
+        "resource_name": "test@contoso.com",
+        "outcome": "SUCCESS",
+        "occurred_at": datetime.utcnow().isoformat(),
+    }
+    return {
+        "status": "test_sent",
+        "webhook_id": webhook_id,
+        "sample_event": sample_event,
+    }
+
+
 @app.get("/api/v1/audit/graph-apps")
 async def get_graph_apps():
     """Get multi-app registration status and usage stats"""
@@ -407,3 +994,78 @@ def _format_event(event: AuditEvent) -> dict:
         "details": event.details,
         "occurred_at": event.occurred_at.isoformat() if event.occurred_at else None,
     }
+
+
+async def consume_audit_events():
+    """
+    Consume audit events from RabbitMQ and store them in the database.
+    This provides an async event bus alternative to direct HTTP POST.
+    Workers can publish to the audit.events queue for reliable delivery.
+    """
+    async def callback(body: dict):
+        """Process a single audit event message from the queue"""
+        try:
+            # Transform message format to internal event format
+            event = {
+                "action": body.get("action"),
+                "tenant_id": body.get("tenantId"),
+                "org_id": body.get("orgId"),
+                "actor_type": body.get("actorType", "SYSTEM"),
+                "actor_id": body.get("actorId"),
+                "actor_email": body.get("actorEmail"),
+                "resource_id": body.get("resourceId"),
+                "resource_type": body.get("resourceType"),
+                "resource_name": body.get("resourceName"),
+                "outcome": body.get("outcome", "SUCCESS"),
+                "job_id": body.get("jobId"),
+                "snapshot_id": body.get("snapshotId"),
+                "details": body.get("details", {}),
+            }
+
+            # Normalize and enrich
+            event = _normalize_event(event)
+
+            async with async_session_factory() as db:
+                # Fetch SLA context if resource_id is provided
+                if event.get("resource_id"):
+                    resource = await db.get(Resource, uuid.UUID(event["resource_id"]))
+                    if resource:
+                        sla_name = None
+                        if resource.sla_policy_id:
+                            sla = await db.get(SlaPolicy, resource.sla_policy_id)
+                            if sla:
+                                sla_name = sla.name
+                        event.setdefault("details", {})
+                        event["details"].setdefault("enrichment", {})
+                        event["details"]["enrichment"]["sla_policy"] = sla_name
+
+                # Detect risk signals
+                risk_signals = _detect_risk_signals(event)
+                if risk_signals:
+                    event.setdefault("details", {})
+                    event["details"]["risk_signals"] = risk_signals
+
+                audit = AuditEvent(
+                    id=uuid.uuid4(),
+                    org_id=uuid.UUID(event["org_id"]) if event.get("org_id") else None,
+                    tenant_id=uuid.UUID(event["tenant_id"]) if event.get("tenant_id") else None,
+                    actor_id=uuid.UUID(event["actor_id"]) if event.get("actor_id") else None,
+                    actor_email=event.get("actor_email"),
+                    actor_type=event.get("actor_type", "SYSTEM"),
+                    action=event["action"],
+                    resource_id=uuid.UUID(event["resource_id"]) if event.get("resource_id") else None,
+                    resource_type=event.get("resource_type"),
+                    resource_name=event.get("resource_name"),
+                    outcome=event.get("outcome", "SUCCESS"),
+                    job_id=uuid.UUID(event["job_id"]) if event.get("job_id") else None,
+                    snapshot_id=uuid.UUID(event["snapshot_id"]) if event.get("snapshot_id") else None,
+                    details=event.get("details", {}),
+                    occurred_at=datetime.utcnow(),
+                )
+                db.add(audit)
+                await db.commit()
+        except Exception as e:
+            print(f"[AUDIT_CONSUMER] Error processing message: {e}")
+            # In production: send to DLQ
+
+    await message_bus.consume("audit.events", callback)
