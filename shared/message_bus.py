@@ -39,12 +39,15 @@ class MessageBus:
                 await self._declare_queue("backup.normal", routing_key="backup.normal")
                 await self._declare_queue("backup.low", routing_key="backup.low")
                 await self._declare_queue("restore.urgent", routing_key="restore.urgent")
+                await self._declare_queue("restore.normal", routing_key="restore.normal")
+                await self._declare_queue("restore.low", routing_key="restore.low")
                 await self._declare_queue("discovery.m365", routing_key="discovery.m365")
                 await self._declare_queue("discovery.azure", routing_key="discovery.azure")
                 await self._declare_queue("notification", routing_key="notification")
                 await self._declare_queue("export.normal", routing_key="export.normal")
                 await self._declare_queue("delete.low", routing_key="delete.low")
                 await self._declare_queue("sla.monitor", routing_key="sla.monitor")
+                await self._declare_queue("report.normal", routing_key="report.normal")
 
                 # Set channel QoS (per-consumer prefetch)
                 await self.channel.set_qos(prefetch_count=50)
@@ -150,11 +153,45 @@ def create_mass_backup_message(
     }
 
 
-def create_restore_message(job_id: str, snapshot_id: str, item_ids: list) -> dict:
+def create_restore_message(
+    job_id: str,
+    restore_type: str = "IN_PLACE",
+    snapshot_ids: list = None,
+    item_ids: list = None,
+    resource_id: str = None,
+    tenant_id: str = None,
+    spec: dict = None
+) -> dict:
+    """Create a restore message for the restore worker"""
+    priority_map = {
+        "IN_PLACE": 5,
+        "CROSS_USER": 3,
+        "CROSS_RESOURCE": 4,
+        "EXPORT_PST": 6,
+        "EXPORT_ZIP": 7,
+        "DOWNLOAD": 8,
+    }
+
+    queue_map = {
+        "IN_PLACE": "restore.normal",
+        "CROSS_USER": "restore.urgent",
+        "CROSS_RESOURCE": "restore.normal",
+        "EXPORT_PST": "restore.normal",
+        "EXPORT_ZIP": "restore.low",
+        "DOWNLOAD": "restore.low",
+    }
+
     return {
         "jobId": job_id,
-        "snapshotId": snapshot_id,
-        "itemIds": item_ids,
+        "restoreType": restore_type,
+        "snapshotIds": snapshot_ids or [],
+        "itemIds": item_ids or [],
+        "resourceId": resource_id,
+        "tenantId": tenant_id,
+        "spec": spec or {},
+        "type": "RESTORE",
+        "priority": priority_map.get(restore_type, 5),
+        "queue": queue_map.get(restore_type, "restore.normal"),
         "createdAt": datetime.utcnow().isoformat(),
     }
 

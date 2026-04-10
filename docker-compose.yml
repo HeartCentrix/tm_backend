@@ -24,8 +24,9 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
-    volumes:
-      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    # Config mounted from host - if mount fails, comment out and use defaults:
+    # volumes:
+    #   - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -351,6 +352,60 @@ services:
       DB_HOST: postgres
     ports:
       - "8012:8012"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  restore-worker:
+    build:
+      context: .
+      dockerfile: workers/restore-worker/Dockerfile
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      RABBITMQ_ENABLED: "true"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
+      AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
+      # Multi-app registration
+      APP_1_CLIENT_ID: ${APP_1_CLIENT_ID}
+      APP_1_CLIENT_SECRET: ${APP_1_CLIENT_SECRET}
+      APP_1_TENANT_ID: ${APP_1_TENANT_ID}
+      APP_2_CLIENT_ID: ${APP_2_CLIENT_ID:-}
+      APP_2_CLIENT_SECRET: ${APP_2_CLIENT_SECRET:-}
+      APP_2_TENANT_ID: ${APP_2_TENANT_ID:-}
+      APP_3_CLIENT_ID: ${APP_3_CLIENT_ID:-}
+      APP_3_CLIENT_SECRET: ${APP_3_CLIENT_SECRET:-}
+      APP_3_TENANT_ID: ${APP_3_TENANT_ID:-}
+      AZURE_AD_CLIENT_ID: ${AZURE_AD_CLIENT_ID}
+      AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+    deploy:
+      replicas: ${RESTORE_WORKER_REPLICAS:-2}
+
+  search-service:
+    build:
+      context: .
+      dockerfile: services/search-service/Dockerfile
+    container_name: tm_vault_search
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+    ports:
+      - "8013:8013"
     depends_on:
       postgres:
         condition: service_healthy

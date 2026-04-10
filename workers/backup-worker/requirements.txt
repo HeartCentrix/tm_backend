@@ -3,5 +3,7 @@ sqlalchemy==2.0.25
 asyncpg==0.29.0
 httpx==0.26.0
 azure-storage-blob==12.19.0
+azure-mgmt-storage==21.1.0
+azure-identity==1.15.0
 pydantic==2.5.3
 pydantic-settings==2.1.0

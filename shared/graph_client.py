@@ -83,6 +83,51 @@ class GraphClient:
                 retry_count = 0  # Reset on success
 
         return {"value": all_items, "@odata.count": data.get("@odata.count", len(all_items))}
+
+    async def _post(self, url: str, payload: Dict[str, Any], headers: Optional[Dict] = None) -> Dict[str, Any]:
+        """Make authenticated POST request"""
+        token = await self._get_token()
+        async with httpx.AsyncClient() as client:
+            req_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            if headers:
+                req_headers.update(headers)
+            resp = await client.post(url, headers=req_headers, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def _put(self, url: str, content: Any, headers: Optional[Dict] = None) -> Dict[str, Any]:
+        """Make authenticated PUT request (for file uploads)"""
+        token = await self._get_token()
+        async with httpx.AsyncClient() as client:
+            req_headers = {"Authorization": f"Bearer {token}"}
+            if headers:
+                req_headers.update(headers)
+            else:
+                req_headers["Content-Type"] = "application/octet-stream"
+            
+            if isinstance(content, str):
+                content = content.encode('utf-8')
+            
+            resp = await client.put(url, headers=req_headers, content=content)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def _patch(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Make authenticated PATCH request"""
+        token = await self._get_token()
+        async with httpx.AsyncClient() as client:
+            req_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            resp = await client.patch(url, headers=req_headers, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def _delete(self, url: str) -> None:
+        """Make authenticated DELETE request"""
+        token = await self._get_token()
+        async with httpx.AsyncClient() as client:
+            headers = {"Authorization": f"Bearer {token}"}
+            resp = await client.delete(url, headers=headers)
+            resp.raise_for_status()
     
     async def discover_users(self) -> List[Dict[str, Any]]:
         """Fetch all users from Entra ID"""
@@ -287,3 +332,209 @@ class GraphClient:
             params["$filter"] = filter_expr
 
         return await self._paginated_get("/auditLogs/signIns", params=params)
+
+    # ==================== Backup-Specific Graph API Methods ====================
+
+    async def get_sharepoint_site_drives(self, site_id: str, delta_token: str = None) -> Dict[str, Any]:
+        """
+        Get drive items from a SharePoint site using delta API.
+        Graph API: GET /sites/{site-id}/drive/root/delta
+        """
+        url = f"{self.GRAPH_URL}/sites/{site_id}/drive/root/delta"
+        if delta_token:
+            url = delta_token
+
+        params = {"$expand": "thumbnails,listItem", "$top": "999"}
+        result = await self._get(url, params=params)
+        return result
+
+    async def get_sharepoint_site_lists(self, site_id: str) -> Dict[str, Any]:
+        """
+        Get SharePoint site lists.
+        Graph API: GET /sites/{site-id}/lists
+        """
+        return await self._get(f"{self.GRAPH_URL}/sites/{site_id}/lists", params={"$top": "999"})
+
+    async def get_sharepoint_site_list_items(self, site_id: str, list_id: str, delta_token: str = None) -> Dict[str, Any]:
+        """
+        Get items from a SharePoint list using delta API.
+        Graph API: GET /sites/{site-id}/lists/{list-id}/items/delta
+        """
+        url = f"{self.GRAPH_URL}/sites/{site_id}/lists/{list_id}/items/delta"
+        if delta_token:
+            url = delta_token
+
+        params = {"$expand": "fields", "$top": "999"}
+        result = await self._get(url, params=params)
+        return result
+
+    async def get_site_permissions(self, site_id: str) -> Dict[str, Any]:
+        """
+        Get SharePoint site permissions.
+        Graph API: GET /sites/{site-id}/permissions
+        """
+        return await self._get(f"{self.GRAPH_URL}/sites/{site_id}/permissions")
+
+    async def get_teams_channels(self, team_id: str) -> Dict[str, Any]:
+        """
+        Get channels in a Teams team.
+        Graph API: GET /teams/{team-id}/channels
+        """
+        return await self._get(f"{self.GRAPH_URL}/teams/{team_id}/channels", params={"$top": "999"})
+
+    async def get_channel_messages(self, team_id: str, channel_id: str, delta_token: str = None) -> Dict[str, Any]:
+        """
+        Get messages from a Teams channel using delta API.
+        Graph API: GET /teams/{team-id}/channels/{channel-id}/messages/delta
+        """
+        url = f"{self.GRAPH_URL}/teams/{team_id}/channels/{channel_id}/messages/delta"
+        if delta_token:
+            url = delta_token
+
+        params = {"$top": "999", "$expand": "replies,hostedContents"}
+        result = await self._get(url, params=params)
+        return result
+
+    async def get_channel_messages_replies(self, team_id: str, channel_id: str, message_id: str) -> Dict[str, Any]:
+        """
+        Get replies to a Teams channel message.
+        Graph API: GET /teams/{team-id}/channels/{channel-id}/messages/{message-id}/replies
+        """
+        return await self._get(
+            f"{self.GRAPH_URL}/teams/{team_id}/channels/{channel_id}/messages/{message_id}/replies",
+            params={"$top": "999"}
+        )
+
+    async def get_teams_chats(self, delta_token: str = None) -> Dict[str, Any]:
+        """
+        Get all Teams chats accessible to the app using delta API.
+        Graph API: GET /chats/delta
+        """
+        url = f"{self.GRAPH_URL}/chats/delta"
+        if delta_token:
+            url = delta_token
+
+        params = {"$top": "999", "$expand": "members,permission"}
+        result = await self._get(url, params=params)
+        return result
+
+    async def get_chat_messages(self, chat_id: str, delta_token: str = None) -> Dict[str, Any]:
+        """
+        Get messages from a Teams chat using delta API.
+        Graph API: GET /chats/{chat-id}/messages/delta
+        """
+        url = f"{self.GRAPH_URL}/chats/{chat_id}/messages/delta"
+        if delta_token:
+            url = delta_token
+
+        params = {"$top": "999"}
+        result = await self._get(url, params=params)
+        return result
+
+    async def get_user_profile(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get detailed user profile.
+        Graph API: GET /users/{id}
+        """
+        return await self._get(f"{self.GRAPH_URL}/users/{user_id}")
+
+    async def get_user_manager(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get user's manager.
+        Graph API: GET /users/{id}/manager
+        """
+        try:
+            return await self._get(f"{self.GRAPH_URL}/users/{user_id}/manager")
+        except Exception:
+            return {}
+
+    async def get_user_direct_reports(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get user's direct reports.
+        Graph API: GET /users/{id}/directReports
+        """
+        return await self._get(f"{self.GRAPH_URL}/users/{user_id}/directReports", params={"$top": "999"})
+
+    async def get_user_group_memberships(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get user's group memberships.
+        Graph API: GET /users/{id}/memberOf
+        """
+        return await self._get(f"{self.GRAPH_URL}/users/{user_id}/memberOf", params={"$top": "999"})
+
+    async def get_group_members(self, group_id: str) -> Dict[str, Any]:
+        """
+        Get group members.
+        Graph API: GET /groups/{id}/members
+        """
+        return await self._get(f"{self.GRAPH_URL}/groups/{group_id}/members", params={"$top": "999"})
+
+    async def get_group_owners(self, group_id: str) -> Dict[str, Any]:
+        """
+        Get group owners.
+        Graph API: GET /groups/{id}/owners
+        """
+        return await self._get(f"{self.GRAPH_URL}/groups/{group_id}/owners", params={"$top": "999"})
+
+    async def get_entra_apps(self) -> Dict[str, Any]:
+        """
+        Get Entra ID application registrations.
+        Graph API: GET /applications
+        """
+        return await self._get(f"{self.GRAPH_URL}/applications", params={"$top": "999"})
+
+    async def get_entra_service_principals(self) -> Dict[str, Any]:
+        """
+        Get service principals.
+        Graph API: GET /servicePrincipals
+        """
+        return await self._get(f"{self.GRAPH_URL}/servicePrincipals", params={"$top": "999"})
+
+    async def get_entra_devices(self) -> Dict[str, Any]:
+        """
+        Get registered devices.
+        Graph API: GET /devices
+        """
+        return await self._get(f"{self.GRAPH_URL}/devices", params={"$top": "999"})
+
+    async def get_user_mailbox_settings(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get user mailbox settings.
+        Graph API: GET /users/{id}/mailboxSettings
+        """
+        return await self._get(f"{self.GRAPH_URL}/users/{user_id}/mailboxSettings")
+
+    async def get_user_contacts(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get user contacts.
+        Graph API: GET /users/{id}/contacts
+        """
+        return await self._get(f"{self.GRAPH_URL}/users/{user_id}/contacts", params={"$top": "999"})
+
+    async def get_user_calendars(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get user calendars.
+        Graph API: GET /users/{id}/calendars
+        """
+        return await self._get(f"{self.GRAPH_URL}/users/{user_id}/calendars", params={"$top": "999"})
+
+    async def get_calendar_events_delta(self, user_id: str, calendar_id: str = None, delta_token: str = None) -> Dict[str, Any]:
+        """
+        Get calendar events using delta API.
+        Graph API: GET /users/{id}/calendar/events/delta or /users/{id}/calendars/{id}/events/delta
+        """
+        if calendar_id:
+            url = f"{self.GRAPH_URL}/users/{user_id}/calendars/{calendar_id}/events/delta"
+        else:
+            url = f"{self.GRAPH_URL}/users/{user_id}/calendar/events/delta"
+
+        if delta_token:
+            url = delta_token
+
+        params = {"$top": "999"}
+        result = await self._get(url, params=params)
+        return result
+
+    async def _paginated_get(self, path: str, params: Optional[Dict] = None) -> Dict[str, Any]:
+        """Helper for paginated GET requests"""
+        return await self._get(f"{self.GRAPH_URL}{path}", params=params)

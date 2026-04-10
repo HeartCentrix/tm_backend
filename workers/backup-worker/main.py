@@ -42,6 +42,8 @@ from shared.message_bus import message_bus
 from shared.config import settings
 from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
+from shared.metadata_extractor import MetadataExtractor
+from shared.azure_immutability import get_immutability_config
 
 
 class ProgressReporter:
@@ -86,6 +88,7 @@ class BackupWorker:
         self.worker_id = f"worker-{uuid.uuid4().hex[:8]}"
         self.graph_clients: Dict[str, GraphClient] = {}
         self.blob_service_client: Optional[BlobServiceClient] = None
+        self.immutability_config = None
         self.semaphore = asyncio.Semaphore(50)  # Max 50 concurrent backups
         self.throttle_tracker: Dict[str, Dict] = {}  # Track API calls per tenant
         self.progress_reporter = ProgressReporter()
@@ -95,7 +98,7 @@ class BackupWorker:
         """Initialize connections and clients"""
         # Connect to message bus
         await message_bus.connect()
-        
+
         # Initialize Azure Blob Storage
         if settings.AZURE_STORAGE_ACCOUNT_NAME and settings.AZURE_STORAGE_ACCOUNT_KEY:
             connection_string = (
@@ -106,7 +109,12 @@ class BackupWorker:
             )
             self.blob_service_client = BlobServiceClient.from_connection_string(connection_string)
             print(f"[{self.worker_id}] Azure Blob Storage initialized")
-        
+
+            # Initialize immutability configuration
+            self.immutability_config = get_immutability_config()
+            if self.immutability_config:
+                print(f"[{self.worker_id}] Azure Blob immutability policy configured")
+
         print(f"[{self.worker_id}] Backup worker initialized")
     
     async def start(self):
@@ -477,6 +485,7 @@ class BackupWorker:
             "ONEDRIVE": self.backup_onedrive,
             "SHAREPOINT_SITE": self.backup_sharepoint,
             "TEAMS_CHANNEL": self.backup_teams_channel,
+            "TEAMS_CHAT": self.backup_teams_chat,
             "ENTRA_USER": self.backup_entra_user,
             "ENTRA_GROUP": self.backup_entra_group,
         }
@@ -567,76 +576,456 @@ class BackupWorker:
             "new_delta_token": new_delta_token,
         }
     
-    async def backup_generic(
-        self,
+    # ==================== Full Backup Handlers ====================
+
+    async def backup_sharepoint(self,
         graph_client: GraphClient,
         resource: Resource,
         snapshot: Snapshot,
         tenant: Tenant,
         message: Dict
     ) -> Dict:
-        """Generic backup for resource types without specific handlers"""
-        print(f"[{self.worker_id}] Using generic backup for {resource.type.value}")
-        
+        """Backup SharePoint site (files + lists + permissions) using delta API"""
+        site_id = resource.external_id
+
+        # Get delta token from previous backup
+        delta_token = None
+        if resource.extra_data:
+            delta_token = resource.extra_data.get("sharepoint_delta_token")
+
+        item_count = 0
+        bytes_added = 0
+        new_delta_token = None
+
+        # 1. Backup site drive files
+        try:
+            drive_data = await graph_client.get_sharepoint_site_drives(site_id, delta_token)
+            new_delta_token = drive_data.get("@odata.deltaLink")
+
+            for item in drive_data.get("value", []):
+                # Extract structured metadata
+                structured_meta = MetadataExtractor.extract_sharepoint_item_metadata(item)
+
+                snapshot_item = await self.create_snapshot_item(
+                    snapshot, tenant, item, "SHAREPOINT_FILE", structured_meta
+                )
+                item_count += 1
+                bytes_added += snapshot_item.content_size or 0
+        except Exception as e:
+            print(f"[{self.worker_id}] SharePoint drive backup failed for {site_id}: {e}")
+
+        # 2. Backup site lists
+        try:
+            lists_data = await graph_client.get_sharepoint_site_lists(site_id)
+            for lst in lists_data.get("value", []):
+                list_id = lst.get("id")
+                if not list_id:
+                    continue
+
+                try:
+                    list_items = await graph_client.get_sharepoint_site_list_items(site_id, list_id)
+                    for list_item in list_items.get("value", []):
+                        structured_meta = MetadataExtractor.extract_sharepoint_list_item_metadata(list_item, lst)
+                        snapshot_item = await self.create_snapshot_item(
+                            snapshot, tenant, list_item, "SHAREPOINT_LIST_ITEM", structured_meta
+                        )
+                        item_count += 1
+                        bytes_added += snapshot_item.content_size or 0
+                except Exception as e:
+                    print(f"[{self.worker_id}] SharePoint list {list_id} backup failed: {e}")
+        except Exception as e:
+            print(f"[{self.worker_id}] SharePoint lists backup failed for {site_id}: {e}")
+
+        # 3. Backup site permissions
+        try:
+            permissions_data = await graph_client.get_site_permissions(site_id)
+            if permissions_data.get("value"):
+                perm_snapshot_item = await self.create_snapshot_item(
+                    snapshot, tenant, permissions_data, "SHAREPOINT_PERMISSIONS",
+                    MetadataExtractor.extract_permissions_metadata(permissions_data)
+                )
+                item_count += 1
+        except Exception as e:
+            print(f"[{self.worker_id}] SharePoint permissions backup failed for {site_id}: {e}")
+
         return {
-            "item_count": 0,
-            "bytes_added": 0,
+            "item_count": item_count,
+            "bytes_added": bytes_added,
+            "new_delta_token": new_delta_token,
+        }
+
+    async def backup_teams_channel(self,
+        graph_client: GraphClient,
+        resource: Resource,
+        snapshot: Snapshot,
+        tenant: Tenant,
+        message: Dict
+    ) -> Dict:
+        """Backup Teams channels (messages + replies + files) using delta API"""
+        team_id = resource.external_id
+
+        # Get delta token from previous backup
+        delta_token = None
+        if resource.extra_data:
+            delta_token = resource.extra_data.get("teams_channels_delta_token")
+
+        item_count = 0
+        bytes_added = 0
+        new_delta_token = None
+
+        try:
+            # 1. Get all channels in the team
+            channels_data = await graph_client.get_teams_channels(team_id)
+
+            for channel in channels_data.get("value", []):
+                channel_id = channel.get("id")
+                if not channel_id:
+                    continue
+
+                # Backup channel metadata
+                channel_meta = MetadataExtractor.extract_teams_channel_metadata(channel, team_id)
+                channel_snapshot_item = await self.create_snapshot_item(
+                    snapshot, tenant, channel, "TEAMS_CHANNEL_META", channel_meta
+                )
+                item_count += 1
+
+                # 2. Get channel messages using delta API
+                try:
+                    messages_data = await graph_client.get_channel_messages(team_id, channel_id, delta_token)
+                    new_delta_token = messages_data.get("@odata.deltaLink")
+
+                    for msg in messages_data.get("value", []):
+                        # Extract message with thread structure
+                        msg_meta = MetadataExtractor.extract_teams_message_metadata(msg)
+
+                        # Backup message
+                        msg_snapshot_item = await self.create_snapshot_item(
+                            snapshot, tenant, msg, "TEAMS_MESSAGE", msg_meta
+                        )
+                        item_count += 1
+                        bytes_added += msg_snapshot_item.content_size or 0
+
+                        # 3. Get replies for the message
+                        try:
+                            replies_data = await graph_client.get_channel_messages_replies(
+                                team_id, channel_id, msg.get("id")
+                            )
+                            for reply in replies_data.get("value", []):
+                                reply_meta = MetadataExtractor.extract_teams_message_metadata(reply, is_reply=True)
+                                reply_snapshot_item = await self.create_snapshot_item(
+                                    snapshot, tenant, reply, "TEAMS_MESSAGE_REPLY", reply_meta
+                                )
+                                item_count += 1
+                                bytes_added += reply_snapshot_item.content_size or 0
+                        except Exception as e:
+                            print(f"[{self.worker_id}] Failed to get replies for message {msg.get('id')}: {e}")
+                except Exception as e:
+                    print(f"[{self.worker_id}] Failed to get messages for channel {channel_id}: {e}")
+        except Exception as e:
+            print(f"[{self.worker_id}] Teams channel backup failed for {team_id}: {e}")
+
+        return {
+            "item_count": item_count,
+            "bytes_added": bytes_added,
+            "new_delta_token": new_delta_token,
+        }
+
+    async def backup_teams_chat(self,
+        graph_client: GraphClient,
+        resource: Resource,
+        snapshot: Snapshot,
+        tenant: Tenant,
+        message: Dict
+    ) -> Dict:
+        """Backup Teams chats (messages) using delta API"""
+        chat_id = resource.external_id
+
+        # Get delta token from previous backup
+        delta_token = None
+        if resource.extra_data:
+            delta_token = resource.extra_data.get("teams_chat_delta_token")
+
+        item_count = 0
+        bytes_added = 0
+        new_delta_token = None
+
+        try:
+            # 1. Backup chat metadata
+            chat_meta = MetadataExtractor.extract_teams_chat_metadata(resource)
+            chat_snapshot_item = await self.create_snapshot_item(
+                snapshot, tenant, {"id": chat_id, **chat_meta}, "TEAMS_CHAT_META", chat_meta
+            )
+            item_count += 1
+
+            # 2. Get chat messages using delta API
+            messages_data = await graph_client.get_chat_messages(chat_id, delta_token)
+            new_delta_token = messages_data.get("@odata.deltaLink")
+
+            for msg in messages_data.get("value", []):
+                msg_meta = MetadataExtractor.extract_teams_message_metadata(msg)
+                msg_snapshot_item = await self.create_snapshot_item(
+                    snapshot, tenant, msg, "TEAMS_CHAT_MESSAGE", msg_meta
+                )
+                item_count += 1
+                bytes_added += msg_snapshot_item.content_size or 0
+        except Exception as e:
+            print(f"[{self.worker_id}] Teams chat backup failed for {chat_id}: {e}")
+
+        return {
+            "item_count": item_count,
+            "bytes_added": bytes_added,
+            "new_delta_token": new_delta_token,
+        }
+
+    async def backup_entra_user(self,
+        graph_client: GraphClient,
+        resource: Resource,
+        snapshot: Snapshot,
+        tenant: Tenant,
+        message: Dict
+    ) -> Dict:
+        """Backup Entra ID user with profile, relationships, and settings"""
+        user_id = resource.external_id
+
+        item_count = 0
+        bytes_added = 0
+
+        try:
+            # 1. Backup user profile
+            user_profile = await graph_client.get_user_profile(user_id)
+            user_meta = MetadataExtractor.extract_entra_user_metadata(user_profile)
+            user_snapshot_item = await self.create_snapshot_item(
+                snapshot, tenant, user_profile, "ENTRA_USER_PROFILE", user_meta
+            )
+            item_count += 1
+            bytes_added += user_snapshot_item.content_size or 0
+
+            # 2. Backup user manager relationship
+            try:
+                manager_data = await graph_client.get_user_manager(user_id)
+                if manager_data:
+                    manager_meta = MetadataExtractor.extract_relationship_metadata(manager_data, "manager", user_id)
+                    manager_snapshot_item = await self.create_snapshot_item(
+                        snapshot, tenant, manager_data, "ENTRA_RELATIONSHIP", manager_meta
+                    )
+                    item_count += 1
+            except Exception as e:
+                print(f"[{self.worker_id}] Failed to get manager for user {user_id}: {e}")
+
+            # 3. Backup direct reports
+            try:
+                direct_reports = await graph_client.get_user_direct_reports(user_id)
+                for report in direct_reports.get("value", []):
+                    report_meta = MetadataExtractor.extract_relationship_metadata(report, "direct_report", user_id)
+                    report_snapshot_item = await self.create_snapshot_item(
+                        snapshot, tenant, report, "ENTRA_RELATIONSHIP", report_meta
+                    )
+                    item_count += 1
+            except Exception as e:
+                print(f"[{self.worker_id}] Failed to get direct reports for user {user_id}: {e}")
+
+            # 4. Backup group memberships
+            try:
+                memberships = await graph_client.get_user_group_memberships(user_id)
+                for group in memberships.get("value", []):
+                    group_meta = MetadataExtractor.extract_membership_metadata(group, user_id)
+                    group_snapshot_item = await self.create_snapshot_item(
+                        snapshot, tenant, group, "ENTRA_MEMBERSHIP", group_meta
+                    )
+                    item_count += 1
+            except Exception as e:
+                print(f"[{self.worker_id}] Failed to get memberships for user {user_id}: {e}")
+
+            # 5. Backup mailbox settings
+            try:
+                mailbox_settings = await graph_client.get_user_mailbox_settings(user_id)
+                if mailbox_settings:
+                    settings_meta = {"user_id": user_id, "type": "mailbox_settings"}
+                    settings_snapshot_item = await self.create_snapshot_item(
+                        snapshot, tenant, mailbox_settings, "ENTRA_MAILBOX_SETTINGS", settings_meta
+                    )
+                    item_count += 1
+            except Exception as e:
+                print(f"[{self.worker_id}] Failed to get mailbox settings for user {user_id}: {e}")
+
+            # 6. Backup contacts
+            try:
+                contacts = await graph_client.get_user_contacts(user_id)
+                for contact in contacts.get("value", []):
+                    contact_meta = MetadataExtractor.extract_contact_metadata(contact, user_id)
+                    contact_snapshot_item = await self.create_snapshot_item(
+                        snapshot, tenant, contact, "ENTRA_CONTACT", contact_meta
+                    )
+                    item_count += 1
+            except Exception as e:
+                print(f"[{self.worker_id}] Failed to get contacts for user {user_id}: {e}")
+
+            # 7. Backup calendar events
+            try:
+                calendar_events = await graph_client.get_calendar_events_delta(user_id)
+                for event in calendar_events.get("value", []):
+                    event_meta = MetadataExtractor.extract_calendar_event_metadata(event, user_id)
+                    event_snapshot_item = await self.create_snapshot_item(
+                        snapshot, tenant, event, "ENTRA_CALENDAR_EVENT", event_meta
+                    )
+                    item_count += 1
+            except Exception as e:
+                print(f"[{self.worker_id}] Failed to get calendar events for user {user_id}: {e}")
+
+        except Exception as e:
+            print(f"[{self.worker_id}] Entra user backup failed for {user_id}: {e}")
+
+        return {
+            "item_count": item_count,
+            "bytes_added": bytes_added,
             "new_delta_token": None,
         }
-    
-    # Placeholder handlers for other resource types
-    async def backup_sharepoint(self, *args, **kwargs):
-        return await self.backup_generic(*args, **kwargs)
-    
-    async def backup_teams_channel(self, *args, **kwargs):
-        return await self.backup_generic(*args, **kwargs)
-    
-    async def backup_entra_user(self, *args, **kwargs):
-        return await self.backup_generic(*args, **kwargs)
-    
-    async def backup_entra_group(self, *args, **kwargs):
-        return await self.backup_generic(*args, **kwargs)
+
+    async def backup_entra_group(self,
+        graph_client: GraphClient,
+        resource: Resource,
+        snapshot: Snapshot,
+        tenant: Tenant,
+        message: Dict
+    ) -> Dict:
+        """Backup Entra ID group with members and owners"""
+        group_id = resource.external_id
+
+        item_count = 0
+        bytes_added = 0
+
+        try:
+            # 1. Backup group metadata
+            group_meta = MetadataExtractor.extract_entra_group_metadata(resource.extra_data or {})
+            group_snapshot_item = await self.create_snapshot_item(
+                snapshot, tenant, resource.extra_data or {}, "ENTRA_GROUP_META", group_meta
+            )
+            item_count += 1
+            bytes_added += group_snapshot_item.content_size or 0
+
+            # 2. Backup group members
+            try:
+                members = await graph_client.get_group_members(group_id)
+                for member in members.get("value", []):
+                    member_meta = MetadataExtractor.extract_group_member_metadata(member, group_id)
+                    member_snapshot_item = await self.create_snapshot_item(
+                        snapshot, tenant, member, "ENTRA_GROUP_MEMBER", member_meta
+                    )
+                    item_count += 1
+            except Exception as e:
+                print(f"[{self.worker_id}] Failed to get members for group {group_id}: {e}")
+
+            # 3. Backup group owners
+            try:
+                owners = await graph_client.get_group_owners(group_id)
+                for owner in owners.get("value", []):
+                    owner_meta = MetadataExtractor.extract_group_owner_metadata(owner, group_id)
+                    owner_snapshot_item = await self.create_snapshot_item(
+                        snapshot, tenant, owner, "ENTRA_GROUP_OWNER", owner_meta
+                    )
+                    item_count += 1
+            except Exception as e:
+                print(f"[{self.worker_id}] Failed to get owners for group {group_id}: {e}")
+
+        except Exception as e:
+            print(f"[{self.worker_id}] Entra group backup failed for {group_id}: {e}")
+
+        return {
+            "item_count": item_count,
+            "bytes_added": bytes_added,
+            "new_delta_token": None,
+        }
     
     async def create_snapshot_item(
         self,
         snapshot: Snapshot,
         tenant: Tenant,
         item: Dict,
-        item_type: str
+        item_type: str,
+        structured_metadata: Optional[Dict] = None
     ) -> SnapshotItem:
-        """Create a snapshot item record"""
+        """Create a snapshot item record with structured metadata preservation
+
+        Args:
+            snapshot: Parent snapshot
+            tenant: Tenant object
+            item: Raw item data from Graph API
+            item_type: Type of item (EMAIL, FILE, TEAMS_MESSAGE, etc.)
+            structured_metadata: Extracted structured metadata (permissions, relationships, etc.)
+        """
         item_id = item.get("id", str(uuid.uuid4()))
-        
+
         # Calculate content hash for deduplication
         content_json = json.dumps(item, sort_keys=True)
         content_hash = hashlib.sha256(content_json.encode()).hexdigest()
-        
+
         # Create versioned storage path
         blob_path = self.build_versioned_blob_path(
             tenant.id, snapshot.resource_id, snapshot.id, item_id
         )
-        
-        # In production: upload to Azure Blob Storage here
-        # For now, just track metadata
-        
+
+        # Merge raw item data with structured metadata
+        metadata_payload = {
+            "raw": item,
+            "structured": structured_metadata or {},
+            "backup_timestamp": datetime.utcnow().isoformat(),
+            "item_type": item_type,
+        }
+
+        # Upload to Azure Blob Storage with immutability
+        content_bytes = content_json.encode('utf-8')
+        upload_success = await self._upload_to_azure_blob(blob_path, content_bytes)
+
         snapshot_item = SnapshotItem(
             snapshot_id=snapshot.id,
             tenant_id=tenant.id,
             external_id=item_id,
             item_type=item_type,
-            name=item.get("displayName", item.get("subject", item_id)),
+            name=item.get("displayName", item.get("subject", item.get("name", item_id))),
             content_hash=content_hash,
-            content_size=len(content_json.encode()),
+            content_size=len(content_bytes),
             blob_path=blob_path,
-            metadata=item,
+            metadata=metadata_payload,
+            content_checksum=content_hash,  # SHA-256 integrity checksum
         )
-        
+
         # Save to database
         async with async_session_factory() as session:
             session.add(snapshot_item)
             await session.commit()
-        
+
         return snapshot_item
+
+    async def _upload_to_azure_blob(self, blob_path: str, content: bytes) -> bool:
+        """Upload content to Azure Blob Storage with immutability
+
+        Args:
+            blob_path: Full blob path in format: {tenant}/{resource}/{snapshot}/{timestamp}/{item}
+            content: Content bytes to upload
+
+        Returns:
+            True if upload successful, False otherwise
+        """
+        if not self.blob_service_client:
+            return False
+
+        try:
+            container_name = "backups"
+            blob_client = self.blob_service_client.get_blob_client(container=container_name, blob=blob_path)
+
+            # Upload with immutability metadata
+            blob_client.upload_blob(
+                content,
+                overwrite=True,
+                metadata={
+                    "immutable": "true",
+                    "backup-item": "true",
+                },
+            )
+            return True
+        except Exception as e:
+            print(f"[{self.worker_id}] Azure Blob upload failed for {blob_path}: {e}")
+            return False
     
     def build_versioned_blob_path(
         self,

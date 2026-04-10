@@ -12,11 +12,11 @@ from sqlalchemy import select, func
 
 from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Job, JobLog, JobType, JobStatus, Resource
+from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot
 from shared.schemas import (
     JobResponse, JobListResponse, TriggerBackupRequest, TriggerBulkBackupRequest
 )
-from shared.message_bus import message_bus, create_backup_message
+from shared.message_bus import message_bus, create_backup_message, create_restore_message
 
 
 @asynccontextmanager
@@ -321,10 +321,74 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
 @app.post("/api/v1/jobs/restore/sharepoint")
 @app.post("/api/v1/jobs/restore/entra-object")
 async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_db)):
-    job = Job(id=uuid4(), type=JobType.RESTORE, status=JobStatus.QUEUED, priority=1, spec=request or {})
+    """Trigger a restore job and publish to RabbitMQ"""
+    if not request:
+        raise HTTPException(status_code=400, detail="Request body is required")
+
+    restore_type = request.get("restoreType", "IN_PLACE")
+    snapshot_ids = request.get("snapshotIds", [])
+    item_ids = request.get("itemIds", [])
+    target_user_id = request.get("targetUserId")
+    spec = {
+        "targetUserId": target_user_id,
+        "targetResourceId": request.get("targetResourceId"),
+        "exportFormat": request.get("exportFormat"),
+    }
+
+    # Fetch first snapshot to get tenant/resource info
+    tenant_id = None
+    resource_id = None
+    if snapshot_ids:
+        from sqlalchemy import select as sa_select
+        stmt = sa_select(Snapshot).where(Snapshot.id == uuid.UUID(snapshot_ids[0]))
+        result = await db.execute(stmt)
+        snapshot = result.scalar_one_or_none()
+        if snapshot:
+            resource_id = str(snapshot.resource_id)
+            resource_stmt = sa_select(Resource).where(Resource.id == snapshot.resource_id)
+            resource_result = await db.execute(resource_stmt)
+            resource = resource_result.scalar_one_or_none()
+            if resource:
+                tenant_id = str(resource.tenant_id)
+
+    job = Job(
+        id=uuid4(),
+        type=JobType.RESTORE,
+        tenant_id=uuid.UUID(tenant_id) if tenant_id else None,
+        resource_id=uuid.UUID(resource_id) if resource_id else None,
+        status=JobStatus.QUEUED,
+        priority=1,
+        spec={
+            "restore_type": restore_type,
+            "snapshot_ids": snapshot_ids,
+            "item_ids": item_ids,
+            **spec,
+        }
+    )
     db.add(job)
     await db.flush()
-    return {"jobId": str(job.id)}
+
+    # Publish to RabbitMQ
+    if settings.RABBITMQ_ENABLED:
+        restore_message = create_restore_message(
+            job_id=str(job.id),
+            restore_type=restore_type,
+            snapshot_ids=snapshot_ids,
+            item_ids=item_ids,
+            resource_id=resource_id,
+            tenant_id=tenant_id,
+            spec=spec,
+        )
+        queue = restore_message.get("queue", "restore.normal")
+        await message_bus.publish(queue, restore_message, priority=restore_message.get("priority", 5))
+
+    return {
+        "jobId": str(job.id),
+        "status": "QUEUED",
+        "restoreType": restore_type,
+        "snapshotCount": len(snapshot_ids),
+        "itemCount": len(item_ids),
+    }
 
 
 @app.get("/api/v1/jobs/restore/{job_id}/status")
