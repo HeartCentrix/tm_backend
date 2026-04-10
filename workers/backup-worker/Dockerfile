@@ -8,5 +8,6 @@ COPY workers/backup-worker /app/workers/backup-worker
 RUN pip install --no-cache-dir -r /app/workers/backup-worker/requirements.txt
 
 ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "workers/backup-worker/main.py"]

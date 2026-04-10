@@ -163,17 +163,29 @@ class BackupWorker:
     async def consume_queue(self, queue_name: str, prefetch_count: int):
         """Consume messages from a specific queue"""
         if not message_bus.channel:
+            print(f"[{self.worker_id}] Cannot consume from {queue_name}: channel is None")
             return
-        
+
         queue = await message_bus.channel.get_queue(queue_name)
-        
-        async for message in queue:
-            async with message.process():
+        print(f"[{self.worker_id}] Listening on {queue_name}...")
+
+        async with queue.iterator() as queue_iter:
+            async for message in queue_iter:
+                print(f"[{self.worker_id}] Got message from {queue_name}")
                 try:
                     body = json.loads(message.body.decode())
+                    print(f"[{self.worker_id}] Received message from {queue_name}: {body}")
                     await self.process_backup_message(body)
+                    await message.ack()
+                    print(f"[{self.worker_id}] Processed message from {queue_name}")
                 except Exception as e:
                     print(f"[{self.worker_id}] Error processing message: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    try:
+                        await message.reject(requeue=True)
+                    except Exception:
+                        pass
                     # In production: send to DLQ
     
     async def process_backup_message(self, message: Dict[str, Any]):
@@ -197,200 +209,215 @@ class BackupWorker:
     async def process_single_backup(self, job_id: uuid.UUID, resource_id: str, tenant_id: str, message: Dict):
         """Process backup for a single resource"""
         async with self.semaphore:  # Concurrency control
-            async with async_session_factory() as session:
+            session = async_session_factory(autoflush=False)
+            try:
+                # Update job status
+                await self.update_job_status(session, job_id, JobStatus.RUNNING)
+                await session.flush()
+
+                # Fetch resource
+                resource = await session.get(Resource, uuid.UUID(resource_id))
+                if not resource:
+                    raise ValueError(f"Resource {resource_id} not found")
+
+                # Fetch tenant
+                tenant = await session.get(Tenant, resource.tenant_id)
+                if not tenant:
+                    raise ValueError(f"Tenant {resource.tenant_id} not found")
+
+                # Get or create Graph client
+                graph_client = await self.get_graph_client(tenant)
+
+                # Create snapshot
+                snapshot = await self.create_snapshot(session, resource, message)
+                await session.flush()
+
+                # Execute backup based on resource type
+                backup_result = await self.execute_backup(
+                    graph_client, resource, snapshot, tenant, message
+                )
+
+                # Report progress (100% complete)
+                await self.progress_reporter.report(
+                    resource_id=resource_id,
+                    job_id=str(job_id),
+                    status="COMPLETED",
+                    progress_pct=100,
+                    processed_items=backup_result.get("item_count", 0),
+                    processed_bytes=backup_result.get("bytes_added", 0),
+                )
+
+                # Complete snapshot
+                await self.complete_snapshot(
+                    session, snapshot, backup_result, message
+                )
+
+                # Update job as completed
+                await self.update_job_status(
+                    session, job_id, JobStatus.COMPLETED,
+                    result=backup_result
+                )
+
+                # Update resource last backup info
+                await self.update_resource_backup_info(
+                    session, resource, job_id, snapshot.id
+                )
+
+                await session.commit()
+
+                # Log audit event: BACKUP_COMPLETED
+                await self.audit_logger.log(
+                    action="BACKUP_COMPLETED",
+                    tenant_id=tenant_id,
+                    org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
+                    actor_type="WORKER",
+                    resource_id=resource_id,
+                    resource_type=resource.type.value if hasattr(resource.type, 'value') else resource.type,
+                    resource_name=resource.display_name or resource.email,
+                    outcome="SUCCESS",
+                    job_id=str(job_id),
+                    snapshot_id=str(snapshot.id),
+                    details={
+                        "item_count": backup_result.get("item_count", 0),
+                        "bytes_added": backup_result.get("bytes_added", 0),
+                        "delta_token": "present" if backup_result.get("new_delta_token") else "none",
+                    },
+                )
+
+                print(f"[{self.worker_id}] Completed backup for {resource_id}")
+
+            except Exception as e:
                 try:
-                    # Update job status
-                    await self.update_job_status(session, job_id, JobStatus.RUNNING)
-                    
-                    # Fetch resource
-                    resource = await session.get(Resource, uuid.UUID(resource_id))
-                    if not resource:
-                        raise ValueError(f"Resource {resource_id} not found")
-                    
-                    # Fetch tenant
-                    tenant = await session.get(Tenant, resource.tenant_id)
-                    if not tenant:
-                        raise ValueError(f"Tenant {resource.tenant_id} not found")
-                    
-                    # Get or create Graph client
-                    graph_client = await self.get_graph_client(tenant)
-                    
-                    # Create snapshot
-                    snapshot = await self.create_snapshot(session, resource, message)
-                    
-                    # Execute backup based on resource type
-                    backup_result = await self.execute_backup(
-                        graph_client, resource, snapshot, tenant, message
-                    )
-
-                    # Report progress (100% complete)
-                    await self.progress_reporter.report(
-                        resource_id=resource_id,
-                        job_id=str(job_id),
-                        status="COMPLETED",
-                        progress_pct=100,
-                        processed_items=backup_result.get("item_count", 0),
-                        processed_bytes=backup_result.get("bytes_added", 0),
-                    )
-                    
-                    # Complete snapshot
-                    await self.complete_snapshot(
-                        session, snapshot, backup_result, message
-                    )
-                    
-                    # Update job as completed
-                    await self.update_job_status(
-                        session, job_id, JobStatus.COMPLETED,
-                        result=backup_result
-                    )
-                    
-                    # Update resource last backup info
-                    await self.update_resource_backup_info(
-                        session, resource, snapshot.id
-                    )
-                    
-                    await session.commit()
-
-                    # Log audit event: BACKUP_COMPLETED
-                    await self.audit_logger.log(
-                        action="BACKUP_COMPLETED",
-                        tenant_id=tenant_id,
-                        org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
-                        actor_type="WORKER",
-                        resource_id=resource_id,
-                        resource_type=resource.type.value if hasattr(resource.type, 'value') else resource.type,
-                        resource_name=resource.display_name or resource.email,
-                        outcome="SUCCESS",
-                        job_id=str(job_id),
-                        snapshot_id=str(snapshot.id),
-                        details={
-                            "item_count": backup_result.get("item_count", 0),
-                            "bytes_added": backup_result.get("bytes_added", 0),
-                            "delta_token": "present" if backup_result.get("new_delta_token") else "none",
-                        },
-                    )
-
-                    print(f"[{self.worker_id}] Completed backup for {resource_id}")
-
-                except Exception as e:
                     await session.rollback()
-                    await self.handle_backup_failure(session, job_id, e, uuid.UUID(resource_id))
+                except Exception:
+                    pass
+                await self.handle_backup_failure(session, job_id, e, uuid.UUID(resource_id))
 
-                    # Log audit event: BACKUP_FAILED
+                # Log audit event: BACKUP_FAILED
+                try:
                     await self.audit_logger.log(
                         action="BACKUP_FAILED",
                         tenant_id=tenant_id,
-                        org_id=str(tenant.org_id) if 'tenant' in dir() and hasattr(tenant, 'org_id') and tenant.org_id else None,
                         actor_type="WORKER",
                         resource_id=resource_id,
-                        resource_type=resource.type.value if 'resource' in dir() and hasattr(resource, 'type') and hasattr(resource.type, 'value') else None,
+                        resource_type=resource.type.value if 'resource' in dir() and hasattr(resource, 'type') else None,
                         resource_name=resource.display_name if 'resource' in dir() and hasattr(resource, 'display_name') else None,
                         outcome="FAILURE",
                         job_id=str(job_id),
                         details={"error": str(e)},
                     )
+                except Exception:
+                    pass
 
-                    print(f"[{self.worker_id}] Backup failed for {resource_id}: {e}")
-                    raise
+                print(f"[{self.worker_id}] Backup failed for {resource_id}: {e}")
+                raise
+            finally:
+                await session.close()
     
     async def process_mass_backup(self, job_id: uuid.UUID, tenant_id: str, message: Dict):
         """Process mass backup for a batch of resources"""
         resource_ids = message["resourceIds"]
         resource_type = message["resourceType"]
         batch_size = len(resource_ids)
-        
+
         print(f"[{self.worker_id}] Starting mass backup: {batch_size} {resource_type} resources")
-        
+
         async with self.semaphore:
-            async with async_session_factory() as session:
+            session = async_session_factory(autoflush=False)
+            try:
+                # Update job status
+                await self.update_job_status(session, job_id, JobStatus.RUNNING)
+                await session.flush()
+
+                # Fetch tenant
+                tenant_result = await session.execute(
+                    select(Tenant).where(Tenant.external_tenant_id == tenant_id)
+                )
+                tenant = tenant_result.scalars().first()
+                if not tenant:
+                    raise ValueError(f"Tenant {tenant_id} not found")
+
+                # Get Graph client
+                graph_client = await self.get_graph_client(tenant)
+
+                # Fetch all resources
+                resources_result = await session.execute(
+                    select(Resource).where(Resource.id.in_([uuid.UUID(rid) for rid in resource_ids]))
+                )
+                resources = resources_result.scalars().all()
+
+                print(f"[{self.worker_id}] Fetched {len(resources)} resources for mass backup")
+
+                # Group resources for batch Graph API calls
+                batch_results = []
+                completed_count = 0
+                failed_count = 0
+
+                # Process in smaller batches for Graph API $batch endpoint
+                GRAPH_BATCH_SIZE = 20  # Graph API limit per $batch call
+
+                for i in range(0, len(resources), GRAPH_BATCH_SIZE):
+                    resource_batch = resources[i:i + GRAPH_BATCH_SIZE]
+
+                    # Execute batch backup
+                    batch_result = await self.execute_batch_backup(
+                        graph_client, resource_batch, tenant, message
+                    )
+                    batch_results.extend(batch_result)
+
+                    completed_count += len([r for r in batch_result if r.get("success")])
+                    failed_count += len([r for r in batch_result if not r.get("success")])
+
+                    # Update progress
+                    progress = int((i + len(resource_batch)) / len(resources) * 100)
+                    await self.update_job_progress(session, job_id, progress)
+
+                    print(f"[{self.worker_id}] Progress: {completed_count}/{len(resources)} completed")
+
+                # Update job as completed
+                await self.update_job_status(
+                    session, job_id, JobStatus.COMPLETED,
+                    result={
+                        "total": len(resources),
+                        "completed": completed_count,
+                        "failed": failed_count,
+                        "batch_results": batch_results,
+                    }
+                )
+
+                await session.commit()
+
+                # Log audit event: BACKUP_COMPLETED (mass)
+                outcome = "PARTIAL" if failed_count > 0 and completed_count > 0 else "SUCCESS"
+                await self.audit_logger.log(
+                    action="BACKUP_COMPLETED",
+                    tenant_id=tenant_id,
+                    org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
+                    actor_type="WORKER",
+                    resource_type=resource_type,
+                    resource_name=f"Mass backup: {resource_type}",
+                    outcome=outcome,
+                    job_id=str(job_id),
+                    details={
+                        "total": len(resources),
+                        "completed": completed_count,
+                        "failed": failed_count,
+                        "batch": True,
+                    },
+                )
+
+                print(f"[{self.worker_id}] Mass backup completed: {completed_count} succeeded, {failed_count} failed")
+
+            except Exception as e:
                 try:
-                    # Update job status
-                    await self.update_job_status(session, job_id, JobStatus.RUNNING)
-                    
-                    # Fetch tenant
-                    tenant_result = await session.execute(
-                        select(Tenant).where(Tenant.external_tenant_id == tenant_id)
-                    )
-                    tenant = tenant_result.scalars().first()
-                    if not tenant:
-                        raise ValueError(f"Tenant {tenant_id} not found")
-                    
-                    # Get Graph client
-                    graph_client = await self.get_graph_client(tenant)
-                    
-                    # Fetch all resources
-                    resources_result = await session.execute(
-                        select(Resource).where(Resource.id.in_([uuid.UUID(rid) for rid in resource_ids]))
-                    )
-                    resources = resources_result.scalars().all()
-                    
-                    print(f"[{self.worker_id}] Fetched {len(resources)} resources for mass backup")
-                    
-                    # Group resources for batch Graph API calls
-                    batch_results = []
-                    completed_count = 0
-                    failed_count = 0
-                    
-                    # Process in smaller batches for Graph API $batch endpoint
-                    GRAPH_BATCH_SIZE = 20  # Graph API limit per $batch call
-                    
-                    for i in range(0, len(resources), GRAPH_BATCH_SIZE):
-                        resource_batch = resources[i:i + GRAPH_BATCH_SIZE]
-                        
-                        # Execute batch backup
-                        batch_result = await self.execute_batch_backup(
-                            graph_client, resource_batch, tenant, message
-                        )
-                        batch_results.extend(batch_result)
-                        
-                        completed_count += len([r for r in batch_result if r.get("success")])
-                        failed_count += len([r for r in batch_result if not r.get("success")])
-                        
-                        # Update progress
-                        progress = int((i + len(resource_batch)) / len(resources) * 100)
-                        await self.update_job_progress(session, job_id, progress)
-                        
-                        print(f"[{self.worker_id}] Progress: {completed_count}/{len(resources)} completed")
-                    
-                    # Update job as completed
-                    await self.update_job_status(
-                        session, job_id, JobStatus.COMPLETED,
-                        result={
-                            "total": len(resources),
-                            "completed": completed_count,
-                            "failed": failed_count,
-                            "batch_results": batch_results,
-                        }
-                    )
-                    
-                    await session.commit()
-
-                    # Log audit event: BACKUP_COMPLETED (mass)
-                    outcome = "PARTIAL" if failed_count > 0 and completed_count > 0 else "SUCCESS"
-                    await self.audit_logger.log(
-                        action="BACKUP_COMPLETED",
-                        tenant_id=tenant_id,
-                        org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
-                        actor_type="WORKER",
-                        resource_type=resource_type,
-                        resource_name=f"Mass backup: {resource_type}",
-                        outcome=outcome,
-                        job_id=str(job_id),
-                        details={
-                            "total": len(resources),
-                            "completed": completed_count,
-                            "failed": failed_count,
-                            "batch": True,
-                        },
-                    )
-
-                    print(f"[{self.worker_id}] Mass backup completed: {completed_count} succeeded, {failed_count} failed")
-                    
-                except Exception as e:
                     await session.rollback()
-                    await self.handle_backup_failure(session, job_id, e)  # Mass backup - no single resource to update
-                    print(f"[{self.worker_id}] Mass backup failed: {e}")
-                    raise
+                except Exception:
+                    pass
+                await self.handle_backup_failure(session, job_id, e)
+                print(f"[{self.worker_id}] Mass backup failed: {e}")
+                raise
+            finally:
+                await session.close()
     
     async def execute_batch_backup(
         self,
@@ -414,7 +441,7 @@ class BackupWorker:
                 
                 # Update resource last backup info
                 async with async_session_factory() as session:
-                    await self.update_resource_backup_info(session, resource, snapshot.id)
+                    await self.update_resource_backup_info(session, resource, None, snapshot.id)
                     await session.commit()
                 
                 results.append({
@@ -498,8 +525,9 @@ class BackupWorker:
         message: Dict
     ) -> Dict:
         """Execute backup based on resource type"""
-        resource_type = resource.type.value
-        
+        resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
+        print(f"[{self.worker_id}] Executing backup for resource type: {resource_type}")
+
         # Route to appropriate backup handler
         handlers = {
             "MAILBOX": self.backup_mailbox,
@@ -512,10 +540,29 @@ class BackupWorker:
             "ENTRA_USER": self.backup_entra_user,
             "ENTRA_GROUP": self.backup_entra_group,
         }
-        
-        handler = handlers.get(resource_type, self.backup_generic)
+
+        handler = handlers.get(resource_type)
+        if not handler:
+            print(f"[{self.worker_id}] No handler for resource type: {resource_type}, using generic backup")
+            return await self._backup_generic(graph_client, resource, snapshot, tenant, message)
         
         return await handler(graph_client, resource, snapshot, tenant, message)
+
+    async def _backup_generic(
+        self,
+        graph_client: GraphClient,
+        resource: Resource,
+        snapshot: Snapshot,
+        tenant: Tenant,
+        message: Dict
+    ) -> Dict:
+        """Generic backup handler for unsupported resource types"""
+        print(f"[{self.worker_id}] Using generic backup for {resource.type}")
+        return {
+            "item_count": 0,
+            "bytes_added": 0,
+            "note": f"Generic backup: no specific handler for {resource.type}",
+        }
     
     async def backup_mailbox(
         self,
@@ -1069,7 +1116,7 @@ class BackupWorker:
         message: Dict
     ):
         """Mark snapshot as completed"""
-        snapshot.status = SnapshotStatus.COMPLETED
+        snapshot.status = SnapshotStatus.COMPLETE
         snapshot.completed_at = datetime.utcnow()
         snapshot.item_count = backup_result.get("item_count", 0)
         snapshot.new_item_count = backup_result.get("item_count", 0)
@@ -1088,13 +1135,14 @@ class BackupWorker:
         self,
         session: AsyncSession,
         resource: Resource,
+        job_id: uuid.UUID,
         snapshot_id: uuid.UUID
     ):
         """Update resource with last backup information"""
-        resource.last_backup_job_id = snapshot_id
+        resource.last_backup_job_id = job_id
         resource.last_backup_at = datetime.utcnow()
         resource.last_backup_status = "COMPLETED"
-        
+
         session.add(resource)
     
     async def update_job_status(

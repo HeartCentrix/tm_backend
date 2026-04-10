@@ -177,10 +177,15 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
     # Publish to RabbitMQ
     if settings.RABBITMQ_ENABLED:
         routing_key = "backup.urgent"
-        await message_bus.publish(routing_key, create_backup_message(
+        msg = create_backup_message(
             job_id=str(job.id), resource_id=request.resourceId,
             tenant_id=str(resource.tenant_id), full_backup=request.fullBackup or False
-        ), priority=request.priority or 1)
+        )
+        print(f"[JOB_SERVICE] Publishing backup message to {routing_key}: {msg}")
+        await message_bus.publish(routing_key, msg, priority=request.priority or 1)
+        print(f"[JOB_SERVICE] Message published successfully")
+    else:
+        print(f"[JOB_SERVICE] RabbitMQ not enabled, skipping publish. RABBITMQ_ENABLED={settings.RABBITMQ_ENABLED}")
 
     # Log audit event: BACKUP_TRIGGERED
     try:

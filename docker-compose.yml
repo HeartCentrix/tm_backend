@@ -129,6 +129,11 @@ services:
     env_file: .env
     environment:
       DB_HOST: postgres
+      RABBITMQ_ENABLED: "true"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
     depends_on:
       postgres:
         condition: service_healthy
@@ -238,6 +243,7 @@ services:
       dockerfile: workers/backup-worker/Dockerfile
     env_file: .env
     environment:
+      PYTHONUNBUFFERED: "1"
       DB_HOST: postgres
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
