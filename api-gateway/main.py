@@ -112,10 +112,10 @@ async def tenant(request: Request):
 
 # Resource routes
 @app.get("/api/v1/resources")
-@app.get("/api/v1/resources/{resource_id}")
 @app.get("/api/v1/resources/search")
 @app.get("/api/v1/resources/by-type")
 @app.get("/api/v1/resources/users")
+@app.get("/api/v1/resources/{resource_id}")
 @app.get("/api/v1/resources/{resource_id}/storage-history")
 @app.post("/api/v1/resources/{resource_id}/assign-policy")
 @app.post("/api/v1/resources/{resource_id}/unassign-policy")

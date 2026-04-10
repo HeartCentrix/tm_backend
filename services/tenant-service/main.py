@@ -9,11 +9,12 @@ from sqlalchemy import select, func
 
 from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Tenant, TenantType, TenantStatus, Organization
+from shared.models import Tenant, TenantType, TenantStatus, Organization, Resource, ResourceStatus, ResourceType
 from shared.schemas import (
     TenantResponse, TenantCreateRequest, DiscoveryStatus,
     StorageSummaryItem, OrganizationResponse
 )
+from shared.graph_client import GraphClient
 
 
 @asynccontextmanager
@@ -128,15 +129,86 @@ async def delete_tenant(tenant_id: str, db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/v1/tenants/{tenant_id}/discover")
 @app.post("/api/v1/tenants/{tenant_id}/discover-m365")
-@app.post("/api/v1/tenants/{tenant_id}/discover-azure")
 async def trigger_discovery(tenant_id: str, db: AsyncSession = Depends(get_db)):
+    """Run M365 discovery via Graph API and store resources"""
+    stmt = select(Tenant).where(Tenant.id == UUID(tenant_id))
+    result = await db.execute(stmt)
+    tenant = result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    
+    tenant.status = TenantStatus.DISCOVERING
+    await db.flush()
+    
+    # Create Graph client
+    client_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
+    client_secret = settings.MICROSOFT_CLIENT_SECRET or settings.AZURE_AD_CLIENT_SECRET
+    ext_tenant_id = tenant.external_tenant_id or settings.MICROSOFT_TENANT_ID or settings.AZURE_AD_TENANT_ID or "common"
+    
+    try:
+        graph = GraphClient(client_id, client_secret, ext_tenant_id)
+        resources = await graph.discover_all()
+        
+        # Store resources in database
+        type_map = {
+            "MAILBOX": ResourceType.MAILBOX,
+            "SHARED_MAILBOX": ResourceType.SHARED_MAILBOX,
+            "ONEDRIVE": ResourceType.ONEDRIVE,
+            "SHAREPOINT_SITE": ResourceType.SHAREPOINT_SITE,
+            "TEAMS_CHANNEL": ResourceType.TEAMS_CHANNEL,
+            "TEAMS_CHAT": ResourceType.TEAMS_CHAT,
+            "ENTRA_USER": ResourceType.ENTRA_USER,
+            "ENTRA_GROUP": ResourceType.ENTRA_GROUP,
+            "ENTRA_APP": ResourceType.ENTRA_APP,
+            "ENTRA_DEVICE": ResourceType.ENTRA_DEVICE,
+        }
+        
+        count = 0
+        for r in resources:
+            # Check if resource already exists
+            existing_stmt = select(Resource).where(
+                Resource.tenant_id == tenant.id,
+                Resource.external_id == r["external_id"],
+            )
+            existing_result = await db.execute(existing_stmt)
+            existing = existing_result.scalar_one_or_none()
+            
+            if existing is None:
+                rtype = type_map.get(r.get("type", "ENTRA_USER"), ResourceType.ENTRA_USER)
+                resource = Resource(
+                    id=uuid4(),
+                    tenant_id=tenant.id,
+                    type=rtype,
+                    external_id=r["external_id"],
+                    display_name=r.get("display_name", "Unknown"),
+                    email=r.get("email"),
+                    metadata=r.get("metadata", {}),
+                    status=ResourceStatus.DISCOVERED,
+                )
+                db.add(resource)
+                count += 1
+        
+        tenant.status = TenantStatus.ACTIVE
+        tenant.last_discovery_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        await db.flush()
+        
+        return {"discoveryId": str(uuid4()), "resourcesFound": count}
+    except Exception as e:
+        tenant.status = TenantStatus.DISCONNECTED
+        await db.flush()
+        raise HTTPException(status_code=500, detail=f"Discovery failed: {str(e)}")
+
+
+@app.post("/api/v1/tenants/{tenant_id}/discover-azure")
+async def trigger_azure_discovery(tenant_id: str, db: AsyncSession = Depends(get_db)):
+    """Azure discovery - not yet implemented"""
     stmt = select(Tenant).where(Tenant.id == UUID(tenant_id))
     result = await db.execute(stmt)
     tenant = result.scalar_one_or_none()
     if tenant:
         tenant.status = TenantStatus.DISCOVERING
         await db.flush()
-    return {"discoveryId": str(uuid4())}
+    return {"discoveryId": str(uuid4()), "resourcesFound": 0}
 
 
 @app.get("/api/v1/tenants/{tenant_id}/discovery-status", response_model=DiscoveryStatus)

@@ -143,6 +143,21 @@ services:
     networks:
       - tm-network
 
+  discovery-worker:
+    build:
+      context: .
+      dockerfile: workers/discovery-worker/Dockerfile
+    container_name: tm_vault_discovery
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
 volumes:
   postgres_data:
 
