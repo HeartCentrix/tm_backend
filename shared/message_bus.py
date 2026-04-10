@@ -1,4 +1,5 @@
 """Shared message bus for inter-service communication via RabbitMQ"""
+import asyncio
 import json
 from typing import Optional, Callable, Dict, Any
 from datetime import datetime
@@ -16,27 +17,50 @@ class MessageBus:
         self.channel: Optional[aio_pika.Channel] = None
         self.exchange: Optional[aio_pika.Exchange] = None
     
-    async def connect(self):
+    async def connect(self, max_retries: int = 10, retry_delay: int = 5):
         if not settings.RABBITMQ_ENABLED:
+            print("[MESSAGE_BUS] RabbitMQ disabled by config")
             return
-        
-        self.connection = await aio_pika.connect_robust(
-            settings.RABBITMQ_URL,
-        )
-        self.channel = await self.connection.channel()
-        self.exchange = await self.channel.declare_exchange(
-            "tm.exchange", aio_pika.ExchangeType.DIRECT, durable=True
-        )
-        
-        # Declare queues
-        await self._declare_queue("backup.urgent", routing_key="backup.urgent")
-        await self._declare_queue("backup.normal", routing_key="backup.normal")
-        await self._declare_queue("restore.urgent", routing_key="restore.urgent")
-        await self._declare_queue("discovery.m365", routing_key="discovery.m365")
-        await self._declare_queue("discovery.azure", routing_key="discovery.azure")
-        await self._declare_queue("notification", routing_key="notification")
-        await self._declare_queue("export.normal", routing_key="export.normal")
-        await self._declare_queue("delete.low", routing_key="delete.low")
+
+        # Retry with exponential backoff
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.connection = await aio_pika.connect_robust(
+                    settings.RABBITMQ_URL,
+                )
+                self.channel = await self.connection.channel()
+                self.exchange = await self.channel.declare_exchange(
+                    "tm.exchange", aio_pika.ExchangeType.DIRECT, durable=True
+                )
+
+                # Declare queues with QoS settings for mass backup
+                await self._declare_queue("backup.urgent", routing_key="backup.urgent")
+                await self._declare_queue("backup.high", routing_key="backup.high")
+                await self._declare_queue("backup.normal", routing_key="backup.normal")
+                await self._declare_queue("backup.low", routing_key="backup.low")
+                await self._declare_queue("restore.urgent", routing_key="restore.urgent")
+                await self._declare_queue("discovery.m365", routing_key="discovery.m365")
+                await self._declare_queue("discovery.azure", routing_key="discovery.azure")
+                await self._declare_queue("notification", routing_key="notification")
+                await self._declare_queue("export.normal", routing_key="export.normal")
+                await self._declare_queue("delete.low", routing_key="delete.low")
+                await self._declare_queue("sla.monitor", routing_key="sla.monitor")
+
+                # Set channel QoS (per-consumer prefetch)
+                await self.channel.set_qos(prefetch_count=50)
+
+                print("[MESSAGE_BUS] Connected to RabbitMQ successfully")
+                return  # Success!
+
+            except Exception as e:
+                if attempt < max_retries:
+                    print(f"[MESSAGE_BUS] Connection attempt {attempt}/{max_retries} failed: {e}")
+                    print(f"[MESSAGE_BUS] Retrying in {retry_delay}s...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    print(f"[MESSAGE_BUS] Failed to connect after {max_retries} attempts: {e}")
+                    print(f"[MESSAGE_BUS] Services requiring RabbitMQ will not function properly")
+                    raise
     
     async def disconnect(self):
         if self.connection:
@@ -91,6 +115,38 @@ def create_backup_message(job_id: str, resource_id: str, tenant_id: str, full_ba
         "type": "FULL" if full_backup else "INCREMENTAL",
         "priority": 1 if full_backup else 5,
         "createdAt": datetime.utcnow().isoformat(),
+    }
+
+
+def create_mass_backup_message(
+    job_id: str,
+    tenant_id: str,
+    resource_type: str,
+    resource_ids: list[str],
+    sla_tier: str = "SILVER",
+    full_backup: bool = False
+) -> dict:
+    """Create a mass backup message for batch processing"""
+    priority_map = {
+        "GOLD": 2,
+        "SILVER": 5,
+        "BRONZE": 8,
+        "MANUAL": 1,
+    }
+    
+    return {
+        "jobId": job_id,
+        "tenantId": tenant_id,
+        "resourceType": resource_type,
+        "resourceIds": resource_ids,  # Batch of resource IDs
+        "type": "FULL" if full_backup else "INCREMENTAL",
+        "priority": priority_map.get(sla_tier, 5),
+        "slaTier": sla_tier,
+        "triggeredBy": "SCHEDULED",
+        "snapshotLabel": "scheduled",
+        "forceFullBackup": full_backup,
+        "createdAt": datetime.utcnow().isoformat(),
+        "batchSize": len(resource_ids),
     }
 
 

@@ -20,12 +20,13 @@ class Settings:
         self.MICROSOFT_TENANT_ID = os.getenv("MICROSOFT_TENANT_ID") or os.getenv("AZURE_AD_TENANT_ID", "common")
         self.REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
         self.REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-        self.REDIS_ENABLED = False
+        self.REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+        self.REDIS_ENABLED = os.getenv("REDIS_ENABLED", "false").lower() in ("true", "1", "yes")
         self.RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
         self.RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
         self.RABBITMQ_USER = os.getenv("RABBITMQ_USERNAME") or os.getenv("RABBITMQ_USER", "guest")
         self.RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
-        self.RABBITMQ_ENABLED = False
+        self.RABBITMQ_ENABLED = os.getenv("RABBITMQ_ENABLED", "false").lower() in ("true", "1", "yes")
         self.AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "")
         self.AZURE_STORAGE_ACCOUNT_KEY = os.getenv("AZURE_STORAGE_ACCOUNT_KEY", "")
         self.ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")

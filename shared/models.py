@@ -185,8 +185,10 @@ class SlaPolicy(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
     name = Column(String, nullable=False)
+    tier = Column(String, default="CUSTOM")  # GOLD | SILVER | BRONZE | MANUAL | CUSTOM
     frequency = Column(String, default="DAILY")
     backup_window_start = Column(String)
+    backup_window_end = Column(String)  # NEW: end of backup window
     backup_exchange = Column(Boolean, default=True)
     backup_exchange_archive = Column(Boolean, default=False)
     backup_exchange_recoverable = Column(Boolean, default=False)
@@ -202,6 +204,10 @@ class SlaPolicy(Base):
     tasks = Column(Boolean, default=False)
     group_mailbox = Column(Boolean, default=True)
     planner = Column(Boolean, default=False)
+    resource_types = Column(ARRAY(String), default=[])  # NEW: explicit resource type list
+    batch_size = Column(Integer, default=20)  # NEW: Graph $batch size
+    max_concurrent_backups = Column(Integer, default=50)  # NEW: max parallel backups
+    sla_violation_alert = Column(Boolean, default=True)  # NEW: alert on violations
     retention_type = Column(String, default="INDEFINITE")
     retention_days = Column(Integer)
     retention_versions = Column(Integer)
@@ -217,6 +223,7 @@ class Job(Base):
     type = Column(SAEnum(JobType), nullable=False)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
     resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id"))
+    batch_resource_ids = Column(ARRAY(UUID(as_uuid=True)), default=[])  # NEW: for mass backup
     snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id"))
     status = Column(SAEnum(JobStatus), default=JobStatus.QUEUED)
     priority = Column(Integer, default=5)
@@ -248,7 +255,11 @@ class Snapshot(Base):
     bytes_added = Column(BigInteger, default=0)
     bytes_total = Column(BigInteger, default=0)
     delta_token = Column(String)
+    delta_tokens_json = Column(JSON, default=dict)  # NEW: per-folder/resource delta tokens
     snapshot_label = Column(String)
+    content_checksum = Column(String)  # NEW: SHA-256 of stored blob
+    blob_path = Column(String)  # NEW: full Azure Blob path
+    storage_version = Column(Integer, default=1)  # NEW: storage schema version
     created_at = Column(DateTime, default=utcnow)
 
 
@@ -262,7 +273,11 @@ class SnapshotItem(Base):
     name = Column(String, nullable=False)
     folder_path = Column(String)
     content_hash = Column(String, index=True)
+    content_checksum = Column(String)  # NEW: SHA-256 integrity checksum
     content_size = Column(BigInteger, default=0)
+    blob_path = Column(String)  # NEW: Azure Blob path for this item
+    encryption_key_id = Column(String)  # NEW: DEK version used
+    backup_version = Column(Integer, default=1)  # NEW: backup schema version
     extra_data = Column("metadata", JSON, default=dict)
     is_deleted = Column(Boolean, default=False)
     indexed_at = Column(DateTime)
