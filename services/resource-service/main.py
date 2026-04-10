@@ -300,6 +300,37 @@ async def bulk_action(request: BulkOperationRequest, db: AsyncSession = Depends(
 
 # ============ SLA Policies ============
 
+def build_schedule(policy):
+    """Build schedule object from policy fields"""
+    hours = []
+    if policy.frequency == "THREE_DAILY":
+        hours = [4, 12, 20]
+        sched_type = "hourly"
+    else:
+        # Parse backup_window_start like "21:00" -> [21]
+        if policy.backup_window_start:
+            try:
+                hours = [int(policy.backup_window_start.split(":")[0])]
+            except:
+                hours = [21]
+        else:
+            hours = [21]
+        sched_type = "daily"
+    
+    return {
+        "type": sched_type,
+        "hours": hours,
+        "timezone": "Asia/Calcutta",
+        "week_days": [0, 1, 2, 3, 4, 5, 6],
+        "jitter_sec": 21600,
+    }
+
+
+def policy_to_dict(p):
+    """Convert policy to API response format"""
+    return SlaPolicyResponse.model_validate(p).model_dump()
+
+
 @app.get("/api/v1/policies")
 async def list_policies(tenantId: Optional[str] = Query(None), db: AsyncSession = Depends(get_db)):
     stmt = select(SlaPolicy).order_by(SlaPolicy.created_at.desc())
@@ -307,14 +338,7 @@ async def list_policies(tenantId: Optional[str] = Query(None), db: AsyncSession 
         stmt = stmt.where(SlaPolicy.tenant_id == UUID(tenantId))
     result = await db.execute(stmt)
     policies = result.scalars().all()
-    return [
-        SlaPolicyResponse(
-            id=str(p.id), tenantId=str(p.tenant_id), name=p.name, tier=p.tier,
-            frequency=p.frequency, retentionType=p.retention_type,
-            createdAt=p.created_at.isoformat() if p.created_at else "",
-        )
-        for p in policies
-    ]
+    return [policy_to_dict(p) for p in policies]
 
 
 @app.get("/api/v1/policies/{policy_id}", response_model=SlaPolicyResponse)
@@ -324,27 +348,44 @@ async def get_policy(policy_id: str, db: AsyncSession = Depends(get_db)):
     policy = result.scalar_one_or_none()
     if not policy:
         raise HTTPException(status_code=404, detail="Policy not found")
-    return SlaPolicyResponse(
-        id=str(policy.id), tenantId=str(policy.tenant_id), name=policy.name,
-        tier=policy.tier, frequency=policy.frequency, retentionType=policy.retention_type,
-        createdAt=policy.created_at.isoformat(),
-    )
+    return SlaPolicyResponse.model_validate(policy)
 
 
-@app.post("/api/v1/policies", response_model=SlaPolicyResponse)
-async def create_policy(request: SlaPolicyCreateRequest, db: AsyncSession = Depends(get_db)):
+@app.post("/api/v1/policies")
+async def create_policy(request: dict, db: AsyncSession = Depends(get_db)):
+    # Helper to get value by camelCase or snake_case
+    def get_val(camel: str, snake: str, default=None):
+        return request.get(camel, request.get(snake, default))
+
     policy = SlaPolicy(
-        id=uuid4(), tenant_id=UUID(request.tenantId), name=request.name,
-        tier=request.tier, frequency=request.frequency, retention_type=request.retentionType,
-        enabled=request.enabled if request.enabled is not None else True,
+        id=uuid4(),
+        tenant_id=UUID(get_val("tenantId", "tenant_id")),
+        name=get_val("name", "name", "New Policy"),
+        frequency=get_val("frequency", "frequency", "DAILY"),
+        backup_window_start=get_val("backupWindowStart", "backup_window_start", "21:00"),
+        backup_exchange=get_val("backupExchange", "backup_exchange", True),
+        backup_exchange_archive=get_val("backupExchangeArchive", "backup_exchange_archive", False),
+        backup_exchange_recoverable=get_val("backupExchangeRecoverable", "backup_exchange_recoverable", False),
+        backup_onedrive=get_val("backupOneDrive", "backup_onedrive", True),
+        backup_sharepoint=get_val("backupSharepoint", "backup_sharepoint", True),
+        backup_teams=get_val("backupTeams", "backup_teams", True),
+        backup_teams_chats=get_val("backupTeamsChats", "backup_teams_chats", False),
+        backup_entra_id=get_val("backupEntraId", "backup_entra_id", True),
+        backup_power_platform=get_val("backupPowerPlatform", "backup_power_platform", False),
+        backup_copilot=get_val("backupCopilot", "backup_copilot", False),
+        contacts=get_val("contacts", "contacts", True),
+        calendars=get_val("calendars", "calendars", True),
+        tasks=get_val("tasks", "tasks", False),
+        group_mailbox=get_val("groupMailbox", "group_mailbox", True),
+        planner=get_val("planner", "planner", False),
+        retention_type=get_val("retentionType", "retention_type", "INDEFINITE"),
+        retention_days=get_val("retentionDays", "retention_days"),
+        enabled=get_val("enabled", "enabled", True),
+        is_default=get_val("isDefault", "is_default", False),
     )
     db.add(policy)
     await db.flush()
-    return SlaPolicyResponse(
-        id=str(policy.id), tenantId=str(policy.tenant_id), name=policy.name,
-        tier=policy.tier, frequency=policy.frequency, retentionType=policy.retention_type,
-        createdAt=policy.created_at.isoformat(),
-    )
+    return policy_to_dict(policy)
 
 
 @app.put("/api/v1/policies/{policy_id}", response_model=SlaPolicyResponse)
@@ -354,16 +395,34 @@ async def update_policy(policy_id: str, request: dict, db: AsyncSession = Depend
     policy = result.scalar_one_or_none()
     if not policy:
         raise HTTPException(status_code=404, detail="Policy not found")
-    for key, value in request.items():
-        if hasattr(policy, key):
-            setattr(policy, key, value)
+    
+    # Helper to get value by camelCase or snake_case
+    def get_val(camel: str, snake: str, default=None):
+        return request.get(camel, request.get(snake, default))
+    
+    # Map camelCase field names to snake_case DB columns
+    field_map = {
+        'name': 'name', 'frequency': 'frequency', 'backupWindowStart': 'backup_window_start',
+        'backupExchange': 'backup_exchange', 'backupExchangeArchive': 'backup_exchange_archive',
+        'backupExchangeRecoverable': 'backup_exchange_recoverable',
+        'backupOneDrive': 'backup_onedrive', 'backupSharepoint': 'backup_sharepoint',
+        'backupTeams': 'backup_teams', 'backupTeamsChats': 'backup_teams_chats',
+        'backupEntraId': 'backup_entra_id', 'backupPowerPlatform': 'backup_power_platform',
+        'backupCopilot': 'backup_copilot',
+        'contacts': 'contacts', 'calendars': 'calendars', 'tasks': 'tasks',
+        'groupMailbox': 'group_mailbox', 'planner': 'planner',
+        'retentionType': 'retention_type', 'retentionDays': 'retention_days',
+        'enabled': 'enabled', 'isDefault': 'is_default',
+    }
+    
+    for camel_key, snake_key in field_map.items():
+        val = get_val(camel_key, snake_key)
+        if val is not None:
+            setattr(policy, snake_key, val)
+    
     policy.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.flush()
-    return SlaPolicyResponse(
-        id=str(policy.id), tenantId=str(policy.tenant_id), name=policy.name,
-        tier=policy.tier, frequency=policy.frequency, retentionType=policy.retention_type,
-        createdAt=policy.created_at.isoformat(),
-    )
+    return SlaPolicyResponse.model_validate(policy)
 
 
 @app.delete("/api/v1/policies/{policy_id}", status_code=204)

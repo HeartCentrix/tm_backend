@@ -2,7 +2,7 @@
 from datetime import datetime
 from typing import Optional, List
 from uuid import UUID
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 
 # ============ Auth ============
@@ -277,36 +277,68 @@ class SnapshotDiff(BaseModel):
 # ============ SLA Policy ============
 
 class SlaPolicyResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True)
+    
     id: str
-    tenantId: str
+    tenantId: str = Field(alias='tenant_id')
     name: str
-    tier: str
     frequency: str
-    backupWindowStart: Optional[str] = None
-    backupExchange: Optional[bool] = True
-    backupOneDrive: Optional[bool] = True
-    backupSharepoint: Optional[bool] = True
-    backupTeams: Optional[bool] = True
-    backupEntraId: Optional[bool] = True
-    retentionType: str
-    retentionDays: Optional[int] = None
+    backupWindowStart: Optional[str] = Field(default=None, alias='backup_window_start')
+    backupExchange: Optional[bool] = Field(default=True, alias='backup_exchange')
+    backupExchangeArchive: Optional[bool] = Field(default=False, alias='backup_exchange_archive')
+    backupExchangeRecoverable: Optional[bool] = Field(default=False, alias='backup_exchange_recoverable')
+    backupOneDrive: Optional[bool] = Field(default=True, alias='backup_onedrive')
+    backupSharepoint: Optional[bool] = Field(default=True, alias='backup_sharepoint')
+    backupTeams: Optional[bool] = Field(default=True, alias='backup_teams')
+    backupTeamsChats: Optional[bool] = Field(default=False, alias='backup_teams_chats')
+    backupEntraId: Optional[bool] = Field(default=True, alias='backup_entra_id')
+    backupPowerPlatform: Optional[bool] = Field(default=False, alias='backup_power_platform')
+    backupCopilot: Optional[bool] = Field(default=False, alias='backup_copilot')
+    contacts: Optional[bool] = True
+    calendars: Optional[bool] = True
+    tasks: Optional[bool] = False
+    groupMailbox: Optional[bool] = Field(default=True, alias='group_mailbox')
+    planner: Optional[bool] = False
+    retentionType: str = Field(alias='retention_type')
+    retentionDays: Optional[int] = Field(default=None, alias='retention_days')
     enabled: Optional[bool] = True
-    createdAt: str
+    createdAt: str = Field(alias='created_at')
+    
+    @field_validator('id', 'tenantId', mode='before')
+    @classmethod
+    def uuid_to_str(cls, v):
+        return str(v) if v else v
+    
+    @field_validator('createdAt', mode='before')
+    @classmethod
+    def datetime_to_str(cls, v):
+        return v.isoformat() if v else v
 
 
 class SlaPolicyCreateRequest(BaseModel):
-    tenantId: str
+    model_config = ConfigDict(populate_by_name=True)
+    
+    tenantId: str = Field(alias='tenant_id')
     name: str
-    tier: str
     frequency: str
-    backupWindowStart: Optional[str] = None
-    backupExchange: Optional[bool] = True
-    backupOneDrive: Optional[bool] = True
-    backupSharepoint: Optional[bool] = True
-    backupTeams: Optional[bool] = True
-    backupEntraId: Optional[bool] = True
-    retentionType: str
-    retentionDays: Optional[int] = None
+    backupWindowStart: Optional[str] = Field(default=None, alias='backup_window_start')
+    backupExchange: Optional[bool] = Field(default=True, alias='backup_exchange')
+    backupExchangeArchive: Optional[bool] = Field(default=False, alias='backup_exchange_archive')
+    backupExchangeRecoverable: Optional[bool] = Field(default=False, alias='backup_exchange_recoverable')
+    backupOneDrive: Optional[bool] = Field(default=True, alias='backup_onedrive')
+    backupSharepoint: Optional[bool] = Field(default=True, alias='backup_sharepoint')
+    backupTeams: Optional[bool] = Field(default=True, alias='backup_teams')
+    backupTeamsChats: Optional[bool] = Field(default=False, alias='backup_teams_chats')
+    backupEntraId: Optional[bool] = Field(default=True, alias='backup_entra_id')
+    backupPowerPlatform: Optional[bool] = Field(default=False, alias='backup_power_platform')
+    backupCopilot: Optional[bool] = Field(default=False, alias='backup_copilot')
+    contacts: Optional[bool] = True
+    calendars: Optional[bool] = True
+    tasks: Optional[bool] = False
+    groupMailbox: Optional[bool] = Field(default=True, alias='group_mailbox')
+    planner: Optional[bool] = False
+    retentionType: str = Field(alias='retention_type')
+    retentionDays: Optional[int] = Field(default=None, alias='retention_days')
     enabled: Optional[bool] = True
 
 
