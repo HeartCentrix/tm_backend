@@ -326,6 +326,10 @@ async def dispatch_policy_backups(policy_id: str):
                 batch = group_resources[i:i + BATCH_SIZE]
                 resource_ids = [str(r.id) for r in batch]
 
+                # Determine fullBackup: True only if NONE of the resources have been backed up before
+                has_previous_backup = any(r.last_backup_at is not None for r in batch)
+                effective_full_backup = not has_previous_backup
+
                 # Create job record for tracking
                 job_id = uuid.uuid4()
                 job = Job(
@@ -342,6 +346,7 @@ async def dispatch_policy_backups(policy_id: str):
                         "batch_size": len(resource_ids),
                         "triggered_by": "SCHEDULED",
                         "snapshot_label": "scheduled",
+                        "fullBackup": effective_full_backup,
                     }
                 )
                 session.add(job)
@@ -353,7 +358,7 @@ async def dispatch_policy_backups(policy_id: str):
                     resource_type=resource_type,
                     resource_ids=resource_ids,
                     sla_policy_id=str(policy.id),
-                    full_backup=False,
+                    full_backup=effective_full_backup,
                 )
 
                 # Send to queue

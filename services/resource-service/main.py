@@ -102,8 +102,24 @@ async def list_resources(
     def map_status(s):
         return {"ACTIVE": "protected", "ARCHIVED": "archived", "SUSPENDED": "suspended"}.get(s, "discovered")
 
+    def format_backup_size(bytes_val: int) -> str:
+        """Format bytes to human-readable size string"""
+        if not bytes_val or bytes_val == 0:
+            return "0 B"
+        if bytes_val >= 1099511627776:
+            return f"{bytes_val / 1099511627776:.2f} TB"
+        if bytes_val >= 1073741824:
+            return f"{bytes_val / 1073741824:.2f} GB"
+        if bytes_val >= 1048576:
+            return f"{bytes_val / 1048576:.2f} MB"
+        if bytes_val >= 1024:
+            return f"{bytes_val / 1024:.2f} KB"
+        return f"{bytes_val} B"
+
     items = []
     for r in rows:
+        storage_bytes = r[9] or 0
+        has_backup = r[10] is not None  # last_backup_at is not None
         items.append({
             "id": str(r[0]), "tenant_id": str(r[1]), "owner": None,
             "kind": map_kind(r[2]),
@@ -113,7 +129,8 @@ async def list_resources(
             "archived": r[8] == "ARCHIVED", "deleted": r[8] == "PENDING_DELETION",
             "protections": [{"policy_id": str(r[7])}] if r[7] else None,
             "usage": {"resource_id": str(r[0]), "tenant_id": str(r[1]), "backups": 0,
-                      "size": r[9] or 0, "size_delta_year": 0, "size_delta_month": 0, "size_delta_week": 0},
+                      "size": storage_bytes, "size_delta_year": 0, "size_delta_month": 0, "size_delta_week": 0},
+            "backupSize": format_backup_size(storage_bytes) if has_backup else None,
             "status": map_status(r[8]),
             "sla": policies.get(str(r[7])) if r[7] else None,
             "last_backup": r[10].isoformat() if r[10] else None,
@@ -173,8 +190,24 @@ async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] 
              "AZURE_SQL_DB": "azure_sql", "AZURE_POSTGRESQL": "azure_postgresql"}
         return m.get(t, t.lower() if t else "unknown")
 
+    def format_backup_size(bytes_val: int) -> str:
+        """Format bytes to human-readable size string"""
+        if not bytes_val or bytes_val == 0:
+            return "0 B"
+        if bytes_val >= 1099511627776:
+            return f"{bytes_val / 1099511627776:.2f} TB"
+        if bytes_val >= 1073741824:
+            return f"{bytes_val / 1073741824:.2f} GB"
+        if bytes_val >= 1048576:
+            return f"{bytes_val / 1048576:.2f} MB"
+        if bytes_val >= 1024:
+            return f"{bytes_val / 1024:.2f} KB"
+        return f"{bytes_val} B"
+
     items = []
     for row in rows:
+        storage_bytes = row[9] or 0
+        has_backup = row[10] is not None
         items.append({
             "id": str(row[0]), "tenant_id": str(row[1]), "owner": None,
             "kind": map_kind(row[2]),
@@ -184,7 +217,8 @@ async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] 
             "archived": row[8] == "ARCHIVED", "deleted": row[8] == "PENDING_DELETION",
             "protections": None,
             "usage": {"resource_id": str(row[0]), "tenant_id": str(row[1]), "backups": 0,
-                      "size": row[9] or 0, "size_delta_year": 0, "size_delta_month": 0, "size_delta_week": 0},
+                      "size": storage_bytes, "size_delta_year": 0, "size_delta_month": 0, "size_delta_week": 0},
+            "backupSize": format_backup_size(storage_bytes) if has_backup else None,
             "status": "protected" if row[8] == "ACTIVE" else "discovered",
             "sla": None, "last_backup": row[10].isoformat() if row[10] else None,
             "last_backup_status": row[11] if row[11] else None,

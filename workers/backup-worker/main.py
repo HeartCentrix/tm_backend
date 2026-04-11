@@ -260,7 +260,7 @@ class BackupWorker:
 
                 # Update resource last backup info
                 await self.update_resource_backup_info(
-                    session, resource, job_id, snapshot.id
+                    session, resource, job_id, snapshot.id, backup_result
                 )
 
                 await session.commit()
@@ -433,17 +433,17 @@ class BackupWorker:
             try:
                 # Create snapshot for this resource
                 snapshot = await self.create_snapshot_for_resource(resource, message)
-                
+
                 # Execute backup based on resource type
                 backup_result = await self.execute_backup(
                     graph_client, resource, snapshot, tenant, message
                 )
-                
+
                 # Update resource last backup info
                 async with async_session_factory() as session:
-                    await self.update_resource_backup_info(session, resource, None, snapshot.id)
+                    await self.update_resource_backup_info(session, resource, None, snapshot.id, backup_result)
                     await session.commit()
-                
+
                 results.append({
                     "resource_id": str(resource.id),
                     "success": True,
@@ -656,7 +656,10 @@ class BackupWorker:
         message: Dict
     ) -> Dict:
         """Backup SharePoint site (files + lists + permissions) using delta API"""
-        site_id = resource.external_id
+        # Convert external_id from slash format to comma format for Graph API
+        # "hostname/site-id/web-id" -> "hostname,site-id,web-id"
+        raw_site_id = resource.external_id
+        site_id = raw_site_id.replace("/", ",") if "/" in raw_site_id else raw_site_id
 
         # Get delta token from previous backup
         delta_token = None
@@ -1089,7 +1092,7 @@ class BackupWorker:
                 overwrite=True,
                 metadata={
                     "immutable": "true",
-                    "backup-item": "true",
+                    "backup_item": "true",
                 },
             )
             return True
@@ -1136,12 +1139,23 @@ class BackupWorker:
         session: AsyncSession,
         resource: Resource,
         job_id: uuid.UUID,
-        snapshot_id: uuid.UUID
+        snapshot_id: uuid.UUID,
+        backup_result: Dict = None
     ):
         """Update resource with last backup information"""
         resource.last_backup_job_id = job_id
         resource.last_backup_at = datetime.utcnow()
         resource.last_backup_status = "COMPLETED"
+
+        # Update storage_bytes from backup result
+        if backup_result:
+            bytes_added = backup_result.get("bytes_added", 0)
+            bytes_removed = backup_result.get("bytes_removed", 0) or 0
+            # Calculate net change and update storage_bytes
+            net_change = bytes_added - bytes_removed
+            current_storage = resource.storage_bytes or 0
+            resource.storage_bytes = max(0, current_storage + net_change)
+            print(f"[worker] Updated storage_bytes for {resource.id}: {current_storage} -> {resource.storage_bytes} bytes (added {bytes_added}, removed {bytes_removed})")
 
         session.add(resource)
     

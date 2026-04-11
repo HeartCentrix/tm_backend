@@ -163,13 +163,28 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
 
+    # Require SLA policy assignment
+    if not resource.sla_policy_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Resource must have an SLA policy assigned before triggering a backup"
+        )
+
+    # If fullBackup is True but resource already has a backup, set to False
+    effective_full_backup = request.fullBackup or False
+    if effective_full_backup and resource.last_backup_at is not None:
+        print(f"[JOB_SERVICE] Resource {request.resourceId} has last_backup_at={resource.last_backup_at}, setting fullBackup=False")
+        effective_full_backup = False
+    else:
+        print(f"[JOB_SERVICE] Resource {request.resourceId} first backup (last_backup_at={resource.last_backup_at}), fullBackup={effective_full_backup}")
+
     job = Job(
         id=uuid4(), type=JobType.BACKUP,
         tenant_id=resource.tenant_id,
         resource_id=UUID(request.resourceId),
         status=JobStatus.QUEUED, priority=request.priority or 1,
         progress_pct=0, items_processed=0, bytes_processed=0,
-        spec={"fullBackup": request.fullBackup, "note": request.note, "triggered_by": "MANUAL"},
+        spec={"fullBackup": effective_full_backup, "note": request.note, "triggered_by": "MANUAL"},
     )
     db.add(job)
     await db.flush()
@@ -179,7 +194,7 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
         routing_key = "backup.urgent"
         msg = create_backup_message(
             job_id=str(job.id), resource_id=request.resourceId,
-            tenant_id=str(resource.tenant_id), full_backup=request.fullBackup or False
+            tenant_id=str(resource.tenant_id), full_backup=effective_full_backup
         )
         print(f"[JOB_SERVICE] Publishing backup message to {routing_key}: {msg}")
         await message_bus.publish(routing_key, msg, priority=request.priority or 1)
@@ -201,7 +216,7 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
                 "resource_name": resource.display_name,
                 "outcome": "SUCCESS",
                 "job_id": str(job.id),
-                "details": {"fullBackup": request.fullBackup, "note": request.note},
+                "details": {"fullBackup": effective_full_backup, "note": request.note},
             })
     except Exception:
         pass  # Don't fail the trigger if audit logging fails
@@ -230,6 +245,14 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
         if not resources_map:
             raise HTTPException(status_code=404, detail="No valid resources found")
 
+        # Filter out resources without SLA policy
+        resources_without_sla = [rid for rid, res in resources_map.items() if not res.sla_policy_id]
+        if resources_without_sla:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Resources must have SLA policies assigned. {len(resources_without_sla)} resource(s) missing policy: {', '.join(resources_without_sla[:5])}"
+            )
+
         # Group resources by tenant for batch processing
         tenant_groups: Dict[uuid.UUID, List[str]] = {}
         for rid, res in resources_map.items():
@@ -239,6 +262,12 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
 
         # For each tenant, create a single mass backup job
         for tenant_id, resource_ids in tenant_groups.items():
+            # Determine if any resource in the batch has never been backed up
+            # Use fullBackup=True only if ALL resources have never been backed up
+            has_previous_backup = any(resources_map[rid].last_backup_at is not None for rid in resource_ids)
+            effective_full_backup = (request.fullBackup or False) and not has_previous_backup
+            print(f"[JOB_SERVICE] Batch backup for {len(resource_ids)} resources, fullBackup={effective_full_backup}")
+
             # Create single mass backup job
             job = Job(
                 id=uuid4(), type=JobType.BACKUP,
@@ -247,7 +276,7 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
                 batch_resource_ids=[UUID(rid) for rid in resource_ids],
                 status=JobStatus.QUEUED, priority=1,
                 progress_pct=0, items_processed=0, bytes_processed=0,
-                spec={"triggered_by": "MANUAL_BATCH", "resource_count": len(resource_ids)},
+                spec={"triggered_by": "MANUAL_BATCH", "resource_count": len(resource_ids), "fullBackup": effective_full_backup},
             )
             db.add(job)
 
@@ -264,7 +293,7 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
                     resource_type=resource_type,
                     resource_ids=resource_ids,
                     sla_policy_id=None,
-                    full_backup=False
+                    full_backup=effective_full_backup
                 ), priority=1)
 
             jobs_created.append({"jobId": str(job.id), "status": "QUEUED", "resourceId": "BATCH", "resourceCount": len(resource_ids)})
@@ -285,7 +314,7 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
                     "resource_name": f"Batch backup: {len(resources_map)} resources",
                     "outcome": "SUCCESS",
                     "job_id": jobs_created[0]["jobId"] if jobs_created else None,
-                    "details": {"resourceCount": len(resources_map), "batch": True},
+                    "details": {"resourceCount": len(resources_map), "batch": True, "fullBackup": effective_full_backup},
                 })
         except Exception:
             pass
@@ -299,13 +328,24 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
         if not res:
             raise HTTPException(status_code=404, detail="Resource not found")
 
+        # Require SLA policy assignment
+        if not res.sla_policy_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Resource must have an SLA policy assigned before triggering a backup"
+            )
+
+        # Determine fullBackup based on whether resource has been backed up before
+        effective_full_backup = not (res.last_backup_at is not None)
+        print(f"[JOB_SERVICE] Single resource backup for {resource_id}, fullBackup={effective_full_backup}")
+
         job = Job(
             id=uuid4(), type=JobType.BACKUP,
             tenant_id=res.tenant_id,
             resource_id=UUID(resource_id),
             status=JobStatus.QUEUED, priority=1,
             progress_pct=0, items_processed=0, bytes_processed=0,
-            spec={"triggered_by": "MANUAL"},
+            spec={"triggered_by": "MANUAL", "fullBackup": effective_full_backup},
         )
         db.add(job)
         await db.flush()
@@ -313,7 +353,7 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
         if settings.RABBITMQ_ENABLED:
             await message_bus.publish("backup.urgent", create_backup_message(
                 job_id=str(job.id), resource_id=resource_id,
-                tenant_id=str(res.tenant_id), full_backup=False
+                tenant_id=str(res.tenant_id), full_backup=effective_full_backup
             ), priority=1)
 
         return {"jobId": str(job.id), "status": "QUEUED", "resourceId": resource_id}

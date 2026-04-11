@@ -226,14 +226,14 @@ class JobListResponse(BaseModel):
 
 class TriggerBackupRequest(BaseModel):
     resourceId: str
-    fullBackup: Optional[bool] = False
+    fullBackup: Optional[bool] = True
     priority: Optional[int] = 1
     note: Optional[str] = None
 
 
 class TriggerBulkBackupRequest(BaseModel):
     resourceIds: List[str]
-    fullBackup: Optional[bool] = False
+    fullBackup: Optional[bool] = True
     priority: Optional[int] = 1
     note: Optional[str] = None
 
