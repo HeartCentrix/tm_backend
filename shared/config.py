@@ -62,6 +62,10 @@ class Settings:
         origins = os.getenv("CORS_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:4200,http://localhost:3000,http://localhost:5173")
         self.CORS_ORIGINS = [o.strip() for o in origins.split(",")]
 
+        # Multi-app registration for Microsoft Graph API
+        # Parse from env: APP_1_CLIENT_ID, APP_1_CLIENT_SECRET, APP_1_TENANT_ID, etc.
+        self.GRAPH_APPS = self._parse_graph_apps()
+
         # Microsoft Auth URLs (constructed from tenant ID)
         self._tenant_id = self.GRAPH_APPS[0]["tenant_id"] if self.GRAPH_APPS else "common"
         self.MICROSOFT_AUTH_URL = os.getenv("MICROSOFT_AUTH_URL", f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/authorize")
@@ -80,10 +84,6 @@ class Settings:
         self.DELTA_TOKEN_URL = os.getenv("DELTA_TOKEN_URL", "http://delta-token:8010")
         self.PROGRESS_TRACKER_URL = os.getenv("PROGRESS_TRACKER_URL", "http://progress-tracker:8011")
         self.AUDIT_SERVICE_URL = os.getenv("AUDIT_SERVICE_URL", "http://audit-service:8012")
-
-        # Multi-app registration for Microsoft Graph API
-        # Parse from env: APP_1_CLIENT_ID, APP_1_CLIENT_SECRET, APP_1_TENANT_ID, etc.
-        self.GRAPH_APPS = self._parse_graph_apps()
 
     def _parse_graph_apps(self) -> List[dict]:
         """Parse multiple Graph app registrations from env vars."""
