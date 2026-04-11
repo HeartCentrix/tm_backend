@@ -1,28 +1,59 @@
 """Shared configuration for all microservices"""
 import os
 from typing import List
+from urllib.parse import urlparse
 
 
 class Settings:
     def __init__(self):
-        self.DB_HOST = os.getenv("DB_HOST")
-        self.DB_PORT = os.getenv("DB_PORT", "5432")
-        self.DB_NAME = os.getenv("DB_NAME")
-        self.DB_USERNAME = os.getenv("DB_USERNAME")
-        self.DB_PASSWORD = os.getenv("DB_PASSWORD")
+        # Railway provides DATABASE_URL directly; parse it if present
+        railway_database_url = os.getenv("DATABASE_URL")
+        if railway_database_url:
+            parsed = urlparse(railway_database_url)
+            self.DB_HOST = parsed.hostname or "localhost"
+            self.DB_PORT = str(parsed.port or "5432")
+            self.DB_NAME = parsed.path.lstrip("/") if parsed.path else "tm_vault_db"
+            self.DB_USERNAME = parsed.username or "postgres"
+            self.DB_PASSWORD = parsed.password or ""
+        else:
+            self.DB_HOST = os.getenv("DB_HOST")
+            self.DB_PORT = os.getenv("DB_PORT", "5432")
+            self.DB_NAME = os.getenv("DB_NAME")
+            self.DB_USERNAME = os.getenv("DB_USERNAME")
+            self.DB_PASSWORD = os.getenv("DB_PASSWORD")
+
         self.DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
         self.JWT_SECRET = os.getenv("JWT_SECRET", "")
         self.JWT_ALGORITHM = "HS256"
         self.JWT_EXPIRATION_HOURS = 8
         self.JWT_REFRESH_EXPIRATION_DAYS = 7
-        self.REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-        self.REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-        self.REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+
+        # Railway provides REDIS_URL; fall back to individual vars
+        railway_redis_url = os.getenv("REDIS_URL")
+        if railway_redis_url:
+            parsed = urlparse(railway_redis_url)
+            self.REDIS_HOST = parsed.hostname or "localhost"
+            self.REDIS_PORT = parsed.port or 6379
+            self.REDIS_DB = int((parsed.path.lstrip("/") or "0"))
+        else:
+            self.REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+            self.REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+            self.REDIS_DB = int(os.getenv("REDIS_DB", "0"))
         self.REDIS_ENABLED = os.getenv("REDIS_ENABLED", "false").lower() in ("true", "1", "yes")
-        self.RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
-        self.RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
-        self.RABBITMQ_USER = os.getenv("RABBITMQ_USERNAME") or os.getenv("RABBITMQ_USER", "guest")
-        self.RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
+
+        # Railway provides RABBITMQ_URL or AMQP_URL; fall back to individual vars
+        railway_rabbitmq_url = os.getenv("RABBITMQ_URL") or os.getenv("AMQP_URL")
+        if railway_rabbitmq_url:
+            parsed = urlparse(railway_rabbitmq_url)
+            self.RABBITMQ_HOST = parsed.hostname or "localhost"
+            self.RABBITMQ_PORT = parsed.port or 5672
+            self.RABBITMQ_USER = parsed.username or "guest"
+            self.RABBITMQ_PASSWORD = parsed.password or "guest"
+        else:
+            self.RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
+            self.RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
+            self.RABBITMQ_USER = os.getenv("RABBITMQ_USERNAME") or os.getenv("RABBITMQ_USER", "guest")
+            self.RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
         self.RABBITMQ_ENABLED = os.getenv("RABBITMQ_ENABLED", "false").lower() in ("true", "1", "yes")
         self.AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "")
         self.AZURE_STORAGE_ACCOUNT_KEY = os.getenv("AZURE_STORAGE_ACCOUNT_KEY", "")

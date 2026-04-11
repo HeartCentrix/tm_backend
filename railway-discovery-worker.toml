@@ -1,0 +1,8 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "workers/discovery-worker/Dockerfile"
+
+[deploy]
+startCommand = "python main.py"
+healthcheckPath = ""
+restartPolicyType = "ON_FAILURE"

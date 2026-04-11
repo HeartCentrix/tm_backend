@@ -12,7 +12,8 @@ COPY services/delta-token /app/services/delta-token
 RUN pip install --no-cache-dir -r /app/services/delta-token/requirements.txt
 
 ENV PYTHONPATH=/app
+ENV PORT=8010
 
-EXPOSE 8010
+EXPOSE ${PORT}
 
-CMD ["python", "-m", "uvicorn", "services.delta-token.main:app", "--host", "0.0.0.0", "--port", "8010"]
+CMD ["sh", "-c", "python -m uvicorn services.delta-token.main:app --host 0.0.0.0 --port ${PORT:-8010}"]

@@ -12,7 +12,8 @@ COPY services/backup-scheduler /app/services/backup-scheduler
 RUN pip install --no-cache-dir -r /app/services/backup-scheduler/requirements.txt
 
 ENV PYTHONPATH=/app
+ENV PORT=8008
 
-EXPOSE 8008
+EXPOSE ${PORT}
 
-CMD ["python", "-m", "uvicorn", "services.backup-scheduler.main:app", "--host", "0.0.0.0", "--port", "8008"]
+CMD ["sh", "-c", "python -m uvicorn services.backup-scheduler.main:app --host 0.0.0.0 --port ${PORT:-8008}"]

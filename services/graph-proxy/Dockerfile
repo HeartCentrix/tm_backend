@@ -8,7 +8,8 @@ COPY services/graph-proxy /app/services/graph-proxy
 RUN pip install --no-cache-dir -r /app/services/graph-proxy/requirements.txt
 
 ENV PYTHONPATH=/app
+ENV PORT=8009
 
-EXPOSE 8009
+EXPOSE ${PORT}
 
-CMD ["python", "-m", "uvicorn", "services.graph-proxy.main:app", "--host", "0.0.0.0", "--port", "8009"]
+CMD ["sh", "-c", "python -m uvicorn services.graph-proxy.main:app --host 0.0.0.0 --port ${PORT:-8009}"]

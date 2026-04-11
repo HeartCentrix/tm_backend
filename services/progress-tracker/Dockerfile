@@ -8,7 +8,8 @@ COPY services/progress-tracker /app/services/progress-tracker
 RUN pip install --no-cache-dir -r /app/services/progress-tracker/requirements.txt
 
 ENV PYTHONPATH=/app
+ENV PORT=8011
 
-EXPOSE 8011
+EXPOSE ${PORT}
 
-CMD ["python", "-m", "uvicorn", "services.progress-tracker.main:app", "--host", "0.0.0.0", "--port", "8011"]
+CMD ["sh", "-c", "python -m uvicorn services.progress-tracker.main:app --host 0.0.0.0 --port ${PORT:-8011}"]

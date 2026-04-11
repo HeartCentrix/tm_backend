@@ -5,8 +5,9 @@ COPY shared/ /app/shared/
 COPY services/auth-service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY services/auth-service/ .
-EXPOSE 8001
+ENV PORT=8001
+EXPOSE ${PORT}
 RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 CMD python -c "import httpx; httpx.get('http://localhost:8001/health')"
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "2"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 CMD python -c "import httpx; httpx.get('http://localhost:${PORT:-8001}/health')"
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8001} --workers 2"]
