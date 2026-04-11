@@ -150,7 +150,13 @@ async def init_db():
                 metadata JSON DEFAULT '{}',
                 sla_policy_id UUID REFERENCES sla_policies(id),
                 status VARCHAR DEFAULT 'DISCOVERED',
+                last_backup_job_id UUID,
+                last_backup_at TIMESTAMP,
+                last_backup_status VARCHAR,
                 storage_bytes BIGINT DEFAULT 0,
+                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                archived_at TIMESTAMP,
+                deletion_queued_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
