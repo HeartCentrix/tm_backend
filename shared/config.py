@@ -62,6 +62,20 @@ class Settings:
         origins = os.getenv("CORS_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:4200,http://localhost:3000,http://localhost:5173")
         self.CORS_ORIGINS = [o.strip() for o in origins.split(",")]
 
+        # Microservice URLs (Railway or local)
+        self.AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8001")
+        self.TENANT_SERVICE_URL = os.getenv("TENANT_SERVICE_URL", "http://tenant-service:8002")
+        self.RESOURCE_SERVICE_URL = os.getenv("RESOURCE_SERVICE_URL", "http://resource-service:8003")
+        self.JOB_SERVICE_URL = os.getenv("JOB_SERVICE_URL", "http://job-service:8004")
+        self.SNAPSHOT_SERVICE_URL = os.getenv("SNAPSHOT_SERVICE_URL", "http://snapshot-service:8005")
+        self.DASHBOARD_SERVICE_URL = os.getenv("DASHBOARD_SERVICE_URL", "http://dashboard-service:8006")
+        self.ALERT_SERVICE_URL = os.getenv("ALERT_SERVICE_URL", "http://alert-service:8007")
+        self.BACKUP_SCHEDULER_URL = os.getenv("BACKUP_SCHEDULER_URL", "http://backup-scheduler:8008")
+        self.GRAPH_PROXY_URL = os.getenv("GRAPH_PROXY_URL", "http://graph-proxy:8009")
+        self.DELTA_TOKEN_URL = os.getenv("DELTA_TOKEN_URL", "http://delta-token:8010")
+        self.PROGRESS_TRACKER_URL = os.getenv("PROGRESS_TRACKER_URL", "http://progress-tracker:8011")
+        self.AUDIT_SERVICE_URL = os.getenv("AUDIT_SERVICE_URL", "http://audit-service:8012")
+
         # Multi-app registration for Microsoft Graph API
         # Parse from env: APP_1_CLIENT_ID, APP_1_CLIENT_SECRET, APP_1_TENANT_ID, etc.
         self.GRAPH_APPS = self._parse_graph_apps()

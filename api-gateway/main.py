@@ -8,18 +8,18 @@ from shared.config import settings
 
 # Service URLs
 SERVICES = {
-    "auth": "http://auth-service:8001",
-    "tenant": "http://tenant-service:8002",
-    "resource": "http://resource-service:8003",
-    "job": "http://job-service:8004",
-    "snapshot": "http://snapshot-service:8005",
-    "dashboard": "http://dashboard-service:8006",
-    "alert": "http://alert-service:8007",
-    "scheduler": "http://backup-scheduler:8008",
-    "graph-proxy": "http://graph-proxy:8009",
-    "delta-token": "http://delta-token:8010",
-    "progress": "http://progress-tracker:8011",
-    "audit": "http://audit-service:8012",
+    "auth": settings.AUTH_SERVICE_URL,
+    "tenant": settings.TENANT_SERVICE_URL,
+    "resource": settings.RESOURCE_SERVICE_URL,
+    "job": settings.JOB_SERVICE_URL,
+    "snapshot": settings.SNAPSHOT_SERVICE_URL,
+    "dashboard": settings.DASHBOARD_SERVICE_URL,
+    "alert": settings.ALERT_SERVICE_URL,
+    "scheduler": settings.BACKUP_SCHEDULER_URL,
+    "graph-proxy": settings.GRAPH_PROXY_URL,
+    "delta-token": settings.DELTA_TOKEN_URL,
+    "progress": settings.PROGRESS_TRACKER_URL,
+    "audit": settings.AUDIT_SERVICE_URL,
 }
 
 
