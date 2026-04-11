@@ -63,7 +63,7 @@ class Settings:
         self.CORS_ORIGINS = [o.strip() for o in origins.split(",")]
 
         # Frontend URL for OAuth redirects
-        self.FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200")
+        self.FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200").rstrip("/")
 
         # Multi-app registration for Microsoft Graph API
         # Parse from env: APP_1_CLIENT_ID, APP_1_CLIENT_SECRET, APP_1_TENANT_ID, etc.
@@ -73,6 +73,10 @@ class Settings:
         self._tenant_id = self.GRAPH_APPS[0]["tenant_id"] if self.GRAPH_APPS else "common"
         self.MICROSOFT_AUTH_URL = os.getenv("MICROSOFT_AUTH_URL", f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/authorize")
         self.MICROSOFT_TOKEN_URL = os.getenv("MICROSOFT_TOKEN_URL", f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/token")
+
+        # Datasource OAuth URLs (multi-tenant for connecting other orgs)
+        self.DATASOURCE_AUTH_URL = os.getenv("DATASOURCE_AUTH_URL", f"https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize")
+        self.DATASOURCE_TOKEN_URL = os.getenv("DATASOURCE_TOKEN_URL", f"https://login.microsoftonline.com/organizations/oauth2/v2.0/token")
 
         # Microservice URLs (Railway or local)
         self.AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8001")

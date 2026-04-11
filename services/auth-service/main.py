@@ -61,7 +61,8 @@ async def get_datasource_url(state: Optional[str] = Query(None)):
         "scope": "openid profile email offline_access User.Read.All Group.Read.All Mail.Read Files.Read.All Sites.Read.All",
         "state": csrf_state,
     }
-    auth_url = f"{settings.MICROSOFT_AUTH_URL}?{urlencode(params)}"
+    # Use "organizations" to allow multi-tenant sign-in
+    auth_url = f"{settings.DATASOURCE_AUTH_URL}?{urlencode(params)}"
     return MicrosoftAuthUrlResponse(url=auth_url, state=csrf_state)
 
 
@@ -76,7 +77,8 @@ async def get_azure_datasource_url(state: Optional[str] = Query(None)):
         "scope": "https://management.azure.com/.default openid",
         "state": csrf_state,
     }
-    auth_url = f"{settings.MICROSOFT_AUTH_URL}?{urlencode(params)}"
+    # Use "organizations" to allow multi-tenant sign-in
+    auth_url = f"{settings.DATASOURCE_AUTH_URL}?{urlencode(params)}"
     return MicrosoftAuthUrlResponse(url=auth_url, state=csrf_state)
 
 
@@ -181,7 +183,7 @@ async def datasource_callback(
     # Exchange code for tokens
     async with httpx.AsyncClient() as client:
         token_response = await client.post(
-            settings.MICROSOFT_TOKEN_URL,
+            settings.DATASOURCE_TOKEN_URL,
             data={
                 "client_id": settings.MICROSOFT_CLIENT_ID,
                 "client_secret": settings.MICROSOFT_CLIENT_SECRET,
@@ -192,7 +194,15 @@ async def datasource_callback(
         )
         token_response.raise_for_status()
         tokens = token_response.json()
-        
+
+        # Get user info for display name
+        me_response = await client.get(
+            "https://graph.microsoft.com/v1.0/me",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        )
+        me_response.raise_for_status()
+        me_data = me_response.json()
+
         # Get tenant info from Graph API
         graph_response = await client.get(
             "https://graph.microsoft.com/v1.0/organization",
@@ -200,17 +210,33 @@ async def datasource_callback(
         )
         graph_response.raise_for_status()
         org_data = graph_response.json()
-    
+
     external_tenant_id = org_data["value"][0]["id"] if org_data.get("value") else None
-    display_name = org_data["value"][0]["displayName"] if org_data.get("value") else "New Tenant"
-    
+    # Use user's email as the datasource display name
+    display_name = me_data.get("mail") or me_data.get("userPrincipalName") or "New Tenant"
+
     # Check if tenant already exists
     stmt = select(Tenant).where(Tenant.external_tenant_id == external_tenant_id)
     result = await db.execute(stmt)
     tenant = result.scalar_one_or_none()
-    
+
     if tenant is None:
         org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
+        
+        # Ensure org exists (TRUNCATE may have wiped it)
+        if org_id:
+            org_stmt = select(Organization).where(Organization.id == org_id)
+            org_result = await db.execute(org_stmt)
+            org = org_result.scalar_one_or_none()
+            if org is None:
+                org = Organization(
+                    id=org_id,
+                    name="Taylor Morrison",
+                    slug="taylor-morrison",
+                )
+                db.add(org)
+                await db.flush()
+        
         tenant = Tenant(
             id=uuid4(),
             org_id=org_id,
@@ -220,8 +246,8 @@ async def datasource_callback(
             status=TenantStatus.ACTIVE,
         )
         db.add(tenant)
-        await db.flush()
-    
+        await db.commit()
+
     return {"tenantId": str(tenant.id), "tenantName": tenant.display_name}
 
 
@@ -231,17 +257,68 @@ async def azure_datasource_callback(
     current_user: dict = Depends(get_current_user_from_token),
     db: AsyncSession = Depends(get_db),
 ):
-    # For Azure - similar flow with ARM API
-    display_name = "Azure Tenant"
-    tenant = Tenant(
-        id=uuid4(),
-        org_id=UUID(current_user["org_id"]) if current_user.get("org_id") else None,
-        type=TenantType.AZURE,
-        display_name=display_name,
-        status=TenantStatus.ACTIVE,
+    # Exchange code for tokens
+    async with httpx.AsyncClient() as client:
+        token_response = await client.post(
+            settings.DATASOURCE_TOKEN_URL,
+            data={
+                "client_id": settings.MICROSOFT_CLIENT_ID,
+                "client_secret": settings.MICROSOFT_CLIENT_SECRET,
+                "code": callback.code,
+                "redirect_uri": f"{settings.FRONTEND_URL}/azure-datasource-callback",
+                "grant_type": "authorization_code",
+            },
+        )
+        token_response.raise_for_status()
+        tokens = token_response.json()
+
+        # Get user info from Graph API
+        me_response = await client.get(
+            "https://graph.microsoft.com/v1.0/me",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        )
+        me_response.raise_for_status()
+        me_data = me_response.json()
+
+    # Use user's email as the datasource display name
+    display_name = me_data.get("mail") or me_data.get("userPrincipalName") or "Azure Tenant"
+    external_tenant_id = me_data.get("tenantId") or me_data.get("id")
+
+    # Check if Azure tenant already exists for this org
+    org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
+    stmt = select(Tenant).where(
+        Tenant.type == TenantType.AZURE,
+        Tenant.org_id == org_id,
     )
-    db.add(tenant)
-    await db.flush()
+    result = await db.execute(stmt)
+    tenant = result.scalar_one_or_none()
+
+    if tenant is None:
+        # Ensure org exists (TRUNCATE may have wiped it)
+        if org_id:
+            org_stmt = select(Organization).where(Organization.id == org_id)
+            org_result = await db.execute(org_stmt)
+            org = org_result.scalar_one_or_none()
+            if org is None:
+                org = Organization(
+                    id=org_id,
+                    name="Taylor Morrison",
+                    slug="taylor-morrison",
+                )
+                db.add(org)
+                await db.flush()
+        
+        tenant = Tenant(
+            id=uuid4(),
+            org_id=org_id,
+            type=TenantType.AZURE,
+            display_name=display_name,
+            external_tenant_id=external_tenant_id,
+            status=TenantStatus.ACTIVE,
+        )
+        db.add(tenant)
+        await db.commit()
+
     return {"tenantId": str(tenant.id), "tenantName": tenant.display_name}
 
 
