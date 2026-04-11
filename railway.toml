@@ -1,0 +1,781 @@
+[build]
+  builder = "dockerfile"
+
+# ─────────────────────────────────────────────
+# API GATEWAY
+# ─────────────────────────────────────────────
+[[services]]
+  name = "api-gateway"
+  dockerfilePath = "api-gateway/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    startCommand = ""
+    healthcheckPath = "/health"
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+  [[services.variables]]
+    name = "JWT_SECRET"
+    value = "${{shared.JWT_SECRET}}"
+
+  [[services.variables]]
+    name = "CORS_ORIGINS"
+    value = "${{shared.CORS_ALLOWED_ORIGINS}}"
+
+# ─────────────────────────────────────────────
+# AUTH SERVICE
+# ─────────────────────────────────────────────
+[[services]]
+  name = "auth-service"
+  dockerfilePath = "services/auth-service/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+  [[services.variables]]
+    name = "JWT_SECRET"
+    value = "${{shared.JWT_SECRET}}"
+
+# ─────────────────────────────────────────────
+# TENANT SERVICE
+# ─────────────────────────────────────────────
+[[services]]
+  name = "tenant-service"
+  dockerfilePath = "services/tenant-service/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+# ─────────────────────────────────────────────
+# RESOURCE SERVICE
+# ─────────────────────────────────────────────
+[[services]]
+  name = "resource-service"
+  dockerfilePath = "services/resource-service/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+# ─────────────────────────────────────────────
+# JOB SERVICE
+# ─────────────────────────────────────────────
+[[services]]
+  name = "job-service"
+  dockerfilePath = "services/job-service/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_ENABLED"
+    value = "true"
+
+  [[services.variables]]
+    name = "RABBITMQ_HOST"
+    value = "${{rabbitmq.RAILWAY_PRIVATE_DOMAIN}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_PORT"
+    value = "5672"
+
+  [[services.variables]]
+    name = "RABBITMQ_USER"
+    value = "${{shared.RABBITMQ_USER}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_PASSWORD"
+    value = "${{shared.RABBITMQ_PASSWORD}}"
+
+# ─────────────────────────────────────────────
+# SNAPSHOT SERVICE
+# ─────────────────────────────────────────────
+[[services]]
+  name = "snapshot-service"
+  dockerfilePath = "services/snapshot-service/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+# ─────────────────────────────────────────────
+# DASHBOARD SERVICE
+# ─────────────────────────────────────────────
+[[services]]
+  name = "dashboard-service"
+  dockerfilePath = "services/dashboard-service/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+# ─────────────────────────────────────────────
+# ALERT SERVICE
+# ─────────────────────────────────────────────
+[[services]]
+  name = "alert-service"
+  dockerfilePath = "services/alert-service/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+# ─────────────────────────────────────────────
+# DISCOVERY WORKER
+# ─────────────────────────────────────────────
+[[services]]
+  name = "discovery-worker"
+  dockerfilePath = "workers/discovery-worker/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_ENABLED"
+    value = "${{shared.RABBITMQ_ENABLED}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_HOST"
+    value = "${{rabbitmq.RAILWAY_PRIVATE_DOMAIN}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_PORT"
+    value = "5672"
+
+  [[services.variables]]
+    name = "RABBITMQ_USER"
+    value = "${{shared.RABBITMQ_USER}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_PASSWORD"
+    value = "${{shared.RABBITMQ_PASSWORD}}"
+
+# ─────────────────────────────────────────────
+# BACKUP SCHEDULER
+# ─────────────────────────────────────────────
+[[services]]
+  name = "backup-scheduler"
+  dockerfilePath = "services/backup-scheduler/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_ENABLED"
+    value = "true"
+
+  [[services.variables]]
+    name = "RABBITMQ_HOST"
+    value = "${{rabbitmq.RAILWAY_PRIVATE_DOMAIN}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_PORT"
+    value = "5672"
+
+  [[services.variables]]
+    name = "RABBITMQ_USER"
+    value = "${{shared.RABBITMQ_USER}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_PASSWORD"
+    value = "${{shared.RABBITMQ_PASSWORD}}"
+
+  [[services.variables]]
+    name = "REDIS_ENABLED"
+    value = "true"
+
+  [[services.variables]]
+    name = "REDIS_HOST"
+    value = "${{Redis.REDIS_HOST}}"
+
+  [[services.variables]]
+    name = "REDIS_PORT"
+    value = "${{Redis.REDIS_PORT}}"
+
+# ─────────────────────────────────────────────
+# BACKUP WORKER
+# ─────────────────────────────────────────────
+[[services]]
+  name = "backup-worker"
+  dockerfilePath = "workers/backup-worker/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "PYTHONUNBUFFERED"
+    value = "1"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_ENABLED"
+    value = "true"
+
+  [[services.variables]]
+    name = "RABBITMQ_HOST"
+    value = "${{rabbitmq.RAILWAY_PRIVATE_DOMAIN}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_PORT"
+    value = "5672"
+
+  [[services.variables]]
+    name = "RABBITMQ_USER"
+    value = "${{shared.RABBITMQ_USER}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_PASSWORD"
+    value = "${{shared.RABBITMQ_PASSWORD}}"
+
+  [[services.variables]]
+    name = "REDIS_ENABLED"
+    value = "true"
+
+  [[services.variables]]
+    name = "REDIS_HOST"
+    value = "${{Redis.REDIS_HOST}}"
+
+  [[services.variables]]
+    name = "REDIS_PORT"
+    value = "${{Redis.REDIS_PORT}}"
+
+  [[services.variables]]
+    name = "AZURE_STORAGE_ACCOUNT_NAME"
+    value = "${{shared.AZURE_STORAGE_ACCOUNT_NAME}}"
+
+  [[services.variables]]
+    name = "AZURE_STORAGE_ACCOUNT_KEY"
+    value = "${{shared.AZURE_STORAGE_ACCOUNT_KEY}}"
+
+  [[services.variables]]
+    name = "APP_1_CLIENT_ID"
+    value = "${{shared.APP_1_CLIENT_ID}}"
+
+  [[services.variables]]
+    name = "APP_1_CLIENT_SECRET"
+    value = "${{shared.APP_1_CLIENT_SECRET}}"
+
+  [[services.variables]]
+    name = "APP_1_TENANT_ID"
+    value = "${{shared.APP_1_TENANT_ID}}"
+
+  [[services.variables]]
+    name = "AZURE_AD_CLIENT_ID"
+    value = "${{shared.AZURE_AD_CLIENT_ID}}"
+
+  [[services.variables]]
+    name = "AZURE_AD_CLIENT_SECRET"
+    value = "${{shared.AZURE_AD_CLIENT_SECRET}}"
+
+# ─────────────────────────────────────────────
+# GRAPH PROXY
+# ─────────────────────────────────────────────
+[[services]]
+  name = "graph-proxy"
+  dockerfilePath = "services/graph-proxy/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "AZURE_AD_CLIENT_ID"
+    value = "${{shared.AZURE_AD_CLIENT_ID}}"
+
+  [[services.variables]]
+    name = "AZURE_AD_CLIENT_SECRET"
+    value = "${{shared.AZURE_AD_CLIENT_SECRET}}"
+
+  [[services.variables]]
+    name = "AZURE_AD_TENANT_ID"
+    value = "${{shared.AZURE_AD_TENANT_ID}}"
+
+  [[services.variables]]
+    name = "REDIS_ENABLED"
+    value = "true"
+
+  [[services.variables]]
+    name = "REDIS_HOST"
+    value = "${{Redis.REDIS_HOST}}"
+
+  [[services.variables]]
+    name = "REDIS_PORT"
+    value = "${{Redis.REDIS_PORT}}"
+
+# ─────────────────────────────────────────────
+# DELTA TOKEN SERVICE
+# ─────────────────────────────────────────────
+[[services]]
+  name = "delta-token"
+  dockerfilePath = "services/delta-token/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+  [[services.variables]]
+    name = "REDIS_ENABLED"
+    value = "true"
+
+  [[services.variables]]
+    name = "REDIS_HOST"
+    value = "${{Redis.REDIS_HOST}}"
+
+  [[services.variables]]
+    name = "REDIS_PORT"
+    value = "${{Redis.REDIS_PORT}}"
+
+# ─────────────────────────────────────────────
+# PROGRESS TRACKER
+# ─────────────────────────────────────────────
+[[services]]
+  name = "progress-tracker"
+  dockerfilePath = "services/progress-tracker/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_ENABLED"
+    value = "true"
+
+  [[services.variables]]
+    name = "RABBITMQ_HOST"
+    value = "${{rabbitmq.RAILWAY_PRIVATE_DOMAIN}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_PORT"
+    value = "5672"
+
+  [[services.variables]]
+    name = "RABBITMQ_USER"
+    value = "${{shared.RABBITMQ_USER}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_PASSWORD"
+    value = "${{shared.RABBITMQ_PASSWORD}}"
+
+# ─────────────────────────────────────────────
+# AUDIT SERVICE
+# ─────────────────────────────────────────────
+[[services]]
+  name = "audit-service"
+  dockerfilePath = "services/audit-service/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+# ─────────────────────────────────────────────
+# RESTORE WORKER
+# ─────────────────────────────────────────────
+[[services]]
+  name = "restore-worker"
+  dockerfilePath = "workers/restore-worker/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_ENABLED"
+    value = "true"
+
+  [[services.variables]]
+    name = "RABBITMQ_HOST"
+    value = "${{rabbitmq.RAILWAY_PRIVATE_DOMAIN}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_PORT"
+    value = "5672"
+
+  [[services.variables]]
+    name = "RABBITMQ_USER"
+    value = "${{shared.RABBITMQ_USER}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_PASSWORD"
+    value = "${{shared.RABBITMQ_PASSWORD}}"
+
+  [[services.variables]]
+    name = "AZURE_STORAGE_ACCOUNT_NAME"
+    value = "${{shared.AZURE_STORAGE_ACCOUNT_NAME}}"
+
+  [[services.variables]]
+    name = "AZURE_STORAGE_ACCOUNT_KEY"
+    value = "${{shared.AZURE_STORAGE_ACCOUNT_KEY}}"
+
+  [[services.variables]]
+    name = "APP_1_CLIENT_ID"
+    value = "${{shared.APP_1_CLIENT_ID}}"
+
+  [[services.variables]]
+    name = "APP_1_CLIENT_SECRET"
+    value = "${{shared.APP_1_CLIENT_SECRET}}"
+
+  [[services.variables]]
+    name = "APP_1_TENANT_ID"
+    value = "${{shared.APP_1_TENANT_ID}}"
+
+  [[services.variables]]
+    name = "AZURE_AD_CLIENT_ID"
+    value = "${{shared.AZURE_AD_CLIENT_ID}}"
+
+  [[services.variables]]
+    name = "AZURE_AD_CLIENT_SECRET"
+    value = "${{shared.AZURE_AD_CLIENT_SECRET}}"
+
+# ─────────────────────────────────────────────
+# SEARCH SERVICE
+# ─────────────────────────────────────────────
+[[services]]
+  name = "search-service"
+  dockerfilePath = "services/search-service/Dockerfile"
+  buildContext = "."
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "DB_HOST"
+    value = "${{Postgres.PGHOST}}"
+
+  [[services.variables]]
+    name = "DB_PORT"
+    value = "${{Postgres.PGPORT}}"
+
+  [[services.variables]]
+    name = "DB_NAME"
+    value = "${{Postgres.PGDATABASE}}"
+
+  [[services.variables]]
+    name = "DB_USERNAME"
+    value = "${{Postgres.PGUSER}}"
+
+  [[services.variables]]
+    name = "DB_PASSWORD"
+    value = "${{Postgres.PGPASSWORD}}"
+
+# ─────────────────────────────────────────────
+# RABBITMQ (self-hosted on Railway)
+# ─────────────────────────────────────────────
+[[services]]
+  name = "rabbitmq"
+  image = "rabbitmq:3-management-alpine"
+
+  [services.deploy]
+    restartPolicyType = "on_failure"
+
+  [[services.variables]]
+    name = "RABBITMQ_DEFAULT_USER"
+    value = "${{shared.RABBITMQ_USER}}"
+
+  [[services.variables]]
+    name = "RABBITMQ_DEFAULT_PASS"
+    value = "${{shared.RABBITMQ_PASSWORD}}"
