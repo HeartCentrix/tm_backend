@@ -4,6 +4,7 @@ from typing import Optional
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 from datetime import timedelta
+import httpx
 
 from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy import select, func, or_, text
@@ -30,6 +31,15 @@ def format_bytes(bytes_val: int) -> str:
     if bytes_val < 1024**3:
         return f"{bytes_val / 1024**2:.1f} MB"
     return f"{bytes_val / 1024**3:.1f} GB"
+
+
+async def notify_scheduler_reschedule():
+    """Notify the backup Scheduler to reschedule all SLA policy jobs"""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post("http://backup-scheduler:8008/scheduler/reschedule-all")
+    except Exception as e:
+        print(f"[resource-service] Failed to notify scheduler: {e}")
 
 
 app = FastAPI(title="Resource Service", version="1.0.0", lifespan=lifespan)
@@ -476,6 +486,7 @@ async def create_policy(request: dict, db: AsyncSession = Depends(get_db)):
         tenant_id=UUID(get_val("tenantId", "tenant_id")),
         name=get_val("name", "name", "New Policy"),
         frequency=get_val("frequency", "frequency", "DAILY"),
+        backup_days=get_val("backupDays", "backup_days", ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]),
         backup_window_start=get_val("backupWindowStart", "backup_window_start", "21:00"),
         backup_exchange=get_val("backupExchange", "backup_exchange", True),
         backup_exchange_archive=get_val("backupExchangeArchive", "backup_exchange_archive", False),
@@ -499,6 +510,10 @@ async def create_policy(request: dict, db: AsyncSession = Depends(get_db)):
     )
     db.add(policy)
     await db.flush()
+
+    # Notify scheduler to reschedule jobs with updated policy
+    await notify_scheduler_reschedule()
+
     return policy_to_dict(policy)
 
 
@@ -516,7 +531,8 @@ async def update_policy(policy_id: str, request: dict, db: AsyncSession = Depend
     
     # Map camelCase field names to snake_case DB columns
     field_map = {
-        'name': 'name', 'frequency': 'frequency', 'backupWindowStart': 'backup_window_start',
+        'name': 'name', 'frequency': 'frequency', 'backupDays': 'backup_days',
+        'backupWindowStart': 'backup_window_start',
         'backupExchange': 'backup_exchange', 'backupExchangeArchive': 'backup_exchange_archive',
         'backupExchangeRecoverable': 'backup_exchange_recoverable',
         'backupOneDrive': 'backup_onedrive', 'backupSharepoint': 'backup_sharepoint',
@@ -536,6 +552,10 @@ async def update_policy(policy_id: str, request: dict, db: AsyncSession = Depend
     
     policy.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.flush()
+
+    # Notify scheduler to reschedule jobs with updated policy
+    await notify_scheduler_reschedule()
+
     return SlaPolicyResponse.model_validate(policy)
 
 
@@ -548,6 +568,9 @@ async def delete_policy(policy_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Policy not found")
     await db.delete(policy)
     await db.flush()
+
+    # Notify scheduler to reschedule jobs without this policy
+    await notify_scheduler_reschedule()
 
 
 @app.get("/api/v1/policies/{policy_id}/resources")

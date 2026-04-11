@@ -294,6 +294,7 @@ class SlaPolicyResponse(BaseModel):
     tenantId: str = Field(alias='tenant_id')
     name: str
     frequency: str
+    backupDays: Optional[List[str]] = Field(default=None, alias='backup_days')
     backupWindowStart: Optional[str] = Field(default=None, alias='backup_window_start')
     backupExchange: Optional[bool] = Field(default=True, alias='backup_exchange')
     backupExchangeArchive: Optional[bool] = Field(default=False, alias='backup_exchange_archive')
@@ -332,6 +333,7 @@ class SlaPolicyCreateRequest(BaseModel):
     tenantId: str = Field(alias='tenant_id')
     name: str
     frequency: str
+    backupDays: Optional[List[str]] = Field(default=None, alias='backup_days')
     backupWindowStart: Optional[str] = Field(default=None, alias='backup_window_start')
     backupExchange: Optional[bool] = Field(default=True, alias='backup_exchange')
     backupExchangeArchive: Optional[bool] = Field(default=False, alias='backup_exchange_archive')

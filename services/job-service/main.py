@@ -263,7 +263,7 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
                     tenant_id=str(tenant_id),
                     resource_type=resource_type,
                     resource_ids=resource_ids,
-                    sla_tier="MANUAL",
+                    sla_policy_id=None,
                     full_backup=False
                 ), priority=1)
 

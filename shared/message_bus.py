@@ -127,25 +127,18 @@ def create_mass_backup_message(
     tenant_id: str,
     resource_type: str,
     resource_ids: list[str],
-    sla_tier: str = "SILVER",
+    sla_policy_id: str = None,
     full_backup: bool = False
 ) -> dict:
     """Create a mass backup message for batch processing"""
-    priority_map = {
-        "GOLD": 2,
-        "SILVER": 5,
-        "BRONZE": 8,
-        "MANUAL": 1,
-    }
-    
     return {
         "jobId": job_id,
         "tenantId": tenant_id,
         "resourceType": resource_type,
         "resourceIds": resource_ids,  # Batch of resource IDs
         "type": "FULL" if full_backup else "INCREMENTAL",
-        "priority": priority_map.get(sla_tier, 5),
-        "slaTier": sla_tier,
+        "priority": 1 if sla_policy_id is None else 5,
+        "slaPolicyId": sla_policy_id,
         "triggeredBy": "SCHEDULED",
         "snapshotLabel": "scheduled",
         "forceFullBackup": full_backup,

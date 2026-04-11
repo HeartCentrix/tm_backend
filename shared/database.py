@@ -107,6 +107,7 @@ async def init_db():
                 tenant_id UUID REFERENCES tenants(id),
                 name VARCHAR NOT NULL,
                 frequency VARCHAR DEFAULT 'DAILY',
+                backup_days VARCHAR[],
                 backup_window_start VARCHAR,
                 backup_exchange BOOLEAN DEFAULT TRUE,
                 backup_exchange_archive BOOLEAN DEFAULT FALSE,
@@ -130,7 +131,7 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        
+
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS resources (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

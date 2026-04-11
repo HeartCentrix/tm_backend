@@ -1,12 +1,13 @@
 """
-Backup Scheduler Service - SLA-based Mass Backup Scheduling
+Backup Scheduler Service - SLA Policy Frequency-Based Scheduling
 Port: 8008
 
 Responsibilities:
-- Read SLA policies and determine which resources need backup
+- Scan active resources grouped by their assigned SLA policy
+- Schedule backup jobs dynamically based on each policy's frequency field
+- Filter resources by SLA policy backup flags (backup_exchange, backup_onedrive, etc.)
 - Group resources by type and tenant for batch processing
 - Dispatch mass backup jobs to RabbitMQ queues
-- Implement staggered scheduling to prevent Graph API throttling
 - Track SLA compliance and violations
 """
 import asyncio
@@ -28,36 +29,98 @@ from shared.models import (
 from shared.message_bus import message_bus, create_mass_backup_message, create_backup_message
 from shared.config import settings
 
-app = FastAPI(title="Backup Scheduler Service", version="2.0.0")
+app = FastAPI(title="Backup Scheduler Service", version="3.0.0")
 
-# APScheduler for cron-like scheduling
+# APScheduler for dynamic SLA policy scheduling
 scheduler = AsyncIOScheduler()
+
+# Resource type to SLA flag mapping — determines which workloads a policy backs up
+RESOURCE_TYPE_TO_SLA_FLAG: Dict[str, str] = {
+    "MAILBOX": "backup_exchange",
+    "SHARED_MAILBOX": "backup_exchange",
+    "ROOM_MAILBOX": "backup_exchange",
+    "ONEDRIVE": "backup_onedrive",
+    "SHAREPOINT_SITE": "backup_sharepoint",
+    "TEAMS_CHANNEL": "backup_teams",
+    "TEAMS_CHAT": "backup_teams_chats",
+    "ENTRA_USER": "backup_entra_id",
+    "ENTRA_GROUP": "backup_entra_id",
+    "ENTRA_APP": "backup_entra_id",
+    "ENTRA_DEVICE": "backup_entra_id",
+    "POWER_BI": "backup_power_platform",
+    "POWER_APPS": "backup_power_platform",
+    "POWER_AUTOMATE": "backup_power_platform",
+    "POWER_DLP": "backup_power_platform",
+    "COPILOT": "backup_copilot",
+    "PLANNER": "planner",
+    "TODO": "tasks",
+    "ONENOTE": "backup_onedrive",
+}
+
+
+# Valid APScheduler day-of-week abbreviations
+DAY_MAP = {
+    "MON": "mon", "TUE": "tue", "WED": "wed", "THU": "thu",
+    "FRI": "fri", "SAT": "sat", "SUN": "sun",
+}
+
+
+def frequency_to_cron_params(frequency: str, backup_days: list[str] | None = None):
+    """
+    Convert SLA policy frequency string to APScheduler cron parameters.
+
+    Supported frequencies:
+    - THREE_DAILY: 3x per day (every 8 hours at 00:00, 08:00, 16:00 UTC)
+    - DAILY: 1x per day (at 02:00 UTC) — runs every day
+    - WEEKLY: 1x per week (Sunday at 03:00 UTC)
+    - CUSTOM: runs on user-selected days at 02:00 UTC (uses backup_days)
+    """
+    if frequency == "THREE_DAILY":
+        return {"trigger": "cron", "hour": "0,8,16", "minute": 0}
+    elif frequency == "WEEKLY":
+        return {"trigger": "cron", "day_of_week": "sun", "hour": 3, "minute": 0}
+    elif frequency == "CUSTOM" and backup_days:
+        # Convert user-selected days to APScheduler format
+        aps_days = [DAY_MAP.get(d.upper(), d.lower()) for d in backup_days if DAY_MAP.get(d.upper())]
+        if aps_days:
+            return {"trigger": "cron", "day_of_week": ",".join(aps_days), "hour": 2, "minute": 0}
+        # Fallback if no valid days
+        return {"trigger": "cron", "hour": 2, "minute": 0}
+    else:  # DAILY (default)
+        return {"trigger": "cron", "hour": 2, "minute": 0}
+
+
+def resource_type_enabled(resource_type: str, policy: SlaPolicy) -> bool:
+    """Check if a resource type is enabled in the SLA policy's backup flags."""
+    flag_name = RESOURCE_TYPE_TO_SLA_FLAG.get(resource_type)
+    if not flag_name:
+        # Unknown resource types default to enabled
+        return True
+    return getattr(policy, flag_name, True)
 
 
 @app.on_event("startup")
 async def startup():
-    """Initialize services on startup"""
+    """Initialize services on startup and schedule jobs per SLA policy"""
     await message_bus.connect()
 
-    # Schedule SLA-based backup jobs
-    scheduler.add_job(dispatch_gold_backups, 'cron', hour='2,10,18', minute=0, timezone='UTC')
-    scheduler.add_job(dispatch_silver_backups, 'cron', hour=2, minute=0, timezone='UTC')
-    scheduler.add_job(dispatch_bronze_backups, 'cron', hour=4, minute=0, day_of_week='mon-fri', timezone='UTC')
+    # Dynamically schedule backup jobs for each active SLA policy
+    await schedule_all_policies()
 
     # Schedule SLA violation check every 30 minutes
-    scheduler.add_job(check_sla_violations, 'interval', minutes=30)
+    scheduler.add_job(check_sla_violations, "interval", minutes=30)
 
     # Schedule pre-emptive backup check every 15 minutes (ransomware/anomaly detection)
-    scheduler.add_job(check_preemptive_backup_triggers, 'interval', minutes=15)
+    scheduler.add_job(check_preemptive_backup_triggers, "interval", minutes=15)
 
     # Schedule M365 audit log ingestion every hour
-    scheduler.add_job(ingest_m365_audit_logs, 'interval', hours=1)
+    scheduler.add_job(ingest_m365_audit_logs, "interval", hours=1)
 
     # Schedule daily backup report (email/Slack/Teams)
-    scheduler.add_job(send_daily_backup_report, 'cron', hour=8, minute=0, timezone='UTC')
+    scheduler.add_job(send_daily_backup_report, "cron", hour=8, minute=0, timezone="UTC")
 
     # Schedule weekly summary report (Monday 9am UTC)
-    scheduler.add_job(send_weekly_summary_report, 'cron', hour=9, minute=0, day_of_week='mon', timezone='UTC')
+    scheduler.add_job(send_weekly_summary_report, "cron", hour=9, minute=0, day_of_week="mon", timezone="UTC")
 
     scheduler.start()
 
@@ -69,17 +132,67 @@ async def shutdown():
     await message_bus.disconnect()
 
 
+async def schedule_all_policies():
+    """Scan all active SLA policies and schedule backup jobs for each one"""
+    async with async_session_factory() as session:
+        policies_result = await session.execute(
+            select(SlaPolicy).where(SlaPolicy.enabled == True)
+        )
+        policies = policies_result.scalars().all()
+
+    scheduled_count = 0
+    for policy in policies:
+        try:
+            await schedule_policy_job(policy)
+            scheduled_count += 1
+        except Exception as e:
+            print(f"[SCHEDULER] Failed to schedule job for policy {policy.name} ({policy.id}): {e}")
+
+    print(f"[SCHEDULER] Scheduled backup jobs for {scheduled_count} SLA policies")
+
+
+async def schedule_policy_job(policy: SlaPolicy):
+    """Schedule or reschedule a backup job for a specific SLA policy"""
+    job_id = f"policy_backup_{policy.id}"
+
+    # Remove existing job if it exists (for rescheduling)
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+
+    cron_params = frequency_to_cron_params(policy.frequency, policy.backup_days)
+
+    scheduler.add_job(
+        dispatch_policy_backups,
+        args=[str(policy.id)],
+        id=job_id,
+        name=f"Backup: {policy.name}",
+        replace_existing=True,
+        timezone="UTC",
+        **cron_params,
+    )
+
+    days_info = f" days={policy.backup_days}" if policy.frequency == "CUSTOM" and policy.backup_days else ""
+    print(f"[SCHEDULER] Scheduled '{policy.name}' ({policy.frequency}{days_info}) -> job_id={job_id}")
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "service": "backup-scheduler"}
 
 
-@app.post("/scheduler/trigger/{sla_tier}")
-async def trigger_sla_backup(sla_tier: str, background_tasks: BackgroundTasks):
-    """Manually trigger backup dispatch for a specific SLA tier"""
-    background_tasks.add_task(dispatch_backups_by_sla_tier, sla_tier)
-    return {"status": "scheduled", "sla_tier": sla_tier}
+@app.post("/scheduler/policy/{policy_id}/trigger")
+async def trigger_policy_backup(policy_id: str, background_tasks: BackgroundTasks):
+    """Manually trigger backup dispatch for a specific SLA policy"""
+    background_tasks.add_task(dispatch_policy_backups, policy_id)
+    return {"status": "scheduled", "policy_id": policy_id}
+
+
+@app.post("/scheduler/reschedule-all")
+async def reschedule_all_policies(background_tasks: BackgroundTasks):
+    """Re-scan all SLA policies and rebuild the scheduler"""
+    background_tasks.add_task(schedule_all_policies)
+    return {"status": "rescheduling"}
 
 
 @app.post("/scheduler/resource/{resource_id}")
@@ -89,9 +202,9 @@ async def trigger_single_backup(resource_id: str, full_backup: bool = False):
         resource = await session.get(Resource, uuid.UUID(resource_id))
         if not resource:
             return {"error": "Resource not found"}, 404
-        
+
         job_id = uuid.uuid4()
-        
+
         # Create job record
         job = Job(
             id=job_id,
@@ -108,7 +221,7 @@ async def trigger_single_backup(resource_id: str, full_backup: bool = False):
         )
         session.add(job)
         await session.commit()
-        
+
         # Send to urgent queue
         await message_bus.publish(
             "backup.urgent",
@@ -124,102 +237,95 @@ async def trigger_single_backup(resource_id: str, full_backup: bool = False):
             },
             priority=1
         )
-        
+
         return {"status": "queued", "job_id": str(job_id)}
 
 
-async def dispatch_gold_backups():
-    """Dispatch Gold SLA backups (3x daily at 02:00, 10:00, 18:00 UTC)"""
-    await dispatch_backups_by_sla_tier("GOLD")
-
-
-async def dispatch_silver_backups():
-    """Dispatch Silver SLA backups (1x daily at 02:00 UTC)"""
-    await dispatch_backups_by_sla_tier("SILVER")
-
-
-async def dispatch_bronze_backups():
-    """Dispatch Bronze SLA backups (1x daily at 04:00 UTC, Mon-Fri)"""
-    await dispatch_backups_by_sla_tier("BRONZE")
-
-
-async def dispatch_backups_by_sla_tier(sla_tier: str):
+async def dispatch_policy_backups(policy_id: str):
     """
-    Dispatch mass backups for a specific SLA tier
-    
+    Dispatch backups for a specific SLA policy, filtering resources by the policy's backup flags.
+
+    The policy_id comes from the resource's sla_policy_id assignment.
+
     Strategy:
-    1. Fetch all active resources with this SLA tier
-    2. Group by resource_type + tenant_id
-    3. Split into batches of 1000 resources
-    4. Dispatch batches with staggered delays
+    1. Fetch the SLA policy
+    2. Fetch all active resources assigned to this policy
+    3. Filter resources to only include types enabled in the policy's backup flags
+    4. Group by resource_type + tenant_id
+    5. Split into batches of 1000 resources
+    6. Dispatch batches to RabbitMQ
     """
-    print(f"[SCHEDULER] Starting {sla_tier} SLA backup dispatch")
-    
+    print(f"[SCHEDULER] Starting backup dispatch for policy {policy_id}")
+
     async with async_session_factory() as session:
-        # Fetch SLA policies for this tier
-        policies_result = await session.execute(
-            select(SlaPolicy).where(
-                and_(
-                    SlaPolicy.tier == sla_tier,
-                    SlaPolicy.enabled == True
-                )
-            )
-        )
-        policies = policies_result.scalars().all()
-        
-        if not policies:
-            print(f"[SCHEDULER] No active {sla_tier} SLA policies found")
+        # Fetch the SLA policy
+        policy = await session.get(SlaPolicy, uuid.UUID(policy_id))
+        if not policy:
+            print(f"[SCHEDULER] Policy {policy_id} not found")
             return
-        
-        policy_ids = [p.id for p in policies]
-        
-        # Fetch all active resources assigned to these policies
+
+        if not policy.enabled:
+            print(f"[SCHEDULER] Policy {policy.name} is disabled, skipping")
+            return
+
+        print(f"[SCHEDULER] Processing policy '{policy.name}' (frequency={policy.frequency})")
+
+        # Fetch all active resources assigned to this policy
         resources_result = await session.execute(
             select(Resource).where(
                 and_(
-                    Resource.sla_policy_id.in_(policy_ids),
-                    Resource.status == ResourceStatus.ACTIVE
+                    Resource.sla_policy_id == policy.id,
+                    Resource.status == ResourceStatus.ACTIVE,
                 )
             ).options(selectinload(Resource.tenant))
         )
-        resources = resources_result.scalars().all()
-        
-        if not resources:
-            print(f"[SCHEDULER] No active resources for {sla_tier} SLA")
+        all_resources = resources_result.scalars().all()
+
+        if not all_resources:
+            print(f"[SCHEDULER] No active resources for policy '{policy.name}'")
             return
-        
-        print(f"[SCHEDULER] Found {len(resources)} resources for {sla_tier} SLA")
-        
+
+        # Filter resources by the policy's backup flags
+        enabled_resources = [
+            r for r in all_resources
+            if resource_type_enabled(r.type.value, policy)
+        ]
+
+        skipped = len(all_resources) - len(enabled_resources)
+        if skipped > 0:
+            print(f"[SCHEDULER] Filtered out {skipped} resources (disabled by policy flags)")
+
+        if not enabled_resources:
+            print(f"[SCHEDULER] No enabled resources for policy '{policy.name}' after flag filtering")
+            return
+
+        print(f"[SCHEDULER] Found {len(enabled_resources)} resources to backup for policy '{policy.name}'")
+
         # Group by resource type + tenant
         groups: Dict[str, List[Resource]] = {}
-        for resource in resources:
+        for resource in enabled_resources:
             group_key = f"{resource.type.value}:{resource.tenant_id}"
             if group_key not in groups:
                 groups[group_key] = []
             groups[group_key].append(resource)
-        
+
         print(f"[SCHEDULER] Grouped into {len(groups)} resource type + tenant combinations")
-        
-        # Determine queue based on SLA tier
-        queue_map = {
-            "GOLD": "backup.high",
-            "SILVER": "backup.normal",
-            "BRONZE": "backup.low",
-        }
-        queue = queue_map.get(sla_tier, "backup.normal")
-        
+
+        # Determine queue based on frequency (frequent = higher priority queue)
+        queue = "backup.high" if policy.frequency == "THREE_DAILY" else "backup.normal"
+
         # Dispatch batches
         total_dispatched = 0
         BATCH_SIZE = 1000
-        
+
         for group_key, group_resources in groups.items():
             resource_type, tenant_id = group_key.split(":")
-            
+
             # Split into batches
             for i in range(0, len(group_resources), BATCH_SIZE):
                 batch = group_resources[i:i + BATCH_SIZE]
                 resource_ids = [str(r.id) for r in batch]
-                
+
                 # Create job record for tracking
                 job_id = uuid.uuid4()
                 job = Job(
@@ -228,9 +334,10 @@ async def dispatch_backups_by_sla_tier(sla_tier: str):
                     tenant_id=uuid.UUID(tenant_id),
                     batch_resource_ids=[uuid.UUID(rid) for rid in resource_ids],
                     status=JobStatus.QUEUED,
-                    priority=1 if sla_tier == "GOLD" else 5,
+                    priority=5,
                     spec={
-                        "sla_tier": sla_tier,
+                        "sla_policy_id": str(policy.id),
+                        "sla_policy_name": policy.name,
                         "resource_type": resource_type,
                         "batch_size": len(resource_ids),
                         "triggered_by": "SCHEDULED",
@@ -238,33 +345,32 @@ async def dispatch_backups_by_sla_tier(sla_tier: str):
                     }
                 )
                 session.add(job)
-                
+
                 # Create mass backup message
                 message = create_mass_backup_message(
                     job_id=str(job_id),
                     tenant_id=tenant_id,
                     resource_type=resource_type,
                     resource_ids=resource_ids,
-                    sla_tier=sla_tier,
-                    full_backup=False
+                    sla_policy_id=str(policy.id),
+                    full_backup=False,
                 )
-                
+
                 # Send to queue
                 await message_bus.publish(
                     queue,
                     message,
-                    priority=message["priority"]
+                    priority=message["priority"],
                 )
-                
+
                 total_dispatched += len(resource_ids)
-                
+
                 # Stagger dispatch to prevent overwhelming Graph API
-                # Add small delay between batches (100ms per batch)
                 await asyncio.sleep(0.1)
-        
+
         await session.commit()
-        
-        print(f"[SCHEDULER] Dispatched {total_dispatched} resources to {queue}")
+
+        print(f"[SCHEDULER] Dispatched {total_dispatched} resources to {queue} for policy '{policy.name}'")
 
 
 async def check_sla_violations():
@@ -314,7 +420,8 @@ async def check_sla_violations():
                         "resource_id": str(resource.id),
                         "tenant_id": str(resource.tenant_id),
                         "resource_type": resource.type.value,
-                        "sla_tier": policy.tier,
+                        "sla_policy_id": str(policy.id),
+                        "sla_policy_name": policy.name,
                         "last_backup_at": resource.last_backup_at.isoformat(),
                         "hours_overdue": hours_since_backup - frequency_hours,
                         "severity": severity,
@@ -513,8 +620,8 @@ async def trigger_preemptive_backup(session: AsyncSession, tenant: Tenant, reaso
             tenant_id=str(tenant.external_tenant_id),
             resource_type=rtype,
             resource_ids=resource_ids,
-            sla_tier="MANUAL",
-            full_backup=True  # Force full backup for preemptive
+            sla_policy_id=None,
+            full_backup=True,  # Force full backup for preemptive
         )
         message["triggeredBy"] = "PREEMPTIVE"
         message["reason"] = reason

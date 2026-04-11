@@ -186,6 +186,7 @@ class SlaPolicy(Base):
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
     name = Column(String, nullable=False)
     frequency = Column(String, default="DAILY")
+    backup_days = Column(ARRAY(String), default=["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"])
     backup_window_start = Column(String)
     backup_window_end = Column(String)
     backup_exchange = Column(Boolean, default=True)

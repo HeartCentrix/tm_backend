@@ -4,9 +4,9 @@ Consumes backup jobs from RabbitMQ queues and executes them
 
 Queues:
 - backup.urgent (priority 1) - Manual/preemptive backups
-- backup.high (priority 2) - Gold SLA backups
-- backup.normal (priority 5) - Silver SLA backups  
-- backup.low (priority 8) - Bronze SLA backups
+- backup.high (priority 2) - THREE_DAILY frequency policies
+- backup.normal (priority 5) - DAILY/WEEKLY frequency policies
+- backup.low (priority 8) - Future use
 
 Features:
 - Batch processing for mass backup (up to 1000 resources per job)
