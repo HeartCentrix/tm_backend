@@ -41,7 +41,7 @@ async def get_microsoft_login_url(state: Optional[str] = Query(None)):
     params = {
         "client_id": settings.MICROSOFT_CLIENT_ID,
         "response_type": "code",
-        "redirect_uri": "http://localhost:4200/auth/callback",
+        "redirect_uri": f"{settings.FRONTEND_URL}/auth/callback",
         "response_mode": "query",
         "scope": "openid profile email offline_access User.Read",
         "state": csrf_state,
@@ -56,7 +56,7 @@ async def get_datasource_url(state: Optional[str] = Query(None)):
     params = {
         "client_id": settings.MICROSOFT_CLIENT_ID,
         "response_type": "code",
-        "redirect_uri": "http://localhost:4200/datasource-callback",
+        "redirect_uri": f"{settings.FRONTEND_URL}/datasource-callback",
         "response_mode": "query",
         "scope": "openid profile email offline_access User.Read.All Group.Read.All Mail.Read Files.Read.All Sites.Read.All",
         "state": csrf_state,
@@ -71,7 +71,7 @@ async def get_azure_datasource_url(state: Optional[str] = Query(None)):
     params = {
         "client_id": settings.MICROSOFT_CLIENT_ID,
         "response_type": "code",
-        "redirect_uri": "http://localhost:4200/azure-datasource-callback",
+        "redirect_uri": f"{settings.FRONTEND_URL}/azure-datasource-callback",
         "response_mode": "query",
         "scope": "https://management.azure.com/.default openid",
         "state": csrf_state,
@@ -89,7 +89,7 @@ async def oauth_callback(callback: OAuthCallbackRequest, db: AsyncSession = Depe
                 "client_id": settings.MICROSOFT_CLIENT_ID,
                 "client_secret": settings.MICROSOFT_CLIENT_SECRET,
                 "code": callback.code,
-                "redirect_uri": "http://localhost:4200/auth/callback",
+                "redirect_uri": f"{settings.FRONTEND_URL}/auth/callback",
                 "grant_type": "authorization_code",
             },
         )
@@ -186,7 +186,7 @@ async def datasource_callback(
                 "client_id": settings.MICROSOFT_CLIENT_ID,
                 "client_secret": settings.MICROSOFT_CLIENT_SECRET,
                 "code": callback.code,
-                "redirect_uri": "http://localhost:4200/datasource-callback",
+                "redirect_uri": f"{settings.FRONTEND_URL}/datasource-callback",
                 "grant_type": "authorization_code",
             },
         )

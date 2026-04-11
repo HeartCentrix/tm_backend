@@ -62,6 +62,9 @@ class Settings:
         origins = os.getenv("CORS_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:4200,http://localhost:3000,http://localhost:5173")
         self.CORS_ORIGINS = [o.strip() for o in origins.split(",")]
 
+        # Frontend URL for OAuth redirects
+        self.FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200")
+
         # Multi-app registration for Microsoft Graph API
         # Parse from env: APP_1_CLIENT_ID, APP_1_CLIENT_SECRET, APP_1_TENANT_ID, etc.
         self.GRAPH_APPS = self._parse_graph_apps()
