@@ -1,8 +1,0 @@
-[build]
-builder = "DOCKERFILE"
-dockerfilePath = "services/search-service/Dockerfile"
-
-[deploy]
-startCommand = "python -m uvicorn services.search-service.main:app --host 0.0.0.0 --port $PORT"
-healthcheckPath = "/health"
-healthcheckTimeout = 300

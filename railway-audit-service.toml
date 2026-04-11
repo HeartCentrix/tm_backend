@@ -1,8 +1,0 @@
-[build]
-builder = "DOCKERFILE"
-dockerfilePath = "services/audit-service/Dockerfile"
-
-[deploy]
-startCommand = "python -m uvicorn services.audit-service.main:app --host 0.0.0.0 --port $PORT"
-healthcheckPath = "/health"
-healthcheckTimeout = 300
