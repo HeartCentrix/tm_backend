@@ -57,6 +57,34 @@ class Settings:
         self.RABBITMQ_ENABLED = os.getenv("RABBITMQ_ENABLED", "false").lower() in ("true", "1", "yes")
         self.AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "")
         self.AZURE_STORAGE_ACCOUNT_KEY = os.getenv("AZURE_STORAGE_ACCOUNT_KEY", "")
+        self.AZURE_STORAGE_BLOB_ENDPOINT = os.getenv("AZURE_STORAGE_BLOB_ENDPOINT", "https://blob.core.windows.net")
+        
+        # High-Performance Backup Configuration
+        # Parallelism: Max concurrent Graph API calls per worker
+        self.BACKUP_CONCURRENCY = int(os.getenv("BACKUP_CONCURRENCY", "50"))
+        # Parallelism: Max concurrent Server-Side Copy operations
+        self.COPY_CONCURRENCY = int(os.getenv("COPY_CONCURRENCY", "100"))
+        # File size threshold (bytes) - above this, use Server-Side Copy
+        self.SERVER_SIDE_COPY_THRESHOLD = int(os.getenv("SERVER_SIDE_COPY_THRESHOLD", "10485760"))  # 10MB
+        # Workload parallelism: concurrent jobs per workload type
+        self.WORKLOAD_CONCURRENCY = int(os.getenv("WORKLOAD_CONCURRENCY", "5"))
+        # Storage sharding: number of storage accounts to distribute across
+        self.STORAGE_SHARD_COUNT = int(os.getenv("STORAGE_SHARD_COUNT", "1"))
+        # Comma-separated list of storage account names (for sharding)
+        storage_shards = os.getenv("STORAGE_SHARD_ACCOUNTS", "")
+        self.STORAGE_SHARD_ACCOUNTS = [s.strip() for s in storage_shards.split(",") if s.strip()] if storage_shards else []
+        # Comma-separated list of storage account keys (matching order)
+        storage_shard_keys = os.getenv("STORAGE_SHARD_KEYS", "")
+        self.STORAGE_SHARD_KEYS = [k.strip() for k in storage_shard_keys.split(",") if k.strip()] if storage_shard_keys else []
+        # Retry configuration
+        self.MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+        self.RETRY_DELAY_MS = int(os.getenv("RETRY_DELAY_MS", "2000"))
+        self.RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2.0"))
+        # Batch size for Graph API $batch endpoint
+        self.GRAPH_BATCH_SIZE = int(os.getenv("GRAPH_BATCH_SIZE", "20"))
+        # Chunk size for processing resources
+        self.RESOURCE_CHUNK_SIZE = int(os.getenv("RESOURCE_CHUNK_SIZE", "50"))
+        
         self.ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
         self.ELASTICSEARCH_ENABLED = False
         origins = os.getenv("CORS_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:4200,http://localhost:3000,http://localhost:5173")
