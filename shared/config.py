@@ -62,6 +62,11 @@ class Settings:
         origins = os.getenv("CORS_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:4200,http://localhost:3000,http://localhost:5173")
         self.CORS_ORIGINS = [o.strip() for o in origins.split(",")]
 
+        # Microsoft Auth URLs (constructed from tenant ID)
+        self._tenant_id = self.GRAPH_APPS[0]["tenant_id"] if self.GRAPH_APPS else "common"
+        self.MICROSOFT_AUTH_URL = os.getenv("MICROSOFT_AUTH_URL", f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/authorize")
+        self.MICROSOFT_TOKEN_URL = os.getenv("MICROSOFT_TOKEN_URL", f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/token")
+
         # Microservice URLs (Railway or local)
         self.AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8001")
         self.TENANT_SERVICE_URL = os.getenv("TENANT_SERVICE_URL", "http://tenant-service:8002")
