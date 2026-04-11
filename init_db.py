@@ -85,5 +85,82 @@ async def init_db():
         print("[INIT_DB] Database initialization complete!")
 
 
+async def add_missing_columns():
+    """Add columns that may be missing from older deployments"""
+    async with engine.begin() as conn:
+        print("[INIT_DB] Adding missing columns (if needed)...")
+        
+        columns_to_add = [
+            ("sla_policies", "backup_window_start", "VARCHAR"),
+            ("sla_policies", "backup_window_end", "VARCHAR"),
+            ("sla_policies", "contacts", "BOOLEAN DEFAULT TRUE"),
+            ("sla_policies", "calendars", "BOOLEAN DEFAULT TRUE"),
+            ("sla_policies", "tasks", "BOOLEAN DEFAULT FALSE"),
+            ("sla_policies", "group_mailbox", "BOOLEAN DEFAULT TRUE"),
+            ("sla_policies", "planner", "BOOLEAN DEFAULT FALSE"),
+            ("sla_policies", "backup_copilot", "BOOLEAN DEFAULT FALSE"),
+            ("resources", "last_backup_job_id", "UUID REFERENCES jobs(id)"),
+            ("resources", "last_backup_at", "TIMESTAMP"),
+            ("resources", "last_backup_status", "VARCHAR"),
+            ("resources", "storage_bytes", "BIGINT DEFAULT 0"),
+            ("resources", "discovered_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("resources", "archived_at", "TIMESTAMP"),
+            ("resources", "deletion_queued_at", "TIMESTAMP"),
+            ("tenants", "graph_delta_tokens", "JSON DEFAULT '{}'"),
+            ("jobs", "batch_resource_ids", "UUID[]"),
+            ("jobs", "priority", "INTEGER DEFAULT 5"),
+            ("jobs", "attempts", "INTEGER DEFAULT 0"),
+            ("jobs", "max_attempts", "INTEGER DEFAULT 5"),
+            ("jobs", "error_message", "TEXT"),
+            ("jobs", "progress_pct", "INTEGER DEFAULT 0"),
+            ("jobs", "items_processed", "BIGINT DEFAULT 0"),
+            ("jobs", "bytes_processed", "BIGINT DEFAULT 0"),
+            ("jobs", "completed_at", "TIMESTAMP"),
+            ("snapshots", "job_id", "UUID REFERENCES jobs(id)"),
+            ("snapshots", "started_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("snapshots", "duration_secs", "INTEGER"),
+            ("snapshots", "new_item_count", "INTEGER DEFAULT 0"),
+            ("snapshots", "delta_tokens", "JSON DEFAULT '{}'"),
+            ("snapshots", "snapshot_label", "VARCHAR"),
+            ("snapshots", "content_checksum", "VARCHAR"),
+            ("snapshots", "blob_path", "VARCHAR"),
+            ("snapshots", "storage_version", "INTEGER DEFAULT 1"),
+            ("snapshot_items", "folder_path", "VARCHAR"),
+            ("snapshot_items", "content_hash", "VARCHAR"),
+            ("snapshot_items", "content_checksum", "VARCHAR"),
+            ("snapshot_items", "blob_path", "VARCHAR"),
+            ("snapshot_items", "encryption_key_id", "VARCHAR"),
+            ("snapshot_items", "backup_version", "INTEGER DEFAULT 1"),
+            ("snapshot_items", "indexed_at", "TIMESTAMP"),
+            ("alerts", "resource_id", "UUID"),
+            ("alerts", "resource_type", "VARCHAR"),
+            ("alerts", "resource_name", "VARCHAR"),
+            ("alerts", "triggered_by", "VARCHAR"),
+            ("alerts", "resolved_at", "TIMESTAMP"),
+            ("alerts", "resolved_by", "UUID"),
+            ("alerts", "resolution_note", "TEXT"),
+            ("alerts", "details", "JSON DEFAULT '{}'"),
+            ("access_groups", "scope", "VARCHAR DEFAULT 'TENANT'"),
+            ("access_groups", "resource_ids", "UUID[]"),
+            ("access_groups", "permissions", "JSON DEFAULT '{}'"),
+            ("access_groups", "member_ids", "UUID[]"),
+            ("access_groups", "active", "BOOLEAN DEFAULT TRUE"),
+            ("job_logs", "timestamp", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("job_logs", "level", "VARCHAR DEFAULT 'INFO'"),
+            ("job_logs", "message", "TEXT"),
+            ("job_logs", "details", "TEXT"),
+        ]
+        
+        for table, column, type_def in columns_to_add:
+            try:
+                await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {type_def}"))
+                print(f"[INIT_DB]   ✓ {table}.{column}")
+            except Exception as e:
+                print(f"[INIT_DB]   ⚠ {table}.{column}: {e}")
+        
+        print("[INIT_DB] Column migration complete!")
+
+
 if __name__ == "__main__":
     asyncio.run(init_db())
+    asyncio.run(add_missing_columns())
