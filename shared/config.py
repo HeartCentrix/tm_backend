@@ -124,9 +124,16 @@ class Settings:
         """Parse multiple Graph app registrations from env vars."""
         apps = []
         for i in range(1, 11):  # Support up to 10 app registrations
-            client_id = os.getenv(f"APP_{i}_CLIENT_ID") or os.getenv("AZURE_AD_CLIENT_ID", "")
-            client_secret = os.getenv(f"APP_{i}_CLIENT_SECRET") or os.getenv("AZURE_AD_CLIENT_SECRET", "")
-            tenant_id = os.getenv(f"APP_{i}_TENANT_ID") or os.getenv("AZURE_AD_TENANT_ID", "common")
+            # Only use fallback for APP_1 (legacy single-app mode)
+            if i == 1:
+                client_id = os.getenv(f"APP_{i}_CLIENT_ID") or os.getenv("AZURE_AD_CLIENT_ID", "")
+                client_secret = os.getenv(f"APP_{i}_CLIENT_SECRET") or os.getenv("AZURE_AD_CLIENT_SECRET", "")
+                tenant_id = os.getenv(f"APP_{i}_TENANT_ID") or os.getenv("AZURE_AD_TENANT_ID", "common")
+            else:
+                # For APP_2+, require explicit values - no fallback
+                client_id = os.getenv(f"APP_{i}_CLIENT_ID", "")
+                client_secret = os.getenv(f"APP_{i}_CLIENT_SECRET", "")
+                tenant_id = os.getenv(f"APP_{i}_TENANT_ID", "common")
 
             if client_id and client_secret:
                 apps.append({
@@ -138,14 +145,6 @@ class Settings:
 
             # If using single app config (legacy), stop after first
             if not os.getenv(f"APP_{i}_CLIENT_ID") and not os.getenv(f"APP_{i}_CLIENT_SECRET"):
-                if i == 1 and client_id and client_secret:
-                    # Legacy single app mode
-                    apps.append({
-                        "index": 1,
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "tenant_id": tenant_id,
-                    })
                 break
 
         return apps or [{

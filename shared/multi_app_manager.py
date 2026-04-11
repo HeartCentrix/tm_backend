@@ -2,6 +2,7 @@
 Distributes requests across multiple app registrations to avoid throttling.
 """
 import time
+import threading
 import hashlib
 from typing import Dict, List, Optional
 from shared.config import settings
@@ -38,6 +39,7 @@ class MultiAppManager:
             AppRegistry(app) for app in settings.GRAPH_APPS
         ]
         self._current_index = 0
+        self._lock = threading.Lock()
         self._app_map: Dict[str, AppRegistry] = {
             app.client_id: app for app in self.apps
         }
@@ -47,37 +49,44 @@ class MultiAppManager:
         return len(self.apps)
 
     def get_next_app(self) -> AppRegistry:
-        """Get the next app using round-robin with throttling awareness"""
+        """Get the next app using round-robin with throttling awareness.
+        Thread-safe via lock for use across threads and async contexts."""
         if len(self.apps) == 1:
-            return self.apps[0]
+            app = self.apps[0]
+            app.request_count += 1
+            app.last_request_time = time.time()
+            return app
 
-        # Try round-robin first, skipping throttled apps
-        for _ in range(len(self.apps)):
-            app = self.apps[self._current_index % len(self.apps)]
-            self._current_index += 1
-            if not app.is_throttled:
-                app.request_count += 1
-                app.last_request_time = time.time()
-                return app
+        with self._lock:
+            # Try round-robin first, skipping throttled apps
+            for _ in range(len(self.apps)):
+                app = self.apps[self._current_index % len(self.apps)]
+                self._current_index += 1
+                if not app.is_throttled:
+                    app.request_count += 1
+                    app.last_request_time = time.time()
+                    return app
 
-        # All apps throttled, return least loaded
-        return min(self.apps, key=lambda a: a.load_score)
+            # All apps throttled, return least loaded
+            return min(self.apps, key=lambda a: a.load_score)
 
     def get_app_by_client_id(self, client_id: str) -> Optional[AppRegistry]:
         """Get specific app by client_id"""
         return self._app_map.get(client_id)
 
     def mark_throttled(self, client_id: str, retry_after_seconds: int):
-        """Mark an app as throttled"""
-        app = self._app_map.get(client_id)
-        if app:
-            app.throttled_until = time.time() + retry_after_seconds
+        """Mark an app as throttled (thread-safe)"""
+        with self._lock:
+            app = self._app_map.get(client_id)
+            if app:
+                app.throttled_until = time.time() + retry_after_seconds
 
     def reset_throttle(self, client_id: str):
-        """Reset throttle state for an app"""
-        app = self._app_map.get(client_id)
-        if app:
-            app.throttled_until = 0.0
+        """Reset throttle state for an app (thread-safe)"""
+        with self._lock:
+            app = self._app_map.get(client_id)
+            if app:
+                app.throttled_until = 0.0
 
     def get_stats(self) -> List[dict]:
         """Get usage stats for all apps"""

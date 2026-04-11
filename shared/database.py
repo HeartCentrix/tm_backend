@@ -1,7 +1,7 @@
 """Shared database connection"""
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import event, text
+from sqlalchemy import text
 
 from shared.config import settings
 
@@ -10,8 +10,8 @@ engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
+    pool_size=30,
+    max_overflow=40,
     connect_args={"server_settings": {"search_path": settings.DB_SCHEMA}},
 )
 
@@ -43,8 +43,8 @@ async def init_db():
         # Create schema if not exists
         await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {settings.DB_SCHEMA}"))
         await conn.execute(text(f"SET search_path TO {settings.DB_SCHEMA}"))
-        
-        # Create tables if they don't exist
+
+        # 1. Organizations
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS organizations (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -58,7 +58,8 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        
+
+        # 2. Tenants
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS tenants (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -77,7 +78,8 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        
+
+        # 3. Platform Users
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS platform_users (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -92,7 +94,8 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        
+
+        # 4. User Roles
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS user_roles (
                 user_id UUID REFERENCES platform_users(id),
@@ -100,7 +103,8 @@ async def init_db():
                 PRIMARY KEY (user_id, role)
             )
         """))
-        
+
+        # 5. SLA Policies
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS sla_policies (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -139,6 +143,7 @@ async def init_db():
             )
         """))
 
+        # 6. Resources
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS resources (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -161,17 +166,24 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        
+
+        # 7. Jobs
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS jobs (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 type VARCHAR NOT NULL,
                 tenant_id UUID REFERENCES tenants(id),
                 resource_id UUID REFERENCES resources(id),
+                batch_resource_ids UUID[] DEFAULT '{}',
                 snapshot_id UUID,
                 status VARCHAR DEFAULT 'QUEUED',
                 priority INTEGER DEFAULT 5,
+                attempts INTEGER DEFAULT 0,
+                max_attempts INTEGER DEFAULT 5,
+                error_message TEXT,
                 progress_pct INTEGER DEFAULT 0,
+                items_processed BIGINT DEFAULT 0,
+                bytes_processed BIGINT DEFAULT 0,
                 result JSON DEFAULT '{}',
                 spec JSON DEFAULT '{}',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -179,7 +191,8 @@ async def init_db():
                 completed_at TIMESTAMP
             )
         """))
-        
+
+        # 8. Snapshots
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS snapshots (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -187,12 +200,24 @@ async def init_db():
                 job_id UUID REFERENCES jobs(id),
                 type VARCHAR DEFAULT 'INCREMENTAL',
                 status VARCHAR DEFAULT 'COMPLETED',
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                duration_secs INTEGER,
                 item_count INTEGER DEFAULT 0,
+                new_item_count INTEGER DEFAULT 0,
+                bytes_added BIGINT DEFAULT 0,
                 bytes_total BIGINT DEFAULT 0,
+                delta_token VARCHAR,
+                delta_tokens_json JSON DEFAULT '{}',
+                snapshot_label VARCHAR,
+                content_checksum VARCHAR,
+                blob_path VARCHAR,
+                storage_version INTEGER DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        
+
+        # 9. Snapshot Items
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS snapshot_items (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -202,13 +227,32 @@ async def init_db():
                 item_type VARCHAR NOT NULL,
                 name VARCHAR NOT NULL,
                 folder_path VARCHAR,
+                content_hash VARCHAR,
+                content_checksum VARCHAR,
                 content_size BIGINT DEFAULT 0,
+                blob_path VARCHAR,
+                encryption_key_id VARCHAR,
+                backup_version INTEGER DEFAULT 1,
                 metadata JSON DEFAULT '{}',
                 is_deleted BOOLEAN DEFAULT FALSE,
+                indexed_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        
+
+        # 10. Job Logs
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS job_logs (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                job_id UUID REFERENCES jobs(id),
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                level VARCHAR DEFAULT 'INFO',
+                message TEXT,
+                details TEXT
+            )
+        """))
+
+        # 11. Alerts
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -217,12 +261,21 @@ async def init_db():
                 type VARCHAR NOT NULL,
                 severity VARCHAR DEFAULT 'MEDIUM',
                 message TEXT NOT NULL,
+                resource_id UUID,
+                resource_type VARCHAR,
+                resource_name VARCHAR,
+                triggered_by VARCHAR,
                 resolved BOOLEAN DEFAULT FALSE,
+                resolved_at TIMESTAMP,
+                resolved_by UUID,
+                resolution_note TEXT,
+                details JSON DEFAULT '{}',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        
+
+        # 12. Access Groups
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS access_groups (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -230,11 +283,17 @@ async def init_db():
                 tenant_id UUID REFERENCES tenants(id),
                 name VARCHAR NOT NULL,
                 description VARCHAR,
+                scope VARCHAR DEFAULT 'TENANT',
+                resource_ids UUID[] DEFAULT '{}',
+                permissions JSON DEFAULT '{}',
+                member_ids UUID[] DEFAULT '{}',
+                active BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
 
+        # 13. Audit Events
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS audit_events (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -260,6 +319,7 @@ async def init_db():
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_org ON audit_events(org_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_resource ON audit_events(resource_id)"))
 
+        # Sync ORM models (for any remaining ORM-specific configurations)
         await conn.run_sync(Base.metadata.create_all)
 
 

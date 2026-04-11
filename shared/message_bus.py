@@ -71,7 +71,21 @@ class MessageBus:
             await self.connection.close()
     
     async def _declare_queue(self, queue_name: str, routing_key: str):
-        queue = await self.channel.declare_queue(queue_name, durable=True)
+        # Declare a Dead Letter Queue for failed messages
+        dlq_name = f"{queue_name}.dlq"
+        dlq = await self.channel.declare_queue(dlq_name, durable=True)
+        dlq_routing_key = f"{routing_key}.dlq"
+        await dlq.bind(self.exchange, dlq_routing_key)
+
+        # Main queue routes rejected messages to the DLQ
+        queue = await self.channel.declare_queue(
+            queue_name,
+            durable=True,
+            arguments={
+                "x-dead-letter-exchange": "tm.exchange",
+                "x-dead-letter-routing-key": dlq_routing_key,
+            },
+        )
         await queue.bind(self.exchange, routing_key)
     
     async def publish(self, routing_key: str, message: Dict[str, Any], priority: int = 5):

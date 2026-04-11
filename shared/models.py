@@ -103,7 +103,7 @@ class SnapshotStatus(str, enum.Enum):
     RUNNING = "IN_PROGRESS"
     COMPLETE = "COMPLETED"
     FAILED = "FAILED"
-    PARTIAL = "COMPLETED"
+    PARTIAL = "PARTIAL"
     PENDING_DELETION = "PENDING_DELETION"
 
 

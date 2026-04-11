@@ -151,7 +151,14 @@ class BackupWorker:
                     import traceback
                     traceback.print_exc()
                     try:
-                        await message.reject(requeue=True)
+                        # Check delivery count to prevent infinite requeue
+                        headers = message.headers or {}
+                        delivery_count = headers.get("x-delivery-count", 0)
+                        if delivery_count < settings.MAX_RETRIES:
+                            await message.reject(requeue=True)
+                        else:
+                            print(f"[{self.worker_id}] Message exceeded max retries ({settings.MAX_RETRIES}), routing to DLQ")
+                            await message.reject(requeue=False)
                     except Exception:
                         pass
 
@@ -170,6 +177,12 @@ class BackupWorker:
     async def _process_single_backup(self, job_id: uuid.UUID, message: Dict, resource_id: str):
         """Process a backup for a single resource"""
         async with async_session_factory() as session:
+            # Check if the job still exists (stale messages may reference deleted jobs)
+            job = await session.get(Job, job_id)
+            if not job:
+                print(f"[{self.worker_id}] Job {job_id} not found, skipping stale message for {resource_id}")
+                return
+
             resource = await session.get(Resource, uuid.UUID(resource_id))
             if not resource:
                 return
@@ -190,20 +203,72 @@ class BackupWorker:
 
             snapshot = await self.create_snapshot(resource, message, job_id)
 
-            # Route to appropriate handler
+            # Route to appropriate handler based on resource type
             resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
             handlers = {
+                # Exchange
                 "MAILBOX": self.backup_mailbox,
                 "SHARED_MAILBOX": self.backup_mailbox,
+                "ROOM_MAILBOX": self.backup_mailbox,
+                # Files
                 "ONEDRIVE": self.backup_onedrive,
                 "SHAREPOINT_SITE": self.backup_sharepoint,
+                # Teams
+                "TEAMS_CHANNEL": self.backup_teams_single,
+                "TEAMS_CHAT": self.backup_teams_single,
+                # Entra ID
+                "ENTRA_USER": self.backup_entra_single,
+                "ENTRA_GROUP": self.backup_entra_single,
+                "ENTRA_APP": self.backup_entra_single,
+                "ENTRA_DEVICE": self.backup_entra_single,
+                "ENTRA_SERVICE_PRINCIPAL": self.backup_entra_single,
+                # Planner / Tasks / Copilot / Power Platform
+                "PLANNER": self._backup_metadata_only,
+                "TODO": self._backup_metadata_only,
+                "ONENOTE": self._backup_metadata_only,
+                "COPILOT": self._backup_metadata_only,
+                "POWER_BI": self._backup_metadata_only,
+                "POWER_APPS": self._backup_metadata_only,
+                "POWER_AUTOMATE": self._backup_metadata_only,
+                "POWER_DLP": self._backup_metadata_only,
+                # Azure workloads
+                "AZURE_VM": self._backup_metadata_only,
+                "AZURE_SQL": self._backup_metadata_only,
+                "AZURE_SQL_DB": self._backup_metadata_only,
+                "AZURE_POSTGRESQL": self._backup_metadata_only,
+                # Other
+                "RESOURCE_GROUP": self._backup_metadata_only,
+                "DYNAMIC_GROUP": self._backup_metadata_only,
             }
 
             handler = handlers.get(resource_type, self._backup_metadata_only)
             result = await handler(graph_client, resource, snapshot, tenant, message)
 
+            # Complete the snapshot with results
+            await self.complete_snapshot(session, snapshot, result)
+
             await self.update_job_status(session, job_id, JobStatus.COMPLETED, result)
             await self.update_resource_backup_info(session, resource, job_id, snapshot.id)
+
+            # Log audit event
+            await self.audit_logger.log(
+                action="BACKUP_COMPLETED",
+                tenant_id=str(tenant.id),
+                org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
+                actor_type="WORKER",
+                resource_id=str(resource.id),
+                resource_type=resource_type,
+                resource_name=resource.display_name or resource.email or str(resource.id),
+                outcome="SUCCESS",
+                job_id=str(job_id),
+                snapshot_id=str(snapshot.id),
+                details={
+                    "item_count": result.get("item_count", 0),
+                    "bytes_added": result.get("bytes_added", 0),
+                },
+            )
+
+            print(f"[{self.worker_id}] Completed backup for {resource_id}")
 
     # ==================== Mass Backup (Parallel) ====================
 
@@ -293,15 +358,12 @@ class BackupWorker:
         Backup OneDrive/SharePoint using Server-Side Copy for large files.
         This is the FASTEST method - Azure copies files internally.
         """
-        total_items = 0
-        total_bytes = 0
         resource_type = resources[0].type.value
 
         # Process resources in parallel
         semaphore = asyncio.Semaphore(settings.BACKUP_CONCURRENCY)
 
-        async def backup_one_file(resource: Resource):
-            nonlocal total_items, total_bytes
+        async def backup_one_resource(resource: Resource):
             async with semaphore:
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
@@ -313,35 +375,33 @@ class BackupWorker:
                         files = await graph_client.get_sharepoint_site_drives(resource.external_id, delta_token)
 
                     items = files.get("value", [])
-                    
-                    # Process files in parallel
+
+                    # Process ALL files — complete backup, no limits
                     file_tasks = [
                         self.backup_single_file(resource, tenant, snapshot, f, graph_client, job_id)
-                        for f in items[:500]  # Limit per resource to prevent overload
+                        for f in items
                     ]
                     file_results = await asyncio.gather(*file_tasks, return_exceptions=True)
 
                     success = sum(1 for r in file_results if isinstance(r, dict) and r.get("success"))
-                    total_items += success
-                    total_bytes += sum(r.get("size", 0) for r in file_results if isinstance(r, dict))
+                    res_bytes = sum(r.get("size", 0) for r in file_results if isinstance(r, dict))
 
                     # Update delta token
                     new_delta = files.get("@odata.deltaLink")
-                    if new_delta and resource.extra_data is None:
-                        resource.extra_data = {}
                     if new_delta:
+                        resource.extra_data = resource.extra_data or {}
                         resource.extra_data["delta_token"] = new_delta
 
                     async with async_session_factory() as sess:
                         sess.merge(resource)
                         await sess.commit()
 
-                    return {"item_count": success, "bytes_added": total_bytes}
+                    return {"item_count": success, "bytes_added": res_bytes}
                 except Exception as e:
                     print(f"[{self.worker_id}] File backup failed for {resource.id}: {e}")
                     return {"item_count": 0, "bytes_added": 0}
 
-        results = await asyncio.gather(*[backup_one_file(r) for r in resources], return_exceptions=True)
+        results = await asyncio.gather(*[backup_one_resource(r) for r in resources], return_exceptions=True)
         return {
             "item_count": sum(r.get("item_count", 0) for r in results if isinstance(r, dict)),
             "bytes_added": sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict)),
@@ -350,63 +410,102 @@ class BackupWorker:
     async def backup_single_file(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
                                  file_item: Dict, graph_client: GraphClient, job_id: uuid.UUID) -> Dict:
         """
-        Backup a single file using Server-Side Copy if large, or direct upload if small.
+        Backup a single file:
+        - Large files (>threshold): Server-Side Copy via @downloadUrl (Azure copies internally)
+        - Small files with @downloadUrl: Download content then upload to blob
+        - Folders / items without @downloadUrl: Store metadata JSON
         """
         file_id = file_item.get("id", str(uuid.uuid4()))
+        file_name = file_item.get("name", file_id)
         file_size = file_item.get("size", 0)
         download_url = file_item.get("@microsoft.graph.downloadUrl")
-        
+        is_folder = "folder" in file_item  # Graph marks folders with a "folder" facet
+
+        # Skip deleted items from delta (they have no content)
+        if file_item.get("deleted"):
+            return {"success": True, "size": 0, "method": "skipped_deleted"}
+
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "files")
         blob_path = azure_storage_manager.build_blob_path(
             str(tenant.id), str(resource.id), str(snapshot.id), file_id
         )
 
-        # Metadata
+        # Extract metadata for the DB record
         metadata = MetadataExtractor.extract_file_metadata(file_item, str(resource.id))
-        content_json = json.dumps({"raw": file_item, "structured": metadata})
-        content_bytes = content_json.encode('utf-8')
-        content_hash = hashlib.sha256(content_bytes).hexdigest()
-
         upload_result = None
+        actual_size = file_size
 
-        # Decision: Server-Side Copy for large files, direct upload for small
-        if download_url and file_size > settings.SERVER_SIDE_COPY_THRESHOLD:
-            # Server-Side Copy: Azure handles the file transfer
+        if is_folder:
+            # Folders: store metadata only (no content to download)
+            content_bytes = json.dumps({"item": file_item, "metadata": metadata}).encode('utf-8')
+            content_hash = hashlib.sha256(content_bytes).hexdigest()
+            actual_size = len(content_bytes)
+            async with self.backup_semaphore:
+                upload_result = await upload_blob_with_retry(
+                    container, blob_path, content_bytes, shard,
+                    max_retries=settings.MAX_RETRIES, metadata={"content-hash": content_hash, "type": "folder"}
+                )
+        elif download_url and file_size > settings.SERVER_SIDE_COPY_THRESHOLD:
+            # Large files: Server-Side Copy (Azure copies directly, zero server load)
+            content_hash = file_item.get("file", {}).get("hashes", {}).get("sha256Hash", "")
             async with self.copy_semaphore:
                 upload_result = await server_side_copy_with_retry(
                     download_url, container, blob_path, shard, max_retries=settings.MAX_RETRIES
                 )
+        elif download_url:
+            # Small files: Download actual content then upload to blob
+            content_hash = ""
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as http_client:
+                    resp = await http_client.get(download_url)
+                    resp.raise_for_status()
+                    file_bytes = resp.content
+                    actual_size = len(file_bytes)
+                    content_hash = hashlib.sha256(file_bytes).hexdigest()
+
+                async with self.backup_semaphore:
+                    upload_result = await upload_blob_with_retry(
+                        container, blob_path, file_bytes, shard,
+                        max_retries=settings.MAX_RETRIES,
+                        metadata={"content-hash": content_hash, "original-name": file_name}
+                    )
+            except Exception as e:
+                print(f"[{self.worker_id}] Failed to download file {file_name}: {e}")
+                upload_result = {"success": False, "error": str(e)}
         else:
-            # Direct upload for metadata + small files
+            # No download URL (e.g. OneNote notebooks, some SharePoint items): store metadata
+            content_bytes = json.dumps({"item": file_item, "metadata": metadata}).encode('utf-8')
+            content_hash = hashlib.sha256(content_bytes).hexdigest()
+            actual_size = len(content_bytes)
             async with self.backup_semaphore:
                 upload_result = await upload_blob_with_retry(
                     container, blob_path, content_bytes, shard,
-                    max_retries=settings.MAX_RETRIES, metadata={"content-hash": content_hash}
+                    max_retries=settings.MAX_RETRIES, metadata={"content-hash": content_hash, "type": "metadata-only"}
                 )
 
         # Create SnapshotItem record
-        snapshot_item = SnapshotItem(
-            snapshot_id=snapshot.id,
-            tenant_id=tenant.id,
-            external_id=file_id,
-            item_type="FILE",
-            name=file_item.get("name", file_id),
-            folder_path=file_item.get("parentReference", {}).get("path"),
-            content_hash=content_hash,
-            content_size=file_size,
-            blob_path=blob_path,
-            metadata={"raw": file_item, "structured": metadata},
-            content_checksum=content_hash,
-        )
-
-        async with async_session_factory() as session:
-            session.add(snapshot_item)
-            await session.commit()
+        if not is_folder:  # Don't create snapshot items for folders
+            snapshot_item = SnapshotItem(
+                snapshot_id=snapshot.id,
+                tenant_id=tenant.id,
+                external_id=file_id,
+                item_type="FILE",
+                name=file_name,
+                folder_path=file_item.get("parentReference", {}).get("path"),
+                content_hash=content_hash if content_hash else None,
+                content_size=actual_size,
+                blob_path=blob_path,
+                metadata={"structured": metadata},
+                content_checksum=content_hash if content_hash else None,
+            )
+            async with async_session_factory() as session:
+                session.add(snapshot_item)
+                await session.commit()
 
         return {
             "success": upload_result.get("success", False) if upload_result else False,
-            "size": file_size,
+            "size": actual_size,
             "method": upload_result.get("method", "unknown") if upload_result else "none",
         }
 
@@ -426,10 +525,10 @@ class BackupWorker:
                     messages = await graph_client.get_messages_delta(resource.external_id, delta_token)
                     items = messages.get("value", [])
 
-                    # Process messages in parallel batches
+                    # Process ALL messages in parallel batches — complete backup
                     batch_tasks = [
                         self.backup_message_batch(resource, tenant, snapshot, items[i:i+50], job_id)
-                        for i in range(0, min(len(items), 1000), 50)
+                        for i in range(0, len(items), 50)
                     ]
                     batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
 
@@ -521,7 +620,7 @@ class BackupWorker:
                     elif resource_type.startswith("TEAMS"):
                         return await self._backup_teams_resource(resource, tenant, snapshot, graph_client, job_id)
                     else:
-                        return await self._backup_metadata_only(resource, tenant, snapshot, graph_client, job_id)
+                        return await self._backup_metadata_only(graph_client, resource, snapshot, tenant, message)
                 except Exception as e:
                     print(f"[{self.worker_id}] Generic backup failed for {resource.id}: {e}")
                     return {"item_count": 0, "bytes_added": 0}
@@ -534,29 +633,74 @@ class BackupWorker:
 
     async def _backup_entra_resource(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
                                      graph_client: GraphClient, job_id: uuid.UUID) -> Dict:
-        """Backup Entra ID resource (user, group, app, device)"""
+        """Backup Entra ID resource — users (profile/contacts/calendar), groups (members/owners), apps, devices"""
         item_count = 0
         bytes_added = 0
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "entra")
 
-        # Fetch resource data
-        user_id = resource.external_id
+        obj_id = resource.external_id
+        resource_type = resource.type.value
         items_to_backup = []
 
-        if resource.type.value == "ENTRA_USER":
-            profile = await graph_client.get_user_profile(user_id)
+        if resource_type == "ENTRA_USER":
+            profile = await graph_client.get_user_profile(obj_id)
             items_to_backup.append(("USER_PROFILE", profile))
-            
-            contacts = await graph_client.get_user_contacts(user_id)
-            for c in contacts.get("value", [])[:100]:
+
+            contacts = await graph_client.get_user_contacts(obj_id)
+            for c in contacts.get("value", []):
                 items_to_backup.append(("USER_CONTACT", c))
-            
-            calendars = await graph_client.get_calendar_events_delta(user_id)
-            for e in calendars.get("value", [])[:500]:
+
+            calendars = await graph_client.get_calendar_events_delta(obj_id)
+            for e in calendars.get("value", []):
                 items_to_backup.append(("CALENDAR_EVENT", e))
 
-        # Backup items
+            # Save calendar delta token
+            cal_delta = calendars.get("@odata.deltaLink")
+            if cal_delta:
+                async with async_session_factory() as sess:
+                    r = await sess.get(Resource, resource.id)
+                    if r:
+                        r.extra_data = r.extra_data or {}
+                        r.extra_data["calendar_delta_token"] = cal_delta
+                        await sess.commit()
+
+        elif resource_type in ("ENTRA_GROUP", "DYNAMIC_GROUP"):
+            # Group profile + members + owners
+            group = await graph_client.get_group_profile(obj_id)
+            items_to_backup.append(("GROUP_PROFILE", group))
+
+            members = await graph_client.get_group_members(obj_id)
+            for m in members.get("value", []):
+                items_to_backup.append(("GROUP_MEMBER", m))
+
+            owners = await graph_client.get_group_owners(obj_id)
+            for o in owners.get("value", []):
+                items_to_backup.append(("GROUP_OWNER", o))
+
+        elif resource_type == "ENTRA_APP":
+            # Application registration — fetch via /applications?$filter=id eq '{id}'
+            apps = await graph_client.get_entra_apps()
+            for app in apps.get("value", []):
+                if app.get("id") == obj_id:
+                    items_to_backup.append(("APP_REGISTRATION", app))
+                    break
+
+        elif resource_type == "ENTRA_SERVICE_PRINCIPAL":
+            sps = await graph_client.get_entra_service_principals()
+            for sp in sps.get("value", []):
+                if sp.get("id") == obj_id:
+                    items_to_backup.append(("SERVICE_PRINCIPAL", sp))
+                    break
+
+        elif resource_type == "ENTRA_DEVICE":
+            devices = await graph_client.get_entra_devices()
+            for dev in devices.get("value", []):
+                if dev.get("id") == obj_id:
+                    items_to_backup.append(("DEVICE", dev))
+                    break
+
+        # Backup all collected items to blob storage
         for item_type, item_data in items_to_backup:
             item_id = item_data.get("id", str(uuid.uuid4()))
             content_bytes = json.dumps(item_data).encode()
@@ -589,52 +733,140 @@ class BackupWorker:
 
     async def _backup_teams_resource(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
                                      graph_client: GraphClient, job_id: uuid.UUID) -> Dict:
-        """Backup Teams channels/chats"""
+        """Backup Teams channels/chats with full SnapshotItem records"""
         item_count = 0
         bytes_added = 0
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
 
         team_id = resource.external_id
-        
+
         if resource.type.value == "TEAMS_CHANNEL":
             channels = await graph_client.get_teams_channels(team_id)
-            for ch in channels.get("value", [])[:100]:
+            for ch in channels.get("value", []):
                 ch_id = ch.get("id")
+                ch_name = ch.get("displayName", ch_id)
                 msgs = await graph_client.get_channel_messages_delta(team_id, ch_id)
-                for msg in msgs.get("value", [])[:500]:
+                for msg in msgs.get("value", []):
                     msg_id = msg.get("id", str(uuid.uuid4()))
                     content_bytes = json.dumps(msg).encode()
+                    content_hash = hashlib.sha256(content_bytes).hexdigest()
                     blob_path = azure_storage_manager.build_blob_path(
                         str(tenant.id), str(resource.id), str(snapshot.id), f"ch_{ch_id}_msg_{msg_id}"
                     )
                     result = await upload_blob_with_retry(container, blob_path, content_bytes, shard)
                     if result.get("success"):
+                        snapshot_item = SnapshotItem(
+                            snapshot_id=snapshot.id,
+                            tenant_id=tenant.id,
+                            external_id=msg_id,
+                            item_type="TEAMS_MESSAGE",
+                            name=msg.get("subject") or msg.get("body", {}).get("content", "")[:100] or msg_id,
+                            folder_path=f"channels/{ch_name}",
+                            content_hash=content_hash,
+                            content_size=len(content_bytes),
+                            blob_path=blob_path,
+                            metadata={"raw": msg, "channelId": ch_id, "channelName": ch_name},
+                            content_checksum=content_hash,
+                        )
+                        async with async_session_factory() as session:
+                            session.add(snapshot_item)
+                            await session.commit()
                         item_count += 1
                         bytes_added += len(content_bytes)
 
+        elif resource.type.value == "TEAMS_CHAT":
+            # resource.external_id IS the chat_id — back up its messages directly
+            chat_id = resource.external_id
+            delta_token = (resource.extra_data or {}).get("chat_delta_token")
+            chat_msgs = await graph_client.get_chat_messages_delta(chat_id, delta_token)
+            chat_topic = resource.display_name or chat_id
+            for msg in chat_msgs.get("value", []):
+                msg_id = msg.get("id", str(uuid.uuid4()))
+                content_bytes = json.dumps(msg).encode()
+                content_hash = hashlib.sha256(content_bytes).hexdigest()
+                blob_path = azure_storage_manager.build_blob_path(
+                    str(tenant.id), str(resource.id), str(snapshot.id), f"chat_{chat_id}_msg_{msg_id}"
+                )
+                result = await upload_blob_with_retry(container, blob_path, content_bytes, shard)
+                if result.get("success"):
+                    snapshot_item = SnapshotItem(
+                        snapshot_id=snapshot.id,
+                        tenant_id=tenant.id,
+                        external_id=msg_id,
+                        item_type="TEAMS_CHAT_MESSAGE",
+                        name=msg.get("body", {}).get("content", "")[:100] or msg_id,
+                        folder_path=f"chats/{chat_topic}",
+                        content_hash=content_hash,
+                        content_size=len(content_bytes),
+                        blob_path=blob_path,
+                        metadata={"raw": msg, "chatId": chat_id, "chatTopic": chat_topic},
+                        content_checksum=content_hash,
+                    )
+                    async with async_session_factory() as session:
+                        session.add(snapshot_item)
+                        await session.commit()
+                    item_count += 1
+                    bytes_added += len(content_bytes)
+            # Save delta token for next incremental backup
+            new_delta = chat_msgs.get("@odata.deltaLink")
+            if new_delta:
+                async with async_session_factory() as sess:
+                    r = await sess.get(Resource, resource.id)
+                    if r:
+                        r.extra_data = r.extra_data or {}
+                        r.extra_data["chat_delta_token"] = new_delta
+                        await sess.commit()
+
         return {"item_count": item_count, "bytes_added": bytes_added}
 
-    async def _backup_metadata_only(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
-                                    graph_client: GraphClient, job_id: uuid.UUID) -> Dict:
-        """Backup metadata-only resources (Planner, Power Platform, Copilot)"""
+    async def _backup_metadata_only(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
+                                    tenant: Tenant, message: Dict) -> Dict:
+        """Backup metadata-only resources (Planner, Power Platform, Copilot, Azure VMs, etc.)"""
         item_count = 0
         bytes_added = 0
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
-        container = azure_storage_manager.get_container_name(str(tenant.id), resource.type.value.lower())
+        resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
+        container = azure_storage_manager.get_container_name(str(tenant.id), resource_type.lower())
 
         content_bytes = json.dumps(resource.extra_data or {}).encode()
+        content_hash = hashlib.sha256(content_bytes).hexdigest()
         blob_path = azure_storage_manager.build_blob_path(
             str(tenant.id), str(resource.id), str(snapshot.id), "metadata"
         )
         result = await upload_blob_with_retry(container, blob_path, content_bytes, shard)
         if result.get("success"):
+            snapshot_item = SnapshotItem(
+                snapshot_id=snapshot.id,
+                tenant_id=tenant.id,
+                external_id=resource.external_id or str(resource.id),
+                item_type=resource_type,
+                name=resource.display_name or str(resource.id),
+                content_hash=content_hash,
+                content_size=len(content_bytes),
+                blob_path=blob_path,
+                metadata={"extra_data": resource.extra_data or {}},
+                content_checksum=content_hash,
+            )
+            async with async_session_factory() as session:
+                session.add(snapshot_item)
+                await session.commit()
             item_count = 1
             bytes_added = len(content_bytes)
 
         return {"item_count": item_count, "bytes_added": bytes_added}
 
     # ==================== Single Resource Backup Handlers ====================
+
+    async def backup_teams_single(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
+                                  tenant: Tenant, message: Dict) -> Dict:
+        """Single-resource Teams backup (matches handler signature)"""
+        return await self._backup_teams_resource(resource, tenant, snapshot, graph_client, None)
+
+    async def backup_entra_single(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
+                                  tenant: Tenant, message: Dict) -> Dict:
+        """Single-resource Entra ID backup (matches handler signature)"""
+        return await self._backup_entra_resource(resource, tenant, snapshot, graph_client, None)
 
     async def backup_mailbox(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                              tenant: Tenant, message: Dict) -> Dict:
@@ -648,22 +880,36 @@ class BackupWorker:
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "mailbox")
 
-        for msg in items[:1000]:
+        for msg in items:
             msg_id = msg.get("id", str(uuid.uuid4()))
             content_bytes = json.dumps(msg).encode()
+            content_hash = hashlib.sha256(content_bytes).hexdigest()
             blob_path = azure_storage_manager.build_blob_path(
                 str(tenant.id), str(resource.id), str(snapshot.id), msg_id
             )
-            result = await upload_blob_with_retry(container, blob_path, content_bytes, shard, max_retries=3)
-            if result.get("success"):
+            upload_result = await upload_blob_with_retry(container, blob_path, content_bytes, shard, max_retries=3)
+            if upload_result.get("success"):
+                snapshot_item = SnapshotItem(
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    external_id=msg_id,
+                    item_type="EMAIL",
+                    name=msg.get("subject", msg_id),
+                    folder_path=msg.get("parentFolderName"),
+                    content_hash=content_hash,
+                    content_size=len(content_bytes),
+                    blob_path=blob_path,
+                    metadata={"raw": msg},
+                    content_checksum=content_hash,
+                )
+                async with async_session_factory() as session:
+                    session.add(snapshot_item)
+                    await session.commit()
+
                 item_count += 1
                 bytes_added += len(content_bytes)
 
         new_delta = messages.get("@odata.deltaLink")
-        if new_delta:
-            resource.extra_data = resource.extra_data or {}
-            resource.extra_data["mail_delta_token"] = new_delta
-
         return {"item_count": item_count, "bytes_added": bytes_added, "new_delta_token": new_delta}
 
     async def backup_onedrive(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
@@ -672,10 +918,9 @@ class BackupWorker:
         delta_token = (resource.extra_data or {}).get("delta_token")
         files = await graph_client.get_drive_items_delta(resource.external_id, delta_token)
         items = files.get("value", [])
-
         file_tasks = [
             self.backup_single_file(resource, tenant, snapshot, f, graph_client, None)
-            for f in items[:500]
+            for f in items
         ]
         file_results = await asyncio.gather(*file_tasks, return_exceptions=True)
 
@@ -698,7 +943,7 @@ class BackupWorker:
 
         file_tasks = [
             self.backup_single_file(resource, tenant, snapshot, f, graph_client, None)
-            for f in items[:500]
+            for f in items
         ]
         file_results = await asyncio.gather(*file_tasks, return_exceptions=True)
 
@@ -718,8 +963,41 @@ class BackupWorker:
         resource.last_backup_job_id = job_id
         resource.last_backup_at = datetime.utcnow()
         resource.last_backup_status = "COMPLETED"
-        session.merge(resource)
+        await session.merge(resource)
         await session.commit()
+
+    async def complete_snapshot(self, session: AsyncSession, snapshot: Snapshot, result: Dict):
+        """Mark snapshot as completed with result data"""
+        now = datetime.utcnow()
+        snapshot.status = SnapshotStatus.COMPLETE
+        snapshot.completed_at = now
+        snapshot.item_count = result.get("item_count", 0)
+        snapshot.new_item_count = result.get("item_count", 0)
+        snapshot.bytes_added = result.get("bytes_added", 0)
+        snapshot.bytes_total = result.get("bytes_added", 0)
+        snapshot.delta_token = result.get("new_delta_token")
+
+        # Calculate duration
+        if snapshot.started_at:
+            duration = (now - snapshot.started_at).total_seconds()
+            snapshot.duration_secs = int(duration)
+
+        # merge() handles detached instances (snapshot was created in a separate session)
+        await session.merge(snapshot)
+        await session.commit()
+
+        # Persist delta token on resource for incremental backups
+        if result.get("new_delta_token"):
+            resource_id = snapshot.resource_id
+            resource = await session.get(Resource, resource_id)
+            if resource:
+                resource.extra_data = resource.extra_data or {}
+                if resource.type.value in ("MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX"):
+                    resource.extra_data["mail_delta_token"] = result["new_delta_token"]
+                else:
+                    resource.extra_data["delta_token"] = result["new_delta_token"]
+                await session.merge(resource)
+                await session.commit()
 
     # ==================== Helpers ====================
 
@@ -739,6 +1017,7 @@ class BackupWorker:
                 job_id=job_id,
                 type=SnapshotType.INCREMENTAL,
                 status=SnapshotStatus.RUNNING,
+                started_at=datetime.utcnow(),
                 snapshot_label=message.get("snapshotLabel", "scheduled"),
             )
             session.add(snapshot)

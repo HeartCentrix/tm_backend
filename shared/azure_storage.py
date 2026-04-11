@@ -27,11 +27,20 @@ class AzureStorageShard:
         self.account_name = account_name
         self.account_key = account_key
         self.shard_index = shard_index
+        # EndpointSuffix must be just "core.windows.net" — not the full URL
+        raw_endpoint = settings.AZURE_STORAGE_BLOB_ENDPOINT.replace('https://', '').rstrip('/')
+        # raw_endpoint = "stamitkmishr369164905478.blob.core.windows.net"
+        # We need "core.windows.net"
+        parts = raw_endpoint.split('.')
+        if len(parts) >= 3:
+            endpoint_suffix = '.'.join(parts[2:])  # "core.windows.net"
+        else:
+            endpoint_suffix = raw_endpoint
         self.connection_string = (
             f"DefaultEndpointsProtocol=https;"
             f"AccountName={account_name};"
             f"AccountKey={account_key};"
-            f"EndpointSuffix={settings.AZURE_STORAGE_BLOB_ENDPOINT.replace('https://', '')}"
+            f"EndpointSuffix={endpoint_suffix}"
         )
         self._sync_client: Optional[BlobServiceClient] = None
         self._async_client: Optional[AsyncBlobServiceClient] = None
@@ -50,19 +59,21 @@ class AzureStorageShard:
         """
         Server-Side Copy: Azure copies file directly from source to destination.
         Zero load on our server. Fastest method for file-based backups.
-        
+
         Args:
             source_url: Source file URL (e.g., @microsoft.graph.downloadUrl or SAS URL)
             container_name: Target container name
             blob_path: Target blob path in container
-        
+
         Returns:
             Dict with copy_id, status, and blob_url
         """
         try:
+            await self._ensure_container(container_name)
+
             async_client = self.get_async_client()
             blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
-            
+
             # Start server-side copy
             copy_operation = await blob_client.start_copy_from_url(source_url)
             
@@ -81,32 +92,48 @@ class AzureStorageShard:
                 "method": "server_side_copy",
             }
     
-    async def upload_blob(self, container_name: str, blob_path: str, content: bytes, 
+    async def _ensure_container(self, container_name: str):
+        """Create container if it doesn't exist"""
+        try:
+            async_client = self.get_async_client()
+            container_client = async_client.get_container_client(container_name)
+            await container_client.create_container()
+        except ResourceExistsError:
+            pass  # Already exists — fine
+        except AzureError as e:
+            print(f"[AzureStorage] Warning: Could not create container {container_name}: {e}")
+
+    async def upload_blob(self, container_name: str, blob_path: str, content: bytes,
                          overwrite: bool = True, metadata: Optional[Dict] = None) -> Dict:
         """
         Upload content to Azure Blob Storage.
-        Used for small items (emails, metadata, configs).
-        
+        Auto-creates container if it doesn't exist.
+
         Args:
             container_name: Target container name
             blob_path: Target blob path
             content: Content bytes
             overwrite: Whether to overwrite existing blob
             metadata: Optional metadata dict
-        
+
         Returns:
             Dict with success status and blob info
         """
         try:
+            await self._ensure_container(container_name)
+
             async_client = self.get_async_client()
             blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
-            
-            await blob_client.upload_blob(
-                content,
-                overwrite=overwrite,
-                metadata=metadata or {},
+
+            await asyncio.wait_for(
+                blob_client.upload_blob(
+                    content,
+                    overwrite=overwrite,
+                    metadata=metadata or {},
+                ),
+                timeout=60.0,
             )
-            
+
             return {
                 "success": True,
                 "blob_url": blob_client.url,
@@ -115,6 +142,7 @@ class AzureStorageShard:
                 "method": "direct_upload",
             }
         except AzureError as e:
+            print(f"[AzureStorage] Upload failed for {container_name}/{blob_path}: {e}")
             return {
                 "success": False,
                 "error": str(e),

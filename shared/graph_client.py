@@ -52,15 +52,20 @@ class GraphClient:
             return self._access_token
     
     async def _get(self, url: str, params: Optional[Dict] = None) -> Dict[str, Any]:
-        """Make authenticated GET request with pagination and throttling support"""
+        """Make authenticated GET request with pagination and throttling support.
+        Preserves @odata.deltaLink for incremental sync and handles
+        single-object responses (e.g. /users/{id}) that have no 'value' array.
+        """
         token = await self._get_token()
         all_items = []
         next_url = url
         max_retries = 3
         retry_count = 0
+        delta_link = None
+        last_data = {}
 
         while next_url:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=60.0) as client:
                 headers = {"Authorization": f"Bearer {token}", "ConsistencyLevel": "eventual"}
                 resp = await client.get(next_url, headers=headers, params=params if not next_url.startswith("http") else None)
 
@@ -77,12 +82,31 @@ class GraphClient:
 
                 resp.raise_for_status()
                 data = resp.json()
+                last_data = data
+
+                # Single-object response (e.g. /users/{id}, /users/{id}/drive)
+                # These have no "value" array — return the object directly
+                if "value" not in data and "@odata.nextLink" not in data:
+                    return data
+
                 all_items.extend(data.get("value", []))
+
+                # Capture delta link for incremental sync
+                if "@odata.deltaLink" in data:
+                    delta_link = data["@odata.deltaLink"]
+
                 next_url = data.get("@odata.nextLink")
                 params = None  # params only on first request
                 retry_count = 0  # Reset on success
 
-        return {"value": all_items, "@odata.count": data.get("@odata.count", len(all_items))}
+        result = {
+            "value": all_items,
+            "@odata.count": last_data.get("@odata.count", len(all_items)),
+        }
+        # Preserve delta link so callers can save it for incremental backups
+        if delta_link:
+            result["@odata.deltaLink"] = delta_link
+        return result
 
     async def _post(self, url: str, payload: Dict[str, Any], headers: Optional[Dict] = None) -> Dict[str, Any]:
         """Make authenticated POST request"""
@@ -339,8 +363,12 @@ class GraphClient:
         """
         Get drive items from a SharePoint site using delta API.
         Graph API: GET /sites/{site-id}/drive/root/delta
+        site_id format in DB: hostname/site-collection-id/site-id
+        Graph API requires: hostname,site-collection-id,site-id
         """
-        url = f"{self.GRAPH_URL}/sites/{site_id}/drive/root/delta"
+        # Convert slashes to commas for Graph API
+        graph_site_id = site_id.replace("/", ",")
+        url = f"{self.GRAPH_URL}/sites/{graph_site_id}/drive/root/delta"
         if delta_token:
             url = delta_token
 
@@ -430,6 +458,13 @@ class GraphClient:
         params = {"$top": "999"}
         result = await self._get(url, params=params)
         return result
+
+    async def get_group_profile(self, group_id: str) -> Dict[str, Any]:
+        """
+        Get Entra ID group profile.
+        Graph API: GET /groups/{id}
+        """
+        return await self._get(f"{self.GRAPH_URL}/groups/{group_id}")
 
     async def get_user_profile(self, user_id: str) -> Dict[str, Any]:
         """
@@ -562,7 +597,9 @@ class GraphClient:
         Get SharePoint site drive items using delta API.
         Graph API: GET /sites/{site-id}/drive/root/delta
         """
-        url = f"{self.GRAPH_URL}/sites/{site_id}/drive/root/delta"
+        # Convert slashes to commas for Graph API
+        graph_site_id = site_id.replace("/", ",")
+        url = f"{self.GRAPH_URL}/sites/{graph_site_id}/drive/root/delta"
         if delta_token:
             url = delta_token
 

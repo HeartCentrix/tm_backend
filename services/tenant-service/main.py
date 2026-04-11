@@ -17,6 +17,62 @@ from shared.schemas import (
 from shared.graph_client import GraphClient
 
 
+TYPE_MAP = {
+    "MAILBOX": ResourceType.MAILBOX,
+    "SHARED_MAILBOX": ResourceType.SHARED_MAILBOX,
+    "ONEDRIVE": ResourceType.ONEDRIVE,
+    "SHAREPOINT_SITE": ResourceType.SHAREPOINT_SITE,
+    "TEAMS_CHANNEL": ResourceType.TEAMS_CHANNEL,
+    "TEAMS_CHAT": ResourceType.TEAMS_CHAT,
+    "ENTRA_USER": ResourceType.ENTRA_USER,
+    "ENTRA_GROUP": ResourceType.ENTRA_GROUP,
+    "ENTRA_APP": ResourceType.ENTRA_APP,
+    "ENTRA_DEVICE": ResourceType.ENTRA_DEVICE,
+}
+
+
+async def run_tenant_discovery(db: AsyncSession, tenant: Tenant) -> int:
+    """Run discovery for a single tenant. Returns count of new resources."""
+    tenant.status = TenantStatus.DISCOVERING
+    await db.flush()
+
+    client_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
+    client_secret = settings.MICROSOFT_CLIENT_SECRET or settings.AZURE_AD_CLIENT_SECRET
+    ext_tenant_id = tenant.external_tenant_id or settings.MICROSOFT_TENANT_ID or settings.AZURE_AD_TENANT_ID or "common"
+
+    graph = GraphClient(client_id, client_secret, ext_tenant_id)
+    resources = await graph.discover_all()
+
+    count = 0
+    for r in resources:
+        existing_stmt = select(Resource).where(
+            Resource.tenant_id == tenant.id,
+            Resource.external_id == r["external_id"],
+        )
+        existing_result = await db.execute(existing_stmt)
+        existing = existing_result.scalar_one_or_none()
+
+        if existing is None:
+            rtype = TYPE_MAP.get(r.get("type", "ENTRA_USER"), ResourceType.ENTRA_USER)
+            resource = Resource(
+                id=uuid4(),
+                tenant_id=tenant.id,
+                type=rtype,
+                external_id=r["external_id"],
+                display_name=r.get("display_name", "Unknown"),
+                email=r.get("email"),
+                metadata=r.get("metadata", {}),
+                status=ResourceStatus.DISCOVERED,
+            )
+            db.add(resource)
+            count += 1
+
+    tenant.status = TenantStatus.ACTIVE
+    tenant.last_discovery_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    await db.flush()
+    return count
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
@@ -86,12 +142,28 @@ async def create_tenant(request: TenantCreateRequest, db: AsyncSession = Depends
     )
     db.add(tenant)
     await db.flush()
+
+    # Auto-trigger discovery for the new tenant
+    try:
+        count = await run_tenant_discovery(db, tenant)
+        await db.commit()
+    except Exception as e:
+        # Don't fail tenant creation if discovery fails
+        tenant.status = TenantStatus.DISCONNECTED
+        await db.commit()
+        # Still return the tenant - user can retry discovery manually
+        pass
+
     return TenantResponse(
         id=str(tenant.id),
         displayName=tenant.display_name,
         orgId=str(tenant.org_id) if tenant.org_id else None,
-        status=tenant.status.value,
-        createdAt=tenant.created_at.isoformat(),
+        type=tenant.type.value if tenant.type else None,
+        externalTenantId=tenant.external_tenant_id,
+        status=tenant.status.value if tenant.status else "PENDING",
+        storageRegion=tenant.storage_region,
+        lastDiscoveryAt=tenant.last_discovery_at.isoformat() if tenant.last_discovery_at else None,
+        createdAt=tenant.created_at.isoformat() if tenant.created_at else None,
     )
 
 
@@ -136,66 +208,14 @@ async def trigger_discovery(tenant_id: str, db: AsyncSession = Depends(get_db)):
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
-    
-    tenant.status = TenantStatus.DISCOVERING
-    await db.flush()
-    
-    # Create Graph client
-    client_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
-    client_secret = settings.MICROSOFT_CLIENT_SECRET or settings.AZURE_AD_CLIENT_SECRET
-    ext_tenant_id = tenant.external_tenant_id or settings.MICROSOFT_TENANT_ID or settings.AZURE_AD_TENANT_ID or "common"
-    
+
     try:
-        graph = GraphClient(client_id, client_secret, ext_tenant_id)
-        resources = await graph.discover_all()
-        
-        # Store resources in database
-        type_map = {
-            "MAILBOX": ResourceType.MAILBOX,
-            "SHARED_MAILBOX": ResourceType.SHARED_MAILBOX,
-            "ONEDRIVE": ResourceType.ONEDRIVE,
-            "SHAREPOINT_SITE": ResourceType.SHAREPOINT_SITE,
-            "TEAMS_CHANNEL": ResourceType.TEAMS_CHANNEL,
-            "TEAMS_CHAT": ResourceType.TEAMS_CHAT,
-            "ENTRA_USER": ResourceType.ENTRA_USER,
-            "ENTRA_GROUP": ResourceType.ENTRA_GROUP,
-            "ENTRA_APP": ResourceType.ENTRA_APP,
-            "ENTRA_DEVICE": ResourceType.ENTRA_DEVICE,
-        }
-        
-        count = 0
-        for r in resources:
-            # Check if resource already exists
-            existing_stmt = select(Resource).where(
-                Resource.tenant_id == tenant.id,
-                Resource.external_id == r["external_id"],
-            )
-            existing_result = await db.execute(existing_stmt)
-            existing = existing_result.scalar_one_or_none()
-            
-            if existing is None:
-                rtype = type_map.get(r.get("type", "ENTRA_USER"), ResourceType.ENTRA_USER)
-                resource = Resource(
-                    id=uuid4(),
-                    tenant_id=tenant.id,
-                    type=rtype,
-                    external_id=r["external_id"],
-                    display_name=r.get("display_name", "Unknown"),
-                    email=r.get("email"),
-                    metadata=r.get("metadata", {}),
-                    status=ResourceStatus.DISCOVERED,
-                )
-                db.add(resource)
-                count += 1
-        
-        tenant.status = TenantStatus.ACTIVE
-        tenant.last_discovery_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        await db.flush()
-        
+        count = await run_tenant_discovery(db, tenant)
+        await db.commit()
         return {"discoveryId": str(uuid4()), "resourcesFound": count}
     except Exception as e:
         tenant.status = TenantStatus.DISCONNECTED
-        await db.flush()
+        await db.commit()
         raise HTTPException(status_code=500, detail=f"Discovery failed: {str(e)}")
 
 
