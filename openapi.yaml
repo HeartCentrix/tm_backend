@@ -1,0 +1,4274 @@
+openapi: 3.0.3
+info:
+  title: Tenant Management & Backup System API
+  description: |
+    Comprehensive API for managing Microsoft 365 and Azure tenant backups, including authentication, 
+    resource management, backup/restore operations, snapshot management, monitoring, alerts, and audit logging.
+    
+    ## Architecture
+    This API consists of 13 microservices behind an API Gateway:
+    - **Auth Service** - Authentication and authorization
+    - **Tenant Service** - Tenant and organization management
+    - **Resource Service** - Resource and SLA policy management
+    - **Job Service** - Backup, restore, and export jobs
+    - **Snapshot Service** - Snapshot management
+    - **Dashboard Service** - Analytics and overview
+    - **Alert Service** - Alert and access group management
+    - **Backup Scheduler** - Automated backup scheduling
+    - **Delta Token Service** - Incremental backup tracking
+    - **Progress Tracker** - Real-time progress monitoring
+    - **Audit Service** - Audit logging and activity tracking
+    - **Search Service** - Search and discovery
+    
+    ## Authentication
+    Most endpoints require JWT Bearer token authentication. Include the token in the Authorization header:
+    ```
+    Authorization: Bearer <your-jwt-token>
+    ```
+    
+    ## Rate Limiting
+    Rate limiting may be configured at the API Gateway level.
+  version: 1.0.0
+  contact:
+    name: API Support
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:8000
+    description: API Gateway (Development)
+  - url: http://localhost:8001
+    description: Auth Service (Development)
+  - url: http://localhost:8002
+    description: Tenant Service (Development)
+  - url: http://localhost:8003
+    description: Resource Service (Development)
+  - url: http://localhost:8004
+    description: Job Service (Development)
+  - url: http://localhost:8005
+    description: Snapshot Service (Development)
+  - url: http://localhost:8006
+    description: Dashboard Service (Development)
+  - url: http://localhost:8007
+    description: Alert Service (Development)
+  - url: http://localhost:8008
+    description: Backup Scheduler (Development)
+  - url: http://localhost:8010
+    description: Delta Token Service (Development)
+  - url: http://localhost:8011
+    description: Progress Tracker (Development)
+  - url: http://localhost:8012
+    description: Audit Service (Development)
+  - url: http://localhost:8013
+    description: Search Service (Development)
+
+tags:
+  - name: Authentication
+    description: User authentication, token management, and Microsoft/ Azure OAuth flows
+  - name: Tenants
+    description: Manage Microsoft 365 and Azure tenants
+  - name: Organizations
+    description: Manage organizations
+  - name: Resources
+    description: Manage backup resources (mailboxes, OneDrive, SharePoint, Teams, Entra ID)
+  - name: Policies
+    description: Manage SLA backup policies
+  - name: Jobs
+    description: Manage backup, restore, and export jobs
+  - name: Backups
+    description: Trigger and manage backup operations
+  - name: Restores
+    description: Manage restore operations
+  - name: Snapshots
+    description: Manage backup snapshots and snapshot items
+  - name: Dashboard
+    description: Dashboard analytics and overview
+  - name: Alerts
+    description: Manage alerts and notifications
+  - name: Access Groups
+    description: Manage access groups and permissions
+  - name: Scheduler
+    description: Manage backup scheduling
+  - name: Delta Tokens
+    description: Manage delta tokens for incremental backups
+  - name: Progress
+    description: Track backup job progress
+  - name: Audit
+    description: Audit logging and event tracking
+  - name: Activity
+    description: Activity log and export
+  - name: Search
+    description: Search and discovery across all resources
+  - name: DLQ
+    description: Dead Letter Queue management
+  - name: Health
+    description: Health check endpoints
+
+paths:
+  # ==================== AUTH SERVICE ====================
+  /api/v1/auth/microsoft/url:
+    get:
+      tags:
+        - Authentication
+      summary: Get Microsoft OAuth URL
+      description: Returns the Microsoft OAuth authorization URL for initial authentication
+      operationId: getMicrosoftAuthUrl
+      parameters:
+        - name: redirect_uri
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Microsoft authorization URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MicrosoftAuthUrlResponse'
+
+  /api/v1/auth/microsoft/datasource/url:
+    get:
+      tags:
+        - Authentication
+      summary: Get Microsoft datasource OAuth URL
+      description: Returns the Microsoft OAuth URL for datasource connection
+      operationId: getMicrosoftDatasourceAuthUrl
+      responses:
+        '200':
+          description: Microsoft authorization URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MicrosoftAuthUrlResponse'
+
+  /api/v1/auth/azure/datasource/url:
+    get:
+      tags:
+        - Authentication
+      summary: Get Azure datasource OAuth URL
+      description: Returns the Azure OAuth URL for datasource connection
+      operationId: getAzureDatasourceAuthUrl
+      responses:
+        '200':
+          description: Azure authorization URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MicrosoftAuthUrlResponse'
+
+  /api/v1/auth/callback:
+    post:
+      tags:
+        - Authentication
+      summary: Handle OAuth callback
+      description: Processes the OAuth callback from Microsoft/Azure
+      operationId: handleAuthCallback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OAuthCallbackRequest'
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+
+  /api/v1/auth/microsoft/datasource/callback:
+    post:
+      tags:
+        - Authentication
+      summary: Handle Microsoft datasource callback
+      description: Processes the Microsoft datasource OAuth callback
+      operationId: handleMicrosoftDatasourceCallback
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OAuthCallbackRequest'
+      responses:
+        '200':
+          description: Datasource connected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasourceCallbackResponse'
+
+  /api/v1/auth/azure/datasource/callback:
+    post:
+      tags:
+        - Authentication
+      summary: Handle Azure datasource callback
+      description: Processes the Azure datasource OAuth callback
+      operationId: handleAzureDatasourceCallback
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OAuthCallbackRequest'
+      responses:
+        '200':
+          description: Datasource connected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasourceCallbackResponse'
+
+  /api/v1/auth/refresh:
+    post:
+      tags:
+        - Authentication
+      summary: Refresh access token
+      description: Refreshes an expired access token using the refresh token
+      operationId: refreshToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+      responses:
+        '200':
+          description: Token refreshed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshTokenResponse'
+
+  /api/v1/auth/logout:
+    post:
+      tags:
+        - Authentication
+      summary: Logout user
+      description: Logs out the current user and invalidates tokens
+      operationId: logout
+      responses:
+        '200':
+          description: Logout successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+
+  /api/v1/auth/me:
+    get:
+      tags:
+        - Authentication
+      summary: Get current user info
+      description: Returns information about the currently authenticated user
+      operationId: getCurrentUser
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Current user information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+
+  # ==================== TENANT SERVICE ====================
+  /api/v1/tenants:
+    get:
+      tags:
+        - Tenants
+      summary: List all tenants
+      description: Returns a list of all tenants
+      operationId: listTenants
+      responses:
+        '200':
+          description: List of tenants
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TenantResponse'
+    post:
+      tags:
+        - Tenants
+      summary: Create tenant
+      description: Creates a new tenant
+      operationId: createTenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantCreateRequest'
+      responses:
+        '201':
+          description: Tenant created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse'
+
+  /api/v1/tenants/{tenant_id}:
+    get:
+      tags:
+        - Tenants
+      summary: Get tenant by ID
+      description: Returns a specific tenant by ID
+      operationId: getTenant
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Tenant details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse'
+    put:
+      tags:
+        - Tenants
+      summary: Update tenant
+      description: Updates an existing tenant
+      operationId: updateTenant
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantCreateRequest'
+      responses:
+        '200':
+          description: Tenant updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse'
+    delete:
+      tags:
+        - Tenants
+      summary: Delete tenant
+      description: Deletes a tenant
+      operationId: deleteTenant
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Tenant deleted
+
+  /api/v1/tenants/{tenant_id}/discover:
+    post:
+      tags:
+        - Tenants
+      summary: Discover tenant resources
+      description: Initiates resource discovery for a tenant
+      operationId: discoverTenantResources
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Discovery initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscoveryResponse'
+
+  /api/v1/tenants/{tenant_id}/discover-m365:
+    post:
+      tags:
+        - Tenants
+      summary: Discover M365 resources
+      description: Initiates M365 resource discovery for a tenant
+      operationId: discoverM365Resources
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Discovery initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscoveryResponse'
+
+  /api/v1/tenants/{tenant_id}/discover-azure:
+    post:
+      tags:
+        - Tenants
+      summary: Discover Azure resources
+      description: Initiates Azure resource discovery for a tenant
+      operationId: discoverAzureResources
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Discovery initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscoveryResponse'
+
+  /api/v1/tenants/{tenant_id}/discovery-status:
+    get:
+      tags:
+        - Tenants
+      summary: Get discovery status
+      description: Returns the status of tenant resource discovery
+      operationId: getDiscoveryStatus
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Discovery status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscoveryStatus'
+
+  /api/v1/tenants/{tenant_id}/storage-summary:
+    get:
+      tags:
+        - Tenants
+      summary: Get storage summary
+      description: Returns storage usage summary for a tenant
+      operationId: getStorageSummary
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Storage summary
+          content:
+            application/json:
+              type: array
+              items:
+                type: object
+
+  /api/v1/tenants/{tenant_id}/test-connection:
+    post:
+      tags:
+        - Tenants
+      summary: Test tenant connection
+      description: Tests the connection to a tenant
+      operationId: testConnection
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Connection test result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connected:
+                    type: boolean
+                  message:
+                    type: string
+
+  # ==================== ORGANIZATION SERVICE ====================
+  /api/v1/organizations:
+    get:
+      tags:
+        - Organizations
+      summary: List all organizations
+      description: Returns a list of all organizations
+      operationId: listOrganizations
+      responses:
+        '200':
+          description: List of organizations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OrganizationResponse'
+
+  /api/v1/organizations/{org_id}:
+    get:
+      tags:
+        - Organizations
+      summary: Get organization by ID
+      description: Returns a specific organization by ID
+      operationId: getOrganization
+      parameters:
+        - name: org_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Organization details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrganizationResponse'
+
+  # ==================== RESOURCE SERVICE ====================
+  /api/v1/resources:
+    get:
+      tags:
+        - Resources
+      summary: List resources
+      description: Returns a paginated list of resources with optional filtering
+      operationId: listResources
+      parameters:
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paginated resource list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResourceListResponse'
+
+  /api/v1/resources/search:
+    get:
+      tags:
+        - Resources
+      summary: Search resources
+      description: Searches resources by query and type
+      operationId: searchResources
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: type
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ResourceResponse'
+
+  /api/v1/resources/by-type:
+    get:
+      tags:
+        - Resources
+      summary: Get resources by type
+      description: Returns resources filtered by type
+      operationId: getResourcesByType
+      parameters:
+        - name: type
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Paginated resource list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResourceListResponse'
+
+  /api/v1/resources/users:
+    get:
+      tags:
+        - Resources
+      summary: Get user resources
+      description: Returns user-type resources (mailboxes, OneDrive)
+      operationId: getUserResources
+      parameters:
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of user resources
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UserResourceResponse'
+
+  /api/v1/resources/{resource_id}:
+    get:
+      tags:
+        - Resources
+      summary: Get resource by ID
+      description: Returns a specific resource
+      operationId: getResource
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Resource details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResourceResponse'
+    delete:
+      tags:
+        - Resources
+      summary: Delete resource
+      description: Deletes a resource
+      operationId: deleteResource
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Resource deleted
+
+  /api/v1/resources/{resource_id}/storage-history:
+    get:
+      tags:
+        - Resources
+      summary: Get storage history
+      description: Returns 30-day storage size history for a resource
+      operationId: getStorageHistory
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Storage history
+          content:
+            application/json:
+              type: array
+              items:
+                type: object
+                properties:
+                  date:
+                    type: string
+                    format: date
+                  size:
+                    type: integer
+
+  /api/v1/resources/{resource_id}/assign-policy:
+    post:
+      tags:
+        - Resources
+      summary: Assign SLA policy to resource
+      description: Assigns an SLA policy to a resource
+      operationId: assignPolicy
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignPolicyRequest'
+      responses:
+        '204':
+          description: Policy assigned
+
+  /api/v1/resources/{resource_id}/unassign-policy:
+    post:
+      tags:
+        - Resources
+      summary: Unassign SLA policy from resource
+      description: Removes SLA policy assignment from a resource
+      operationId: unassignPolicy
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Policy unassigned
+
+  /api/v1/resources/{resource_id}/archive:
+    post:
+      tags:
+        - Resources
+      summary: Archive resource
+      description: Archives a resource
+      operationId: archiveResource
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Resource archived
+
+  /api/v1/resources/{resource_id}/unarchive:
+    post:
+      tags:
+        - Resources
+      summary: Unarchive resource
+      description: Unarchives a resource
+      operationId: unarchiveResource
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Resource unarchived
+
+  /api/v1/resources/bulk-assign-policy:
+    post:
+      tags:
+        - Resources
+      summary: Bulk assign policy
+      description: Assigns SLA policy to multiple resources
+      operationId: bulkAssignPolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkAssignRequest'
+      responses:
+        '200':
+          description: Bulk assignment result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assigned:
+                    type: integer
+                  not_found:
+                    type: integer
+
+  /api/v1/resources/bulk-unassign-policy:
+    post:
+      tags:
+        - Resources
+      summary: Bulk unassign policy
+      description: Removes SLA policy from multiple resources
+      operationId: bulkUnassignPolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkUnassignRequest'
+      responses:
+        '200':
+          description: Bulk unassignment result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  unassigned:
+                    type: integer
+                  not_found:
+                    type: integer
+
+  # ==================== POLICY SERVICE ====================
+  /api/v1/policies:
+    get:
+      tags:
+        - Policies
+      summary: List SLA policies
+      description: Returns all SLA policies
+      operationId: listPolicies
+      responses:
+        '200':
+          description: List of SLA policies
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SlaPolicyResponse'
+    post:
+      tags:
+        - Policies
+      summary: Create SLA policy
+      description: Creates a new SLA backup policy
+      operationId: createPolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SlaPolicyCreateRequest'
+      responses:
+        '201':
+          description: Policy created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SlaPolicyResponse'
+
+  /api/v1/policies/{policy_id}:
+    get:
+      tags:
+        - Policies
+      summary: Get SLA policy by ID
+      description: Returns a specific SLA policy
+      operationId: getPolicy
+      parameters:
+        - name: policy_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Policy details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SlaPolicyResponse'
+    put:
+      tags:
+        - Policies
+      summary: Update SLA policy
+      description: Updates an existing SLA policy
+      operationId: updatePolicy
+      parameters:
+        - name: policy_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SlaPolicyCreateRequest'
+      responses:
+        '200':
+          description: Policy updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SlaPolicyResponse'
+    delete:
+      tags:
+        - Policies
+      summary: Delete SLA policy
+      description: Deletes an SLA policy
+      operationId: deletePolicy
+      parameters:
+        - name: policy_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Policy deleted
+
+  /api/v1/policies/{policy_id}/resources:
+    get:
+      tags:
+        - Policies
+      summary: Get policy resources
+      description: Returns resources assigned to a policy
+      operationId: getPolicyResources
+      parameters:
+        - name: policy_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Resources list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  content:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ResourceResponse'
+                  totalPages:
+                    type: integer
+                  totalElements:
+                    type: integer
+
+  /api/v1/policies/{policy_id}/auto-assign:
+    post:
+      tags:
+        - Policies
+      summary: Auto-assign policy
+      description: Automatically assigns policy to matching resources
+      operationId: autoAssignPolicy
+      parameters:
+        - name: policy_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Policy auto-assigned
+
+  # ==================== JOB SERVICE ====================
+  /api/v1/jobs:
+    get:
+      tags:
+        - Jobs
+      summary: List jobs
+      description: Returns paginated list of jobs with filtering
+      operationId: listJobs
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [PENDING, RUNNING, COMPLETED, FAILED, CANCELLED]
+        - name: type
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [BACKUP, RESTORE, EXPORT, DISCOVERY, DELETE]
+      responses:
+        '200':
+          description: Job list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobListResponse'
+
+  /api/v1/jobs/{job_id}:
+    get:
+      tags:
+        - Jobs
+      summary: Get job by ID
+      description: Returns job details
+      operationId: getJob
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Job details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+
+  /api/v1/jobs/{job_id}/progress:
+    get:
+      tags:
+        - Jobs
+      summary: Get job progress stream
+      description: Returns Server-Sent Events stream of job progress
+      operationId: getJobProgressStream
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: SSE stream of progress
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /api/v1/jobs/{job_id}/cancel:
+    post:
+      tags:
+        - Jobs
+      summary: Cancel job
+      description: Cancels a running job
+      operationId: cancelJob
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Job cancelled
+
+  /api/v1/jobs/{job_id}/retry:
+    post:
+      tags:
+        - Jobs
+      summary: Retry job
+      description: Retries a failed job
+      operationId: retryJob
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Job retried
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+
+  /api/v1/jobs/{job_id}/logs:
+    get:
+      tags:
+        - Jobs
+      summary: Get job logs
+      description: Returns logs for a job
+      operationId: getJobLogs
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Job logs
+          content:
+            application/json:
+              type: array
+              items:
+                $ref: '#/components/schemas/JobLog'
+
+  # ==================== BACKUP SERVICE ====================
+  /api/v1/backups/trigger:
+    post:
+      tags:
+        - Backups
+      summary: Trigger backup
+      description: Triggers a backup for a resource
+      operationId: triggerBackup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TriggerBackupRequest'
+      responses:
+        '200':
+          description: Backup triggered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+
+  /api/v1/backups/trigger-user/{resource_id}:
+    post:
+      tags:
+        - Backups
+      summary: Trigger user backup
+      description: Triggers a backup for a user resource
+      operationId: triggerUserBackup
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Backup triggered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobId:
+                    type: string
+                  status:
+                    type: string
+                  resourceId:
+                    type: string
+
+  /api/v1/backups/trigger-bulk:
+    post:
+      tags:
+        - Backups
+      summary: Trigger bulk backup
+      description: Triggers backups for multiple resources
+      operationId: triggerBulkBackup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TriggerBulkBackupRequest'
+      responses:
+        '200':
+          description: Bulk backup results
+          content:
+            application/json:
+              type: array
+              items:
+                type: object
+                properties:
+                  jobId:
+                    type: string
+                  status:
+                    type: string
+                  resourceId:
+                    type: string
+                  resourceCount:
+                    type: integer
+
+  # ==================== RESTORE SERVICE ====================
+  /api/v1/jobs/restore:
+    post:
+      tags:
+        - Restores
+      summary: Restore job
+      description: Initiates a restore job
+      operationId: createRestoreJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                restoreType:
+                  type: string
+                  enum: [MAILBOX, ONEDRIVE, SHAREPOINT, ENTRA_OBJECT]
+                snapshotIds:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                targetLocation:
+                  type: string
+      responses:
+        '200':
+          description: Restore job created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobId:
+                    type: string
+                  status:
+                    type: string
+                  restoreType:
+                    type: string
+                  snapshotCount:
+                    type: integer
+                  itemCount:
+                    type: integer
+
+  /api/v1/jobs/restore/mailbox:
+    post:
+      tags:
+        - Restores
+      summary: Restore mailbox
+      description: Initiates a mailbox restore
+      operationId: restoreMailbox
+      responses:
+        '200':
+          description: Restore initiated
+
+  /api/v1/jobs/restore/onedrive:
+    post:
+      tags:
+        - Restores
+      summary: Restore OneDrive
+      description: Initiates a OneDrive restore
+      operationId: restoreOneDrive
+      responses:
+        '200':
+          description: Restore initiated
+
+  /api/v1/jobs/restore/sharepoint:
+    post:
+      tags:
+        - Restores
+      summary: Restore SharePoint
+      description: Initiates a SharePoint site restore
+      operationId: restoreSharePoint
+      responses:
+        '200':
+          description: Restore initiated
+
+  /api/v1/jobs/restore/entra-object:
+    post:
+      tags:
+        - Restores
+      summary: Restore Entra object
+      description: Initiates an Entra ID object restore
+      operationId: restoreEntraObject
+      responses:
+        '200':
+          description: Restore initiated
+
+  /api/v1/jobs/restore/{job_id}/status:
+    get:
+      tags:
+        - Restores
+      summary: Get restore status
+      description: Returns restore job status
+      operationId: getRestoreStatus
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Restore status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobId:
+                    type: string
+                  status:
+                    type: string
+                  progress:
+                    type: number
+
+  /api/v1/jobs/restore/history:
+    get:
+      tags:
+        - Restores
+      summary: Get restore history
+      description: Returns paginated restore history
+      operationId: getRestoreHistory
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Restore history
+
+  # ==================== EXPORT SERVICE ====================
+  /api/v1/jobs/export:
+    post:
+      tags:
+        - Jobs
+      summary: Create export job
+      description: Creates an export job
+      operationId: createExportJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                snapshotIds:
+                  type: array
+                  items:
+                    type: string
+                format:
+                  type: string
+      responses:
+        '200':
+          description: Export job created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobId:
+                    type: string
+
+  /api/v1/jobs/export/{job_id}/status:
+    get:
+      tags:
+        - Jobs
+      summary: Get export status
+      description: Returns export job status
+      operationId: getExportStatus
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Export status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobId:
+                    type: string
+                  status:
+                    type: string
+                  progress:
+                    type: number
+
+  /api/v1/jobs/export/{job_id}/download:
+    get:
+      tags:
+        - Jobs
+      summary: Download export
+      description: Downloads export file
+      operationId: downloadExport
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Download URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url:
+                    type: string
+
+  # ==================== SNAPSHOT SERVICE ====================
+  /api/v1/resources/{resource_id}/snapshots:
+    get:
+      tags:
+        - Snapshots
+      summary: List resource snapshots
+      description: Returns snapshots for a resource
+      operationId: listResourceSnapshots
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Snapshot list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotListResponse'
+
+  /api/v1/resources/snapshots/{snapshot_id}:
+    get:
+      tags:
+        - Snapshots
+      summary: Get snapshot by ID
+      description: Returns snapshot details
+      operationId: getSnapshot
+      parameters:
+        - name: snapshot_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Snapshot details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotResponse'
+
+  /api/v1/resources/snapshots/{snapshot_id}/items:
+    get:
+      tags:
+        - Snapshots
+      summary: List snapshot items
+      description: Returns items in a snapshot
+      operationId: listSnapshotItems
+      parameters:
+        - name: snapshot_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Snapshot items list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotItemListResponse'
+
+  /api/v1/resources/{resource_id}/snapshots/{snapshot_id}/items:
+    get:
+      tags:
+        - Snapshots
+      summary: List resource snapshot items
+      description: Returns items in a resource snapshot
+      operationId: listResourceSnapshotItems
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: snapshot_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Snapshot items list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotItemListResponse'
+
+  /api/v1/resources/snapshots/{snapshot_id}/diff:
+    get:
+      tags:
+        - Snapshots
+      summary: Get snapshot diff
+      description: Returns diff between two snapshots
+      operationId: getSnapshotDiff
+      parameters:
+        - name: snapshot_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: snapshot2
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Snapshot diff
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotDiff'
+
+  # ==================== DASHBOARD SERVICE ====================
+  /api/v1/dashboard/overview:
+    get:
+      tags:
+        - Dashboard
+      summary: Get dashboard overview
+      description: Returns dashboard overview statistics
+      operationId: getDashboardOverview
+      parameters:
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Dashboard overview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardOverview'
+
+  /api/v1/dashboard/status/24hour:
+    get:
+      tags:
+        - Dashboard
+      summary: Get 24-hour backup status
+      description: Returns 24-hour backup status summary
+      operationId: get24HourStatus
+      parameters:
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 24-hour status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupStatus24Hour'
+
+  /api/v1/dashboard/status/7day:
+    get:
+      tags:
+        - Dashboard
+      summary: Get 7-day backup status
+      description: Returns 7-day backup status summary with daily breakdown
+      operationId: get7DayStatus
+      parameters:
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 7-day status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupStatus7Day'
+
+  /api/v1/dashboard/protection/status:
+    get:
+      tags:
+        - Dashboard
+      summary: Get protection status
+      description: Returns backup protection status by resource type
+      operationId: getProtectionStatus
+      parameters:
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Protection status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProtectionStatus'
+
+  /api/v1/dashboard/backup/size:
+    get:
+      tags:
+        - Dashboard
+      summary: Get backup size trends
+      description: Returns backup size data over time
+      operationId: getBackupSize
+      parameters:
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Backup size data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupSize'
+
+  # ==================== ALERT SERVICE ====================
+  /api/v1/alerts:
+    get:
+      tags:
+        - Alerts
+      summary: List alerts
+      description: Returns paginated alerts
+      operationId: listAlerts
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+        - name: unresolved
+          in: query
+          required: false
+          schema:
+            type: boolean
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Alert list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertListResponse'
+
+  /api/v1/alerts/{alert_id}:
+    get:
+      tags:
+        - Alerts
+      summary: Get alert by ID
+      description: Returns alert details
+      operationId: getAlert
+      parameters:
+        - name: alert_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Alert details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertResponse'
+
+  /api/v1/alerts/{alert_id}/resolve:
+    post:
+      tags:
+        - Alerts
+      summary: Resolve alert
+      description: Marks an alert as resolved
+      operationId: resolveAlert
+      parameters:
+        - name: alert_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Alert resolved
+
+  /api/v1/alerts/notifications/settings:
+    get:
+      tags:
+        - Alerts
+      summary: Get notification settings
+      description: Returns notification settings
+      operationId: getNotificationSettings
+      responses:
+        '200':
+          description: Notification settings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  emailEnabled:
+                    type: boolean
+                  slackEnabled:
+                    type: boolean
+                  teamsEnabled:
+                    type: boolean
+                  alertThresholds:
+                    type: object
+    put:
+      tags:
+        - Alerts
+      summary: Update notification settings
+      description: Updates notification settings
+      operationId: updateNotificationSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                emailEnabled:
+                  type: boolean
+                slackEnabled:
+                  type: boolean
+                teamsEnabled:
+                  type: boolean
+                alertThresholds:
+                  type: object
+      responses:
+        '200':
+          description: Settings updated
+
+  /api/v1/alerts/webhooks:
+    get:
+      tags:
+        - Alerts
+      summary: List webhooks
+      description: Returns configured webhooks
+      operationId: listWebhooks
+      responses:
+        '200':
+          description: Webhook list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WebhookResponse'
+    post:
+      tags:
+        - Alerts
+      summary: Create webhook
+      description: Creates a new webhook
+      operationId: createWebhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - url
+              properties:
+                name:
+                  type: string
+                url:
+                  type: string
+                  format: uri
+                enabled:
+                  type: boolean
+                  default: true
+      responses:
+        '201':
+          description: Webhook created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+
+  /api/v1/alerts/webhooks/{webhook_id}:
+    delete:
+      tags:
+        - Alerts
+      summary: Delete webhook
+      description: Deletes a webhook
+      operationId: deleteWebhook
+      parameters:
+        - name: webhook_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Webhook deleted
+
+  /api/v1/alerts/webhooks/{webhook_id}/test:
+    post:
+      tags:
+        - Alerts
+      summary: Test webhook
+      description: Sends a test payload to webhook
+      operationId: testWebhook
+      parameters:
+        - name: webhook_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Test result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+
+  # ==================== ACCESS GROUPS ====================
+  /api/v1/access-groups:
+    get:
+      tags:
+        - Access Groups
+      summary: List access groups
+      description: Returns paginated access groups
+      operationId: listAccessGroups
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Access group list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessGroupListResponse'
+    post:
+      tags:
+        - Access Groups
+      summary: Create access group
+      description: Creates a new access group
+      operationId: createAccessGroup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+      responses:
+        '201':
+          description: Access group created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  name:
+                    type: string
+                  description:
+                    type: string
+                  createdAt:
+                    type: string
+                    format: date-time
+
+  /api/v1/access-groups/{group_id}:
+    put:
+      tags:
+        - Access Groups
+      summary: Update access group
+      description: Updates an access group
+      operationId: updateAccessGroup
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+      responses:
+        '200':
+          description: Access group updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  name:
+                    type: string
+    delete:
+      tags:
+        - Access Groups
+      summary: Delete access group
+      description: Deletes an access group
+      operationId: deleteAccessGroup
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Access group deleted
+
+  /api/v1/access-groups/{group_id}/members:
+    post:
+      tags:
+        - Access Groups
+      summary: Add group member
+      description: Adds a member to an access group
+      operationId: addAccessGroupMember
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - userId
+              properties:
+                userId:
+                  type: string
+                role:
+                  type: string
+      responses:
+        '201':
+          description: Member added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  groupId:
+                    type: string
+                  userId:
+                    type: string
+                  userName:
+                    type: string
+                  userEmail:
+                    type: string
+                  role:
+                    type: string
+                  addedAt:
+                    type: string
+                    format: date-time
+
+  /api/v1/access-groups/{group_id}/members/{member_id}:
+    delete:
+      tags:
+        - Access Groups
+      summary: Remove group member
+      description: Removes a member from an access group
+      operationId: removeAccessGroupMember
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: member_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Member removed
+
+  /api/v1/access-groups/self-service/settings:
+    get:
+      tags:
+        - Access Groups
+      summary: Get self-service settings
+      description: Returns self-service configuration
+      operationId: getSelfServiceSettings
+      responses:
+        '200':
+          description: Self-service settings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  allowRestore:
+                    type: boolean
+                  allowExport:
+                    type: boolean
+                  maxExportItems:
+                    type: integer
+    put:
+      tags:
+        - Access Groups
+      summary: Update self-service settings
+      description: Updates self-service configuration
+      operationId: updateSelfServiceSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled:
+                  type: boolean
+                allowRestore:
+                  type: boolean
+                allowExport:
+                  type: boolean
+                maxExportItems:
+                  type: integer
+      responses:
+        '200':
+          description: Settings updated
+
+  /api/v1/access-groups/ip-restrictions:
+    get:
+      tags:
+        - Access Groups
+      summary: Get IP restrictions
+      description: Returns IP restriction settings
+      operationId: getIpRestrictions
+      responses:
+        '200':
+          description: IP restrictions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  allowedIPs:
+                    type: array
+                    items:
+                      type: string
+                  blockedIPs:
+                    type: array
+                    items:
+                      type: string
+    put:
+      tags:
+        - Access Groups
+      summary: Update IP restrictions
+      description: Updates IP restriction settings
+      operationId: updateIpRestrictions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled:
+                  type: boolean
+                allowedIPs:
+                  type: array
+                  items:
+                    type: string
+                blockedIPs:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Restrictions updated
+
+  # ==================== BACKUP SCHEDULER ====================
+  /scheduler/policy/{policy_id}/trigger:
+    post:
+      tags:
+        - Scheduler
+      summary: Trigger policy backup
+      description: Triggers immediate backup for a policy
+      operationId: triggerPolicyBackup
+      parameters:
+        - name: policy_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Backup scheduled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  policy_id:
+                    type: string
+
+  /scheduler/reschedule-all:
+    post:
+      tags:
+        - Scheduler
+      summary: Reschedule all backups
+      description: Reschedules all automated backups
+      operationId: rescheduleAll
+      responses:
+        '200':
+          description: Rescheduling initiated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+
+  /scheduler/resource/{resource_id}:
+    post:
+      tags:
+        - Scheduler
+      summary: Schedule resource backup
+      description: Schedules immediate backup for a resource
+      operationId: scheduleResourceBackup
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Backup queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  job_id:
+                    type: string
+
+  # ==================== DELTA TOKEN SERVICE ====================
+  /delta-token/{resource_id}:
+    get:
+      tags:
+        - Delta Tokens
+      summary: Get delta token
+      description: Returns delta token for a resource
+      operationId: getDeltaToken
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: folder_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Delta token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeltaTokenResponse'
+    delete:
+      tags:
+        - Delta Tokens
+      summary: Invalidate delta token
+      description: Invalidates delta token for a resource
+      operationId: invalidateDeltaToken
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: folder_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Token invalidated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  resource_id:
+                    type: string
+
+  /delta-token:
+    post:
+      tags:
+        - Delta Tokens
+      summary: Save delta token
+      description: Saves or updates a delta token
+      operationId: saveDeltaToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeltaTokenRequest'
+      responses:
+        '200':
+          description: Token saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  resource_id:
+                    type: string
+                  folder_id:
+                    type: string
+
+  /delta-token/history/{resource_id}:
+    get:
+      tags:
+        - Delta Tokens
+      summary: Get delta token history
+      description: Returns delta token history for a resource
+      operationId: getDeltaTokenHistory
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Token history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  history:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DeltaTokenResponse'
+                  total:
+                    type: integer
+
+  /delta-tokens/bulk:
+    get:
+      tags:
+        - Delta Tokens
+      summary: Get bulk delta tokens
+      description: Returns delta tokens for multiple resources
+      operationId: getBulkDeltaTokens
+      parameters:
+        - name: resource_ids
+          in: query
+          required: true
+          schema:
+            type: array
+            items:
+              type: string
+      responses:
+        '200':
+          description: Bulk tokens
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DeltaTokenResponse'
+
+  # ==================== PROGRESS TRACKER ====================
+  /api/v1/progress/resource/{resource_id}:
+    get:
+      tags:
+        - Progress
+      summary: Get resource progress
+      description: Returns progress data for a resource
+      operationId: getResourceProgress
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Resource progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResourceProgress'
+
+  /api/v1/progress/resources:
+    get:
+      tags:
+        - Progress
+      summary: Get resources progress
+      description: Returns progress for multiple resources
+      operationId: getResourcesProgress
+      parameters:
+        - name: tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Resources progress
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  resources:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ResourceProgress'
+                  total:
+                    type: integer
+
+  /api/v1/progress/resource/{resource_id}/stream:
+    get:
+      tags:
+        - Progress
+      summary: Get progress stream
+      description: Returns SSE stream of resource progress
+      operationId: getProgressStream
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /api/v1/progress/update:
+    post:
+      tags:
+        - Progress
+      summary: Update progress
+      description: Updates progress for a resource
+      operationId: updateProgress
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - resource_id
+              properties:
+                resource_id:
+                  type: string
+                status:
+                  type: string
+                progress_pct:
+                  type: number
+                total_bytes:
+                  type: integer
+                processed_bytes:
+                  type: integer
+                total_items:
+                  type: integer
+                processed_items:
+                  type: integer
+                job_id:
+                  type: string
+      responses:
+        '200':
+          description: Progress updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+
+  /api/v1/progress/estimate/{resource_id}:
+    post:
+      tags:
+        - Progress
+      summary: Get backup estimate
+      description: Estimates backup size and item count
+      operationId: getBackupEstimate
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Backup estimate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  resource_id:
+                    type: string
+                  resource_type:
+                    type: string
+                  total_bytes:
+                    type: integer
+                  total_items:
+                    type: integer
+                  estimated:
+                    type: boolean
+                  note:
+                    type: string
+
+  # ==================== AUDIT SERVICE ====================
+  /api/v1/audit/log:
+    post:
+      tags:
+        - Audit
+      summary: Create audit log
+      description: Creates a new audit log entry
+      operationId: createAuditLog
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuditEventCreateRequest'
+      responses:
+        '200':
+          description: Audit log created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  action:
+                    type: string
+                  occurred_at:
+                    type: string
+                    format: date-time
+
+  /api/v1/audit/events:
+    get:
+      tags:
+        - Audit
+      summary: List audit events
+      description: Returns paginated audit events with filtering
+      operationId: listAuditEvents
+      parameters:
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: action
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: outcome
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: resourceId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: actorType
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: from_date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to_date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Audit events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AuditEventResponse'
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  size:
+                    type: integer
+                  pages:
+                    type: integer
+
+  /api/v1/audit/resource/{resource_id}:
+    get:
+      tags:
+        - Audit
+      summary: Get audit events for resource
+      description: Returns audit events for a specific resource
+      operationId: getResourceAuditEvents
+      parameters:
+        - name: resource_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Audit events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AuditEventResponse'
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  size:
+                    type: integer
+
+  /api/v1/audit/events/{event_id}:
+    get:
+      tags:
+        - Audit
+      summary: Get audit event by ID
+      description: Returns a single audit event
+      operationId: getAuditEvent
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Audit event details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventResponse'
+
+  /api/v1/audit/risk-signals:
+    get:
+      tags:
+        - Audit
+      summary: Get risk signals
+      description: Returns risk signals with filtering
+      operationId: getRiskSignals
+      parameters:
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: from_date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to_date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: min_risk_score
+          in: query
+          required: false
+          schema:
+            type: number
+        - name: risk_level
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Risk signals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  size:
+                    type: integer
+                  has_more:
+                    type: boolean
+
+  /api/v1/audit/export:
+    get:
+      tags:
+        - Audit
+      summary: Export audit data
+      description: Exports audit data as CSV
+      operationId: exportAuditData
+      parameters:
+        - name: from_date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to_date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: CSV file
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
+
+  /api/v1/audit/actions:
+    get:
+      tags:
+        - Audit
+      summary: Get audit action types
+      description: Returns list of available audit action types
+      operationId: getAuditActions
+      responses:
+        '200':
+          description: Action types
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    action:
+                      type: string
+                    description:
+                      type: string
+
+  /api/v1/audit/stats:
+    get:
+      tags:
+        - Audit
+      summary: Get audit statistics
+      description: Returns audit statistics
+      operationId: getAuditStats
+      responses:
+        '200':
+          description: Audit statistics
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/v1/audit/siem/stream:
+    get:
+      tags:
+        - Audit
+      summary: Get SIEM stream
+      description: Returns SSE stream for SIEM integration
+      operationId: getSiemStream
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /api/v1/audit/siem/webhook:
+    post:
+      tags:
+        - Audit
+      summary: Create SIEM webhook
+      description: Creates a webhook for SIEM integration
+      operationId: createSiemWebhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - url
+              properties:
+                name:
+                  type: string
+                url:
+                  type: string
+                  format: uri
+                enabled:
+                  type: boolean
+      responses:
+        '200':
+          description: Webhook created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+
+  /api/v1/audit/siem/webhook/{webhook_id}/test:
+    post:
+      tags:
+        - Audit
+      summary: Test SIEM webhook
+      description: Tests a SIEM webhook
+      operationId: testSiemWebhook
+      parameters:
+        - name: webhook_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Test result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+
+  /api/v1/audit/graph-apps:
+    get:
+      tags:
+        - Audit
+      summary: List Graph apps
+      description: Returns registered Microsoft Graph apps
+      operationId: getGraphApps
+      responses:
+        '200':
+          description: Graph apps
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+
+  /api/v1/audit/ingest/graph/{tenant_id}:
+    post:
+      tags:
+        - Audit
+      summary: Ingest Graph data
+      description: Ingests audit data from Microsoft Graph
+      operationId: ingestGraphData
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Ingestion result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ingested:
+                    type: integer
+                  errors:
+                    type: integer
+
+  # ==================== ACTIVITY LOG ====================
+  /api/v1/activity:
+    get:
+      tags:
+        - Activity
+      summary: List activity log
+      description: Returns paginated activity log
+      operationId: listActivity
+      parameters:
+        - name: start_date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: end_date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: operation
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Activity log
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  size:
+                    type: integer
+                  has_more:
+                    type: boolean
+
+  /api/v1/activity/export:
+    get:
+      tags:
+        - Activity
+      summary: Export activity
+      description: Exports activity log as CSV
+      operationId: exportActivity
+      parameters:
+        - name: start_date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: end_date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: CSV file
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
+
+  # ==================== SEARCH SERVICE ====================
+  /api/v1/search:
+    get:
+      tags:
+        - Search
+      summary: Search items
+      description: Searches across all resources with filtering
+      operationId: search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: tenantId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: workloadType
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: itemType
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: dateFrom
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: dateTo
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+
+  /api/v1/search/suggestions:
+    get:
+      tags:
+        - Search
+      summary: Get search suggestions
+      description: Returns search suggestions
+      operationId: getSearchSuggestions
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 10
+      responses:
+        '200':
+          description: Suggestions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  suggestions:
+                    type: array
+                    items:
+                      type: string
+                  query:
+                    type: string
+
+  /api/v1/search/reindex:
+    post:
+      tags:
+        - Search
+      summary: Reindex search
+      description: Triggers reindexing of search data
+      operationId: reindex
+      responses:
+        '200':
+          description: Reindex result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  indexed:
+                    type: integer
+
+  # ==================== DLQ SERVICE ====================
+  /api/v1/dlq/stats:
+    get:
+      tags:
+        - DLQ
+      summary: Get DLQ statistics
+      description: Returns Dead Letter Queue statistics
+      operationId: getDlqStats
+      responses:
+        '200':
+          description: DLQ statistics
+          content:
+            application/json:
+              type: array
+              items:
+                type: object
+                properties:
+                  queue:
+                    type: string
+                  messages:
+                    type: integer
+
+  /api/v1/dlq/{dlq_name}/purge:
+    post:
+      tags:
+        - DLQ
+      summary: Purge DLQ
+      description: Purges all messages from a Dead Letter Queue
+      operationId: purgeDlq
+      parameters:
+        - name: dlq_name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: DLQ purged
+
+  /api/v1/dlq/{dlq_name}/requeue:
+    post:
+      tags:
+        - DLQ
+      summary: Requeue DLQ
+      description: Requeues all messages from a Dead Letter Queue
+      operationId: requeueDlq
+      parameters:
+        - name: dlq_name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Messages requeued
+
+  # ==================== HEALTH CHECKS ====================
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Gateway health check
+      description: Returns API Gateway health status
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT Bearer token for authentication
+
+  schemas:
+    # Auth Schemas
+    MicrosoftAuthUrlResponse:
+      type: object
+      properties:
+        url:
+          type: string
+          description: Microsoft/Azure OAuth authorization URL
+        state:
+          type: string
+          description: OAuth state parameter
+
+    OAuthCallbackRequest:
+      type: object
+      required:
+        - code
+      properties:
+        code:
+          type: string
+          description: OAuth authorization code
+        state:
+          type: string
+          description: OAuth state parameter
+
+    RefreshTokenRequest:
+      type: object
+      required:
+        - refreshToken
+      properties:
+        refreshToken:
+          type: string
+          description: Refresh token
+
+    RefreshTokenResponse:
+      type: object
+      properties:
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+        expiresIn:
+          type: integer
+          description: Token expiry in seconds
+
+    LoginResponse:
+      type: object
+      properties:
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+        expiresIn:
+          type: integer
+        user:
+          $ref: '#/components/schemas/UserResponse'
+
+    UserResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        name:
+          type: string
+        roles:
+          type: array
+          items:
+            type: string
+            enum: [SUPER_ADMIN, ORG_ADMIN, TENANT_ADMIN, BACKUP_OPERATOR, RESTORE_OPERATOR, CONTENT_VIEWER, USER]
+        organizationId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+
+    DatasourceCallbackResponse:
+      type: object
+      properties:
+        tenantId:
+          type: string
+        tenantName:
+          type: string
+
+    # Tenant Schemas
+    TenantCreateRequest:
+      type: object
+      required:
+        - name
+        - organizationId
+        - microsoftTenantId
+      properties:
+        name:
+          type: string
+        organizationId:
+          type: string
+          format: uuid
+        microsoftTenantId:
+          type: string
+        connectionDetails:
+          type: object
+
+    TenantResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        orgId:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [M365, AZURE, BOTH]
+        displayName:
+          type: string
+        externalTenantId:
+          type: string
+        subscriptionId:
+          type: string
+        clientId:
+          type: string
+        status:
+          type: string
+        storageRegion:
+          type: string
+        lastDiscoveryAt:
+          type: string
+          format: date-time
+
+    DiscoveryResponse:
+      type: object
+      properties:
+        discoveryId:
+          type: string
+        resourcesFound:
+          type: integer
+
+    DiscoveryStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [PENDING, RUNNING, COMPLETED, FAILED]
+        progress:
+          type: number
+        resourcesFound:
+          type: integer
+
+    # Organization Schemas
+    OrganizationResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: string
+        storageRegion:
+          type: string
+        encryptionMode:
+          type: string
+        storageQuotaBytes:
+          type: integer
+        storageBytesUsed:
+          type: integer
+
+    # Resource Schemas
+    ResourceResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [MAILBOX, ONEDRIVE, SHAREPOINT, TEAMS, ENTRA_USER, ENTRA_GROUP, SHARED_MAILBOX, ROOM]
+        externalId:
+          type: string
+        displayName:
+          type: string
+        email:
+          type: string
+        metadata:
+          type: object
+        slaPolicyId:
+          type: string
+          format: uuid
+        status:
+          type: string
+        storageBytes:
+          type: integer
+        lastBackupAt:
+          type: string
+          format: date-time
+
+    ResourceListResponse:
+      type: object
+      properties:
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResourceResponse'
+        totalPages:
+          type: integer
+        totalElements:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+
+    UserResourceResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+        status:
+          type: string
+
+    AssignPolicyRequest:
+      type: object
+      required:
+        - policyId
+      properties:
+        policyId:
+          type: string
+          format: uuid
+
+    BulkAssignRequest:
+      type: object
+      required:
+        - resourceIds
+        - policyId
+      properties:
+        resourceIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        policyId:
+          type: string
+          format: uuid
+
+    BulkUnassignRequest:
+      type: object
+      required:
+        - resourceIds
+      properties:
+        resourceIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+
+    # Policy Schemas
+    SlaPolicyResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        frequency:
+          type: string
+          enum: [DAILY, THREE_DAILY, WEEKLY, CUSTOM]
+        backupDays:
+          type: array
+          items:
+            type: string
+        backupWindowStart:
+          type: string
+        backupExchange:
+          type: boolean
+        backupOneDrive:
+          type: boolean
+        backupSharepoint:
+          type: boolean
+        backupTeams:
+          type: boolean
+        backupTeamsChats:
+          type: boolean
+        backupEntraId:
+          type: boolean
+        backupPowerPlatform:
+          type: boolean
+        backupCopilot:
+          type: boolean
+        backupPlanner:
+          type: boolean
+        backupContacts:
+          type: boolean
+        backupCalendars:
+          type: boolean
+        backupTasks:
+          type: boolean
+        backupGroupMailbox:
+          type: boolean
+        retentionType:
+          type: string
+        retentionDays:
+          type: integer
+        enabled:
+          type: boolean
+        isDefault:
+          type: boolean
+
+    SlaPolicyCreateRequest:
+      type: object
+      required:
+        - tenantId
+        - name
+        - frequency
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        frequency:
+          type: string
+          enum: [DAILY, THREE_DAILY, WEEKLY, CUSTOM]
+        backupDays:
+          type: array
+          items:
+            type: string
+        backupWindowStart:
+          type: string
+        backupExchange:
+          type: boolean
+          default: true
+        backupOneDrive:
+          type: boolean
+          default: true
+        backupSharepoint:
+          type: boolean
+        backupTeams:
+          type: boolean
+        backupTeamsChats:
+          type: boolean
+        backupEntraId:
+          type: boolean
+        backupPowerPlatform:
+          type: boolean
+        backupCopilot:
+          type: boolean
+        backupPlanner:
+          type: boolean
+        backupContacts:
+          type: boolean
+        backupCalendars:
+          type: boolean
+        backupTasks:
+          type: boolean
+        backupGroupMailbox:
+          type: boolean
+        retentionType:
+          type: string
+        retentionDays:
+          type: integer
+        enabled:
+          type: boolean
+          default: true
+        isDefault:
+          type: boolean
+          default: false
+
+    # Job Schemas
+    JobResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [BACKUP, RESTORE, EXPORT, DISCOVERY, DELETE]
+        tenantId:
+          type: string
+          format: uuid
+        resourceId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [PENDING, RUNNING, COMPLETED, FAILED, CANCELLED]
+        priority:
+          type: integer
+        attempts:
+          type: integer
+        errorMessage:
+          type: string
+        progressPct:
+          type: number
+        itemsProcessed:
+          type: integer
+        bytesProcessed:
+          type: integer
+        spec:
+          type: object
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    JobListResponse:
+      type: object
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/JobResponse'
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+
+    JobLog:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        jobId:
+          type: string
+          format: uuid
+        timestamp:
+          type: string
+          format: date-time
+        level:
+          type: string
+          enum: [INFO, WARNING, ERROR, DEBUG]
+        message:
+          type: string
+        details:
+          type: object
+
+    TriggerBackupRequest:
+      type: object
+      required:
+        - resourceId
+      properties:
+        resourceId:
+          type: string
+          format: uuid
+        fullBackup:
+          type: boolean
+        priority:
+          type: integer
+        note:
+          type: string
+
+    TriggerBulkBackupRequest:
+      type: object
+      required:
+        - resourceIds
+      properties:
+        resourceIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        fullBackup:
+          type: boolean
+        priority:
+          type: integer
+        note:
+          type: string
+
+    # Snapshot Schemas
+    SnapshotResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        resourceId:
+          type: string
+          format: uuid
+        createdAt:
+          type: string
+          format: date-time
+        size:
+          type: integer
+        status:
+          type: string
+          enum: [PENDING, IN_PROGRESS, COMPLETED, FAILED]
+        type:
+          type: string
+          enum: [FULL, INCREMENTAL, PREEMPTIVE, MANUAL]
+        itemCount:
+          type: integer
+
+    SnapshotListResponse:
+      type: object
+      properties:
+        snapshots:
+          type: array
+          items:
+            $ref: '#/components/schemas/SnapshotResponse'
+        total:
+          type: integer
+
+    SnapshotItemResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        snapshotId:
+          type: string
+          format: uuid
+        externalId:
+          type: string
+        itemType:
+          type: string
+        name:
+          type: string
+        folderPath:
+          type: string
+        contentSize:
+          type: integer
+        metadata:
+          type: object
+        isDeleted:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    SnapshotItemListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SnapshotItemResponse'
+        total:
+          type: integer
+
+    SnapshotDiff:
+      type: object
+      properties:
+        added:
+          type: array
+          items:
+            $ref: '#/components/schemas/SnapshotItemResponse'
+        removed:
+          type: array
+          items:
+            $ref: '#/components/schemas/SnapshotItemResponse'
+        modified:
+          type: array
+          items:
+            $ref: '#/components/schemas/SnapshotItemResponse'
+
+    # Dashboard Schemas
+    DashboardOverview:
+      type: object
+      properties:
+        totalResources:
+          type: integer
+        protectedResources:
+          type: integer
+        failedBackups:
+          type: integer
+        pendingBackups:
+          type: integer
+        storageUsed:
+          type: integer
+        lastBackupTime:
+          type: string
+          format: date-time
+
+    BackupStatus24Hour:
+      type: object
+      properties:
+        success:
+          type: integer
+        warnings:
+          type: integer
+        failures:
+          type: integer
+
+    BackupStatus7Day:
+      type: object
+      properties:
+        dailyStatus:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+                format: date
+              success:
+                type: integer
+              warnings:
+                type: integer
+              failures:
+                type: integer
+        summary:
+          type: object
+          properties:
+            totalBackups:
+              type: integer
+            successRate:
+              type: number
+            avgDuration:
+              type: number
+
+    ProtectionStatus:
+      type: object
+      properties:
+        users:
+          type: integer
+        sharedMailboxes:
+          type: integer
+        rooms:
+          type: integer
+        sharepointSites:
+          type: integer
+        groupsAndTeams:
+          type: integer
+        entraId:
+          type: integer
+        powerPlatform:
+          type: integer
+        percentage:
+          type: number
+
+    BackupSize:
+      type: object
+      properties:
+        total:
+          type: integer
+        oneDayChange:
+          type: integer
+        oneMonthChange:
+          type: integer
+        oneYearChange:
+          type: integer
+        dailyData:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+                format: date
+              size:
+                type: integer
+
+    # Alert Schemas
+    AlertResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        orgId:
+          type: string
+          format: uuid
+        type:
+          type: string
+        severity:
+          type: string
+          enum: [LOW, MEDIUM, HIGH, CRITICAL]
+        message:
+          type: string
+        resolved:
+          type: boolean
+        details:
+          type: object
+        createdAt:
+          type: string
+          format: date-time
+
+    AlertListResponse:
+      type: object
+      properties:
+        alerts:
+          type: array
+          items:
+            $ref: '#/components/schemas/AlertResponse'
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+
+    WebhookResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+        enabled:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    # Access Group Schemas
+    AccessGroupResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    AccessGroupListResponse:
+      type: object
+      properties:
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccessGroupResponse'
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+
+    # Delta Token Schemas
+    DeltaTokenResponse:
+      type: object
+      properties:
+        resource_id:
+          type: string
+        folder_id:
+          type: string
+        delta_token:
+          type: string
+        last_updated:
+          type: string
+          format: date-time
+
+    DeltaTokenRequest:
+      type: object
+      required:
+        - resource_id
+        - delta_token
+      properties:
+        resource_id:
+          type: string
+        folder_id:
+          type: string
+        delta_token:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+
+    # Progress Schemas
+    ResourceProgress:
+      type: object
+      properties:
+        resource_id:
+          type: string
+        status:
+          type: string
+        progress_pct:
+          type: number
+        total_bytes:
+          type: integer
+        processed_bytes:
+          type: integer
+        total_items:
+          type: integer
+        processed_items:
+          type: integer
+        last_backup_at:
+          type: string
+          format: date-time
+        job_id:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        eta_seconds:
+          type: integer
+
+    # Audit Schemas
+    AuditEventCreateRequest:
+      type: object
+      required:
+        - action
+        - tenant_id
+        - org_id
+      properties:
+        action:
+          type: string
+          example: "BACKUP_COMPLETED"
+        tenant_id:
+          type: string
+          format: uuid
+        org_id:
+          type: string
+          format: uuid
+        actor_type:
+          type: string
+          enum: [SYSTEM, USER, WORKER]
+        actor_id:
+          type: string
+          format: uuid
+        actor_email:
+          type: string
+        resource_id:
+          type: string
+          format: uuid
+        resource_type:
+          type: string
+          enum: [MAILBOX, ONEDRIVE, SHAREPOINT, TEAMS, ENTRA_USER, ENTRA_GROUP]
+        resource_name:
+          type: string
+        outcome:
+          type: string
+          enum: [SUCCESS, FAILURE, PARTIAL]
+        job_id:
+          type: string
+          format: uuid
+        snapshot_id:
+          type: string
+          format: uuid
+        details:
+          type: object
+
+    AuditEventResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        orgId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        actorId:
+          type: string
+        actorEmail:
+          type: string
+        actorType:
+          type: string
+        action:
+          type: string
+        resourceId:
+          type: string
+        resourceType:
+          type: string
+        outcome:
+          type: string
+        jobId:
+          type: string
+        details:
+          type: object
+        occurredAt:
+          type: string
+          format: date-time
+
+    # Search Schemas
+    SearchResponse:
+      type: object
+      properties:
+        query:
+          type: string
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              itemType:
+                type: string
+              name:
+                type: string
+              content:
+                type: string
+              snippet:
+                type: string
+              score:
+                type: number
+        totalResults:
+          type: integer
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        totalPages:
+          type: integer
+        filters:
+          type: object
+
+security:
+  - BearerAuth: []
