@@ -165,6 +165,46 @@ class BackupWorker:
         elif resource_id:
             await self._process_single_backup(job_id, message, resource_id)
 
+    # ==================== Single Backup ====================
+
+    async def _process_single_backup(self, job_id: uuid.UUID, message: Dict, resource_id: str):
+        """Process a backup for a single resource"""
+        async with async_session_factory() as session:
+            resource = await session.get(Resource, uuid.UUID(resource_id))
+            if not resource:
+                return
+
+            tenant = resource.tenant if hasattr(resource, 'tenant') else None
+            if not tenant:
+                result = await session.execute(
+                    select(Tenant).where(Tenant.id == resource.tenant_id)
+                )
+                tenant = result.scalar_one_or_none()
+
+            if not tenant:
+                return
+
+            graph_client = await self.get_graph_client(tenant)
+            if not graph_client:
+                return
+
+            snapshot = await self.create_snapshot(resource, message, job_id)
+
+            # Route to appropriate handler
+            resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
+            handlers = {
+                "MAILBOX": self.backup_mailbox,
+                "SHARED_MAILBOX": self.backup_mailbox,
+                "ONEDRIVE": self.backup_onedrive,
+                "SHAREPOINT_SITE": self.backup_sharepoint,
+            }
+
+            handler = handlers.get(resource_type, self._backup_metadata_only)
+            result = await handler(graph_client, resource, snapshot, tenant, message)
+
+            await self.update_job_status(session, job_id, JobStatus.COMPLETED, result)
+            await self.update_resource_backup_info(session, resource, job_id, snapshot.id)
+
     # ==================== Mass Backup (Parallel) ====================
 
     async def _process_mass_backup(self, job_id: uuid.UUID, message: Dict, resource_ids: List[str]):
@@ -593,6 +633,93 @@ class BackupWorker:
             bytes_added = len(content_bytes)
 
         return {"item_count": item_count, "bytes_added": bytes_added}
+
+    # ==================== Single Resource Backup Handlers ====================
+
+    async def backup_mailbox(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
+                             tenant: Tenant, message: Dict) -> Dict:
+        """Backup a single mailbox"""
+        delta_token = (resource.extra_data or {}).get("mail_delta_token")
+        messages = await graph_client.get_messages_delta(resource.external_id, delta_token)
+        items = messages.get("value", [])
+
+        item_count = 0
+        bytes_added = 0
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "mailbox")
+
+        for msg in items[:1000]:
+            msg_id = msg.get("id", str(uuid.uuid4()))
+            content_bytes = json.dumps(msg).encode()
+            blob_path = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id), msg_id
+            )
+            result = await upload_blob_with_retry(container, blob_path, content_bytes, shard, max_retries=3)
+            if result.get("success"):
+                item_count += 1
+                bytes_added += len(content_bytes)
+
+        new_delta = messages.get("@odata.deltaLink")
+        if new_delta:
+            resource.extra_data = resource.extra_data or {}
+            resource.extra_data["mail_delta_token"] = new_delta
+
+        return {"item_count": item_count, "bytes_added": bytes_added, "new_delta_token": new_delta}
+
+    async def backup_onedrive(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
+                              tenant: Tenant, message: Dict) -> Dict:
+        """Backup a single OneDrive"""
+        delta_token = (resource.extra_data or {}).get("delta_token")
+        files = await graph_client.get_drive_items_delta(resource.external_id, delta_token)
+        items = files.get("value", [])
+
+        file_tasks = [
+            self.backup_single_file(resource, tenant, snapshot, f, graph_client, None)
+            for f in items[:500]
+        ]
+        file_results = await asyncio.gather(*file_tasks, return_exceptions=True)
+
+        total_items = sum(1 for r in file_results if isinstance(r, dict) and r.get("success"))
+        total_bytes = sum(r.get("size", 0) for r in file_results if isinstance(r, dict))
+
+        new_delta = files.get("@odata.deltaLink")
+        if new_delta:
+            resource.extra_data = resource.extra_data or {}
+            resource.extra_data["delta_token"] = new_delta
+
+        return {"item_count": total_items, "bytes_added": total_bytes, "new_delta_token": new_delta}
+
+    async def backup_sharepoint(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
+                                tenant: Tenant, message: Dict) -> Dict:
+        """Backup a single SharePoint site"""
+        delta_token = (resource.extra_data or {}).get("delta_token")
+        files = await graph_client.get_sharepoint_site_drives(resource.external_id, delta_token)
+        items = files.get("value", [])
+
+        file_tasks = [
+            self.backup_single_file(resource, tenant, snapshot, f, graph_client, None)
+            for f in items[:500]
+        ]
+        file_results = await asyncio.gather(*file_tasks, return_exceptions=True)
+
+        total_items = sum(1 for r in file_results if isinstance(r, dict) and r.get("success"))
+        total_bytes = sum(r.get("size", 0) for r in file_results if isinstance(r, dict))
+
+        new_delta = files.get("@odata.deltaLink")
+        if new_delta:
+            resource.extra_data = resource.extra_data or {}
+            resource.extra_data["delta_token"] = new_delta
+
+        return {"item_count": total_items, "bytes_added": total_bytes, "new_delta_token": new_delta}
+
+    async def update_resource_backup_info(self, session: AsyncSession, resource: Resource,
+                                          job_id: uuid.UUID, snapshot_id: uuid.UUID):
+        """Update resource with last backup information"""
+        resource.last_backup_job_id = job_id
+        resource.last_backup_at = datetime.utcnow()
+        resource.last_backup_status = "COMPLETED"
+        session.merge(resource)
+        await session.commit()
 
     # ==================== Helpers ====================
 
