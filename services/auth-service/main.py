@@ -8,7 +8,7 @@ import secrets
 
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import select, String
 
 from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession
@@ -77,8 +77,8 @@ async def get_azure_datasource_url(state: Optional[str] = Query(None)):
         "scope": "https://management.azure.com/.default openid",
         "state": csrf_state,
     }
-    # Use "organizations" to allow multi-tenant sign-in
-    auth_url = f"{settings.DATASOURCE_AUTH_URL}?{urlencode(params)}"
+    # Azure ARM requires specific tenant ID, not "organizations"
+    auth_url = f"{settings.MICROSOFT_AUTH_URL}?{urlencode(params)}"
     return MicrosoftAuthUrlResponse(url=auth_url, state=csrf_state)
 
 
@@ -257,10 +257,10 @@ async def azure_datasource_callback(
     current_user: dict = Depends(get_current_user_from_token),
     db: AsyncSession = Depends(get_db),
 ):
-    # Exchange code for tokens
+    # Exchange code for tokens (Azure ARM scope)
     async with httpx.AsyncClient() as client:
         token_response = await client.post(
-            settings.DATASOURCE_TOKEN_URL,
+            settings.MICROSOFT_TOKEN_URL,
             data={
                 "client_id": settings.MICROSOFT_CLIENT_ID,
                 "client_secret": settings.MICROSOFT_CLIENT_SECRET,
@@ -272,24 +272,64 @@ async def azure_datasource_callback(
         token_response.raise_for_status()
         tokens = token_response.json()
 
-        # Get user info from Graph API
-        me_response = await client.get(
-            "https://graph.microsoft.com/v1.0/me",
-            headers={"Authorization": f"Bearer {tokens['access_token']}"},
-        )
-        me_response.raise_for_status()
-        me_data = me_response.json()
-
-    # Use user's email as the datasource display name
-    display_name = me_data.get("mail") or me_data.get("userPrincipalName") or "Azure Tenant"
-    external_tenant_id = me_data.get("tenantId") or me_data.get("id")
+        # Get user info from Graph API (need to use the same token - if it has Graph scopes it will work)
+        # If the token is only for ARM, we need to decode the JWT to get user info
+        from jose import jwt
+        from jose.exceptions import JWTError
+        
+        # Try to decode the access token to get user info
+        display_name = "Azure Tenant"
+        external_tenant_id = None
+        
+        try:
+            # Decode JWT without verification to extract claims
+            decoded = jwt.decode(tokens.get("access_token", ""), key="", algorithms=["RS256", "HS256"], options={"verify_signature": False, "verify_aud": False})
+            display_name = decoded.get("name") or decoded.get("unique_name") or decoded.get("email") or "Azure Tenant"
+            external_tenant_id = decoded.get("tid")  # Azure AD tenant ID
+            
+            if not external_tenant_id:
+                # Try calling Azure ARM to get subscription info
+                arm_response = await client.get(
+                    "https://management.azure.com/subscriptions?api-version=2022-12-01",
+                    headers={"Authorization": f"Bearer {tokens['access_token']}"},
+                )
+                if arm_response.status_code == 200:
+                    arm_data = arm_response.json()
+                    if arm_data.get("value"):
+                        # Use first subscription's tenant ID
+                        external_tenant_id = arm_data["value"][0].get("tenantId")
+                        display_name = f"Azure - {arm_data['value'][0].get('displayName', 'Subscription')}"
+        except JWTError:
+            # If JWT decode fails, try ARM API
+            try:
+                arm_response = await client.get(
+                    "https://management.azure.com/subscriptions?api-version=2022-12-01",
+                    headers={"Authorization": f"Bearer {tokens['access_token']}"},
+                )
+                if arm_response.status_code == 200:
+                    arm_data = arm_response.json()
+                    if arm_data.get("value"):
+                        external_tenant_id = arm_data["value"][0].get("tenantId")
+                        display_name = f"Azure - {arm_data['value'][0].get('displayName', 'Subscription')}"
+            except Exception:
+                pass
 
     # Check if Azure tenant already exists for this org
     org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
-    stmt = select(Tenant).where(
-        Tenant.type == TenantType.AZURE,
-        Tenant.org_id == org_id,
-    )
+    
+    # Use external_tenant_id if available, otherwise just check by org
+    # Cast Tenant.type to string to avoid enum type mismatch in SQL
+    if external_tenant_id:
+        stmt = select(Tenant).where(
+            Tenant.type.cast(String) == "AZURE",
+            Tenant.external_tenant_id == external_tenant_id,
+        )
+    else:
+        stmt = select(Tenant).where(
+            Tenant.type.cast(String) == "AZURE",
+            Tenant.org_id == org_id,
+        )
+    
     result = await db.execute(stmt)
     tenant = result.scalar_one_or_none()
 
