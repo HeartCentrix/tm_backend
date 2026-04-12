@@ -127,6 +127,7 @@ class Tenant(Base):
     type = Column(SAEnum(TenantType), default=TenantType.M365)
     display_name = Column(String, nullable=False)
     external_tenant_id = Column(String)
+    customer_id = Column(String)  # Internal Afi-generated customer ID (UUID-like)
     subscription_id = Column(String)
     client_id = Column(String)
     client_secret_ref = Column(String)

@@ -104,6 +104,7 @@ class TenantResponse(BaseModel):
     orgId: Optional[str] = None
     type: Optional[str] = None
     externalTenantId: Optional[str] = None
+    customerId: Optional[str] = None
     status: str
     storageRegion: Optional[str] = None
     lastDiscoveryAt: Optional[str] = None
@@ -115,6 +116,24 @@ class TenantCreateRequest(BaseModel):
     organizationId: str
     microsoftTenantId: str
     connectionDetails: Optional[dict] = None
+
+
+class TenantInfoResponse(BaseModel):
+    """Response for tenant info page (Customer ID, Tenant ID, Region)"""
+    customerId: str
+    tenantId: str
+    region: str
+
+
+class UsageReportEntry(BaseModel):
+    """Single entry in the usage report"""
+    resourceId: str
+    resourceName: str
+    resourceKind: str
+    sla: str
+    isActive: str
+    backupSizeGB: float
+    dailySizes: dict  # date -> size in GB
 
 
 class DiscoveryStatus(BaseModel):

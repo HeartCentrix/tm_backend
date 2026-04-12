@@ -100,6 +100,8 @@ async def dashboard(request: Request):
 # Tenant routes
 @app.get("/api/v1/tenants")
 @app.get("/api/v1/tenants/{tenant_id}")
+@app.get("/api/v1/tenants/{tenant_id}/info")
+@app.get("/api/v1/tenants/{tenant_id}/usage-report")
 @app.post("/api/v1/tenants")
 @app.put("/api/v1/tenants/{tenant_id}")
 @app.delete("/api/v1/tenants/{tenant_id}")

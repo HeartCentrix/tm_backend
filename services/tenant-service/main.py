@@ -2,16 +2,18 @@
 from contextlib import asynccontextmanager
 from typing import Optional
 from uuid import UUID, uuid4
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import csv
+import io
 
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Response
 from sqlalchemy import select, func
 
 from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Tenant, TenantType, TenantStatus, Organization, Resource, ResourceStatus, ResourceType
+from shared.models import Tenant, TenantType, TenantStatus, Organization, Resource, ResourceStatus, ResourceType, SlaPolicy
 from shared.schemas import (
-    TenantResponse, TenantCreateRequest, DiscoveryStatus,
+    TenantResponse, TenantCreateRequest, DiscoveryStatus, TenantInfoResponse,
     StorageSummaryItem, OrganizationResponse
 )
 from shared.graph_client import GraphClient
@@ -105,6 +107,7 @@ async def list_tenants(
             orgId=str(t.org_id) if t.org_id else None,
             type=t.type.value if t.type else None,
             externalTenantId=t.external_tenant_id,
+            customerId=t.customer_id,
             status=t.status.value if t.status else "PENDING",
             storageRegion=t.storage_region,
             lastDiscoveryAt=t.last_discovery_at.isoformat() if t.last_discovery_at else None,
@@ -138,6 +141,7 @@ async def create_tenant(request: TenantCreateRequest, db: AsyncSession = Depends
         type=TenantType.M365,
         display_name=request.name,
         external_tenant_id=request.microsoftTenantId,
+        customer_id=str(uuid4()),  # Auto-generate customer ID
         status=TenantStatus.PENDING,
     )
     db.add(tenant)
@@ -289,4 +293,140 @@ async def get_org(org_id: str, db: AsyncSession = Depends(get_db)):
         status="ACTIVE",
         tenantCount=0,
         createdAt=org.created_at.isoformat() if org.created_at else "",
+    )
+
+
+@app.get("/api/v1/tenants/{tenant_id}/info", response_model=TenantInfoResponse)
+async def get_tenant_info(tenant_id: str, db: AsyncSession = Depends(get_db)):
+    """Get tenant info for the settings info page (Customer ID, Tenant ID, Region)"""
+    stmt = select(Tenant).where(Tenant.id == UUID(tenant_id))
+    result = await db.execute(stmt)
+    tenant = result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    
+    # Generate customer_id if it doesn't exist
+    if not tenant.customer_id:
+        tenant.customer_id = str(uuid4())
+        await db.flush()
+    
+    # Map region code to human-readable name
+    region_map = {
+        "AU": "Australia",
+        "US": "United States",
+        "EU": "Europe",
+        "UK": "United Kingdom",
+        "CA": "Canada",
+        "DE": "Germany",
+        "FR": "France",
+        "JP": "Japan",
+        "IN": "India",
+        "BR": "Brazil",
+    }
+    
+    region_code = tenant.storage_region or "US"
+    region_name = region_map.get(region_code, region_code)
+    
+    return TenantInfoResponse(
+        customerId=tenant.customer_id,
+        tenantId=tenant.external_tenant_id or tenant_id,
+        region=region_name,
+    )
+
+
+@app.get("/api/v1/tenants/{tenant_id}/usage-report")
+async def download_usage_report(tenant_id: str, db: AsyncSession = Depends(get_db)):
+    """Download usage report as CSV for the tenant"""
+    stmt = select(Tenant).where(Tenant.id == UUID(tenant_id))
+    result = await db.execute(stmt)
+    tenant = result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    
+    # Get all resources for this tenant
+    resource_stmt = select(Resource).where(Resource.tenant_id == UUID(tenant_id))
+    resource_result = await db.execute(resource_stmt)
+    resources = resource_result.scalars().all()
+    
+    # Get SLA policies for mapping
+    policy_stmt = select(SlaPolicy).where(SlaPolicy.tenant_id == UUID(tenant_id))
+    policy_result = await db.execute(policy_stmt)
+    policies = {str(p.id): p.name for p in policy_result.scalars().all()}
+    
+    # Generate dates for the last 12 days (including today)
+    today = datetime.now(timezone.utc).replace(tzinfo=None)
+    dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(11, -1, -1)]
+    
+    # Map resource types to human-readable kinds
+    type_map = {
+        ResourceType.MAILBOX: "User",
+        ResourceType.SHARED_MAILBOX: "Shared Mailbox",
+        ResourceType.ONEDRIVE: "OneDrive",
+        ResourceType.SHAREPOINT_SITE: "SharePoint site",
+        ResourceType.TEAMS_CHANNEL: "Team Channel",
+        ResourceType.TEAMS_CHAT: "Teams Chat",
+        ResourceType.ENTRA_USER: "User",
+        ResourceType.ENTRA_GROUP: "Microsoft 365 group",
+        ResourceType.ENTRA_APP: "App",
+        ResourceType.ENTRA_DEVICE: "Device",
+    }
+    
+    # Create CSV in memory
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Header row with report date
+    writer.writerow(["Report date:", today.strftime("%b %d %Y")])
+    writer.writerow([])  # Empty row
+    
+    # Column headers
+    headers = [
+        "Resource ID",
+        "Resource name",
+        "Resource kind",
+        "SLA",
+        "Is active",
+        "Backup Size, GB (current)",
+    ] + dates
+    writer.writerow(headers)
+    
+    # Data rows
+    for resource in resources:
+        # Determine resource kind
+        resource_kind = type_map.get(resource.type, "Unknown")
+        
+        # Determine SLA
+        sla_name = "Not protected"
+        if resource.sla_policy_id:
+            sla_name = policies.get(str(resource.sla_policy_id), "Manual")
+        
+        # Determine active status
+        is_active = "active" if resource.status == ResourceStatus.ACTIVE else "archived"
+        
+        # Calculate backup size in GB
+        backup_size_gb = resource.storage_bytes / (1024 ** 3) if resource.storage_bytes else 0.0
+        
+        # Row data
+        row = [
+            str(resource.id),
+            resource.display_name,
+            resource_kind,
+            sla_name,
+            is_active,
+            f"{backup_size_gb:.1f}",
+        ] + [f"{backup_size_gb:.1f}" for _ in dates]  # Same size for all dates (simplified)
+        
+        writer.writerow(row)
+    
+    # Get CSV content
+    csv_content = output.getvalue()
+    output.close()
+    
+    # Generate filename
+    filename = f"{tenant.display_name.replace(' ', '_')}_report_{today.strftime('%b-%d-%Y')}.csv"
+    
+    return Response(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
