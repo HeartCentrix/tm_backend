@@ -11,7 +11,7 @@ from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy import select, String
 
 from shared.config import settings
-from shared.database import get_db, init_db, close_db, AsyncSession
+from shared.database import get_db, init_db, close_db, AsyncSession, async_session_factory
 from shared.models import PlatformUser, UserRoleMapping, Organization, UserRole, Tenant, TenantType, TenantStatus
 from shared.security import create_access_token, create_refresh_token, decode_token, get_current_user_from_token
 from shared.schemas import (
