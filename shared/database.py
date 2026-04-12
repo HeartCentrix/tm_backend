@@ -86,7 +86,7 @@ async def init_db():
         await conn.execute(text("ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_SERVICE_PRINCIPAL';"))
         await conn.execute(text("ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'PARTIAL';"))
 
-        # 1. Organizations
+        # ── CREATE TABLE IF NOT EXISTS (13 tables + indexes) ──
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS organizations (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -363,10 +363,11 @@ async def init_db():
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_org ON audit_events(org_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_resource ON audit_events(resource_id)"))
 
-        # ── Convert VARCHAR columns to enum types (idempotent) ──
+        # ── Convert VARCHAR columns to enum types (each in its own top-level transaction) ──
+        # These use separate engine.begin() calls so one failure doesn't abort others
         alter_statements = [
-            """ALTER TABLE tenants ALTER COLUMN type TYPE tenanttype USING type::tenanttype;""",
-            """ALTER TABLE tenants ALTER COLUMN status TYPE tenantstatus USING status::tenantstatus;""",
+            """ALTER TABLE tenants ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE tenanttype USING type::tenanttype, ALTER COLUMN type SET DEFAULT 'M365'::tenanttype;""",
+            """ALTER TABLE tenants ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE tenantstatus USING status::tenantstatus, ALTER COLUMN status SET DEFAULT 'PENDING'::tenantstatus;""",
             """ALTER TABLE resources ALTER COLUMN type TYPE resourcetype USING type::resourcetype;""",
             """ALTER TABLE resources ALTER COLUMN status TYPE resourcestatus USING status::resourcestatus;""",
             """ALTER TABLE jobs ALTER COLUMN type TYPE jobtype USING type::jobtype;""",
@@ -377,7 +378,9 @@ async def init_db():
         ]
         for stmt in alter_statements:
             try:
-                await conn.execute(text(stmt))
+                async with engine.begin() as ac:
+                    await ac.execute(text(f"SET search_path TO {settings.DB_SCHEMA};"))
+                    await ac.execute(text(stmt))
             except Exception:
                 pass  # Already converted or column doesn't exist
 
