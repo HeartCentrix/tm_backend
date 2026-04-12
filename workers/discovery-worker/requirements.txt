@@ -4,4 +4,6 @@ asyncpg==0.29.0
 httpx==0.26.0
 pydantic-settings==2.1.0
 python-dotenv==1.0.0
-aio-pika>=9.3
+aio-pika==9.4.0
+cryptography==42.0.2
+python-jose==3.3.0

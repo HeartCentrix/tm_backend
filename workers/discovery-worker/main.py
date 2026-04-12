@@ -15,7 +15,6 @@ from typing import Dict, Any
 import aio_pika
 from aio_pika import IncomingMessage
 from sqlalchemy import select, text
-from sqlalchemy.dialects.postgresql import insert
 
 from shared.config import settings
 from shared.database import async_session_factory, init_db
@@ -44,7 +43,6 @@ TYPE_MAP: Dict[str, ResourceType] = {
     "ENTRA_GROUP": ResourceType.ENTRA_GROUP,
     "ENTRA_APP": ResourceType.ENTRA_APP,
     "ENTRA_DEVICE": ResourceType.ENTRA_DEVICE,
-    "ENTRA_SERVICE_PRINCIPAL": ResourceType.ENTRA_SERVICE_PRINCIPAL,
 }
 
 
@@ -93,31 +91,39 @@ async def discover_tenant(tenant_id: UUID) -> int:
             for r in resources:
                 rtype_str = r.get("type", "ENTRA_USER")
                 rtype = TYPE_MAP.get(rtype_str, ResourceType.ENTRA_USER)
+                ext_id = r["external_id"]
 
-                # Upsert using ON CONFLICT for idempotency
-                insert_stmt = (
-                    insert(Resource)
-                    .values(
+                # Check if resource already exists (same tenant + type + external_id)
+                existing = await db.execute(
+                    select(Resource).where(
+                        Resource.tenant_id == tenant.id,
+                        Resource.type == rtype,
+                        Resource.external_id == ext_id,
+                    )
+                )
+                existing_resource = existing.scalar_one_or_none()
+
+                if existing_resource is None:
+                    # Insert new resource
+                    resource = Resource(
+                        id=uuid.uuid4(),
                         tenant_id=tenant.id,
                         type=rtype,
-                        external_id=r["external_id"],
+                        external_id=ext_id,
                         display_name=r.get("display_name", "Unknown"),
                         email=r.get("email"),
                         metadata=r.get("metadata", {}),
                         status=ResourceStatus.DISCOVERED,
                         discovered_at=datetime.now(timezone.utc).replace(tzinfo=None),
                     )
-                    .on_conflict_do_update(
-                        constraint="uq_resources_tenant_type_external",
-                        set_=dict(
-                            display_name=text("EXCLUDED.display_name"),
-                            email=text("EXCLUDED.email"),
-                            metadata=text("EXCLUDED.metadata"),
-                            discovered_at=text("NOW()"),
-                        ),
-                    )
-                )
-                await db.execute(insert_stmt)
+                    db.add(resource)
+                else:
+                    # Update existing resource
+                    existing_resource.display_name = r.get("display_name", existing_resource.display_name)
+                    existing_resource.email = r.get("email") or existing_resource.email
+                    existing_resource.metadata = r.get("metadata", existing_resource.metadata)
+                    existing_resource.discovered_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
                 count += 1
 
             tenant.status = TenantStatus.ACTIVE
@@ -151,7 +157,21 @@ async def handle_discovery_message(message: Dict[str, Any]):
 
 async def consume_discovery_queue():
     """Consume messages from discovery.m365 queue."""
-    await message_bus.connect()
+    # Retry connecting to RabbitMQ
+    max_retries = 30
+    for attempt in range(max_retries):
+        try:
+            await message_bus.connect()
+            if message_bus.channel:
+                break
+            raise RuntimeError("Channel is None after connect")
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning("[discovery-worker] RabbitMQ not ready (attempt %d/%d): %s", attempt + 1, max_retries, e)
+                await asyncio.sleep(5)
+            else:
+                logger.error("[discovery-worker] Failed to connect to RabbitMQ after %d attempts", max_retries)
+                raise
 
     queue = await message_bus.channel.get_queue("discovery.m365")
     logger.info("[discovery-worker] Listening on discovery.m365...")
@@ -160,22 +180,31 @@ async def consume_discovery_queue():
         async for message in queue_iter:
             try:
                 body = json.loads(message.body.decode())
-                await handle_discovery_message(body)
+                tenant_id = UUID(body["tenantId"])
+                logger.info(
+                    "[discovery-worker] Consumed discovery.m365 for tenant %s (jobId=%s)",
+                    tenant_id, body.get("jobId"),
+                )
+                # Process discovery and commit within this message scope
+                result_count = await discover_tenant(tenant_id)
+                # ONLY ack after successful DB commit
                 await message.ack()
+                logger.info(
+                    "[discovery-worker] Discovery complete for tenant %s: %d resources upserted, message acked",
+                    tenant_id, result_count,
+                )
             except Exception as e:
-                logger.error("[discovery-worker] Error processing discovery message: %s", e)
-                import traceback
-                traceback.print_exc()
+                logger.exception("[discovery-worker] Error processing discovery message: %s", e)
                 try:
                     headers = message.headers or {}
-                    delivery_count = headers.get("x-delivery-count", 0)
-                    if delivery_count < 5:
-                        await message.reject(requeue=True)
-                    else:
+                    retry_count = int(headers.get("x-retry-count", 0))
+                    if retry_count >= 5:
                         logger.error(
-                            "[discovery-worker] Message exceeded max retries, routing to DLQ"
+                            "[discovery-worker] Message exceeded max retries (5), routing to DLQ"
                         )
-                        await message.reject(requeue=False)
+                        await message.reject(requeue=False)  # goes to DLQ
+                    else:
+                        await message.nack(requeue=True)
                 except Exception:
                     pass
 

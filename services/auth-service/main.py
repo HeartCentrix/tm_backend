@@ -287,13 +287,15 @@ async def datasource_callback(
     await db.commit()
 
     # 5. PUBLISH DISCOVERY JOB — critical missing step
+    # Uses canonical signature: publish(routing_key: str, message: Dict, priority: int = 5)
+    # Matching: services/job-service/main.py:200, services/backup-scheduler/main.py:226
     from shared.message_bus import message_bus as msg_bus
     if not msg_bus.connection:
         await msg_bus.connect()
 
-    await msg_bus.publish(
-        "discovery.m365",
-        message={
+    discovery_status = "queued"
+    try:
+        discovery_message = {
             "jobId": str(uuid4()),
             "tenantId": str(tenant_id),
             "externalTenantId": external_tenant_id,
@@ -301,16 +303,27 @@ async def datasource_callback(
                                "onedrive", "sharepoint", "teams"],
             "triggeredBy": str(current_user["id"]),
             "triggeredAt": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
-        },
-        priority=5,
-    )
-
-    print(f"[auth-service] Published discovery.m365 for tenant {tenant_id} ({display_name})")
+        }
+        print(f"[auth-service] Publishing discovery.m365 for tenant {tenant_id} ({display_name})")
+        await msg_bus.publish("discovery.m365", discovery_message, priority=5)
+        print(f"[auth-service] Published discovery.m365 successfully for tenant {tenant_id}")
+    except Exception as e:
+        import logging
+        logging.getLogger("auth-service").exception(
+            "Failed to publish discovery.m365 for tenant %s", tenant_id
+        )
+        # Mark tenant so a reconciler job picks it up
+        async with async_session_factory() as retry_session:
+            retry_tenant = await retry_session.get(Tenant, tenant_id)
+            if retry_tenant:
+                retry_tenant.status = TenantStatus.PENDING_DISCOVERY
+                await retry_session.commit()
+        discovery_status = "queue_failed_will_retry"
 
     return DatasourceCallbackResponse(
         tenantId=str(tenant_id),
         tenantName=display_name,
-        discoveryStatus="queued",
+        discoveryStatus=discovery_status,
     )
 
 

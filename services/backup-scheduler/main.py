@@ -124,6 +124,9 @@ async def startup():
 
     scheduler.start()
 
+    # Start discovery reconciler (runs every 5 min, independent of APScheduler)
+    await start_reconciler_loop()
+
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -990,6 +993,64 @@ async def send_violations_to_alert_service(violations: List[Dict]):
                 })
     except Exception as e:
         print(f"[SLA] Failed to send violations to alert-service: {e}")
+
+
+async def reconcile_pending_discovery():
+    """
+    Reconciler job: runs every 5 minutes.
+    Finds tenants stuck in PENDING_DISCOVERY for >10 minutes and re-enqueues discovery.
+    """
+    from shared.message_bus import message_bus
+    from shared.models import TenantStatus
+
+    try:
+        cutoff = datetime.utcnow() - timedelta(minutes=10)
+        async with async_session_factory() as session:
+            stmt = select(Tenant).where(
+                Tenant.status == TenantStatus.PENDING_DISCOVERY,
+                Tenant.updated_at < cutoff,
+            )
+            result = await session.execute(stmt)
+            pending_tenants = result.scalars().all()
+
+            if not pending_tenants:
+                return
+
+            for tenant in pending_tenants:
+                try:
+                    print(f"[RECONCILER] Re-enqueueing discovery for tenant {tenant.id} ({tenant.display_name})")
+                    if not message_bus.connection:
+                        await message_bus.connect()
+                    await message_bus.publish("discovery.m365", {
+                        "jobId": str(uuid.uuid4()),
+                        "tenantId": str(tenant.id),
+                        "externalTenantId": tenant.external_tenant_id,
+                        "discoveryScope": ["users", "groups", "mailboxes", "shared_mailboxes",
+                                           "onedrive", "sharepoint", "teams"],
+                        "triggeredBy": "RECONCILER",
+                        "triggeredAt": datetime.utcnow().isoformat(),
+                    }, priority=5)
+                    tenant.status = TenantStatus.DISCOVERING
+                    await session.commit()
+                    print(f"[RECONCILER] Discovery re-enqueued for tenant {tenant.id}")
+                except Exception as e:
+                    print(f"[RECONCILER] Failed to re-enqueue discovery for tenant {tenant.id}: {e}")
+                    await session.rollback()
+    except Exception as e:
+        print(f"[RECONCILER] Reconciler error: {e}")
+
+
+async def start_reconciler_loop():
+    """Start reconciler background task (runs every 5 minutes)."""
+    async def _reconciler():
+        while True:
+            await asyncio.sleep(300)  # 5 minutes
+            try:
+                await reconcile_pending_discovery()
+            except Exception as e:
+                print(f"[RECONCILER] Reconciler loop error: {e}")
+
+    asyncio.create_task(_reconciler())
 
 
 if __name__ == "__main__":

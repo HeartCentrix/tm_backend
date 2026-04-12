@@ -38,6 +38,7 @@ class TenantStatus(str, enum.Enum):
     SUSPENDED = "SUSPENDED"
     PENDING_DELETION = "PENDING_DELETION"
     DISCOVERING = "DISCOVERING"
+    PENDING_DISCOVERY = "PENDING_DISCOVERY"  # Tenant saved but discovery not yet enqueued
 
 
 class ResourceType(str, enum.Enum):
