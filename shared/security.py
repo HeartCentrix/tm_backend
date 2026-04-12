@@ -3,13 +3,49 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 
 from shared.config import settings
 
 security = HTTPBearer()
+
+
+# ==================== Secret Encryption ====================
+
+def _get_fernet() -> Fernet:
+    """Get Fernet cipher instance from ENCRYPTION_KEY env var."""
+    key = settings.ENCRYPTION_KEY
+    if not key:
+        # Generate a deterministic key from JWT_SECRET as fallback (dev only)
+        import hashlib
+        import base64
+        raw = hashlib.sha256((settings.JWT_SECRET or "dev-fallback-key-never-use-in-prod").encode()).digest()
+        key = base64.urlsafe_b64encode(raw).decode()
+    # Ensure key is valid Fernet key (base64-encoded 32 bytes)
+    try:
+        return Fernet(key.encode() if isinstance(key, str) else key)
+    except Exception:
+        raise RuntimeError("Invalid ENCRYPTION_KEY. Must be a base64-encoded 32-byte key.")
+
+
+def encrypt_secret(plaintext: str) -> bytes:
+    """Encrypt a secret string using Fernet symmetric encryption.
+    
+    Returns ciphertext as bytes.
+    """
+    f = _get_fernet()
+    return f.encrypt(plaintext.encode('utf-8'))
+
+
+def decrypt_secret(ciphertext: bytes) -> str:
+    """Decrypt a previously encrypted secret string.
+    
+    Returns the original plaintext string.
+    """
+    f = _get_fernet()
+    return f.decrypt(ciphertext).decode('utf-8')
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:

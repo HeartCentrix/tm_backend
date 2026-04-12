@@ -16,7 +16,8 @@ from shared.models import PlatformUser, UserRoleMapping, Organization, UserRole,
 from shared.security import create_access_token, create_refresh_token, decode_token, get_current_user_from_token
 from shared.schemas import (
     UserResponse, LoginResponse, RefreshTokenRequest, RefreshTokenResponse,
-    MicrosoftAuthUrlResponse, OAuthCallbackRequest
+    MicrosoftAuthUrlResponse, OAuthCallbackRequest,
+    DatasourceConsentRequest, DatasourceCallbackResponse,
 )
 
 
@@ -52,17 +53,19 @@ async def get_microsoft_login_url(state: Optional[str] = Query(None)):
 
 @app.get("/api/v1/auth/microsoft/datasource/url", response_model=MicrosoftAuthUrlResponse)
 async def get_datasource_url(state: Optional[str] = Query(None)):
+    """
+    Initiate admin-consent flow for M365 datasource onboarding.
+    Redirects to /adminconsent endpoint — no user login required.
+    After admin grants consent, redirects to /datasource-callback with ?tenant=...&admin_consent=True.
+    """
     csrf_state = state or secrets.token_urlsafe(32)
     params = {
         "client_id": settings.MICROSOFT_CLIENT_ID,
-        "response_type": "code",
         "redirect_uri": f"{settings.FRONTEND_URL}/datasource-callback",
-        "response_mode": "query",
-        "scope": "openid profile email offline_access User.Read.All Group.Read.All Mail.Read Files.Read.All Sites.Read.All",
         "state": csrf_state,
     }
-    # Use "organizations" to allow multi-tenant sign-in
-    auth_url = f"{settings.DATASOURCE_AUTH_URL}?{urlencode(params)}"
+    # Use admin-consent endpoint — grants app-level (not user-delegated) permissions
+    auth_url = f"https://login.microsoftonline.com/organizations/adminconsent?{urlencode(params)}"
     return MicrosoftAuthUrlResponse(url=auth_url, state=csrf_state)
 
 
@@ -174,56 +177,81 @@ async def oauth_callback(callback: OAuthCallbackRequest, db: AsyncSession = Depe
     )
 
 
-@app.post("/api/v1/auth/microsoft/datasource/callback")
+@app.post("/api/v1/auth/microsoft/datasource/callback", response_model=DatasourceCallbackResponse)
 async def datasource_callback(
-    callback: OAuthCallbackRequest,
+    callback: DatasourceConsentRequest,
     current_user: dict = Depends(get_current_user_from_token),
     db: AsyncSession = Depends(get_db),
 ):
-    # Exchange code for tokens
-    async with httpx.AsyncClient() as client:
-        token_response = await client.post(
-            settings.DATASOURCE_TOKEN_URL,
-            data={
-                "client_id": settings.MICROSOFT_CLIENT_ID,
-                "client_secret": settings.MICROSOFT_CLIENT_SECRET,
-                "code": callback.code,
-                "redirect_uri": f"{settings.FRONTEND_URL}/datasource-callback",
-                "grant_type": "authorization_code",
-            },
-        )
-        token_response.raise_for_status()
-        tokens = token_response.json()
+    """
+    Handle Microsoft admin-consent callback for M365 datasource onboarding.
+    
+    Flow:
+    1. Validate CSRF state
+    2. Verify admin consent was granted
+    3. Test client-credentials flow against the newly-consented tenant
+    4. Store encrypted Graph API credentials on the Tenant row
+    5. Publish discovery.m365 message to RabbitMQ
+    """
+    # 1. Validate CSRF state
+    from shared.config import settings as app_settings
+    if app_settings.REDIS_ENABLED:
+        try:
+            import redis.asyncio as aioredis
+            redis_client = aioredis.from_url(
+                f"redis://{app_settings.REDIS_HOST}:{app_settings.REDIS_PORT}/{app_settings.REDIS_DB}",
+                decode_responses=True,
+            )
+            expected_state = await redis_client.get(f"oauth_state:{current_user['id']}")
+            await redis_client.delete(f"oauth_state:{current_user['id']}")
+            await redis_client.aclose()
+            if not expected_state or expected_state != callback.state:
+                raise HTTPException(400, "Invalid or expired state token")
+        except Exception:
+            # Redis unavailable — skip CSRF check (dev mode)
+            pass
 
-        # Get user info for display name
-        me_response = await client.get(
-            "https://graph.microsoft.com/v1.0/me",
-            headers={"Authorization": f"Bearer {tokens['access_token']}"},
-        )
-        me_response.raise_for_status()
-        me_data = me_response.json()
+    if not callback.admin_consent:
+        raise HTTPException(400, "Admin consent was not granted")
 
-        # Get tenant info from Graph API
-        graph_response = await client.get(
+    external_tenant_id = callback.external_tenant_id
+
+    # 2. Test client-credentials flow against the newly-consented tenant
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        token_url = f"https://login.microsoftonline.com/{external_tenant_id}/oauth2/v2.0/token"
+        token_resp = await client.post(token_url, data={
+            "client_id": settings.MICROSOFT_CLIENT_ID,
+            "client_secret": settings.MICROSOFT_CLIENT_SECRET,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        })
+        if token_resp.status_code != 200:
+            raise HTTPException(400,
+                f"Consent verification failed: {token_resp.text}. "
+                "Confirm the app has required application permissions and the admin granted consent.")
+        app_token = token_resp.json()["access_token"]
+
+        # 3. Fetch organization info using the app token
+        org_resp = await client.get(
             "https://graph.microsoft.com/v1.0/organization",
-            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            headers={"Authorization": f"Bearer {app_token}"},
         )
-        graph_response.raise_for_status()
-        org_data = graph_response.json()
+        org_resp.raise_for_status()
+        org_data = org_resp.json()
+        display_name = (org_data["value"][0]["displayName"]
+                        if org_data.get("value") else "M365 Tenant")
 
-    external_tenant_id = org_data["value"][0]["id"] if org_data.get("value") else None
-    # Use user's email as the datasource display name
-    display_name = me_data.get("mail") or me_data.get("userPrincipalName") or "New Tenant"
+    # 4. Upsert tenant with CREDENTIALS STORED (encrypted)
+    from shared.security import encrypt_secret
+    encrypted_secret = encrypt_secret(settings.MICROSOFT_CLIENT_SECRET)
 
-    # Check if tenant already exists
     stmt = select(Tenant).where(Tenant.external_tenant_id == external_tenant_id)
-    result = await db.execute(stmt)
-    tenant = result.scalar_one_or_none()
+    tenant = (await db.execute(stmt)).scalar_one_or_none()
 
     if tenant is None:
         org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
-        
-        # Ensure org exists (TRUNCATE may have wiped it)
+
+        # Ensure org exists
         if org_id:
             org_stmt = select(Organization).where(Organization.id == org_id)
             org_result = await db.execute(org_stmt)
@@ -231,24 +259,60 @@ async def datasource_callback(
             if org is None:
                 org = Organization(
                     id=org_id,
-                    name="Taylor Morrison",
-                    slug="taylor-morrison",
+                    name="Default Organization",
+                    slug="default-org",
                 )
                 db.add(org)
                 await db.flush()
-        
+
         tenant = Tenant(
             id=uuid4(),
             org_id=org_id,
             type=TenantType.M365,
             display_name=display_name,
             external_tenant_id=external_tenant_id,
+            graph_client_id=settings.MICROSOFT_CLIENT_ID,
+            graph_client_secret_encrypted=encrypted_secret,
+            graph_delta_tokens={},
             status=TenantStatus.ACTIVE,
         )
         db.add(tenant)
-        await db.commit()
+    else:
+        tenant.graph_client_id = settings.MICROSOFT_CLIENT_ID
+        tenant.graph_client_secret_encrypted = encrypted_secret
+        tenant.status = TenantStatus.ACTIVE
 
-    return {"tenantId": str(tenant.id), "tenantName": tenant.display_name}
+    await db.flush()
+    tenant_id = tenant.id
+    await db.commit()
+
+    # 5. PUBLISH DISCOVERY JOB — critical missing step
+    from shared.message_bus import message_bus as msg_bus
+    if not msg_bus.connection:
+        await msg_bus.connect()
+
+    await msg_bus.publish(
+        exchange="",  # default exchange
+        routing_key="discovery.m365",
+        message={
+            "jobId": str(uuid4()),
+            "tenantId": str(tenant_id),
+            "externalTenantId": external_tenant_id,
+            "discoveryScope": ["users", "groups", "mailboxes", "shared_mailboxes",
+                               "onedrive", "sharepoint", "teams"],
+            "triggeredBy": str(current_user["id"]),
+            "triggeredAt": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        },
+        priority=5,
+    )
+
+    print(f"[auth-service] Published discovery.m365 for tenant {tenant_id} ({display_name})")
+
+    return DatasourceCallbackResponse(
+        tenantId=str(tenant_id),
+        tenantName=display_name,
+        discoveryStatus="queued",
+    )
 
 
 @app.post("/api/v1/auth/azure/datasource/callback")

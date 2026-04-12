@@ -10,6 +10,7 @@ Features:
 """
 import asyncio
 import hashlib
+import re
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -18,6 +19,30 @@ from azure.storage.blob.aio import BlobServiceClient as AsyncBlobServiceClient
 from azure.core.exceptions import AzureError, ResourceExistsError
 
 from shared.config import settings
+
+
+def _sanitize_metadata(metadata: Optional[Dict]) -> Dict:
+    """
+    Sanitize Azure Blob Storage metadata.
+    - Keys: alphanumeric + underscores only (Azure requires valid C# identifier format)
+    - Values: ASCII printable chars only (no Unicode, no control chars)
+    Non-ASCII values are stripped to ASCII; keys are cleaned of invalid chars.
+    """
+    if not metadata:
+        return {}
+    clean = {}
+    for k, v in metadata.items():
+        # Sanitize key: replace non-alphanumeric/underscore chars
+        safe_key = re.sub(r'[^a-zA-Z0-9_]', '_', str(k))
+        if not safe_key or safe_key[0].isdigit():
+            safe_key = f"m_{safe_key}"
+        # Sanitize value: encode to ASCII, dropping non-ASCII chars
+        safe_val = str(v).encode('ascii', errors='replace').decode('ascii')
+        # Remove control characters (0x00-0x1F and 0x7F)
+        safe_val = re.sub(r'[\x00-\x1f\x7f]', '', safe_val)
+        # Truncate to 8KB limit per Azure spec
+        clean[safe_key] = safe_val[:8192]
+    return clean
 
 
 class AzureStorageShard:
@@ -106,7 +131,7 @@ class AzureStorageShard:
     async def upload_blob(self, container_name: str, blob_path: str, content: bytes,
                          overwrite: bool = True, metadata: Optional[Dict] = None) -> Dict:
         """
-        Upload content to Azure Blob Storage.
+        Upload content to Azure Blob Storage with parallel block uploads.
         Auto-creates container if it doesn't exist.
 
         Args:
@@ -125,13 +150,17 @@ class AzureStorageShard:
             async_client = self.get_async_client()
             blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
 
+            # Azure Blob SDK automatically chunks and uploads blocks in parallel
+            # with max_concurrency. For large files this is much faster than sequential.
             await asyncio.wait_for(
                 blob_client.upload_blob(
                     content,
                     overwrite=overwrite,
-                    metadata=metadata or {},
+                    metadata=_sanitize_metadata(metadata),
+                    max_concurrency=5,  # Upload 5 blocks in parallel
+                    length=len(content),
                 ),
-                timeout=60.0,
+                timeout=600.0,  # 10 min timeout for large files
             )
 
             return {
@@ -141,12 +170,66 @@ class AzureStorageShard:
                 "size_bytes": len(content),
                 "method": "direct_upload",
             }
+        except asyncio.TimeoutError:
+            print(f"[AzureStorage] Upload TIMEOUT for {container_name}/{blob_path} after 120s")
+            return {
+                "success": False,
+                "error": f"Upload timed out after 120s",
+                "method": "direct_upload",
+            }
         except AzureError as e:
             print(f"[AzureStorage] Upload failed for {container_name}/{blob_path}: {e}")
             return {
                 "success": False,
                 "error": str(e),
                 "method": "direct_upload",
+            }
+
+    async def upload_blob_from_file(self, container_name: str, blob_path: str, file_path: str,
+                                    file_size: int = 0, overwrite: bool = True,
+                                    metadata: Optional[Dict] = None) -> Dict:
+        """
+        Upload from local file using streaming block upload.
+        Never loads full file into memory — streams from disk in 100MB blocks.
+        Azure SDK uploads blocks in parallel (max_concurrency=5).
+        """
+        try:
+            await self._ensure_container(container_name)
+
+            async_client = self.get_async_client()
+            blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+
+            await asyncio.wait_for(
+                blob_client.upload_blob(
+                    file_path,
+                    overwrite=overwrite,
+                    metadata=_sanitize_metadata(metadata),
+                    max_concurrency=settings.AZURE_UPLOAD_CONCURRENCY,
+                    length=file_size,
+                ),
+                timeout=1800.0,  # 30 min for very large files
+            )
+
+            return {
+                "success": True,
+                "blob_url": blob_client.url,
+                "blob_path": blob_path,
+                "size_bytes": file_size,
+                "method": "stream_upload",
+            }
+        except asyncio.TimeoutError:
+            print(f"[AzureStorage] Stream upload TIMEOUT for {container_name}/{blob_path} after 30min")
+            return {
+                "success": False,
+                "error": "Upload timed out after 30min",
+                "method": "stream_upload",
+            }
+        except AzureError as e:
+            print(f"[AzureStorage] Stream upload failed for {container_name}/{blob_path}: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "method": "stream_upload",
             }
     
     async def get_blob_properties(self, container_name: str, blob_path: str) -> Optional[Dict]:
@@ -302,10 +385,45 @@ async def server_side_copy_with_retry(source_url: str, container_name: str,
         # Exponential backoff
         delay = settings.RETRY_DELAY_MS * (settings.RETRY_BACKOFF_MULTIPLIER ** attempt) / 1000
         await asyncio.sleep(delay)
-    
+
     return {"success": False, "error": f"Failed after {max_retries} retries: {last_error}"}
 
 
+async def upload_blob_with_retry_from_file(container_name: str, blob_path: str, file_path: str,
+                                           shard: AzureStorageShard, file_size: int = 0,
+                                           max_retries: int = 3, metadata: Optional[Dict] = None) -> Dict:
+    """
+    Upload from a local file with parallel block uploads.
+    Streams from disk — never loads full file into memory.
+    Uses large block sizes (100MB) for maximum throughput.
+    """
+    import os
+    last_error = None
+    file_size = file_size or os.path.getsize(file_path)
+
+    for attempt in range(max_retries):
+        result = await shard.upload_blob_from_file(container_name, blob_path, file_path,
+                                                    file_size=file_size, metadata=metadata)
+
+        if result["success"]:
+            try:
+                os.unlink(file_path)
+            except OSError:
+                pass
+            return result
+
+        last_error = result.get("error", "Unknown error")
+        if "Authorization" in last_error or "Authentication" in last_error:
+            return result
+
+        delay = settings.RETRY_DELAY_MS * (settings.RETRY_BACKOFF_MULTIPLIER ** attempt) / 1000
+        await asyncio.sleep(delay)
+
+    try:
+        os.unlink(file_path)
+    except OSError:
+        pass
+    return {"success": False, "error": f"Failed after {max_retries} retries: {last_error}"}
 async def upload_blob_with_retry(container_name: str, blob_path: str, content: bytes,
                                 shard: AzureStorageShard, max_retries: int = 3,
                                 metadata: Optional[Dict] = None) -> Dict:

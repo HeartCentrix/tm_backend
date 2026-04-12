@@ -107,6 +107,8 @@ async def add_missing_columns():
             ("resources", "archived_at", "TIMESTAMP"),
             ("resources", "deletion_queued_at", "TIMESTAMP"),
             ("tenants", "graph_delta_tokens", "JSON DEFAULT '{}'"),
+            ("tenants", "graph_client_id", "VARCHAR"),
+            ("tenants", "graph_client_secret_encrypted", "BYTEA"),
             ("jobs", "batch_resource_ids", "UUID[]"),
             ("jobs", "priority", "INTEGER DEFAULT 5"),
             ("jobs", "attempts", "INTEGER DEFAULT 0"),
@@ -160,6 +162,19 @@ async def add_missing_columns():
             except Exception as e:
                 print(f"[INIT_DB]   ⚠ {table}.{column}: {e}")
         
+        print("[INIT_DB] Column migration complete!")
+
+        # Add unique constraint on resources(tenant_id, type, external_id) for idempotent upsert
+        print("[INIT_DB] Adding unique constraint on resources(tenant_id, type, external_id)...")
+        try:
+            await conn.execute(text(
+                "ALTER TABLE resources ADD CONSTRAINT uq_resources_tenant_type_external "
+                "UNIQUE (tenant_id, type, external_id)"
+            ))
+            print("[INIT_DB]   ✓ Unique constraint added")
+        except Exception as e:
+            print(f"[INIT_DB]   ⚠ Constraint already exists: {e}")
+
         print("[INIT_DB] Column migration complete!")
 
 

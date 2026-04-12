@@ -227,6 +227,57 @@ curl http://localhost:8002/health  # Tenant
 curl http://localhost:8000/health  # Gateway
 ```
 
+## Azure AD App Setup
+
+TM Vault uses **application-only (app-only) permissions** with Microsoft Graph API to perform enterprise backup operations. This requires a multi-tenant Azure AD app registration.
+
+### Required Application Permissions (not delegated)
+
+The following **Application** permissions must be granted on the Azure AD app:
+
+| Permission | API | Purpose |
+|-----------|-----|---------|
+| `Directory.Read.All` | Microsoft Graph | Enumerate users, groups, devices |
+| `User.Read.All` | Microsoft Graph | Read all user profiles |
+| `Group.Read.All` | Microsoft Graph | Read all group objects |
+| `Mail.Read` | Microsoft Graph | Read all mailboxes (backup emails) |
+| `Files.Read.All` | Microsoft Graph | Read all OneDrive files |
+| `Sites.Read.All` | Microsoft Graph | Read all SharePoint sites |
+| `Channel.ReadBasic.All` | Microsoft Graph | List Teams channels |
+| `ChannelMessage.Read.All` | Microsoft Graph | Read Teams channel messages |
+| `Chat.Read.All` | Microsoft Graph | Read Teams chat messages |
+| `Contacts.Read` | Microsoft Graph | Read user contacts |
+| `Calendars.Read` | Microsoft Graph | Read user calendars |
+| `Notes.Read.All` | Microsoft Graph | Read OneNote notebooks |
+| `Tasks.Read.All` | Microsoft Graph | Read Planner/Todo tasks |
+| `Application.Read.All` | Microsoft Graph | Read app registrations |
+| `Policy.Read.All` | Microsoft Graph | Read Conditional Access policies (future) |
+
+### Admin Consent Flow
+
+After registering the app with the above permissions:
+
+1. Go to **Azure Portal → App registrations → Your App → API permissions → Grant admin consent**
+2. Or use the **admin consent URL** which TM Vault provides:
+   ```
+   https://login.microsoftonline.com/organizations/adminconsent?client_id={APP_CLIENT_ID}&redirect_uri={FRONTEND_URL}/datasource-callback&state={csrf_token}
+   ```
+3. An admin signs in and grants consent — this gives the app tenant-wide access
+4. TM Vault then authenticates using **client credentials flow** (`grant_type=client_credentials`) with the app's own `client_secret`
+
+### Environment Variables
+
+```env
+# Microsoft Graph app-only credentials (from Azure AD app registration)
+MICROSOFT_CLIENT_ID=your-app-client-id
+MICROSOFT_CLIENT_SECRET=your-app-client-secret
+
+# Encryption key for storing secrets (generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+ENCRYPTION_KEY=your-fernet-key
+```
+
+> **Important**: `MICROSOFT_CLIENT_ID` and `MICROSOFT_CLIENT_SECRET` belong to a **multi-tenant app** with the application permissions listed above. Do **not** use delegated (user-delegated) permissions — they cannot enumerate 10,000 tenant users or access all mailboxes.
+
 ## Frontend Integration
 
 Frontend connects to API Gateway at `http://localhost:8000/api/v1/`

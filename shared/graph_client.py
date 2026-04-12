@@ -52,52 +52,68 @@ class GraphClient:
             return self._access_token
     
     async def _get(self, url: str, params: Optional[Dict] = None) -> Dict[str, Any]:
-        """Make authenticated GET request with pagination and throttling support.
+        """Make authenticated GET request with pagination, throttling, and timeout retry.
         Preserves @odata.deltaLink for incremental sync and handles
         single-object responses (e.g. /users/{id}) that have no 'value' array.
         """
         token = await self._get_token()
         all_items = []
         next_url = url
-        max_retries = 3
+        max_retries = 5
         retry_count = 0
         delta_link = None
         last_data = {}
 
         while next_url:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                headers = {"Authorization": f"Bearer {token}", "ConsistencyLevel": "eventual"}
-                resp = await client.get(next_url, headers=headers, params=params if not next_url.startswith("http") else None)
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    # ConsistencyLevel: eventual is only valid with $count queries
+                    if params and params.get("$count") == "true":
+                        headers = {"Authorization": f"Bearer {token}", "ConsistencyLevel": "eventual"}
+                    else:
+                        headers = {"Authorization": f"Bearer {token}"}
+                    resp = await client.get(next_url, headers=headers, params=params if not next_url.startswith("http") else None)
 
-                # Handle 429 throttling
-                if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", "30"))
-                    from shared.multi_app_manager import multi_app_manager
-                    multi_app_manager.mark_throttled(self.client_id, retry_after)
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        await __import__('asyncio').sleep(retry_after)
-                        continue
+                    # Handle 429 throttling
+                    if resp.status_code == 429:
+                        retry_after = int(resp.headers.get("Retry-After", "30"))
+                        from shared.multi_app_manager import multi_app_manager
+                        multi_app_manager.mark_throttled(self.client_id, retry_after)
+                        if retry_count < max_retries:
+                            retry_count += 1
+                            await __import__('asyncio').sleep(retry_after)
+                            continue
+                        resp.raise_for_status()
+
                     resp.raise_for_status()
+                    data = resp.json()
+                    last_data = data
+                    retry_count = 0  # Reset on success
 
-                resp.raise_for_status()
-                data = resp.json()
-                last_data = data
+                    # Single-object response (e.g. /users/{id}, /users/{id}/drive)
+                    # These have no "value" array — return the object directly
+                    if "value" not in data and "@odata.nextLink" not in data:
+                        return data
 
-                # Single-object response (e.g. /users/{id}, /users/{id}/drive)
-                # These have no "value" array — return the object directly
-                if "value" not in data and "@odata.nextLink" not in data:
-                    return data
+                    all_items.extend(data.get("value", []))
 
-                all_items.extend(data.get("value", []))
+                    # Capture delta link for incremental sync
+                    if "@odata.deltaLink" in data:
+                        delta_link = data["@odata.deltaLink"]
 
-                # Capture delta link for incremental sync
-                if "@odata.deltaLink" in data:
-                    delta_link = data["@odata.deltaLink"]
+                    next_url = data.get("@odata.nextLink")
+                    params = None  # params only on first request
 
-                next_url = data.get("@odata.nextLink")
-                params = None  # params only on first request
-                retry_count = 0  # Reset on success
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
+                if retry_count < max_retries:
+                    retry_count += 1
+                    wait = min(5 * retry_count, 30)
+                    print(f"[GraphClient] Timeout on {next_url} (attempt {retry_count}/{max_retries}), retrying in {wait}s: {e}")
+                    await __import__('asyncio').sleep(wait)
+                    # Refresh token in case it expired during the wait
+                    token = await self._get_token()
+                    continue
+                raise
 
         result = {
             "value": all_items,
@@ -230,25 +246,31 @@ class GraphClient:
     
     async def discover_onedrive(self) -> List[Dict[str, Any]]:
         """Discover OneDrive sites for all users"""
-        result = await self._get(
-            f"{self.GRAPH_URL}/sites",
-            params={"$search": '"contentclass:STS_Site"', "$top": "999"}
-        )
+        # Get all users with mailbox licenses, then fetch each user's drive
+        users = await self.discover_users()
         drives = []
-        for site in result.get("value", []):
-            site_id = site.get("id", "").split(",")[-1] if site.get("id") else None
-            if site_id:
-                drives.append({
-                    "external_id": site_id,
-                    "display_name": site.get("name", "Unknown OneDrive"),
-                    "email": None,
-                    "type": "ONEDRIVE",
-                    "metadata": {
-                        "site_id": site.get("id"),
-                        "web_url": site.get("webUrl"),
-                        "site_collection": site.get("siteCollection", {}),
-                    },
-                })
+        for u in users:
+            if not u.get("email"):
+                continue
+            try:
+                user_id = u["external_id"]
+                drive_result = await self._get(f"{self.GRAPH_URL}/users/{user_id}/drive")
+                if drive_result and drive_result.get("id"):
+                    drives.append({
+                        "external_id": drive_result["id"],
+                        "display_name": drive_result.get("name", f"OneDrive - {u['display_name']}"),
+                        "email": u["email"],
+                        "type": "ONEDRIVE",
+                        "metadata": {
+                            "user_id": user_id,
+                            "user_email": u["email"],
+                            "drive_id": drive_result["id"],
+                            "web_url": drive_result.get("webUrl"),
+                            "quota": drive_result.get("quota", {}),
+                        },
+                    })
+            except Exception as e:
+                print(f"Error discovering OneDrive for user {u.get('email')}: {e}")
         return drives
     
     async def discover_sharepoint(self) -> List[Dict[str, Any]]:
@@ -311,7 +333,12 @@ class GraphClient:
             all_resources.extend(await self.discover_mailboxes())
         except Exception as e:
             print(f"Error discovering mailboxes: {e}")
-        
+
+        try:
+            all_resources.extend(await self.discover_onedrive())
+        except Exception as e:
+            print(f"Error discovering OneDrive: {e}")
+
         try:
             all_resources.extend(await self.discover_sharepoint())
         except Exception as e:
@@ -322,15 +349,15 @@ class GraphClient:
         except Exception as e:
             print(f"Error discovering Teams: {e}")
         
-        # Deduplicate by external_id
+        # Deduplicate: same external_id AND same type
         seen = set()
         unique = []
         for r in all_resources:
-            key = r.get("external_id")
+            key = f"{r.get('external_id')}:{r.get('type')}"
             if key and key not in seen:
                 seen.add(key)
                 unique.append(r)
-        
+
         return unique
 
     async def get_directory_audit_logs(self, filter_expr: str = None, top: int = 100) -> List[Dict[str, Any]]:
@@ -561,23 +588,24 @@ class GraphClient:
 
     async def get_messages_delta(self, user_id: str, delta_token: str = None) -> Dict[str, Any]:
         """
-        Get mailbox messages using delta API.
-        Graph API: GET /users/{id}/messages/delta
+        Get mailbox messages.
+        NOTE: Graph API does NOT support delta/change tracking on messages with app-only auth.
+        Falls back to regular /messages endpoint with $top pagination.
+        Graph API: GET /users/{id}/messages
         """
-        url = f"{self.GRAPH_URL}/users/{user_id}/messages/delta"
-        if delta_token:
-            url = delta_token
-
-        params = {"$top": "999", "$expand": "attachments"}
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages"
+        params = {"$top": "999"}
         result = await self._get(url, params=params)
         return result
 
-    async def get_drive_items_delta(self, user_id: str, delta_token: str = None) -> Dict[str, Any]:
+    async def get_drive_items_delta(self, drive_id: str, delta_token: str = None) -> Dict[str, Any]:
         """
-        Get OneDrive drive items using delta API.
-        Graph API: GET /users/{id}/drive/root/delta
+        Get drive items using delta API.
+        Works with both user drives and SharePoint drives.
+        Graph API: GET /drives/{drive-id}/root/delta
         """
-        url = f"{self.GRAPH_URL}/users/{user_id}/drive/root/delta"
+        # Use /drives/{drive-id}/root/delta — works for any drive type
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/root/delta"
         if delta_token:
             url = delta_token
 
@@ -591,28 +619,6 @@ class GraphClient:
         Graph API: GET /users/{id}/drive
         """
         return await self._get(f"{self.GRAPH_URL}/users/{user_id}/drive")
-
-    async def get_sharepoint_site_drives(self, site_id: str, delta_token: str = None) -> Dict[str, Any]:
-        """
-        Get SharePoint site drive items using delta API.
-        Graph API: GET /sites/{site-id}/drive/root/delta
-        """
-        # Convert slashes to commas for Graph API
-        graph_site_id = site_id.replace("/", ",")
-        url = f"{self.GRAPH_URL}/sites/{graph_site_id}/drive/root/delta"
-        if delta_token:
-            url = delta_token
-
-        params = {"$top": "999", "$expand": "thumbnails,listItem"}
-        result = await self._get(url, params=params)
-        return result
-
-    async def get_teams_channels(self, team_id: str) -> Dict[str, Any]:
-        """
-        Get Teams channels.
-        Graph API: GET /teams/{team-id}/channels
-        """
-        return await self._get(f"{self.GRAPH_URL}/teams/{team_id}/channels", params={"$top": "999"})
 
     async def get_channel_messages_delta(self, team_id: str, channel_id: str, delta_token: str = None) -> Dict[str, Any]:
         """
@@ -646,26 +652,6 @@ class GraphClient:
         Graph API: GET /chats/{chat-id}/messages/delta
         """
         url = f"{self.GRAPH_URL}/chats/{chat_id}/messages/delta"
-        if delta_token:
-            url = delta_token
-
-        params = {"$top": "999"}
-        result = await self._get(url, params=params)
-        return result
-
-    async def get_user_contacts(self, user_id: str) -> Dict[str, Any]:
-        """
-        Get user contacts.
-        Graph API: GET /users/{id}/contacts
-        """
-        return await self._get(f"{self.GRAPH_URL}/users/{user_id}/contacts", params={"$top": "999"})
-
-    async def get_calendar_events_delta(self, user_id: str, delta_token: str = None) -> Dict[str, Any]:
-        """
-        Get calendar events using delta API.
-        Graph API: GET /users/{id}/calendar/events/delta
-        """
-        url = f"{self.GRAPH_URL}/users/{user_id}/calendar/events/delta"
         if delta_token:
             url = delta_token
 
@@ -709,6 +695,60 @@ class GraphClient:
             "$filter": "resourceProvisioningOptions/Any(x:x eq 'PowerBI')",
             "$top": "999"
         })
+
+    async def get_onenote_notebooks(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get user's OneNote notebooks.
+        Graph API: GET /users/{id}/onenote/notebooks
+        Permission: Notes.Read.All
+        """
+        return await self._get(f"{self.GRAPH_URL}/users/{user_id}/onenote/notebooks", params={"$top": "999"})
+
+    async def get_onenote_sections(self, user_id: str, notebook_id: str) -> Dict[str, Any]:
+        """
+        Get sections in a OneNote notebook.
+        Graph API: GET /users/{id}/onenote/notebooks/{nb-id}/sections
+        """
+        return await self._get(
+            f"{self.GRAPH_URL}/users/{user_id}/onenote/notebooks/{notebook_id}/sections",
+            params={"$top": "999"}
+        )
+
+    async def get_onenote_pages(self, user_id: str, section_id: str) -> Dict[str, Any]:
+        """
+        Get pages in a OneNote section.
+        Graph API: GET /users/{id}/onenote/sections/{section-id}/pages
+        """
+        return await self._get(
+            f"{self.GRAPH_URL}/users/{user_id}/onenote/sections/{section_id}/pages",
+            params={"$top": "999"}
+        )
+
+    async def get_user_todo_lists(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get user's To Do task lists.
+        Graph API: GET /users/{id}/todo/lists
+        Permission: Tasks.Read.All
+        """
+        return await self._get(f"{self.GRAPH_URL}/users/{user_id}/todo/lists", params={"$top": "999"})
+
+    async def get_user_todo_tasks(self, user_id: str, list_id: str) -> Dict[str, Any]:
+        """
+        Get tasks in a To Do list.
+        Graph API: GET /users/{id}/todo/lists/{list-id}/tasks
+        """
+        return await self._get(
+            f"{self.GRAPH_URL}/users/{user_id}/todo/lists/{list_id}/tasks",
+            params={"$top": "999"}
+        )
+
+    async def get_planner_plans_for_group(self, group_id: str) -> Dict[str, Any]:
+        """
+        Get Planner plans for a group/team.
+        Graph API: GET /groups/{id}/planner/plans
+        Permission: Tasks.Read.All
+        """
+        return await self._get(f"{self.GRAPH_URL}/groups/{group_id}/planner/plans", params={"$top": "999"})
 
     async def _paginated_get(self, path: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         """Helper for paginated GET requests"""

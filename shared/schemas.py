@@ -43,6 +43,19 @@ class OAuthCallbackRequest(BaseModel):
     state: Optional[str] = None
 
 
+class DatasourceConsentRequest(BaseModel):
+    """Admin consent callback request for M365 datasource onboarding."""
+    external_tenant_id: str  # from ?tenant=... query param
+    admin_consent: bool
+    state: str               # CSRF token issued during initiation
+
+
+class DatasourceCallbackResponse(BaseModel):
+    tenantId: str
+    tenantName: str
+    discoveryStatus: str
+
+
 # ============ Dashboard ============
 
 class DashboardOverview(BaseModel):

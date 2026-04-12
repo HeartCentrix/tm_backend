@@ -78,8 +78,21 @@ class Settings:
         self.STORAGE_SHARD_KEYS = [k.strip() for k in storage_shard_keys.split(",") if k.strip()] if storage_shard_keys else []
         # Retry configuration
         self.MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+
+        # Backup streaming performance settings (cloud-to-cloud, matches Afi.ai architecture)
+        # Azure Blob supports up to 4GB block size, 50,000 blocks per blob
+        # 100MB blocks are optimal for throughput (per Azure perf tuning docs)
+        self.AZURE_BLOCK_SIZE_MB = int(os.getenv("AZURE_BLOCK_SIZE_MB", "100"))
+        # Parallel block uploads per file (5-8 is optimal)
+        self.AZURE_UPLOAD_CONCURRENCY = int(os.getenv("AZURE_UPLOAD_CONCURRENCY", "5"))
+        # How many files to download+upload simultaneously (pipeline parallelism)
+        self.BACKUP_CONCURRENCY = int(os.getenv("BACKUP_CONCURRENCY", "50"))
+        # How many resource groups to process in parallel (workload parallelism)
+        self.WORKLOAD_CONCURRENCY = int(os.getenv("WORKLOAD_CONCURRENCY", "5"))
         self.RETRY_DELAY_MS = int(os.getenv("RETRY_DELAY_MS", "2000"))
         self.RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2.0"))
+        # Encryption key for storing secrets (Fernet key, base64-encoded 32-byte key)
+        self.ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
         # Batch size for Graph API $batch endpoint
         self.GRAPH_BATCH_SIZE = int(os.getenv("GRAPH_BATCH_SIZE", "20"))
         # Chunk size for processing resources

@@ -187,7 +187,7 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
         spec={"fullBackup": effective_full_backup, "note": request.note, "triggered_by": "MANUAL"},
     )
     db.add(job)
-    await db.flush()
+    await db.commit()  # commit BEFORE publishing — worker must find the job in DB
 
     # Publish to RabbitMQ
     if settings.RABBITMQ_ENABLED:
@@ -259,46 +259,45 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
             tenant_groups.setdefault(res.tenant_id, []).append(rid)
 
         jobs_created = []
+        pending_publishes = []  # collect publish payloads; send AFTER commit
 
         # For each tenant, create a single mass backup job
         for tenant_id, resource_ids in tenant_groups.items():
-            # Determine if any resource in the batch has never been backed up
-            # Use fullBackup=True only if ALL resources have never been backed up
             has_previous_backup = any(resources_map[rid].last_backup_at is not None for rid in resource_ids)
             effective_full_backup = (request.fullBackup or False) and not has_previous_backup
             print(f"[JOB_SERVICE] Batch backup for {len(resource_ids)} resources, fullBackup={effective_full_backup}")
 
-            # Create single mass backup job
             job = Job(
                 id=uuid4(), type=JobType.BACKUP,
                 tenant_id=tenant_id,
-                resource_id=None,  # Mass backup
+                resource_id=None,
                 batch_resource_ids=[UUID(rid) for rid in resource_ids],
                 status=JobStatus.QUEUED, priority=1,
                 progress_pct=0, items_processed=0, bytes_processed=0,
                 spec={"triggered_by": "MANUAL_BATCH", "resource_count": len(resource_ids), "fullBackup": effective_full_backup},
             )
             db.add(job)
+            jobs_created.append({"jobId": str(job.id), "status": "QUEUED", "resourceId": "BATCH", "resourceCount": len(resource_ids)})
 
-            # Publish mass backup message to RabbitMQ
             if settings.RABBITMQ_ENABLED:
                 from shared.message_bus import create_mass_backup_message
-                # Get first resource to determine resource type
                 first_res = resources_map[resource_ids[0]]
                 resource_type = first_res.type.value if hasattr(first_res.type, 'value') else str(first_res.type)
-
-                await message_bus.publish("backup.urgent", create_mass_backup_message(
+                pending_publishes.append(create_mass_backup_message(
                     job_id=str(job.id),
                     tenant_id=str(tenant_id),
                     resource_type=resource_type,
                     resource_ids=resource_ids,
                     sla_policy_id=None,
                     full_backup=effective_full_backup
-                ), priority=1)
+                ))
 
-            jobs_created.append({"jobId": str(job.id), "status": "QUEUED", "resourceId": "BATCH", "resourceCount": len(resource_ids)})
+        # Commit ALL jobs first so workers always find them in DB
+        await db.commit()
 
-        await db.flush()
+        # Now publish — jobs are visible to workers
+        for msg in pending_publishes:
+            await message_bus.publish("backup.urgent", msg, priority=1)
 
         # Log audit event
         try:
@@ -348,7 +347,7 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
             spec={"triggered_by": "MANUAL", "fullBackup": effective_full_backup},
         )
         db.add(job)
-        await db.flush()
+        await db.commit()  # commit before publish so worker finds the job
 
         if settings.RABBITMQ_ENABLED:
             await message_bus.publish("backup.urgent", create_backup_message(

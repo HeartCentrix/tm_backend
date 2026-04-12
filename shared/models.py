@@ -2,8 +2,8 @@
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy import (
-    Column, String, DateTime, Boolean, Integer, BigInteger, 
-    Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func
+    Column, String, DateTime, Boolean, Integer, BigInteger,
+    Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func, LargeBinary
 )
 from sqlalchemy.dialects.postgresql import UUID
 import enum
@@ -126,11 +126,15 @@ class Tenant(Base):
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
     type = Column(SAEnum(TenantType), default=TenantType.M365)
     display_name = Column(String, nullable=False)
-    external_tenant_id = Column(String)
-    customer_id = Column(String)  # Internal Afi-generated customer ID (UUID-like)
+    external_tenant_id = Column(String, unique=True, index=True)
+
+    customer_id = Column(String)
     subscription_id = Column(String)
     client_id = Column(String)
     client_secret_ref = Column(String)
+    # Graph API app-only credentials (encrypted)
+    graph_client_id = Column(String, nullable=True)
+    graph_client_secret_encrypted = Column(LargeBinary, nullable=True)
     status = Column(SAEnum(TenantStatus), default=TenantStatus.PENDING)
     storage_region = Column(String)
     last_discovery_at = Column(DateTime)
