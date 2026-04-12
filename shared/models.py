@@ -145,6 +145,13 @@ class Tenant(Base):
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
+    # AZ-4: Cross-region DR replication fields
+    dr_region_enabled = Column(Boolean, default=False, nullable=False)
+    dr_region = Column(String, nullable=True)  # e.g., "westeurope"
+    dr_storage_account_name = Column(String, nullable=True)
+    dr_storage_account_key_encrypted = Column(LargeBinary, nullable=True)
+    dr_last_replicated_at = Column(DateTime, nullable=True)
+
 
 class PlatformUser(Base):
     __tablename__ = "platform_users"
@@ -187,6 +194,11 @@ class Resource(Base):
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
+    # Azure workload metadata (for VM, SQL, PostgreSQL)
+    azure_subscription_id = Column(String, nullable=True)
+    azure_resource_group = Column(String, nullable=True)
+    azure_region = Column(String, nullable=True)
+
 
 class SlaPolicy(Base):
     __tablename__ = "sla_policies"
@@ -219,6 +231,13 @@ class SlaPolicy(Base):
     retention_type = Column(String, default="INDEFINITE")
     retention_days = Column(Integer)
     retention_versions = Column(Integer)
+    # AZ-0: Tiered retention policy (Hot → Cool → Archive → Delete)
+    retention_hot_days = Column(Integer, default=7, nullable=False)
+    retention_cool_days = Column(Integer, default=30, nullable=False)
+    retention_archive_days = Column(Integer, nullable=True)  # NULL = unlimited (no delete rule)
+    legal_hold_enabled = Column(Boolean, default=False, nullable=False)
+    legal_hold_until = Column(DateTime, nullable=True)
+    immutability_mode = Column(String, default="None", nullable=False)  # "None", "Unlocked", "Locked"
     enabled = Column(Boolean, default=True)
     is_default = Column(Boolean, default=False)
     created_at = Column(DateTime, default=utcnow)
@@ -268,6 +287,14 @@ class Snapshot(Base):
     content_checksum = Column(String)  # NEW: SHA-256 of stored blob
     blob_path = Column(String)  # NEW: full Azure Blob path
     storage_version = Column(Integer, default=1)  # NEW: storage schema version
+    azure_restore_point_id = Column(String, nullable=True)  # VM restore point ID for restore
+    azure_operation_id = Column(String, nullable=True)  # Track in-flight Azure LROs for resume
+    # AZ-4: Cross-region DR replication fields
+    dr_replication_status = Column(String, default="pending", nullable=False)  # "pending", "in_progress", "replicated", "failed", "skipped"
+    dr_blob_path = Column(String, nullable=True)
+    dr_replicated_at = Column(DateTime, nullable=True)
+    dr_error = Column(Text, nullable=True)
+    dr_replication_attempts = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=utcnow)
 
 

@@ -50,6 +50,11 @@ class MessageBus:
                 await self._declare_queue("report.normal", routing_key="report.normal")
                 await self._declare_queue("audit.events", routing_key="audit.events")
 
+                # Azure workload queues (separate from M365 backup for LRO isolation)
+                await self._declare_queue("azure.vm", routing_key="azure.vm")
+                await self._declare_queue("azure.sql", routing_key="azure.sql")
+                await self._declare_queue("azure.postgres", routing_key="azure.postgres")
+
                 # Set channel QoS (per-consumer prefetch)
                 await self.channel.set_qos(prefetch_count=50)
 

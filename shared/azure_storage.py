@@ -480,6 +480,248 @@ async def server_side_copy_with_retry(source_url: str, container_name: str,
     return {"success": False, "error": f"Failed after {max_retries} retries: {last_error}"}
 
 
+# ── AZ-0: Lifecycle & Immutability Helpers ──
+
+import logging
+import traceback
+
+_lifecycle_logger = logging.getLogger("azure.lifecycle")
+
+
+async def apply_lifecycle_policy(container_name: str, hot_days: int = 7,
+                                  cool_days: int = 30, archive_days: int = None,
+                                  shard: AzureStorageShard = None) -> Dict:
+    """
+    Configure Azure Blob lifecycle management rules for a container.
+    If archive_days is None, blobs in archive never expire (unlimited retention).
+
+    Returns:
+        {"success": True/False, "rules_count": N, "container": "...", "error": "..."}
+    """
+    _lifecycle_logger.info(
+        "[LifecyclePolicy] START — container=%s, hot=%dd, cool=%dd, archive=%s (unlimited=%s)",
+        container_name, hot_days, cool_days,
+        archive_days if archive_days is not None else "NULL",
+        archive_days is None,
+    )
+
+    if shard is None:
+        shard = azure_storage_manager.get_default_shard()
+        if not shard:
+            _lifecycle_logger.error("[LifecyclePolicy] No storage shard available — cannot apply policy")
+            return {"success": False, "error": "No storage shard available"}
+
+    rules = [
+        {
+            "enabled": True,
+            "name": f"{container_name}_hot_to_cool",
+            "definition": {
+                "filters": {"blobTypes": ["blockBlob"],
+                            "prefixMatch": [f"{container_name}/"]},
+                "actions": {"baseBlob": {
+                    "tierToCool": {"daysAfterModificationGreaterThan": hot_days}}}
+            }
+        },
+        {
+            "enabled": True,
+            "name": f"{container_name}_cool_to_archive",
+            "definition": {
+                "filters": {"blobTypes": ["blockBlob"],
+                            "prefixMatch": [f"{container_name}/"]},
+                "actions": {"baseBlob": {
+                    "tierToArchive": {"daysAfterModificationGreaterThan": hot_days + cool_days}}}
+            }
+        },
+    ]
+
+    # Only add delete rule if archive_days is set (unlimited retention = no delete)
+    if archive_days is not None:
+        rules.append({
+            "enabled": True,
+            "name": f"{container_name}_expire",
+            "definition": {
+                "filters": {"blobTypes": ["blockBlob"],
+                            "prefixMatch": [f"{container_name}/"]},
+                "actions": {"baseBlob": {
+                    "delete": {"daysAfterModificationGreaterThan":
+                               hot_days + cool_days + archive_days}}}
+            }
+        })
+
+    _lifecycle_logger.info(
+        "[LifecyclePolicy] Prepared %d rules for container=%s (shard=%s)",
+        len(rules), container_name, shard.account_name,
+    )
+
+    try:
+        from azure.mgmt.storage.aio import StorageManagementClient
+        from azure.identity.aio import ClientSecretCredential
+        from shared.config import settings
+
+        client_id = settings.EFFECTIVE_ARM_CLIENT_ID or settings.MICROSOFT_CLIENT_ID
+        client_secret = settings.EFFECTIVE_ARM_CLIENT_SECRET or settings.MICROSOFT_CLIENT_SECRET
+        tenant_id = settings.EFFECTIVE_ARM_TENANT_ID or settings.MICROSOFT_TENANT_ID
+
+        if not client_id or not client_secret:
+            _lifecycle_logger.warning(
+                "[LifecyclePolicy] No ARM credentials configured — skipping policy application for %s",
+                container_name,
+            )
+            return {"success": False, "error": "ARM credentials not configured (set AZURE_ARM_CLIENT_ID/SECRET)"}
+
+        credential = ClientSecretCredential(
+            client_id=client_id,
+            client_secret=client_secret,
+            tenant_id=tenant_id,
+        )
+
+        async with StorageManagementClient(credential) as mgmt:
+            account_name = shard.account_name
+            rg_name = settings.AZURE_BACKUP_RESOURCE_GROUP or "tmvault-storage"
+
+            _lifecycle_logger.info(
+                "[LifecyclePolicy] Applying policy — account=%s, rg=%s, policy=DefaultManagementPolicy",
+                account_name, rg_name,
+            )
+
+            try:
+                await mgmt.management_policies.create_or_update(
+                    resource_group_name=rg_name,
+                    account_name=account_name,
+                    policy_name="DefaultManagementPolicy",
+                    parameters={"policy": {"rules": rules}},
+                )
+                _lifecycle_logger.info(
+                    "[LifecyclePolicy] SUCCESS — Applied %d rules to %s (account=%s, rg=%s)",
+                    len(rules), container_name, account_name, rg_name,
+                )
+                return {"success": True, "rules_count": len(rules), "container": container_name,
+                        "account": account_name, "resource_group": rg_name}
+            except Exception as mgmt_exc:
+                _lifecycle_logger.error(
+                    "[LifecyclePolicy] MANAGEMENT API ERROR — container=%s, account=%s, rg=%s: %s\n%s",
+                    container_name, account_name, rg_name, mgmt_exc, traceback.format_exc(),
+                )
+                return {"success": False, "error": str(mgmt_exc), "container": container_name}
+    except ImportError as ie:
+        _lifecycle_logger.error(
+            "[LifecyclePolicy] IMPORT ERROR — Missing Azure management libraries: %s", ie,
+        )
+        return {"success": False, "error": f"Missing dependency: {ie}"}
+    except Exception as outer_exc:
+        _lifecycle_logger.error(
+            "[LifecyclePolicy] UNEXPECTED ERROR — container=%s: %s\n%s",
+            container_name, outer_exc, traceback.format_exc(),
+        )
+        return {"success": False, "error": str(outer_exc)}
+
+
+async def apply_blob_immutability(container_name: str, blob_path: str,
+                                   retention_until: datetime, mode: str = "Unlocked",
+                                   shard: AzureStorageShard = None) -> Dict:
+    """
+    Apply time-based immutability (WORM) to a specific blob.
+    mode='Locked' is permanent; mode='Unlocked' allows extension.
+    For "forever" retention, Azure requires a concrete expiry date — use now + 100 years.
+
+    Returns:
+        {"success": True/False, "blob": "...", "until": "...", "mode": "...", "error": "..."}
+    """
+    _lifecycle_logger.info(
+        "[Immutability] START — container=%s, blob=%s, until=%s, mode=%s",
+        container_name, blob_path, retention_until.isoformat(), mode,
+    )
+
+    if shard is None:
+        shard = azure_storage_manager.get_default_shard()
+        if not shard:
+            _lifecycle_logger.error("[Immutability] No storage shard available — cannot apply immutability")
+            return {"success": False, "error": "No storage shard available", "blob": blob_path}
+
+    try:
+        async_client = shard.get_async_client()
+        blob_client = async_client.get_blob_client(container_name, blob_path)
+        await blob_client.set_immutability_policy(
+            immutability_policy={"expiry_time": retention_until, "policy_mode": mode},
+        )
+        _lifecycle_logger.info(
+            "[Immutability] SUCCESS — blob=%s, until=%s, mode=%s",
+            blob_path, retention_until.isoformat(), mode,
+        )
+        return {"success": True, "blob": blob_path, "until": retention_until.isoformat(), "mode": mode}
+    except Exception as e:
+        error_type = type(e).__name__
+        _lifecycle_logger.error(
+            "[Immutability] FAILED — container=%s, blob=%s, error_type=%s: %s\n%s",
+            container_name, blob_path, error_type, e, traceback.format_exc(),
+        )
+        # Provide actionable hints
+        error_msg = str(e)
+        if "ImmutabilityPolicyAlreadyExists" in error_msg:
+            hint = "Immutability policy already set on this blob — this is safe, blob is already protected."
+            _lifecycle_logger.warning("[Immutability] %s", hint)
+            return {"success": True, "blob": blob_path, "until": retention_until.isoformat(),
+                    "mode": mode, "note": "already_exists"}
+        elif "ImmutableBlob" in error_msg or "immutable" in error_msg.lower():
+            hint = "Blob is already immutable — this is expected behavior."
+            _lifecycle_logger.warning("[Immutability] %s", hint)
+            return {"success": True, "blob": blob_path, "note": "already_immutable"}
+        elif "Authorization" in error_msg or "Authentication" in error_msg:
+            hint = "Check storage account key permissions — need Blob Contributor role."
+            _lifecycle_logger.warning("[Immutability] %s", hint)
+            return {"success": False, "error": error_msg, "hint": hint}
+        else:
+            return {"success": False, "error": error_msg}
+
+
+async def apply_legal_hold(container_name: str, blob_path: str,
+                           tag: str = "tmvault-legal-hold",
+                           shard: AzureStorageShard = None) -> Dict:
+    """
+    Apply legal hold to a blob. Separate from time-based immutability and does not expire.
+
+    Returns:
+        {"success": True/False, "blob": "...", "legal_hold": True, "tag": "...", "error": "..."}
+    """
+    _lifecycle_logger.info(
+        "[LegalHold] START — container=%s, blob=%s, tag=%s",
+        container_name, blob_path, tag,
+    )
+
+    if shard is None:
+        shard = azure_storage_manager.get_default_shard()
+        if not shard:
+            _lifecycle_logger.error("[LegalHold] No storage shard available — cannot apply legal hold")
+            return {"success": False, "error": "No storage shard available", "blob": blob_path}
+
+    try:
+        async_client = shard.get_async_client()
+        blob_client = async_client.get_blob_client(container_name, blob_path)
+        await blob_client.set_legal_hold(legal_hold=True)
+        _lifecycle_logger.info(
+            "[LegalHold] SUCCESS — blob=%s, tag=%s",
+            blob_path, tag,
+        )
+        return {"success": True, "blob": blob_path, "legal_hold": True, "tag": tag}
+    except Exception as e:
+        error_type = type(e).__name__
+        _lifecycle_logger.error(
+            "[LegalHold] FAILED — container=%s, blob=%s, error_type=%s: %s\n%s",
+            container_name, blob_path, error_type, e, traceback.format_exc(),
+        )
+        error_msg = str(e)
+        if "LegalHoldAlreadyExists" in error_msg or "already" in error_msg.lower():
+            hint = "Legal hold already set on this blob — this is safe."
+            _lifecycle_logger.warning("[LegalHold] %s", hint)
+            return {"success": True, "blob": blob_path, "legal_hold": True, "note": "already_set"}
+        elif "Authorization" in error_msg or "Authentication" in error_msg:
+            hint = "Check storage account key permissions — need Blob Contributor role."
+            _lifecycle_logger.warning("[LegalHold] %s", hint)
+            return {"success": False, "error": error_msg, "hint": hint}
+        else:
+            return {"success": False, "error": error_msg}
+
+
 async def upload_blob_with_retry_from_file(container_name: str, blob_path: str, file_path: str,
                                            shard: AzureStorageShard, file_size: int = 0,
                                            max_retries: int = 3, metadata: Optional[Dict] = None) -> Dict:
