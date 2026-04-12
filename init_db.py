@@ -49,6 +49,11 @@ async def init_db():
         for stmt in enum_statements:
             await conn.execute(text(stmt))
 
+        # Add new enum value to existing enum (idempotent — catches duplicate)
+        await conn.execute(text("""
+            ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_SERVICE_PRINCIPAL';
+        """))
+
         print("[INIT_DB] Creating tables...")
 
         # Import models to trigger Base.metadata.create_all

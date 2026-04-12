@@ -5,6 +5,7 @@ from typing import Optional
 
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 
 from shared.config import settings
