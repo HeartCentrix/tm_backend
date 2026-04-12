@@ -39,10 +39,52 @@ async def get_db() -> AsyncSession:
 
 
 async def init_db():
+    """
+    Auto-create schema, enum types, and ALL tables on every service startup.
+    Everything is idempotent (IF NOT EXISTS / EXCEPTION duplicate_object).
+    No separate migration script or init_db.py needed.
+    """
     async with engine.begin() as conn:
         # Create schema if not exists
         await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {settings.DB_SCHEMA}"))
         await conn.execute(text(f"SET search_path TO {settings.DB_SCHEMA}"))
+
+        # ── Enum Types (idempotent) ──
+        enum_statements = [
+            """DO $$ BEGIN
+                CREATE TYPE userrole AS ENUM ('SUPER_ADMIN', 'ORG_ADMIN', 'TENANT_ADMIN', 'BACKUP_OPERATOR', 'RESTORE_OPERATOR', 'CONTENT_VIEWER', 'USER');
+            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+            """DO $$ BEGIN
+                CREATE TYPE tenanttype AS ENUM ('M365', 'AZURE', 'BOTH');
+            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+            """DO $$ BEGIN
+                CREATE TYPE tenantstatus AS ENUM ('PENDING', 'ACTIVE', 'DISCONNECTED', 'SUSPENDED', 'PENDING_DELETION', 'DISCOVERING');
+            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+            """DO $$ BEGIN
+                CREATE TYPE resourcetype AS ENUM ('MAILBOX', 'SHARED_MAILBOX', 'ROOM_MAILBOX', 'ONEDRIVE', 'SHAREPOINT_SITE', 'TEAMS_CHANNEL', 'TEAMS_CHAT', 'ENTRA_USER', 'ENTRA_GROUP', 'ENTRA_APP', 'ENTRA_SERVICE_PRINCIPAL', 'ENTRA_DEVICE', 'AZURE_VM', 'AZURE_SQL_DB', 'AZURE_POSTGRESQL', 'RESOURCE_GROUP', 'DYNAMIC_GROUP', 'POWER_BI', 'POWER_APPS', 'POWER_AUTOMATE', 'POWER_DLP', 'COPILOT', 'PLANNER', 'TODO', 'ONENOTE');
+            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+            """DO $$ BEGIN
+                CREATE TYPE resourcestatus AS ENUM ('DISCOVERED', 'ACTIVE', 'ARCHIVED', 'SUSPENDED', 'PENDING_DELETION');
+            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+            """DO $$ BEGIN
+                CREATE TYPE jobtype AS ENUM ('BACKUP', 'RESTORE', 'EXPORT', 'DISCOVERY', 'DELETE');
+            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+            """DO $$ BEGIN
+                CREATE TYPE jobstatus AS ENUM ('QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'RETRYING');
+            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+            """DO $$ BEGIN
+                CREATE TYPE snapshottype AS ENUM ('FULL', 'INCREMENTAL', 'PREEMPTIVE', 'MANUAL');
+            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+            """DO $$ BEGIN
+                CREATE TYPE snapshotstatus AS ENUM ('IN_PROGRESS', 'COMPLETED', 'FAILED', 'PARTIAL', 'PENDING_DELETION');
+            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+        ]
+        for stmt in enum_statements:
+            await conn.execute(text(stmt))
+
+        # New enum values (idempotent)
+        await conn.execute(text("ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_SERVICE_PRINCIPAL';"))
+        await conn.execute(text("ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'PARTIAL';"))
 
         # 1. Organizations
         await conn.execute(text("""
@@ -320,6 +362,24 @@ async def init_db():
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_occurred ON audit_events(occurred_at DESC)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_org ON audit_events(org_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_resource ON audit_events(resource_id)"))
+
+        # ── Convert VARCHAR columns to enum types (idempotent) ──
+        alter_statements = [
+            """ALTER TABLE tenants ALTER COLUMN type TYPE tenanttype USING type::tenanttype;""",
+            """ALTER TABLE tenants ALTER COLUMN status TYPE tenantstatus USING status::tenantstatus;""",
+            """ALTER TABLE resources ALTER COLUMN type TYPE resourcetype USING type::resourcetype;""",
+            """ALTER TABLE resources ALTER COLUMN status TYPE resourcestatus USING status::resourcestatus;""",
+            """ALTER TABLE jobs ALTER COLUMN type TYPE jobtype USING type::jobtype;""",
+            """ALTER TABLE jobs ALTER COLUMN status TYPE jobstatus USING status::jobstatus;""",
+            """ALTER TABLE snapshots ALTER COLUMN type TYPE snapshottype USING type::snapshottype;""",
+            """ALTER TABLE snapshots ALTER COLUMN status TYPE snapshotstatus USING status::snapshotstatus;""",
+            """ALTER TABLE user_roles ALTER COLUMN role TYPE userrole USING role::userrole;""",
+        ]
+        for stmt in alter_statements:
+            try:
+                await conn.execute(text(stmt))
+            except Exception:
+                pass  # Already converted or column doesn't exist
 
         # Sync ORM models (for any remaining ORM-specific configurations)
         await conn.run_sync(Base.metadata.create_all)
