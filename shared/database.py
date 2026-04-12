@@ -377,25 +377,7 @@ async def init_db():
             )
         """))
 
-        # 12. Access Groups
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS access_groups (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                org_id UUID REFERENCES organizations(id),
-                tenant_id UUID REFERENCES tenants(id),
-                name VARCHAR NOT NULL,
-                description VARCHAR,
-                scope VARCHAR DEFAULT 'TENANT',
-                resource_ids UUID[] DEFAULT '{}',
-                permissions JSON DEFAULT '{}',
-                member_ids UUID[] DEFAULT '{}',
-                active BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-
-        # 13. Audit Events
+        # 12. Audit Events
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS audit_events (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
