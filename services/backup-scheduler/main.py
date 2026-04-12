@@ -102,6 +102,10 @@ def resource_type_enabled(resource_type: str, policy: SlaPolicy) -> bool:
 @app.on_event("startup")
 async def startup():
     """Initialize services on startup and schedule jobs per SLA policy"""
+    # Auto-create schema and tables if they don't exist
+    from shared.database import init_db as db_init_db
+    await db_init_db()
+
     await message_bus.connect()
 
     # Dynamically schedule backup jobs for each active SLA policy
