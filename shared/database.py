@@ -364,16 +364,16 @@ async def init_db():
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_resource ON audit_events(resource_id)"))
 
         # ── Convert VARCHAR columns to enum types (each in its own top-level transaction) ──
-        # These use separate engine.begin() calls so one failure doesn't abort others
+        # DROP DEFAULT first for columns that have defaults, otherwise PG can't auto-cast
         alter_statements = [
             """ALTER TABLE tenants ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE tenanttype USING type::tenanttype, ALTER COLUMN type SET DEFAULT 'M365'::tenanttype;""",
             """ALTER TABLE tenants ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE tenantstatus USING status::tenantstatus, ALTER COLUMN status SET DEFAULT 'PENDING'::tenantstatus;""",
-            """ALTER TABLE resources ALTER COLUMN type TYPE resourcetype USING type::resourcetype;""",
-            """ALTER TABLE resources ALTER COLUMN status TYPE resourcestatus USING status::resourcestatus;""",
-            """ALTER TABLE jobs ALTER COLUMN type TYPE jobtype USING type::jobtype;""",
-            """ALTER TABLE jobs ALTER COLUMN status TYPE jobstatus USING status::jobstatus;""",
-            """ALTER TABLE snapshots ALTER COLUMN type TYPE snapshottype USING type::snapshottype;""",
-            """ALTER TABLE snapshots ALTER COLUMN status TYPE snapshotstatus USING status::snapshotstatus;""",
+            """ALTER TABLE resources ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE resourcetype USING type::resourcetype, ALTER COLUMN type SET DEFAULT 'ENTRA_USER'::resourcetype;""",
+            """ALTER TABLE resources ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE resourcestatus USING status::resourcestatus, ALTER COLUMN status SET DEFAULT 'DISCOVERED'::resourcestatus;""",
+            """ALTER TABLE jobs ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE jobtype USING type::jobtype, ALTER COLUMN type SET DEFAULT 'BACKUP'::jobtype;""",
+            """ALTER TABLE jobs ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE jobstatus USING status::jobstatus, ALTER COLUMN status SET DEFAULT 'QUEUED'::jobstatus;""",
+            """ALTER TABLE snapshots ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE snapshottype USING type::snapshottype, ALTER COLUMN type SET DEFAULT 'FULL'::snapshottype;""",
+            """ALTER TABLE snapshots ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE snapshotstatus USING status::snapshotstatus, ALTER COLUMN status SET DEFAULT 'IN_PROGRESS'::snapshotstatus;""",
             """ALTER TABLE user_roles ALTER COLUMN role TYPE userrole USING role::userrole;""",
         ]
         for stmt in alter_statements:
