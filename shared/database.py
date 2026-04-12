@@ -83,9 +83,65 @@ async def init_db():
         for stmt in enum_statements:
             await conn.execute(text(stmt))
 
-        # New enum values (idempotent)
-        await conn.execute(text("ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_SERVICE_PRINCIPAL';"))
-        await conn.execute(text("ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'PARTIAL';"))
+    # ── Ensure ALL enum values exist (must run OUTSIDE transaction — ALTER TYPE ADD VALUE can't be in a tx block) ──
+    ensure_enum_values = [
+        "ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'IN_PROGRESS';",
+        "ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'COMPLETED';",
+        "ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'FAILED';",
+        "ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'PARTIAL';",
+        "ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'PENDING_DELETION';",
+        "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_SERVICE_PRINCIPAL';",
+        "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'QUEUED';",
+        "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'RUNNING';",
+        "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'COMPLETED';",
+        "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'FAILED';",
+        "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'CANCELLED';",
+        "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'RETRYING';",
+        "ALTER TYPE snapshottype ADD VALUE IF NOT EXISTS 'FULL';",
+        "ALTER TYPE snapshottype ADD VALUE IF NOT EXISTS 'INCREMENTAL';",
+        "ALTER TYPE snapshottype ADD VALUE IF NOT EXISTS 'PREEMPTIVE';",
+        "ALTER TYPE snapshottype ADD VALUE IF NOT EXISTS 'MANUAL';",
+        "ALTER TYPE resourcestatus ADD VALUE IF NOT EXISTS 'DISCOVERED';",
+        "ALTER TYPE resourcestatus ADD VALUE IF NOT EXISTS 'ACTIVE';",
+        "ALTER TYPE resourcestatus ADD VALUE IF NOT EXISTS 'ARCHIVED';",
+        "ALTER TYPE resourcestatus ADD VALUE IF NOT EXISTS 'SUSPENDED';",
+        "ALTER TYPE resourcestatus ADD VALUE IF NOT EXISTS 'PENDING_DELETION';",
+        "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'PENDING';",
+        "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'ACTIVE';",
+        "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'DISCONNECTED';",
+        "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'SUSPENDED';",
+        "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'PENDING_DELETION';",
+        "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'DISCOVERING';",
+        "ALTER TYPE tenanttype ADD VALUE IF NOT EXISTS 'M365';",
+        "ALTER TYPE tenanttype ADD VALUE IF NOT EXISTS 'AZURE';",
+        "ALTER TYPE tenanttype ADD VALUE IF NOT EXISTS 'BOTH';",
+        "ALTER TYPE jobtype ADD VALUE IF NOT EXISTS 'BACKUP';",
+        "ALTER TYPE jobtype ADD VALUE IF NOT EXISTS 'RESTORE';",
+        "ALTER TYPE jobtype ADD VALUE IF NOT EXISTS 'EXPORT';",
+        "ALTER TYPE jobtype ADD VALUE IF NOT EXISTS 'DISCOVERY';",
+        "ALTER TYPE jobtype ADD VALUE IF NOT EXISTS 'DELETE';",
+        "ALTER TYPE userrole ADD VALUE IF NOT EXISTS 'SUPER_ADMIN';",
+        "ALTER TYPE userrole ADD VALUE IF NOT EXISTS 'ORG_ADMIN';",
+        "ALTER TYPE userrole ADD VALUE IF NOT EXISTS 'TENANT_ADMIN';",
+        "ALTER TYPE userrole ADD VALUE IF NOT EXISTS 'BACKUP_OPERATOR';",
+        "ALTER TYPE userrole ADD VALUE IF NOT EXISTS 'RESTORE_OPERATOR';",
+        "ALTER TYPE userrole ADD VALUE IF NOT EXISTS 'CONTENT_VIEWER';",
+        "ALTER TYPE userrole ADD VALUE IF NOT EXISTS 'USER';",
+    ]
+    for stmt in ensure_enum_values:
+        try:
+            # ALTER TYPE ADD VALUE cannot run inside a transaction — use AUTOCOMMIT
+            async with engine.connect() as ac:
+                await ac.execution_options(isolation_level="AUTOCOMMIT").execute(
+                    text(f"SET search_path TO {settings.DB_SCHEMA};")
+                )
+                await ac.execution_options(isolation_level="AUTOCOMMIT").execute(text(stmt))
+        except Exception:
+            pass  # Already exists
+
+    # Now create tables and run remaining ALTERs inside a new transaction
+    async with engine.begin() as conn:
+        await conn.execute(text(f"SET search_path TO {settings.DB_SCHEMA};"))
 
         # ── CREATE TABLE IF NOT EXISTS (13 tables + indexes) ──
         await conn.execute(text("""
