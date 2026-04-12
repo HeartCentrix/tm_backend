@@ -43,6 +43,10 @@ TYPE_MAP: Dict[str, ResourceType] = {
     "ENTRA_GROUP": ResourceType.ENTRA_GROUP,
     "ENTRA_APP": ResourceType.ENTRA_APP,
     "ENTRA_DEVICE": ResourceType.ENTRA_DEVICE,
+    "POWER_BI": ResourceType.POWER_BI,
+    "POWER_APPS": ResourceType.POWER_APPS,
+    "POWER_AUTOMATE": ResourceType.POWER_AUTOMATE,
+    "POWER_DLP": ResourceType.POWER_DLP,
 }
 
 
