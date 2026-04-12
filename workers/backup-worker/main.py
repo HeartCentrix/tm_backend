@@ -32,7 +32,7 @@ from sqlalchemy.orm import selectinload
 from shared.database import async_session_factory
 from shared.models import (
     Resource, Tenant, Job, Snapshot, SnapshotItem,
-    SlaPolicy, ResourceType, JobStatus, SnapshotType, SnapshotStatus
+    SlaPolicy, ResourceType, ResourceStatus, JobStatus, SnapshotType, SnapshotStatus
 )
 from shared.message_bus import message_bus
 from shared.config import settings
@@ -1456,6 +1456,9 @@ class BackupWorker:
         resource.last_backup_job_id = job_id
         resource.last_backup_at = datetime.utcnow()
         resource.last_backup_status = "COMPLETED"
+        # Transition from DISCOVERED to ACTIVE after first successful backup
+        if resource.status == ResourceStatus.DISCOVERED:
+            resource.status = ResourceStatus.ACTIVE
         await session.merge(resource)
         await session.commit()
 

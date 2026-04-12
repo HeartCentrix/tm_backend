@@ -278,7 +278,7 @@ async def dispatch_policy_backups(policy_id: str):
             select(Resource).where(
                 and_(
                     Resource.sla_policy_id == policy.id,
-                    Resource.status == ResourceStatus.ACTIVE,
+                    Resource.status.in_([ResourceStatus.DISCOVERED, ResourceStatus.ACTIVE]),
                 )
             ).options(selectinload(Resource.tenant))
         )
@@ -397,7 +397,7 @@ async def check_sla_violations():
                 SlaPolicy, Resource.sla_policy_id == SlaPolicy.id, isouter=True
             ).where(
                 and_(
-                    Resource.status == ResourceStatus.ACTIVE,
+                    Resource.status.in_([ResourceStatus.DISCOVERED, ResourceStatus.ACTIVE]),
                     Resource.sla_policy_id.isnot(None),
                     SlaPolicy.enabled == True,
                     SlaPolicy.sla_violation_alert == True
@@ -536,7 +536,7 @@ async def calculate_anomaly_score(session: AsyncSession, tenant: Tenant) -> floa
         select(func.count(Resource.id)).where(
             and_(
                 Resource.tenant_id == tenant.id,
-                Resource.status == ResourceStatus.ACTIVE,
+                Resource.status.in_([ResourceStatus.DISCOVERED, ResourceStatus.ACTIVE]),
                 (Resource.last_backup_at == None) | (Resource.last_backup_at <= now - timedelta(hours=48))
             )
         )
@@ -581,7 +581,7 @@ async def trigger_preemptive_backup(session: AsyncSession, tenant: Tenant, reaso
         select(Resource).where(
             and_(
                 Resource.tenant_id == tenant.id,
-                Resource.status == ResourceStatus.ACTIVE,
+                Resource.status.in_([ResourceStatus.DISCOVERED, ResourceStatus.ACTIVE]),
                 Resource.sla_policy_id.isnot(None)
             )
         )
