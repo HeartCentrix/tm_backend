@@ -198,16 +198,20 @@ class BackupWorker:
             tenant = result.scalar_one_or_none()
 
             if not tenant:
+                print(f"[{self.worker_id}] Tenant not found for resource {resource_id}, skipping")
                 return
 
             graph_client = await self.get_graph_client(tenant)
             if not graph_client:
+                print(f"[{self.worker_id}] Graph client not available for resource {resource_id}, skipping")
                 return
-
-            snapshot = await self.create_snapshot(resource, message, job_id)
 
             # Route to appropriate handler based on resource type
             resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
+            print(f"[{self.worker_id}] Processing backup for {resource_id} (type={resource_type}, tenant={tenant.id})")
+
+            snapshot = await self.create_snapshot(resource, message, job_id)
+
             handlers = {
                 # Exchange
                 "MAILBOX": self.backup_mailbox,
@@ -245,7 +249,15 @@ class BackupWorker:
             }
 
             handler = handlers.get(resource_type, self._backup_metadata_only)
-            result = await handler(graph_client, resource, snapshot, tenant, message)
+            
+            try:
+                print(f"[{self.worker_id}] Calling handler for {resource_type}: {resource.display_name}")
+                result = await handler(graph_client, resource, snapshot, tenant, message)
+            except Exception as e:
+                print(f"[{self.worker_id}] Handler FAILED for {resource_type}: {resource.display_name} — {e}")
+                import traceback
+                traceback.print_exc()
+                raise
 
             # Complete the snapshot with results
             await self.complete_snapshot(session, snapshot, result)
