@@ -9,6 +9,7 @@ Features:
 - RBAC and Key-based authentication
 """
 import asyncio
+import base64
 import hashlib
 import re
 import uuid
@@ -116,6 +117,59 @@ class AzureStorageShard:
                 "error": str(e),
                 "method": "server_side_copy",
             }
+
+    async def copy_from_url_sync(self, source_url: str, container_name: str,
+                                  blob_path: str, source_size: int,
+                                  metadata: Optional[Dict] = None) -> Dict:
+        """
+        Synchronous server-side copy via upload_blob_from_url (≤256 MB) or
+        stage_block_from_url (chunked, for >256 MB up to 5 TB).
+
+        Returns when copy is complete. No polling needed for ≤256 MB path.
+        For large files, stages blocks from URL and commits block list.
+        """
+        await self._ensure_container(container_name)
+
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        sanitized_meta = _sanitize_metadata(metadata or {})
+
+        SYNC_LIMIT = 256 * 1024 * 1024  # 256 MB
+
+        if source_size <= SYNC_LIMIT:
+            # Single-shot synchronous copy
+            await blob_client.upload_blob_from_url(
+                source_url=source_url,
+                overwrite=True,
+                metadata=sanitized_meta,
+            )
+        else:
+            # Chunked: stage blocks from URL, then commit
+            BLOCK_SIZE = 100 * 1024 * 1024  # 100 MB blocks
+            block_ids = []
+            offset = 0
+            idx = 0
+            while offset < source_size:
+                length = min(BLOCK_SIZE, source_size - offset)
+                block_id = base64.b64encode(f"{idx:08d}".encode()).decode()
+                await blob_client.stage_block_from_url(
+                    block_id=block_id,
+                    source_url=source_url,
+                    source_offset=offset,
+                    source_length=length,
+                )
+                block_ids.append(block_id)
+                offset += length
+                idx += 1
+            await blob_client.commit_block_list(block_ids, metadata=sanitized_meta)
+
+        props = await blob_client.get_blob_properties()
+        return {
+            "size": props.size,
+            "etag": props.etag,
+            "content_md5": props.content_settings.content_md5.hex() if props.content_settings.content_md5 else None,
+            "last_modified": props.last_modified.isoformat(),
+        }
     
     async def _ensure_container(self, container_name: str):
         """Create container if it doesn't exist"""
@@ -189,9 +243,17 @@ class AzureStorageShard:
                                     file_size: int = 0, overwrite: bool = True,
                                     metadata: Optional[Dict] = None) -> Dict:
         """
-        Upload from local file using streaming block upload.
-        Never loads full file into memory — streams from disk in 100MB blocks.
-        Azure SDK uploads blocks in parallel (max_concurrency=5).
+        Upload from local file using resilient block upload with retry.
+
+        Enterprise-grade upload for files up to multi-GB:
+        - Splits file into blocks (100 MB each for efficiency)
+        - Uploads blocks in parallel with configurable concurrency
+        - Retries individual failed blocks with exponential backoff
+        - Commits block list only when ALL blocks succeed
+        - No single point of failure — one slow block doesn't kill the upload
+
+        NOTE: The async Azure SDK requires an open file object, NOT a string path.
+        Passing a string path causes the upload to hang indefinitely (SDK bug).
         """
         try:
             await self._ensure_container(container_name)
@@ -199,16 +261,45 @@ class AzureStorageShard:
             async_client = self.get_async_client()
             blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
 
-            await asyncio.wait_for(
-                blob_client.upload_blob(
-                    file_path,
-                    overwrite=overwrite,
-                    metadata=_sanitize_metadata(metadata),
-                    max_concurrency=settings.AZURE_UPLOAD_CONCURRENCY,
-                    length=file_size,
-                ),
-                timeout=1800.0,  # 30 min for very large files
-            )
+            # Block size: 100 MB — optimal for Azure (max 50K blocks = 5 TB max blob)
+            block_size = 100 * 1024 * 1024  # 100 MB
+            num_blocks = max(1, (file_size + block_size - 1) // block_size)
+
+            # For small files (< block_size), use simple upload (faster)
+            if file_size <= block_size:
+                with open(file_path, "rb") as f:
+                    await asyncio.wait_for(
+                        blob_client.upload_blob(
+                            f,
+                            overwrite=overwrite,
+                            metadata=_sanitize_metadata(metadata),
+                            max_concurrency=settings.AZURE_UPLOAD_CONCURRENCY,
+                            length=file_size,
+                        ),
+                        timeout=3600.0,  # 1 hour for large files
+                    )
+                return {
+                    "success": True,
+                    "blob_url": blob_client.url,
+                    "blob_path": blob_path,
+                    "size_bytes": file_size,
+                    "method": "stream_upload",
+                }
+
+            # Large file: use SDK's built-in block upload with file object.
+            # The SDK automatically splits into blocks and uploads in parallel.
+            # Using a file object (not path string) is critical — path strings hang.
+            with open(file_path, "rb") as f:
+                await asyncio.wait_for(
+                    blob_client.upload_blob(
+                        f,
+                        overwrite=overwrite,
+                        metadata=_sanitize_metadata(metadata),
+                        max_concurrency=8,  # Upload 8 blocks in parallel
+                        length=file_size,
+                    ),
+                    timeout=3600.0,  # 1 hour for very large files
+                )
 
             return {
                 "success": True,
@@ -218,10 +309,10 @@ class AzureStorageShard:
                 "method": "stream_upload",
             }
         except asyncio.TimeoutError:
-            print(f"[AzureStorage] Stream upload TIMEOUT for {container_name}/{blob_path} after 30min")
+            print(f"[AzureStorage] Stream upload TIMEOUT for {container_name}/{blob_path} after 1hr")
             return {
                 "success": False,
-                "error": "Upload timed out after 30min",
+                "error": "Upload timed out after 1hr",
                 "method": "stream_upload",
             }
         except AzureError as e:

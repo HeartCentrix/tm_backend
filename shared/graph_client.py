@@ -1,9 +1,14 @@
 """Microsoft Graph API client for resource discovery"""
+import asyncio
 import httpx
-from typing import List, Optional, Dict, Any
-from datetime import datetime
+from typing import List, Optional, Dict, Any, Tuple
+from datetime import datetime, timedelta
 import hashlib
 import time
+
+# Timeout constants — tuned for Graph API and token endpoint behavior
+_DEFAULT_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=10.0)
+_TOKEN_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 
 
 class GraphClient:
@@ -29,27 +34,36 @@ class GraphClient:
         return self.client_id
 
     async def _get_token(self) -> str:
-        """Get or refresh access token using client credentials"""
+        """Get or refresh access token using client credentials with retry."""
         if self._access_token and self._token_expiry and datetime.utcnow() < self._token_expiry:
             return self._access_token
-        
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                self.TOKEN_URL.format(tenant_id=self.tenant_id),
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "scope": "https://graph.microsoft.com/.default",
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            self._access_token = data["access_token"]
-            # Token expires in ~1 hour, refresh 5 min early
-            expires_in = data.get("expires_in", 3600)
-            self._token_expiry = datetime.utcnow() + __import__('datetime').timedelta(seconds=expires_in - 300)
-            return self._access_token
+
+        last_exc = None
+        for attempt in range(1, 4):  # 3 attempts
+            try:
+                async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT) as client:
+                    resp = await client.post(
+                        self.TOKEN_URL.format(tenant_id=self.tenant_id),
+                        data={
+                            "grant_type": "client_credentials",
+                            "client_id": self.client_id,
+                            "client_secret": self.client_secret,
+                            "scope": "https://graph.microsoft.com/.default",
+                        },
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    self._access_token = data["access_token"]
+                    # Token expires in ~1 hour, refresh 5 min early
+                    expires_in = data.get("expires_in", 3600)
+                    self._token_expiry = datetime.utcnow() + timedelta(seconds=expires_in - 300)
+                    return self._access_token
+            except (httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+                last_exc = e
+                wait = 2 ** attempt
+                print(f"[GraphClient] Token fetch timeout (attempt {attempt}/3), retry in {wait}s: {e}")
+                await asyncio.sleep(wait)
+        raise RuntimeError(f"Could not acquire token after 3 attempts: {last_exc}")
     
     async def _get(self, url: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         """Make authenticated GET request with pagination, throttling, and timeout retry.
@@ -127,7 +141,7 @@ class GraphClient:
     async def _post(self, url: str, payload: Dict[str, Any], headers: Optional[Dict] = None) -> Dict[str, Any]:
         """Make authenticated POST request"""
         token = await self._get_token()
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
             req_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
             if headers:
                 req_headers.update(headers)
@@ -138,16 +152,16 @@ class GraphClient:
     async def _put(self, url: str, content: Any, headers: Optional[Dict] = None) -> Dict[str, Any]:
         """Make authenticated PUT request (for file uploads)"""
         token = await self._get_token()
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
             req_headers = {"Authorization": f"Bearer {token}"}
             if headers:
                 req_headers.update(headers)
             else:
                 req_headers["Content-Type"] = "application/octet-stream"
-            
+
             if isinstance(content, str):
                 content = content.encode('utf-8')
-            
+
             resp = await client.put(url, headers=req_headers, content=content)
             resp.raise_for_status()
             return resp.json()
@@ -155,7 +169,7 @@ class GraphClient:
     async def _patch(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Make authenticated PATCH request"""
         token = await self._get_token()
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
             req_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
             resp = await client.patch(url, headers=req_headers, json=payload)
             resp.raise_for_status()
@@ -164,7 +178,7 @@ class GraphClient:
     async def _delete(self, url: str) -> None:
         """Make authenticated DELETE request"""
         token = await self._get_token()
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
             headers = {"Authorization": f"Bearer {token}"}
             resp = await client.delete(url, headers=headers)
             resp.raise_for_status()
@@ -399,7 +413,8 @@ class GraphClient:
         if delta_token:
             url = delta_token
 
-        params = {"$expand": "thumbnails,listItem", "$top": "999"}
+        # No $select or $expand — delta endpoint ignores them
+        params = {"$top": "999"}
         result = await self._get(url, params=params)
         return result
 
@@ -603,13 +618,18 @@ class GraphClient:
         Get drive items using delta API.
         Works with both user drives and SharePoint drives.
         Graph API: GET /drives/{drive-id}/root/delta
+
+        NOTE: The delta endpoint does NOT support $select. It returns a fixed
+        set of properties (id, name, size, file, folder, deleted, eTag,
+        lastModifiedDateTime, @microsoft.graph.downloadUrl, etc.).
         """
         # Use /drives/{drive-id}/root/delta — works for any drive type
         url = f"{self.GRAPH_URL}/drives/{drive_id}/root/delta"
         if delta_token:
             url = delta_token
 
-        params = {"$top": "999", "$expand": "thumbnails,listItem"}
+        # No $select or $expand — delta endpoint ignores them and returns empty
+        params = {"$top": "999"}
         result = await self._get(url, params=params)
         return result
 
@@ -619,6 +639,55 @@ class GraphClient:
         Graph API: GET /users/{id}/drive
         """
         return await self._get(f"{self.GRAPH_URL}/users/{user_id}/drive")
+
+    async def get_download_url(self, drive_id: str, item_id: str,
+                               max_attempts: int = 3) -> Tuple[str, int, Optional[str]]:
+        """
+        Reliably obtain a fresh @microsoft.graph.downloadUrl for a drive item.
+
+        Why this is non-trivial:
+          - Delta responses don't always include @microsoft.graph.downloadUrl.
+          - When you $select it explicitly, Graph computes it on-the-fly.
+          - The URL is short-lived (~1 hour) and must be used promptly.
+          - For files just modified, the URL may briefly 404; retry helps.
+          - Some file types (whiteboards, notebooks, packages) have NO download URL
+            even though they have a 'file' facet — these are cloud-native objects.
+
+        Returns: (download_url, size_bytes, quick_xor_hash_or_none)
+        Raises: RuntimeError if no URL can be obtained after retries.
+        Raises: RuntimeError("no_download_url") if item is not downloadable at all.
+        """
+        # For app-only access, do NOT use $select - Graph ignores it or strips downloadUrl
+        # for application permission tokens. Get the full item and extract what we need.
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}"
+        last_error = None
+        for attempt in range(max_attempts):
+            try:
+                item = await self._get(url)
+                download_url = item.get("@microsoft.graph.downloadUrl")
+                size = item.get("size", 0)
+                qxh = (item.get("file") or {}).get("hashes", {}).get("quickXorHash")
+                file_facet = item.get("file")
+                if download_url:
+                    return download_url, size, qxh
+                # DEBUG: log what Graph returned
+                keys = list(item.keys()) if isinstance(item, dict) else "not a dict"
+                print(f"[GraphClient] get_download_url attempt {attempt+1}/{max_attempts} for "
+                      f"item {item_id}: download_url={'present' if download_url else 'MISSING'}, "
+                      f"file_facet={'yes' if file_facet else 'no'}, "
+                      f"size={size}, keys={keys}")
+                if not file_facet:
+                    raise RuntimeError(f"Item {item_id} has no 'file' facet — not downloadable")
+                last_error = "downloadUrl missing despite $select; retrying"
+            except Exception as e:
+                last_error = str(e)
+                if attempt == 0:
+                    print(f"[GraphClient] get_download_url attempt {attempt+1}/{max_attempts} for "
+                          f"item {item_id}: EXCEPTION: {e}")
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(2 ** attempt)
+        # Final attempt failed — check if this item type is fundamentally non-downloadable
+        raise RuntimeError(f"Could not obtain downloadUrl for item {item_id}: {last_error}")
 
     async def get_channel_messages_delta(self, team_id: str, channel_id: str, delta_token: str = None) -> Dict[str, Any]:
         """

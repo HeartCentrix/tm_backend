@@ -42,7 +42,7 @@ async def init_db():
                 CREATE TYPE snapshottype AS ENUM ('FULL', 'INCREMENTAL', 'PREEMPTIVE', 'MANUAL');
             EXCEPTION WHEN duplicate_object THEN null; END $$;""",
             """DO $$ BEGIN
-                CREATE TYPE snapshotstatus AS ENUM ('IN_PROGRESS', 'COMPLETED', 'FAILED', 'PENDING_DELETION');
+                CREATE TYPE snapshotstatus AS ENUM ('IN_PROGRESS', 'COMPLETED', 'FAILED', 'PARTIAL', 'PENDING_DELETION');
             EXCEPTION WHEN duplicate_object THEN null; END $$;""",
         ]
 

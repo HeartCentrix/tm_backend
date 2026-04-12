@@ -1,0 +1,42 @@
+# ============================================================
+# TMvault shared base requirements
+# Union of all service/worker requirements — install once in
+# tmvault-base:latest so every service image just COPYs code.
+# ============================================================
+
+# --- Web framework ---
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# --- Database ---
+sqlalchemy==2.0.25
+asyncpg==0.29.0
+
+# --- HTTP client ---
+httpx==0.26.0
+
+# --- Message queue ---
+aio-pika==9.4.0
+
+# --- Pydantic ---
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# --- Auth / cryptography (needs gcc + libffi on ARM64) ---
+cryptography==42.0.2
+python-jose[cryptography]==3.3.0
+
+# --- Cache ---
+redis==5.0.1
+
+# --- Scheduling ---
+apscheduler==3.10.4
+
+# --- Azure SDK ---
+azure-storage-blob==12.19.0
+azure-identity==1.15.0
+azure-mgmt-storage==21.0.0
+
+# --- Utilities ---
+python-dotenv==1.0.0

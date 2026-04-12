@@ -5,6 +5,7 @@ from sqlalchemy import (
     Column, String, DateTime, Boolean, Integer, BigInteger,
     Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func, LargeBinary
 )
+from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.dialects.postgresql import UUID
 import enum
 
@@ -140,7 +141,7 @@ class Tenant(Base):
     status = Column(SAEnum(TenantStatus), default=TenantStatus.PENDING)
     storage_region = Column(String)
     last_discovery_at = Column(DateTime)
-    graph_delta_tokens = Column(JSON, default=dict)
+    graph_delta_tokens = Column(MutableDict.as_mutable(JSON), default=dict)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -173,7 +174,7 @@ class Resource(Base):
     external_id = Column(String, nullable=False)
     display_name = Column(String, nullable=False)
     email = Column(String)
-    extra_data = Column("metadata", JSON, default=dict)
+    extra_data = Column("metadata", MutableDict.as_mutable(JSON), default=dict)
     sla_policy_id = Column(UUID(as_uuid=True), ForeignKey("sla_policies.id"))
     status = Column(SAEnum(ResourceStatus), default=ResourceStatus.DISCOVERED)
     last_backup_job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id"))
@@ -262,7 +263,7 @@ class Snapshot(Base):
     bytes_added = Column(BigInteger, default=0)
     bytes_total = Column(BigInteger, default=0)
     delta_token = Column(String)
-    delta_tokens_json = Column(JSON, default=dict)  # NEW: per-folder/resource delta tokens
+    delta_tokens_json = Column(MutableDict.as_mutable(JSON), default=dict)  # per-folder/resource delta tokens
     snapshot_label = Column(String)
     content_checksum = Column(String)  # NEW: SHA-256 of stored blob
     blob_path = Column(String)  # NEW: full Azure Blob path

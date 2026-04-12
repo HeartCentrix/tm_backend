@@ -20,6 +20,8 @@ import asyncio
 import json
 import uuid
 import hashlib
+import os
+import tempfile
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 import aio_pika
@@ -106,8 +108,8 @@ class BackupWorker:
         self.progress_reporter = ProgressReporter()
         self.audit_logger = AuditLogger()
         # Concurrency controls
-        self.backup_semaphore = asyncio.Semaphore(settings.BACKUP_CONCURRENCY)
-        self.copy_semaphore = asyncio.Semaphore(settings.COPY_CONCURRENCY)
+        self.backup_semaphore = asyncio.Semaphore(8)  # 8 concurrent file streams per worker NIC
+        self.copy_semaphore = asyncio.Semaphore(20)  # Azure Storage account ingress limit
 
     async def initialize(self):
         await message_bus.connect()
@@ -390,8 +392,50 @@ class BackupWorker:
                     ]
                     file_results = await asyncio.gather(*file_tasks, return_exceptions=True)
 
-                    success = sum(1 for r in file_results if isinstance(r, dict) and r.get("success"))
-                    res_bytes = sum(r.get("size", 0) for r in file_results if isinstance(r, dict))
+                    server_copy_ok = 0
+                    streaming_ok = 0
+                    failed_count = 0
+                    skipped_count = 0
+                    failed_items = []
+                    res_bytes = 0
+
+                    for r in file_results:
+                        if isinstance(r, Exception):
+                            failed_count += 1
+                            failed_items.append({"id": "unknown", "name": "unknown", "reason": str(r)})
+                        elif isinstance(r, dict):
+                            method = r.get("method", "")
+                            if r.get("success"):
+                                if method in ("server_side_copy", "server_side_copy_retry"):
+                                    server_copy_ok += 1
+                                elif method in ("streaming_fallback", "streaming"):
+                                    streaming_ok += 1
+                                elif method.startswith("skipped"):
+                                    skipped_count += 1
+                            else:
+                                failed_count += 1
+                                failed_items.append({
+                                    "id": r.get("item_id", "unknown"),
+                                    "name": r.get("file_name", "unknown"),
+                                    "reason": r.get("reason", "unknown"),
+                                })
+                                # Log per-file failure reason for visibility
+                                print(f"[{self.worker_id}]   [FILE FAIL] {r.get('file_name','?')}: "
+                                      f"method={r.get('method','?')} reason={r.get('reason','no reason')}")
+                            res_bytes += r.get("size", 0)
+
+                    # Store per-file outcome tracking on snapshot (use delta_tokens_json for JSON storage)
+                    snapshot.delta_tokens_json = snapshot.delta_tokens_json or {}
+                    snapshot.delta_tokens_json["files_total"] = len(items)
+                    snapshot.delta_tokens_json["files_succeeded_server_copy"] = server_copy_ok
+                    snapshot.delta_tokens_json["files_succeeded_streaming"] = streaming_ok
+                    snapshot.delta_tokens_json["files_failed"] = failed_count
+                    snapshot.delta_tokens_json["files_skipped"] = skipped_count
+                    if failed_items:
+                        snapshot.delta_tokens_json["failed_items"] = failed_items[:100]  # cap at 100
+                    async with async_session_factory() as sess:
+                        sess.merge(snapshot)
+                        await sess.commit()
 
                     # Update delta token
                     new_delta = files.get("@odata.deltaLink")
@@ -403,7 +447,8 @@ class BackupWorker:
                         sess.merge(resource)
                         await sess.commit()
 
-                    return {"item_count": success, "bytes_added": res_bytes}
+                    total_success = server_copy_ok + streaming_ok
+                    return {"item_count": total_success, "bytes_added": res_bytes}
                 except Exception as e:
                     print(f"[{self.worker_id}] File backup failed for {resource.id}: {e}")
                     return {"item_count": 0, "bytes_added": 0}
@@ -417,126 +462,299 @@ class BackupWorker:
     async def backup_single_file(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
                                  file_item: Dict, graph_client: GraphClient, job_id: uuid.UUID) -> Dict:
         """
-        Backup a single file:
-        - Large files (>threshold): Server-Side Copy via @downloadUrl (Azure copies internally)
-        - Small files with @downloadUrl: Download content then upload to blob
-        - Folders / items without @downloadUrl: Store metadata JSON
+        Backup a single file via worker-side streaming with Range-resume.
+
+        Server-side copy from Graph URLs to Azure Blob is NOT viable —
+        Graph download URLs are rejected by Azure with CannotVerifyCopySource
+        because they aren't Azure SAS URLs. Streaming through the worker is
+        the primary (and only reliable) path for M365 file backup.
+
+        Strategy:
+          1. SKIP: deleted items, folders, non-file items
+          2. IDEMPOTENCY: skip if blob exists with matching etag
+          3. PRIMARY: Stream through worker with Range-resume
         """
         file_id = file_item.get("id", str(uuid.uuid4()))
         file_name = file_item.get("name", file_id)
-        file_size = file_item.get("size", 0)
-        download_url = file_item.get("@microsoft.graph.downloadUrl")
-        is_folder = "folder" in file_item  # Graph marks folders with a "folder" facet
+        file_size_hint = file_item.get("size", 0)
 
-        # Construct download URL if not provided (delta endpoint doesn't include it)
-        if not download_url and resource.external_id and file_id and not is_folder:
-            download_url = f"https://graph.microsoft.com/v1.0/drives/{resource.external_id}/items/{file_id}/content"
-
-        # Skip deleted items from delta (they have no content)
+        # Skip deleted items from delta
         if file_item.get("deleted"):
-            return {"success": True, "size": 0, "method": "skipped_deleted"}
+            return {"success": True, "size": 0, "method": "skipped_deleted",
+                    "item_id": file_id, "file_name": file_name}
 
-        # Skip folders — they have no content to back up
-        if is_folder:
-            return {"success": True, "size": 0, "method": "skipped_folder"}
+        # Skip folders — no content to back up
+        if "folder" in file_item:
+            return {"success": True, "size": 0, "method": "skipped_folder",
+                    "item_id": file_id, "file_name": file_name}
+
+        # Skip items without a file facet
+        if "file" not in file_item:
+            return {"success": True, "size": 0, "method": "skipped_no_file_facet",
+                    "item_id": file_id, "file_name": file_name}
 
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "files")
         blob_path = azure_storage_manager.build_blob_path(
-            str(tenant.id), str(resource.id), str(snapshot.id), file_id
-        )
+            str(tenant.id), str(resource.id), str(snapshot.id), file_id)
 
-        # Extract metadata for the DB record
-        metadata = MetadataExtractor.extract_sharepoint_item_metadata(file_item)
-        upload_result = None
-        actual_size = file_size
-
-        if download_url:
-            # Download file to temp file, then stream upload to Azure Blob.
-            # Avoids loading full file into memory (prevents OOM for large files).
-            # Azure Blob SDK uploads in parallel blocks (max_concurrency=5).
-            content_hash = ""
-            temp_path = None
-            try:
-                # Step 1: Get auth token for Graph API (with retry on timeout)
-                headers = {}
-                if "graph.microsoft.com" in download_url:
-                    for attempt in range(3):
-                        try:
-                            token = await graph_client._get_token()
-                            headers["Authorization"] = f"Bearer {token}"
-                            break
-                        except httpx.ReadTimeout:
-                            if attempt < 2:
-                                await asyncio.sleep(2 ** attempt)
-                                continue
-                            raise
-
-                # Step 2: Stream download to temp file (no memory load)
-                import tempfile
-                async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as http_client:
-                    async with http_client.stream("GET", download_url, headers=headers) as resp:
-                        resp.raise_for_status()
-                        actual_size = int(resp.headers.get("Content-Length", file_size))
-
-                        # Stream to temp file in 4MB chunks
-                        hasher = hashlib.sha256()
-                        with tempfile.NamedTemporaryFile(delete=False, suffix='.blob') as tmp:
-                            temp_path = tmp.name
-                            async for chunk in resp.aiter_bytes(chunk_size=4 * 1024 * 1024):
-                                hasher.update(chunk)
-                                tmp.write(chunk)
-                        content_hash = hasher.hexdigest()
-
-                # Step 3: Stream upload from temp file to Azure Blob (parallel blocks)
-                async with self.backup_semaphore:
-                    upload_result = await upload_blob_with_retry_from_file(
-                        container, blob_path, temp_path, shard,
-                        file_size=actual_size,
-                        max_retries=settings.MAX_RETRIES,
-                        metadata={"content-hash": content_hash, "original-name": file_name}
-                    )
-            except Exception as e:
-                print(f"[{self.worker_id}] Failed to download file {file_name}: {e}")
-                upload_result = {"success": False, "error": str(e)}
-        else:
-            # No download URL (e.g. OneNote notebooks, some SharePoint items): store metadata
-            content_bytes = json.dumps({"item": file_item, "metadata": metadata}).encode('utf-8')
-            content_hash = hashlib.sha256(content_bytes).hexdigest()
-            actual_size = len(content_bytes)
-            async with self.backup_semaphore:
-                upload_result = await upload_blob_with_retry(
-                    container, blob_path, content_bytes, shard,
-                    max_retries=settings.MAX_RETRIES, metadata={"content-hash": content_hash, "type": "metadata-only"}
-                )
-
-        # Create SnapshotItem record
-        if not is_folder:  # Don't create snapshot items for folders
+        # Handle empty files
+        if file_size_hint == 0:
+            upload_result = await upload_blob_with_retry(
+                container, blob_path, b"", shard,
+                metadata={"source": "empty", "original-name": file_name})
             if upload_result.get("success"):
-                snapshot_item = SnapshotItem(
-                    snapshot_id=snapshot.id,
-                    tenant_id=tenant.id,
-                    external_id=file_id,
-                    item_type="FILE",
-                    name=file_name,
-                    folder_path=file_item.get("parentReference", {}).get("path"),
-                    content_hash=content_hash if content_hash else None,
-                    content_size=actual_size,
-                    blob_path=blob_path,
-                    metadata={"structured": metadata},
-                    content_checksum=content_hash if content_hash else None,
-                )
-                async with async_session_factory() as session:
-                    session.add(snapshot_item)
-                    await session.commit()
-            else:
-                print(f"[{self.worker_id}]   [FILE] Upload FAILED: {file_name}: {upload_result.get('error', 'unknown')}")
+                await self._create_file_snapshot_item(snapshot, tenant, file_id, file_name, 0, blob_path, {}, file_item)
+            return {"success": upload_result.get("success", False), "size": 0, "method": "empty",
+                    "item_id": file_id, "file_name": file_name}
 
-        return {
-            "success": upload_result.get("success", False) if upload_result else False,
-            "size": actual_size,
-            "method": upload_result.get("method", "unknown") if upload_result else "none",
+        # Idempotency: check if blob already exists with matching etag
+        source_etag = (file_item.get("eTag") or "")[:64]
+        existing_props = await shard.get_blob_properties(container, blob_path)
+        if existing_props:
+            existing_etag = (existing_props.get("metadata", {}) or {}).get("source_etag", "")
+            if existing_etag and existing_etag == source_etag:
+                return {"success": True, "size": existing_props.get("size", 0),
+                        "method": "skipped_already_present",
+                        "item_id": file_id, "file_name": file_name}
+
+        metadata = {
+            "source_item_id": file_id,
+            "source_etag": source_etag,
+            "source_modified": file_item.get("lastModifiedDateTime", ""),
+            "original-name": file_name,
         }
+
+        # Resolve fresh download URL (delta items often lack it)
+        drive_id = resource.external_id
+        try:
+            download_url, size, qxh = await graph_client.get_download_url(drive_id, file_id)
+        except RuntimeError as e:
+            error_str = str(e).lower()
+            # Some file types (whiteboards, notebooks, packages, cloud-native objects)
+            # have a 'file' facet but Graph can't generate a download URL for them.
+            # These are not backup failures — they're fundamentally non-downloadable.
+            if "downloadurl" in error_str or "download url" in error_str:
+                return {"success": True, "size": 0, "method": "skipped_not_downloadable",
+                        "item_id": file_id, "file_name": file_name,
+                        "reason": str(e)}
+            return {"success": False, "size": 0, "method": "failed",
+                    "item_id": file_id, "file_name": file_name,
+                    "reason": f"no download url: {e}"}
+
+        # PRIMARY: Stream through worker with Range-resume
+        tmp_path = None
+        try:
+            async with self.backup_semaphore:
+                tmp_path, sha256 = await self._download_to_temp_resumable(
+                    download_url=download_url, expected_size=size, file_name=file_name,
+                )
+                upload_result = await upload_blob_with_retry_from_file(
+                    container_name=container, blob_path=blob_path,
+                    file_path=tmp_path, shard=shard, file_size=size,
+                    metadata={**metadata, "sha256": sha256},
+                )
+            if not upload_result.get("success"):
+                raise RuntimeError(f"blob upload failed: {upload_result.get('error')}")
+            await self._create_file_snapshot_item(
+                snapshot, tenant, file_id, file_name, size, blob_path,
+                {"sha256": sha256, "quickxor": qxh}, file_item)
+            return {"success": True, "size": size, "method": "streaming",
+                    "blob_path": blob_path, "sha256": sha256,
+                    "item_id": file_id, "file_name": file_name}
+        except Exception as e:
+            print(f"[{self.worker_id}] FILE FAIL {file_name} ({file_size_hint} bytes): "
+                  f"{type(e).__name__}: {e}")
+            return {"success": False, "size": 0, "method": "failed",
+                    "item_id": file_id, "file_name": file_name,
+                    "reason": f"{type(e).__name__}: {e}"}
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    async def _create_file_snapshot_item(self, snapshot, tenant, file_id, file_name,
+                                         content_size, blob_path, hashes, file_item):
+        """Create a SnapshotItem DB record for a successfully backed-up file."""
+        metadata = MetadataExtractor.extract_sharepoint_item_metadata(file_item)
+        content_hash = hashes.get("sha256") or hashes.get("quickxor") or ""
+        snapshot_item = SnapshotItem(
+            snapshot_id=snapshot.id,
+            tenant_id=tenant.id,
+            external_id=file_id,
+            item_type="FILE",
+            name=file_name,
+            folder_path=file_item.get("parentReference", {}).get("path"),
+            content_hash=content_hash if content_hash else None,
+            content_size=content_size,
+            blob_path=blob_path,
+            metadata={"structured": metadata},
+            content_checksum=content_hash if content_hash else None,
+        )
+        async with async_session_factory() as session:
+            session.add(snapshot_item)
+            await session.commit()
+
+    async def _download_to_temp_resumable(
+        self,
+        download_url: str,
+        expected_size: int,
+        file_name: str,
+        max_attempts: int = 6,
+        chunk_size: int = 4 * 1024 * 1024,
+    ) -> tuple[str, str]:
+        """
+        Download a file from a Graph/SharePoint pre-signed URL to a temp file,
+        using HTTP Range requests to resume from the last byte received instead
+        of restarting from zero on partial failures.
+
+        This is the FALLBACK path for backup_single_file. The primary path is
+        Azure Blob server-side copy via shard.copy_from_url_sync(). This helper
+        is only invoked when the server-side copy path fails.
+
+        Returns:
+            (tmp_file_path, sha256_hex)
+
+        Raises:
+            RuntimeError if the file cannot be fully downloaded after all
+            retries, or if progress stalls.
+        """
+        hasher = hashlib.sha256()
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".part", prefix="backup_dl_")
+        os.close(tmp_fd)
+
+        bytes_received = 0
+        consecutive_no_progress = 0
+
+        timeout = httpx.Timeout(connect=15.0, read=120.0, write=60.0, pool=15.0)
+        limits = httpx.Limits(max_keepalive_connections=4, max_connections=8)
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                limits=limits,
+                follow_redirects=True,
+                http2=False,  # Force HTTP/1.1; some MS CDN edges misbehave on HTTP/2
+            ) as client:
+                for attempt in range(1, max_attempts + 1):
+                    progress_before = bytes_received
+
+                    # Build headers — only set Range if we have partial progress.
+                    # IMPORTANT: do NOT add Authorization. The pre-signed URL
+                    # is anonymously accessible; an auth header makes CDN reject.
+                    headers = {}
+                    if bytes_received > 0:
+                        headers["Range"] = f"bytes={bytes_received}-"
+
+                    try:
+                        async with client.stream("GET", download_url, headers=headers) as resp:
+                            # ----- Status code handling -----
+                            if resp.status_code == 416:
+                                # Range Not Satisfiable: source file changed.
+                                # Restart from byte 0 with fresh hash.
+                                print(f"[{self.worker_id}] {file_name}: HTTP 416, "
+                                      f"source changed — restarting from 0")
+                                bytes_received = 0
+                                hasher = hashlib.sha256()
+                                with open(tmp_path, "wb"):
+                                    pass  # truncate
+                                continue
+
+                            if resp.status_code >= 500:
+                                wait = min(2 ** attempt, 30)
+                                print(f"[{self.worker_id}] {file_name}: HTTP "
+                                      f"{resp.status_code}, retry in {wait}s "
+                                      f"(attempt {attempt}/{max_attempts}, "
+                                      f"at byte {bytes_received}/{expected_size})")
+                                await asyncio.sleep(wait)
+                                continue
+
+                            if resp.status_code not in (200, 206):
+                                # 4xx other than 416 = unrecoverable
+                                body = await resp.aread()
+                                raise RuntimeError(
+                                    f"Download failed with HTTP {resp.status_code} "
+                                    f"for {file_name}: {body!r}"
+                                )
+
+                            # ----- Range-header-ignored detection -----
+                            # If we sent a Range header and the server returned 200
+                            # instead of 206, it means the server ignored the Range
+                            # request and is sending the full file from byte 0.
+                            # We must reset our state, otherwise we'd append the
+                            # full file to our existing partial bytes = corruption.
+                            if bytes_received > 0 and resp.status_code == 200:
+                                print(f"[{self.worker_id}] {file_name}: server "
+                                      f"returned 200 to Range request — "
+                                      f"resetting and writing from byte 0")
+                                bytes_received = 0
+                                hasher = hashlib.sha256()
+                                with open(tmp_path, "wb"):
+                                    pass
+
+                            # ----- Stream chunks to disk -----
+                            mode = "ab" if bytes_received > 0 else "wb"
+                            with open(tmp_path, mode) as f:
+                                async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
+                                    if not chunk:
+                                        continue
+                                    f.write(chunk)
+                                    hasher.update(chunk)
+                                    bytes_received += len(chunk)
+
+                        # Stream completed without exception
+                        if bytes_received >= expected_size:
+                            break  # success — exit retry loop
+
+                        # Stream ended early without raising; loop will resume via Range
+                        if bytes_received == progress_before:
+                            consecutive_no_progress += 1
+                        else:
+                            consecutive_no_progress = 0
+
+                    except (httpx.RemoteProtocolError, httpx.ReadError,
+                            httpx.ReadTimeout, httpx.ConnectError, httpx.WriteError) as e:
+                        # All retryable transport errors — resume on next iteration
+                        if bytes_received == progress_before:
+                            consecutive_no_progress += 1
+                        else:
+                            consecutive_no_progress = 0
+
+                        wait = min(2 ** attempt, 30)
+                        print(f"[{self.worker_id}] {file_name}: "
+                              f"{type(e).__name__} at byte "
+                              f"{bytes_received}/{expected_size}, retry in {wait}s "
+                              f"(attempt {attempt}/{max_attempts}, "
+                              f"no_progress_count={consecutive_no_progress}): {e}")
+                        await asyncio.sleep(wait)
+
+                    # ----- Stall detection -----
+                    if consecutive_no_progress >= 3:
+                        raise RuntimeError(
+                            f"Download stalled for {file_name}: zero progress over "
+                            f"{consecutive_no_progress} consecutive attempts at byte "
+                            f"{bytes_received}/{expected_size}"
+                        )
+
+                # ----- Final completeness check -----
+                if bytes_received < expected_size:
+                    raise RuntimeError(
+                        f"Download incomplete for {file_name} after {max_attempts} "
+                        f"attempts: got {bytes_received}/{expected_size} bytes"
+                    )
+
+            return tmp_path, hasher.hexdigest()
+
+        except Exception:
+            # Cleanup on any failure path
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     # ==================== Mailbox Backup (Parallel) ====================
 
@@ -1415,9 +1633,38 @@ class BackupWorker:
         ]
         file_results = await asyncio.gather(*file_tasks, return_exceptions=True)
 
+        # Categorize results for visibility
+        actual_uploads = 0
+        skips = {}
+        failures = 0
+        for r in file_results:
+            if isinstance(r, Exception):
+                failures += 1
+                print(f"[{self.worker_id}]   [FILE FAIL] unknown: {type(r).__name__}: {r}")
+            elif isinstance(r, dict):
+                method = r.get("method", "")
+                if r.get("success"):
+                    if method == "streaming":
+                        actual_uploads += 1
+                    elif method.startswith("skipped"):
+                        skips[method] = skips.get(method, 0) + 1
+                    elif method == "empty":
+                        actual_uploads += 1
+                else:
+                    failures += 1
+                    print(f"[{self.worker_id}]   [FILE FAIL] {r.get('file_name','?')}: "
+                          f"method={r.get('method','?')} reason={r.get('reason','no reason')}")
+
         total_items = sum(1 for r in file_results if isinstance(r, dict) and r.get("success"))
         total_bytes = sum(r.get("size", 0) for r in file_results if isinstance(r, dict))
-        failed = sum(1 for r in file_results if isinstance(r, Exception) or (isinstance(r, dict) and not r.get("success")))
+        failed = failures
+
+        # Log skip summary
+        if skips:
+            skip_summary = ", ".join(f"{k}: {v}" for k, v in sorted(skips.items()))
+            print(f"[{self.worker_id}]   [SKIPS] {skip_summary}")
+        print(f"[{self.worker_id}]   [UPLOADS] {actual_uploads} actual uploads, {failures} failures")
+
         print(f"[{self.worker_id}]   [FILES] Done — {total_items} uploaded, {failed} failed, {total_bytes} bytes")
 
         new_delta = files.get("@odata.deltaLink")
@@ -1444,6 +1691,15 @@ class BackupWorker:
         total_items = sum(1 for r in file_results if isinstance(r, dict) and r.get("success"))
         total_bytes = sum(r.get("size", 0) for r in file_results if isinstance(r, dict))
         failed = sum(1 for r in file_results if isinstance(r, Exception) or (isinstance(r, dict) and not r.get("success")))
+
+        # Log per-file failures for debugging
+        for r in file_results:
+            if isinstance(r, Exception):
+                print(f"[{self.worker_id}]   [SP_FILE FAIL] unknown: {type(r).__name__}: {r}")
+            elif isinstance(r, dict) and not r.get("success"):
+                print(f"[{self.worker_id}]   [SP_FILE FAIL] {r.get('file_name','?')}: "
+                      f"method={r.get('method','?')} reason={r.get('reason','no reason')}")
+
         print(f"[{self.worker_id}]   [SP_FILES] Done — {total_items} uploaded, {failed} failed, {total_bytes} bytes")
 
         new_delta = files.get("@odata.deltaLink")
@@ -1452,26 +1708,39 @@ class BackupWorker:
 
     async def update_resource_backup_info(self, session: AsyncSession, resource: Resource,
                                           job_id: uuid.UUID, snapshot_id: uuid.UUID):
-        """Update resource with last backup information"""
-        resource.last_backup_job_id = job_id
-        resource.last_backup_at = datetime.utcnow()
-        resource.last_backup_status = "COMPLETED"
-        # Transition from DISCOVERED to ACTIVE after first successful backup
-        if resource.status == ResourceStatus.DISCOVERED:
-            resource.status = ResourceStatus.ACTIVE
-        await session.merge(resource)
+        """Update resource with last backup information — uses targeted UPDATE
+        to avoid overwriting extra_data (delta_token) set by complete_snapshot."""
+        from sqlalchemy import update as sa_update
+        new_status = ResourceStatus.ACTIVE if resource.status == ResourceStatus.DISCOVERED else resource.status
+        await session.execute(
+            sa_update(Resource)
+            .where(Resource.id == resource.id)
+            .values(
+                last_backup_job_id=job_id,
+                last_backup_at=datetime.utcnow(),
+                last_backup_status="COMPLETED",
+                status=new_status,
+            )
+        )
         await session.commit()
 
     async def complete_snapshot(self, session: AsyncSession, snapshot: Snapshot, result: Dict):
         """Mark snapshot as completed with result data"""
         now = datetime.utcnow()
-        snapshot.status = SnapshotStatus.COMPLETE
         snapshot.completed_at = now
         snapshot.item_count = result.get("item_count", 0)
         snapshot.new_item_count = result.get("item_count", 0)
         snapshot.bytes_added = result.get("bytes_added", 0)
         snapshot.bytes_total = result.get("bytes_added", 0)
         snapshot.delta_token = result.get("new_delta_token")
+
+        # Set status: PARTIAL if there are failed files, COMPLETE otherwise
+        file_tracking = snapshot.delta_tokens_json or {}
+        files_failed = file_tracking.get("files_failed", 0)
+        if files_failed > 0:
+            snapshot.status = SnapshotStatus.PARTIAL
+        else:
+            snapshot.status = SnapshotStatus.COMPLETE
 
         # Calculate duration
         if snapshot.started_at:
