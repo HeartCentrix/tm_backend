@@ -292,8 +292,7 @@ async def datasource_callback(
         await msg_bus.connect()
 
     await msg_bus.publish(
-        exchange="",  # default exchange
-        routing_key="discovery.m365",
+        "discovery.m365",
         message={
             "jobId": str(uuid4()),
             "tenantId": str(tenant_id),
