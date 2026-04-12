@@ -166,6 +166,7 @@ async def init_db():
                 type VARCHAR DEFAULT 'M365',
                 display_name VARCHAR NOT NULL,
                 external_tenant_id VARCHAR UNIQUE,
+                customer_id VARCHAR,
                 subscription_id VARCHAR,
                 client_id VARCHAR,
                 client_secret_ref VARCHAR,
@@ -419,6 +420,18 @@ async def init_db():
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_occurred ON audit_events(occurred_at DESC)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_org ON audit_events(org_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_resource ON audit_events(resource_id)"))
+
+        # ── Add missing columns to existing tables (idempotent) ──
+        add_column_statements = [
+            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS customer_id VARCHAR;",
+        ]
+        for stmt in add_column_statements:
+            try:
+                async with engine.begin() as ac:
+                    await ac.execute(text(f"SET search_path TO {settings.DB_SCHEMA};"))
+                    await ac.execute(text(stmt))
+            except Exception:
+                pass
 
         # ── Convert VARCHAR columns to enum types (each in its own top-level transaction) ──
         # DROP DEFAULT first for columns that have defaults, otherwise PG can't auto-cast
