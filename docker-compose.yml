@@ -421,6 +421,69 @@ services:
     networks:
       - tm-network
 
+  # ===== Azure Workload Worker (AZ-1/2/3) =====
+
+  azure-workload-worker:
+    build:
+      context: .
+      dockerfile: workers/azure-workload-worker/Dockerfile
+    container_name: tm_vault_azure_workload
+    env_file: .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: postgres
+      RABBITMQ_ENABLED: "true"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
+      AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
+      # Azure ARM credentials for VM/SQL/PostgreSQL backup
+      AZURE_ARM_CLIENT_ID: ${AZURE_ARM_CLIENT_ID:-}
+      AZURE_ARM_CLIENT_SECRET: ${AZURE_ARM_CLIENT_SECRET:-}
+      AZURE_ARM_TENANT_ID: ${AZURE_ARM_TENANT_ID:-}
+      # Fallback to Graph app credentials if ARM-specific not set
+      APP_1_CLIENT_ID: ${APP_1_CLIENT_ID}
+      APP_1_CLIENT_SECRET: ${APP_1_CLIENT_SECRET}
+      APP_1_TENANT_ID: ${APP_1_TENANT_ID}
+      # Backup resource group
+      AZURE_BACKUP_RESOURCE_GROUP: ${AZURE_BACKUP_RESOURCE_GROUP:-tmvault-backup}
+      AZURE_BACKUP_REGION: ${AZURE_BACKUP_REGION:-eastus}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+    deploy:
+      replicas: ${AZURE_WORKER_REPLICAS:-1}
+
+  # ===== DR Replication Worker (AZ-4) =====
+
+  dr-replication-worker:
+    build:
+      context: .
+      dockerfile: services/dr-replication-worker/Dockerfile
+    container_name: tm_vault_dr_replication
+    env_file: .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: postgres
+      AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
+      AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+    deploy:
+      replicas: ${DR_WORKER_REPLICAS:-1}
+
 volumes:
   postgres_data:
   redis_data:

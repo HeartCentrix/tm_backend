@@ -81,8 +81,11 @@ async def get_azure_datasource_url(state: Optional[str] = Query(None)):
         "scope": "https://management.azure.com/.default openid",
         "state": csrf_state,
     }
-    # Azure ARM requires specific tenant ID, not "organizations"
-    auth_url = f"{settings.MICROSOFT_AUTH_URL}?{urlencode(params)}"
+    # CRITICAL: Use /organizations for multi-tenant Azure datasource onboarding.
+    # The MICROSOFT_AUTH_URL uses the specific tenant ID which only works for
+    # users within that tenant. For external Azure tenants connecting as datasources,
+    # we need /organizations to accept any Azure AD tenant.
+    auth_url = f"https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?{urlencode(params)}"
     return MicrosoftAuthUrlResponse(url=auth_url, state=csrf_state)
 
 
@@ -364,9 +367,10 @@ async def azure_datasource_callback(
     db: AsyncSession = Depends(get_db),
 ):
     # Exchange code for tokens (Azure ARM scope)
+    # CRITICAL: Use /organizations for token exchange since the auth URL used /organizations
     async with httpx.AsyncClient() as client:
         token_response = await client.post(
-            settings.MICROSOFT_TOKEN_URL,
+            "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
             data={
                 "client_id": settings.MICROSOFT_CLIENT_ID,
                 "client_secret": settings.MICROSOFT_CLIENT_SECRET,
@@ -420,27 +424,26 @@ async def azure_datasource_callback(
             except Exception:
                 pass
 
-    # Check if Azure tenant already exists for this org
+    # Check if tenant already exists for this org
     org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
-    
-    # Use external_tenant_id if available, otherwise just check by org
-    # Cast Tenant.type to string to avoid enum type mismatch in SQL
+
+    # CRITICAL: Query by external_tenant_id WITHOUT type filter.
+    # The same Azure AD tenant ID is used for both M365 and Azure datasources.
+    # If M365 was onboarded first, a tenant with this external_tenant_id exists as type M365.
+    # We should reuse that tenant or upgrade it to BOTH, not create a duplicate.
     if external_tenant_id:
-        stmt = select(Tenant).where(
-            Tenant.type.cast(String) == "AZURE",
-            Tenant.external_tenant_id == external_tenant_id,
-        )
+        stmt = select(Tenant).where(Tenant.external_tenant_id == external_tenant_id)
     else:
         stmt = select(Tenant).where(
             Tenant.type.cast(String) == "AZURE",
             Tenant.org_id == org_id,
         )
-    
+
     result = await db.execute(stmt)
     tenant = result.scalar_one_or_none()
 
     if tenant is None:
-        # Ensure org exists (TRUNCATE may have wiped it)
+        # Ensure org exists
         if org_id:
             org_stmt = select(Organization).where(Organization.id == org_id)
             org_result = await db.execute(org_stmt)
@@ -453,7 +456,7 @@ async def azure_datasource_callback(
                 )
                 db.add(org)
                 await db.flush()
-        
+
         tenant = Tenant(
             id=uuid4(),
             org_id=org_id,
@@ -463,42 +466,42 @@ async def azure_datasource_callback(
             status=TenantStatus.ACTIVE,
         )
         db.add(tenant)
-        await db.flush()
+        await db.commit()
+        print(f"[auth-service] Created Azure tenant: {tenant.id} ({display_name}), external_tenant_id={external_tenant_id}")
+    else:
+        print(f"[auth-service] Azure tenant already exists: {tenant.id} ({tenant.display_name}), type={tenant.type}")
+        # If existing tenant is M365 type, upgrade to BOTH (M365 + Azure connected)
+        if tenant.type == TenantType.M365:
+            tenant.type = TenantType.BOTH
+            print(f"[auth-service] Upgraded tenant {tenant.id} from M365 to BOTH")
+            await db.commit()
 
-    # Also store in admin_consent_tokens table for settings page tracking
-    from datetime import timedelta
-    from shared.security import encrypt_secret as enc_sec
-    encrypted_access_token = enc_sec(tokens["access_token"])
-    encrypted_refresh_token = enc_sec(tokens.get("refresh_token", "")) if tokens.get("refresh_token") else None
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=tokens.get("expires_in", 3600))
+    # Publish discovery.azure message so the discovery worker picks up Azure resources
+    from shared.message_bus import message_bus as msg_bus
+    if not msg_bus.connection:
+        await msg_bus.connect()
 
-    # Deactivate previous consent tokens for this tenant/type
-    deactivate_stmt = select(AdminConsentToken).where(
-        AdminConsentToken.tenant_id == tenant.id,
-        AdminConsentToken.consent_type == "AZURE",
-        AdminConsentToken.is_active == True,
-    )
-    old_tokens = (await db.execute(deactivate_stmt)).scalars().all()
-    for old_token in old_tokens:
-        old_token.is_active = False
+    discovery_status = "queued"
+    try:
+        discovery_message = {
+            "jobId": str(uuid4()),
+            "tenantId": str(tenant.id),
+            "externalTenantId": external_tenant_id or "",
+            "discoveryScope": ["azure_vms", "azure_sql", "azure_postgresql"],
+            "triggeredBy": str(current_user["id"]) if current_user.get("id") else "system",
+            "triggeredAt": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        }
+        print(f"[auth-service] Publishing discovery.azure for tenant {tenant.id} ({tenant.display_name})")
+        await msg_bus.publish("discovery.azure", discovery_message, priority=5)
+        print(f"[auth-service] Published discovery.azure successfully for tenant {tenant.id}")
+    except Exception as e:
+        import logging
+        logging.getLogger("auth-service").exception(
+            "Failed to publish discovery.azure for tenant %s", tenant.id
+        )
+        discovery_status = "queue_failed_will_retry"
 
-    consent_token = AdminConsentToken(
-        id=uuid4(),
-        org_id=tenant.org_id,
-        tenant_id=tenant.id,
-        consent_type="AZURE",
-        access_token_encrypted=encrypted_access_token,
-        refresh_token_encrypted=encrypted_refresh_token,
-        token_type="Bearer",
-        expires_at=expires_at.replace(tzinfo=None),
-        granted_by=current_user.get("email"),
-        scope="https://management.azure.com/.default offline_access",
-        is_active=True,
-    )
-    db.add(consent_token)
-    await db.commit()
-
-    return {"tenantId": str(tenant.id), "tenantName": tenant.display_name}
+    return {"tenantId": str(tenant.id), "tenantName": tenant.display_name, "discoveryStatus": discovery_status}
 
 
 # ============ Admin Consent Status Endpoints ============

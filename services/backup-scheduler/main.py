@@ -57,6 +57,13 @@ RESOURCE_TYPE_TO_SLA_FLAG: Dict[str, str] = {
     "ONENOTE": "backup_onedrive",
 }
 
+# AZ-4: Azure workload queue routing
+AZURE_WORKLOAD_QUEUES = {
+    ResourceType.AZURE_VM: "azure.vm",
+    ResourceType.AZURE_SQL_DB: "azure.sql",
+    ResourceType.AZURE_POSTGRESQL: "azure.postgres",
+}
+
 
 # Valid APScheduler day-of-week abbreviations
 DAY_MAP = {
@@ -119,6 +126,12 @@ async def startup():
 
     # Schedule M365 audit log ingestion every hour
     scheduler.add_job(ingest_m365_audit_logs, "interval", hours=1)
+
+    # AZ-0: Schedule lifecycle policy reconciler (daily)
+    scheduler.add_job(reconcile_lifecycle_policies, "interval", hours=24)
+
+    # AZ-4: Schedule DR setup reconciler (every 6 hours)
+    scheduler.add_job(reconcile_dr_setup, "interval", hours=6)
 
     # Schedule daily backup report (email/Slack/Teams)
     scheduler.add_job(send_daily_backup_report, "cron", hour=8, minute=0, timezone="UTC")
@@ -328,6 +341,18 @@ async def dispatch_policy_backups(policy_id: str):
         for group_key, group_resources in groups.items():
             resource_type, tenant_id = group_key.split(":")
 
+            # AZ-4: Route Azure workload resources to their dedicated queues
+            azure_queue = None
+            try:
+                rt = ResourceType(resource_type)
+                azure_queue = AZURE_WORKLOAD_QUEUES.get(rt)
+            except ValueError:
+                pass
+
+            group_queue = azure_queue or ("backup.high" if policy.frequency == "THREE_DAILY" else "backup.normal")
+            if azure_queue:
+                print(f"[SCHEDULER] Azure workload {resource_type} → queue {azure_queue} (not backup.*)")
+
             # Split into batches
             for i in range(0, len(group_resources), BATCH_SIZE):
                 batch = group_resources[i:i + BATCH_SIZE]
@@ -370,7 +395,7 @@ async def dispatch_policy_backups(policy_id: str):
 
                 # Send to queue
                 await message_bus.publish(
-                    queue,
+                    group_queue,
                     message,
                     priority=message["priority"],
                 )
@@ -1055,6 +1080,189 @@ async def start_reconciler_loop():
                 print(f"[RECONCILER] Reconciler loop error: {e}")
 
     asyncio.create_task(_reconciler())
+
+
+# ── AZ-0: Lifecycle Policy Reconciler ──
+
+async def reconcile_lifecycle_policies():
+    """
+    Daily: ensure every tenant's blob containers have current lifecycle policy
+    based on their SLA retention settings.
+    """
+    import traceback as _tb
+    print("[LIFECYCLE] === START: Daily lifecycle policy reconciliation ===")
+
+    try:
+        from shared.azure_storage import apply_lifecycle_policy
+    except ImportError:
+        print("[LIFECYCLE] ERROR: azure_storage.apply_lifecycle_policy not available — skipping")
+        return
+
+    try:
+        async with async_session_factory() as session:
+            tenants_result = await session.execute(select(Tenant))
+            tenants = tenants_result.scalars().all()
+
+            if not tenants:
+                print("[LIFECYCLE] No tenants found — nothing to reconcile")
+                return
+
+            print(f"[LIFECYCLE] Found {len(tenants)} tenant(s) to reconcile")
+
+            success_count = 0
+            fail_count = 0
+            skip_count = 0
+
+            for tenant in tenants:
+                try:
+                    # Get tenant's default SLA policy
+                    sla_result = await session.execute(
+                        select(SlaPolicy).where(
+                            SlaPolicy.tenant_id == tenant.id,
+                            SlaPolicy.enabled == True
+                        ).limit(1)
+                    )
+                    sla = sla_result.scalar_one_or_none()
+                    if not sla:
+                        skip_count += 1
+                        print(f"[LIFECYCLE] Tenant {tenant.id} ({tenant.display_name}): No active SLA — skipping")
+                        continue
+
+                    hot = sla.retention_hot_days or 7
+                    cool = sla.retention_cool_days or 30
+                    archive = sla.retention_archive_days  # None = unlimited
+
+                    print(
+                        f"[LIFECYCLE] Tenant {tenant.id} ({tenant.display_name}): hot={hot}d, cool={cool}d, "
+                        f"archive={'unlimited' if archive is None else f'{archive}d'}, "
+                        f"immutability={sla.immutability_mode}, legal_hold={sla.legal_hold_enabled}"
+                    )
+
+                    for workload in ["files", "azure-vm", "azure-sql", "azure-postgres"]:
+                        shard = azure_storage_manager.get_default_shard()
+                        container = azure_storage_manager.get_container_name(str(tenant.id), workload)
+                        try:
+                            result = await apply_lifecycle_policy(container, hot, cool, archive, shard)
+                            if result.get("success"):
+                                print(f"[LIFECYCLE]   ✓ {container}: {result.get('rules_count', 0)} rules applied")
+                                success_count += 1
+                            else:
+                                print(f"[LIFECYCLE]   ✗ {container}: {result.get('error', 'unknown error')}")
+                                fail_count += 1
+                        except Exception as e:
+                            print(f"[LIFECYCLE]   ✗ {container}: {e}")
+                            fail_count += 1
+
+                except Exception as tenant_exc:
+                    print(f"[LIFECYCLE] Tenant {tenant.id} reconciliation error: {tenant_exc}")
+                    fail_count += 1
+
+            print(
+                f"[LIFECYCLE] === COMPLETE: success={success_count}, failed={fail_count}, skipped={skip_count} ==="
+            )
+
+    except Exception as e:
+        print(f"[LIFECYCLE] FATAL ERROR: {e}\n{_tb.format_exc()}")
+
+
+# ── AZ-4: DR Setup Reconciler ──
+
+async def reconcile_dr_setup():
+    """
+    Every 6 hours: ensure DR containers exist and have matching lifecycle policies.
+    Only runs for tenants with dr_region_enabled=True.
+    """
+    import traceback as _tb
+    print("[DR-RECONCILER] === START: DR setup reconciliation (every 6h) ===")
+
+    try:
+        from shared.azure_storage import apply_lifecycle_policy, AzureStorageShard
+        from shared.security import decrypt_secret
+    except ImportError as ie:
+        print(f"[DR-RECONCILER] ERROR: Required imports not available — skipping: {ie}")
+        return
+
+    try:
+        async with async_session_factory() as session:
+            tenants_result = await session.execute(
+                select(Tenant).where(Tenant.dr_region_enabled == True)
+            )
+            tenants = tenants_result.scalars().all()
+
+            if not tenants:
+                print("[DR-RECONCILER] No tenants with DR enabled — skipping")
+                return
+
+            print(f"[DR-RECONCILER] Found {len(tenants)} tenant(s) with DR enabled")
+
+            success_count = 0
+            fail_count = 0
+
+            for tenant in tenants:
+                try:
+                    if not tenant.dr_storage_account_name:
+                        print(f"[DR-RECONCILER] Tenant {tenant.id}: DR storage account name not configured — skipping")
+                        fail_count += 1
+                        continue
+
+                    print(
+                        f"[DR-RECONCILER] Tenant {tenant.id} ({tenant.display_name}): "
+                        f"DR region={tenant.dr_region}, DR account={tenant.dr_storage_account_name}"
+                    )
+
+                    try:
+                        dr_key = decrypt_secret(tenant.dr_storage_account_key_encrypted)
+                    except Exception as dec_exc:
+                        print(f"[DR-RECONCILER] Tenant {tenant.id}: Cannot decrypt DR storage key: {dec_exc}")
+                        fail_count += 1
+                        continue
+
+                    dr_shard = AzureStorageShard(
+                        account_name=tenant.dr_storage_account_name,
+                        account_key=dr_key,
+                    )
+
+                    # Get tenant's SLA
+                    sla_result = await session.execute(
+                        select(SlaPolicy).where(
+                            SlaPolicy.tenant_id == tenant.id,
+                            SlaPolicy.enabled == True
+                        ).limit(1)
+                    )
+                    sla = sla_result.scalar_one_or_none()
+                    hot = sla.retention_hot_days if sla else 7
+                    cool = sla.retention_cool_days if sla else 30
+                    archive = sla.retention_archive_days if sla else None
+
+                    print(
+                        f"[DR-RECONCILER]   SLA: hot={hot}d, cool={cool}d, "
+                        f"archive={'unlimited' if archive is None else f'{archive}d'}"
+                    )
+
+                    for workload in ["files", "azure-vm", "azure-sql", "azure-postgres"]:
+                        container = f"{azure_storage_manager.get_container_name(str(tenant.id), workload)}-dr"
+                        try:
+                            result = await apply_lifecycle_policy(container, hot, cool, archive, dr_shard)
+                            if result.get("success"):
+                                print(f"[DR-RECONCILER]   ✓ DR {container}: {result.get('rules_count', 0)} rules applied")
+                                success_count += 1
+                            else:
+                                print(f"[DR-RECONCILER]   ✗ DR {container}: {result.get('error', 'unknown')}")
+                                fail_count += 1
+                        except Exception as container_exc:
+                            print(f"[DR-RECONCILER]   ✗ DR {container}: {container_exc}")
+                            fail_count += 1
+
+                except Exception as tenant_exc:
+                    print(f"[DR-RECONCILER] Tenant {tenant.id} DR reconciliation error: {tenant_exc}\n{_tb.format_exc()}")
+                    fail_count += 1
+
+            print(
+                f"[DR-RECONCILER] === COMPLETE: success={success_count}, failed={fail_count} ==="
+            )
+
+    except Exception as e:
+        print(f"[DR-RECONCILER] FATAL ERROR: {e}\n{_tb.format_exc()}")
 
 
 if __name__ == "__main__":

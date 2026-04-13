@@ -173,6 +173,11 @@ async def init_db():
                 storage_region VARCHAR,
                 last_discovery_at TIMESTAMP,
                 graph_delta_tokens JSON DEFAULT '{}',
+                dr_region_enabled BOOLEAN DEFAULT FALSE,
+                dr_region VARCHAR,
+                dr_storage_account_name VARCHAR,
+                dr_storage_account_key_encrypted BYTEA,
+                dr_last_replicated_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -235,6 +240,12 @@ async def init_db():
                 group_mailbox BOOLEAN DEFAULT TRUE,
                 planner BOOLEAN DEFAULT FALSE,
                 retention_type VARCHAR DEFAULT 'INDEFINITE',
+                retention_hot_days INTEGER DEFAULT 7,
+                retention_cool_days INTEGER DEFAULT 30,
+                retention_archive_days INTEGER,
+                legal_hold_enabled BOOLEAN DEFAULT FALSE,
+                legal_hold_until TIMESTAMP,
+                immutability_mode VARCHAR DEFAULT 'None',
                 enabled BOOLEAN DEFAULT TRUE,
                 is_default BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -261,6 +272,9 @@ async def init_db():
                 discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 archived_at TIMESTAMP,
                 deletion_queued_at TIMESTAMP,
+                azure_subscription_id VARCHAR,
+                azure_resource_group VARCHAR,
+                azure_region VARCHAR,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -308,10 +322,18 @@ async def init_db():
                 bytes_total BIGINT DEFAULT 0,
                 delta_token VARCHAR,
                 delta_tokens_json JSON DEFAULT '{}',
+                extra_data JSON DEFAULT '{}',
                 snapshot_label VARCHAR,
                 content_checksum VARCHAR,
                 blob_path VARCHAR,
                 storage_version INTEGER DEFAULT 1,
+                azure_restore_point_id VARCHAR,
+                azure_operation_id VARCHAR,
+                dr_replication_status VARCHAR DEFAULT 'pending',
+                dr_blob_path VARCHAR,
+                dr_replicated_at TIMESTAMP,
+                dr_error TEXT,
+                dr_replication_attempts INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
@@ -428,6 +450,30 @@ async def init_db():
         # ── Add missing columns to existing tables (idempotent) ──
         add_column_statements = [
             "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS customer_id VARCHAR;",
+            "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_subscription_id VARCHAR;",
+            "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_resource_group VARCHAR;",
+            "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_region VARCHAR;",
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS azure_restore_point_id VARCHAR;",
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS azure_operation_id VARCHAR;",
+            # AZ-0: Retention policy columns
+            "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_hot_days INTEGER DEFAULT 7;",
+            "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_cool_days INTEGER DEFAULT 30;",
+            "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_archive_days INTEGER;",
+            "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS legal_hold_enabled BOOLEAN DEFAULT FALSE;",
+            "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMP;",
+            "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS immutability_mode VARCHAR DEFAULT 'None';",
+            # AZ-4: DR replication columns
+            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_region_enabled BOOLEAN DEFAULT FALSE;",
+            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_region VARCHAR;",
+            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_storage_account_name VARCHAR;",
+            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_storage_account_key_encrypted BYTEA;",
+            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_last_replicated_at TIMESTAMP;",
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replication_status VARCHAR DEFAULT 'pending';",
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_blob_path VARCHAR;",
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replicated_at TIMESTAMP;",
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_error TEXT;",
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replication_attempts INTEGER DEFAULT 0;",
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS extra_data JSON DEFAULT '{}';",
         ]
         for stmt in add_column_statements:
             try:

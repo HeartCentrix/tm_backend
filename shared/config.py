@@ -58,6 +58,17 @@ class Settings:
         self.AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "")
         self.AZURE_STORAGE_ACCOUNT_KEY = os.getenv("AZURE_STORAGE_ACCOUNT_KEY", "")
         self.AZURE_STORAGE_BLOB_ENDPOINT = os.getenv("AZURE_STORAGE_BLOB_ENDPOINT", "https://blob.core.windows.net")
+
+        # Azure ARM (Azure Resource Manager) credentials for VM/SQL/PostgreSQL backup
+        # Service Principal for ARM API access
+        self.AZURE_ARM_CLIENT_ID = os.getenv("AZURE_ARM_CLIENT_ID", "")
+        self.AZURE_ARM_CLIENT_SECRET = os.getenv("AZURE_ARM_CLIENT_SECRET", "")
+        self.AZURE_ARM_TENANT_ID = os.getenv("AZURE_ARM_TENANT_ID", "")
+
+        # Azure Backup resource group (for VM restore point collections)
+        self.AZURE_BACKUP_RESOURCE_GROUP = os.getenv("AZURE_BACKUP_RESOURCE_GROUP", "rg-tmvault-backup")
+        # Backup storage region (for RPC placement)
+        self.AZURE_BACKUP_REGION = os.getenv("AZURE_BACKUP_REGION", "eastus")
         
         # High-Performance Backup Configuration
         # Parallelism: Max concurrent Graph API calls per worker
@@ -183,6 +194,19 @@ class Settings:
     @property
     def MICROSOFT_TENANT_ID(self) -> str:
         return self.GRAPH_APPS[0]["tenant_id"] if self.GRAPH_APPS else "common"
+
+    # ARM credentials fallback to Graph app if not explicitly set
+    @property
+    def EFFECTIVE_ARM_CLIENT_ID(self) -> str:
+        return self.AZURE_ARM_CLIENT_ID or self.MICROSOFT_CLIENT_ID
+
+    @property
+    def EFFECTIVE_ARM_CLIENT_SECRET(self) -> str:
+        return self.AZURE_ARM_CLIENT_SECRET or self.MICROSOFT_CLIENT_SECRET
+
+    @property
+    def EFFECTIVE_ARM_TENANT_ID(self) -> str:
+        return self.AZURE_ARM_TENANT_ID or self.MICROSOFT_TENANT_ID
 
     @property
     def DATABASE_URL(self) -> str:
