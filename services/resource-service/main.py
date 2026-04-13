@@ -221,6 +221,9 @@ async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] 
              "POWER_DLP": "power_dlp", "COPILOT": "copilot", "PLANNER": "planner"}
         return m.get(t, t.lower() if t else "unknown")
 
+    def map_status(s):
+        return {"ACTIVE": "protected", "ARCHIVED": "archived", "SUSPENDED": "suspended"}.get(s, "discovered")
+
     def format_backup_size(bytes_val: int) -> str:
         """Format bytes to human-readable size string"""
         if not bytes_val or bytes_val == 0:
@@ -234,6 +237,14 @@ async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] 
         if bytes_val >= 1024:
             return f"{bytes_val / 1024:.2f} KB"
         return f"{bytes_val} B"
+
+    # Get SLA policy names
+    sla_ids = [row[7] for row in rows if row[7]]
+    policies = {}
+    if sla_ids:
+        policy_stmt = select(SlaPolicy).where(SlaPolicy.id.in_(sla_ids))
+        policy_result = await db.execute(policy_stmt)
+        policies = {str(p.id): p.name for p in policy_result.scalars().all()}
 
     # Get backup counts for all resources in one query
     resource_ids = [row[0] for row in rows]
@@ -261,12 +272,13 @@ async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] 
             "external_id": row[3], "name": row[4], "email": row[5],
             "data": row[6] or {},
             "archived": row[8] == "ARCHIVED", "deleted": row[8] == "PENDING_DELETION",
-            "protections": None,
+            "protections": [{"policy_id": str(row[7])}] if row[7] else None,
             "usage": {"resource_id": str(row[0]), "tenant_id": str(row[1]), "backups": backup_count,
                       "size": storage_bytes, "size_delta_year": 0, "size_delta_month": 0, "size_delta_week": 0},
             "backupSize": format_backup_size(storage_bytes) if has_backup else None,
-            "status": "protected" if row[8] == "ACTIVE" else "discovered",
-            "sla": None, "last_backup": row[10].isoformat() if row[10] else None,
+            "status": map_status(row[8]),
+            "sla": policies.get(str(row[7])) if row[7] else None,
+            "last_backup": row[10].isoformat() if row[10] else None,
             "last_backup_status": row[11] if row[11] else None,
             "group_ids": [],
         })
