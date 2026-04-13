@@ -160,6 +160,11 @@ async def tenant(request: Request):
 
 
 # Resource routes
+@app.get("/api/v1/resources/with-backups")
+async def resources_with_backups(request: Request):
+    return await proxy_request("snapshot", request.url.path, request)
+
+
 @app.get("/api/v1/resources")
 @app.get("/api/v1/resources/search")
 @app.get("/api/v1/resources/by-type")
@@ -195,6 +200,11 @@ async def job(request: Request):
 
 
 # Snapshot routes
+@app.get("/api/v1/resources/snapshots/folders")
+async def snapshot_folders(request: Request):
+    return await proxy_request("snapshot", request.url.path, request)
+
+
 @app.get("/api/v1/resources/{resource_id}/snapshots")
 @app.get("/api/v1/resources/{resource_id}/snapshots/by-date")
 @app.get("/api/v1/resources/{resource_id}/snapshots/calendar")
@@ -206,6 +216,8 @@ async def job(request: Request):
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/diff")
 @app.get("/api/v1/resources/{resource_id}/snapshots/{snapshot_id}/items")
 @app.get("/api/v1/resources/{resource_id}/snapshots/changes")
+# Recovery: search snapshot items
+@app.get("/api/v1/resources/{resource_id}/snapshots/search")
 async def snapshot(request: Request):
     return await proxy_request("snapshot", request.url.path, request)
 
