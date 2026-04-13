@@ -454,10 +454,7 @@ async def init_db():
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_active ON admin_consent_tokens(is_active)"))
 
         # ── Add missing columns to existing tables (idempotent) ──
-        # Use advisory lock so only ONE service runs ALTERs at a time (prevents deadlock)
-        # Lock ID: 1234567890 — arbitrary, must be consistent across all services
-        await conn.execute(text("SELECT pg_advisory_xact_lock(1234567890);"))
-        
+        # Run all ALTERs inside the same conn transaction to prevent deadlock
         add_column_statements = [
             "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS customer_id VARCHAR;",
             "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_subscription_id VARCHAR;",
@@ -465,14 +462,12 @@ async def init_db():
             "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_region VARCHAR;",
             "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS azure_restore_point_id VARCHAR;",
             "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS azure_operation_id VARCHAR;",
-            # AZ-0: Retention policy columns
             "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_hot_days INTEGER DEFAULT 7;",
             "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_cool_days INTEGER DEFAULT 30;",
             "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_archive_days INTEGER;",
             "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS legal_hold_enabled BOOLEAN DEFAULT FALSE;",
             "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMP;",
             "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS immutability_mode VARCHAR DEFAULT 'None';",
-            # AZ-4: DR replication columns
             "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_region_enabled BOOLEAN DEFAULT FALSE;",
             "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_region VARCHAR;",
             "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_storage_account_name VARCHAR;",
@@ -492,17 +487,11 @@ async def init_db():
         ]
         for stmt in add_column_statements:
             try:
-                async with engine.begin() as ac:
-                    await ac.execute(text(f"SET search_path TO {settings.DB_SCHEMA};"))
-                    await ac.execute(text(stmt))
+                await conn.execute(text(stmt))
             except Exception:
-                pass
+                pass  # Already exists
 
-        # ── Convert VARCHAR columns to enum types (each in its own top-level transaction) ──
-        # DROP DEFAULT first for columns that have defaults, otherwise PG can't auto-cast
-        # Also under advisory lock to prevent deadlock
-        await conn.execute(text("SELECT pg_advisory_xact_lock(1234567890);"))
-        
+        # ── Convert VARCHAR columns to enum types ──
         alter_statements = [
             """ALTER TABLE tenants ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE tenanttype USING type::tenanttype, ALTER COLUMN type SET DEFAULT 'M365'::tenanttype;""",
             """ALTER TABLE tenants ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE tenantstatus USING status::tenantstatus, ALTER COLUMN status SET DEFAULT 'PENDING'::tenantstatus;""",
@@ -516,11 +505,9 @@ async def init_db():
         ]
         for stmt in alter_statements:
             try:
-                async with engine.begin() as ac:
-                    await ac.execute(text(f"SET search_path TO {settings.DB_SCHEMA};"))
-                    await ac.execute(text(stmt))
+                await conn.execute(text(stmt))
             except Exception:
-                pass  # Already converted or column doesn't exist
+                pass  # Already converted
 
         # Sync ORM models (for any remaining ORM-specific configurations)
         await conn.run_sync(Base.metadata.create_all)
