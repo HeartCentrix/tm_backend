@@ -24,7 +24,7 @@ from shared.models import (
 )
 from shared.graph_client import GraphClient
 from shared.message_bus import message_bus
-from azure_discovery import discover_all_azure_resources
+from azure_discovery import discover_azure_tenant as discover_azure_resources
 
 logging.basicConfig(
     level=logging.INFO,
@@ -220,8 +220,7 @@ async def consume_discovery_queue():
 async def discover_azure_tenant(tenant_id: UUID) -> int:
     """
     Run Azure resource discovery for a specific tenant.
-    Discovers VMs, SQL DBs, and PostgreSQL servers via ARM API.
-    This is SEPARATE from M365/Graph discovery.
+    Uses Afi-style delegated ARM access with auto-assignment of SP as SQL admin.
     """
     async with async_session_factory() as db:
         try:
@@ -233,22 +232,30 @@ async def discover_azure_tenant(tenant_id: UUID) -> int:
                 logger.warning("Azure tenant %s not found", tenant_id)
                 return 0
 
-            if not settings.EFFECTIVE_ARM_CLIENT_ID or not settings.EFFECTIVE_ARM_CLIENT_SECRET:
-                logger.warning("No Azure ARM credentials. Skipping Azure discovery for tenant %s.", tenant_id)
-                return 0
-
             logger.info("Starting Azure resource discovery for tenant %s (%s)...", tenant.display_name, tenant_id)
             tenant.status = TenantStatus.DISCOVERING
             await db.flush()
 
-            azure_resources = await discover_all_azure_resources()
-            logger.info("Discovered %d Azure resources for tenant %s.", len(azure_resources), tenant.display_name)
+            # Use Afi-style discovery (delegated ARM access + auto SQL admin assignment)
+            discovered = await discover_azure_resources(tenant)
+            logger.info(
+                "Discovered %d subscriptions, %d VMs, %d SQL DBs, %d Postgres servers for tenant %s.",
+                len(discovered["subscriptions"]), len(discovered["vms"]),
+                len(discovered["sql_dbs"]), len(discovered["postgres_servers"]),
+                tenant.display_name,
+            )
 
             count = 0
-            for az_r in azure_resources:
-                rtype_str = az_r.get("type", "")
-                rtype = TYPE_MAP.get(rtype_str, ResourceType.ENTRA_USER)
-                ext_id = az_r["external_id"]
+
+            # Upsert VMs
+            for vm in discovered["vms"]:
+                rtype = ResourceType.AZURE_VM
+                ext_id = vm.get("name", vm.get("id", ""))
+                metadata = {
+                    "vm_id": vm.get("id", ""),
+                    "location": vm.get("location", ""),
+                    "subscription_id": vm.get("subscription_id", ""),
+                }
 
                 existing = await db.execute(
                     select(Resource).where(
@@ -265,24 +272,109 @@ async def discover_azure_tenant(tenant_id: UUID) -> int:
                         tenant_id=tenant.id,
                         type=rtype,
                         external_id=ext_id,
-                        display_name=az_r.get("display_name", "Unknown"),
-                        email=az_r.get("email"),
-                        metadata=az_r.get("metadata", {}),
+                        display_name=vm.get("name", "Unknown"),
+                        extra_data=metadata,
                         status=ResourceStatus.DISCOVERED,
                         discovered_at=datetime.now(timezone.utc).replace(tzinfo=None),
-                        azure_subscription_id=az_r.get("azure_subscription_id"),
-                        azure_resource_group=az_r.get("azure_resource_group"),
-                        azure_region=az_r.get("azure_region"),
+                        azure_subscription_id=vm.get("subscription_id"),
+                        azure_resource_group=vm.get("resource_group"),
+                        azure_region=vm.get("location"),
                     )
                     db.add(resource)
                 else:
-                    existing_resource.display_name = az_r.get("display_name", existing_resource.display_name)
-                    existing_resource.metadata = az_r.get("metadata", existing_resource.metadata)
-                    existing_resource.azure_subscription_id = az_r.get("azure_subscription_id") or existing_resource.azure_subscription_id
-                    existing_resource.azure_resource_group = az_r.get("azure_resource_group") or existing_resource.azure_resource_group
-                    existing_resource.azure_region = az_r.get("azure_region") or existing_resource.azure_region
+                    existing_resource.metadata = metadata
+                    existing_resource.azure_subscription_id = vm.get("subscription_id") or existing_resource.azure_subscription_id
+                    existing_resource.azure_resource_group = vm.get("resource_group") or existing_resource.azure_resource_group
+                    existing_resource.azure_region = vm.get("location") or existing_resource.azure_region
                     existing_resource.discovered_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                count += 1
 
+            # Upsert SQL DBs
+            for sql_db in discovered["sql_dbs"]:
+                rtype = ResourceType.AZURE_SQL_DB
+                ext_id = sql_db.get("database_name", "")
+                display_name = f"{sql_db.get('server_name', '')}/{ext_id}"
+                metadata = {
+                    "server_name": sql_db.get("server_name", ""),
+                    "server_fqdn": sql_db.get("server_fqdn", ""),
+                    "server_id": sql_db.get("server_id", ""),
+                    "database_id": sql_db.get("database_id", ""),
+                    "subscription_id": sql_db.get("subscription_id", ""),
+                }
+
+                existing = await db.execute(
+                    select(Resource).where(
+                        Resource.tenant_id == tenant.id,
+                        Resource.type == rtype,
+                        Resource.external_id == ext_id,
+                    )
+                )
+                existing_resource = existing.scalar_one_or_none()
+
+                if existing_resource is None:
+                    resource = Resource(
+                        id=uuid.uuid4(),
+                        tenant_id=tenant.id,
+                        type=rtype,
+                        external_id=ext_id,
+                        display_name=display_name,
+                        extra_data=metadata,
+                        status=ResourceStatus.DISCOVERED,
+                        discovered_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                        azure_subscription_id=sql_db.get("subscription_id"),
+                        azure_resource_group=sql_db.get("resource_group"),
+                        azure_region=sql_db.get("location"),
+                    )
+                    db.add(resource)
+                else:
+                    existing_resource.display_name = display_name
+                    existing_resource.metadata = metadata
+                    existing_resource.azure_subscription_id = sql_db.get("subscription_id") or existing_resource.azure_subscription_id
+                    existing_resource.azure_resource_group = sql_db.get("resource_group") or existing_resource.azure_resource_group
+                    existing_resource.azure_region = sql_db.get("location") or existing_resource.azure_region
+                    existing_resource.discovered_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                count += 1
+
+            # Upsert PostgreSQL
+            for pg in discovered["postgres_servers"]:
+                rtype = ResourceType.AZURE_POSTGRESQL
+                ext_id = pg.get("name", pg.get("id", ""))
+                metadata = {
+                    "server_id": pg.get("id", ""),
+                    "location": pg.get("location", ""),
+                    "subscription_id": pg.get("subscription_id", ""),
+                }
+
+                existing = await db.execute(
+                    select(Resource).where(
+                        Resource.tenant_id == tenant.id,
+                        Resource.type == rtype,
+                        Resource.external_id == ext_id,
+                    )
+                )
+                existing_resource = existing.scalar_one_or_none()
+
+                if existing_resource is None:
+                    resource = Resource(
+                        id=uuid.uuid4(),
+                        tenant_id=tenant.id,
+                        type=rtype,
+                        external_id=ext_id,
+                        display_name=pg.get("name", "Unknown"),
+                        extra_data=metadata,
+                        status=ResourceStatus.DISCOVERED,
+                        discovered_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                        azure_subscription_id=pg.get("subscription_id"),
+                        azure_resource_group=pg.get("resource_group"),
+                        azure_region=pg.get("location"),
+                    )
+                    db.add(resource)
+                else:
+                    existing_resource.metadata = metadata
+                    existing_resource.azure_subscription_id = pg.get("subscription_id") or existing_resource.azure_subscription_id
+                    existing_resource.azure_resource_group = pg.get("resource_group") or existing_resource.azure_resource_group
+                    existing_resource.azure_region = pg.get("location") or existing_resource.azure_region
+                    existing_resource.discovered_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 count += 1
 
             tenant.status = TenantStatus.ACTIVE

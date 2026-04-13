@@ -152,6 +152,13 @@ class Tenant(Base):
     dr_storage_account_key_encrypted = Column(LargeBinary, nullable=True)
     dr_last_replicated_at = Column(DateTime, nullable=True)
 
+    # Afi.ai-style Azure onboarding fields
+    azure_refresh_token_encrypted = Column(LargeBinary, nullable=True)
+    azure_refresh_token_updated_at = Column(DateTime(timezone=True), nullable=True)
+    azure_subscriptions_cached = Column(JSON, default=dict, nullable=False)
+    azure_sql_servers_configured = Column(JSON, default=dict, nullable=False)
+    extra_data = Column(MutableDict.as_mutable(JSON), default=dict, nullable=True)
+
 
 class PlatformUser(Base):
     __tablename__ = "platform_users"
