@@ -99,12 +99,17 @@ class SqlBackupHandler:
         total_size = data_result.get("total_bytes", 0) + schema_result.get("size_bytes", 0) + config_result.get("size_bytes", 0)
 
         # Record last backup time on RESOURCE for next incremental
-        resource.extra_data = resource.extra_data or {}
-        resource.extra_data["last_full_backup_at"] = datetime.now(timezone.utc).isoformat()
-        resource.extra_data["last_backup_rows"] = data_result.get("rows_count", 0)
+        resource.extra_data = {
+            **(resource.extra_data or {}),
+            "last_full_backup_at": datetime.now(timezone.utc).isoformat(),
+            "last_backup_rows": data_result.get("rows_count", 0),
+        }
 
-        snapshot.extra_data = snapshot.extra_data or {}
-        snapshot.extra_data.update({
+        # Set blob_path on snapshot for recovery panel indexing
+        snapshot.blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/"
+
+        snapshot.extra_data = {
+            **(snapshot.extra_data or {}),
             "mode": "AFI_STREAMING",
             "total_size_bytes": total_size,
             "tables_exported": data_result.get("tables_count", 0),
@@ -119,7 +124,7 @@ class SqlBackupHandler:
             "auth_method": "ActiveDirectoryServicePrincipal",
             "backup_timestamp": datetime.now(timezone.utc).isoformat(),
             "last_full_backup_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
 
         # Format size in human-readable units
         if total_size >= 1024 * 1024 * 1024:

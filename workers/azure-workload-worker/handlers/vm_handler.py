@@ -136,8 +136,11 @@ class VmBackupHandler:
             failed_copies = [r for r in final_results if r["status"] == "failed"]
 
             # Update snapshot metadata
-            snapshot.extra_data = snapshot.extra_data or {}
-            snapshot.extra_data.update({
+            # Set blob_path for recovery panel indexing
+            snapshot.blob_path = f"{resource.external_id}/{snapshot.id.hex[:12]}/"
+
+            snapshot.extra_data = {
+                **(snapshot.extra_data or {}),
                 "vm_config_captured": config_blob_result.get("success", False),
                 "network_config_captured": network_blob_result.get("success", False),
                 "total_disks": len(disk_info),
@@ -149,7 +152,7 @@ class VmBackupHandler:
                 "snapshot_family_id": disk_info[0].get("snapshot_family_id") if disk_info else None,
                 "api_calls_optimized": True,
                 "vm_config_etag": vm_etag,
-            })
+            }
 
             success = len(failed_copies) == 0
             total_bytes = sum(r.get("size_bytes", 0) for r in successful_copies)
