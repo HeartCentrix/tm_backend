@@ -365,3 +365,29 @@ class AuditEvent(Base):
     details = Column(JSON, default=dict)
 
     occurred_at = Column(DateTime, default=utcnow, index=True, nullable=False)
+
+
+class AdminConsentToken(Base):
+    __tablename__ = "admin_consent_tokens"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), index=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
+    
+    # Consent type: M365 or AZURE
+    consent_type = Column(String, nullable=False, index=True)
+    
+    # Encrypted tokens
+    access_token_encrypted = Column(LargeBinary, nullable=True)
+    refresh_token_encrypted = Column(LargeBinary, nullable=True)
+    token_type = Column(String, default="Bearer")
+    expires_at = Column(DateTime, nullable=True)
+    
+    # Metadata
+    granted_by = Column(String, nullable=True)  # Email of user who granted consent
+    consented_at = Column(DateTime, default=utcnow)
+    last_used_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True, index=True)
+    scope = Column(String, nullable=True)  # Space-separated list of scopes
+    
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)

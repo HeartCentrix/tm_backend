@@ -12,12 +12,13 @@ from sqlalchemy import select, String
 
 from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession, async_session_factory
-from shared.models import PlatformUser, UserRoleMapping, Organization, UserRole, Tenant, TenantType, TenantStatus
+from shared.models import PlatformUser, UserRoleMapping, Organization, UserRole, Tenant, TenantType, TenantStatus, AdminConsentToken
 from shared.security import create_access_token, create_refresh_token, decode_token, get_current_user_from_token
 from shared.schemas import (
     UserResponse, LoginResponse, RefreshTokenRequest, RefreshTokenResponse,
     MicrosoftAuthUrlResponse, OAuthCallbackRequest,
     DatasourceConsentRequest, DatasourceCallbackResponse,
+    AdminConsentResponse, AdminConsentTokenResponse,
 )
 
 
@@ -284,6 +285,35 @@ async def datasource_callback(
 
     await db.flush()
     tenant_id = tenant.id
+
+    # 4b. Also store in admin_consent_tokens table for settings page tracking
+    from datetime import timedelta
+    encrypted_access_token = encrypt_secret(app_token)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=token_resp.json().get("expires_in", 3600))
+    
+    # Deactivate previous consent tokens for this tenant/type
+    deactivate_stmt = select(AdminConsentToken).where(
+        AdminConsentToken.tenant_id == tenant.id,
+        AdminConsentToken.consent_type == "M365",
+        AdminConsentToken.is_active == True,
+    )
+    old_tokens = (await db.execute(deactivate_stmt)).scalars().all()
+    for old_token in old_tokens:
+        old_token.is_active = False
+
+    consent_token = AdminConsentToken(
+        id=uuid4(),
+        org_id=tenant.org_id,
+        tenant_id=tenant.id,
+        consent_type="M365",
+        access_token_encrypted=encrypted_access_token,
+        token_type="Bearer",
+        expires_at=expires_at.replace(tzinfo=None),
+        granted_by=current_user.get("email"),
+        scope="https://graph.microsoft.com/.default",
+        is_active=True,
+    )
+    db.add(consent_token)
     await db.commit()
 
     # 5. PUBLISH DISCOVERY JOB — critical missing step
@@ -433,9 +463,90 @@ async def azure_datasource_callback(
             status=TenantStatus.ACTIVE,
         )
         db.add(tenant)
-        await db.commit()
+        await db.flush()
+
+    # Also store in admin_consent_tokens table for settings page tracking
+    from datetime import timedelta
+    from shared.security import encrypt_secret as enc_sec
+    encrypted_access_token = enc_sec(tokens["access_token"])
+    encrypted_refresh_token = enc_sec(tokens.get("refresh_token", "")) if tokens.get("refresh_token") else None
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=tokens.get("expires_in", 3600))
+
+    # Deactivate previous consent tokens for this tenant/type
+    deactivate_stmt = select(AdminConsentToken).where(
+        AdminConsentToken.tenant_id == tenant.id,
+        AdminConsentToken.consent_type == "AZURE",
+        AdminConsentToken.is_active == True,
+    )
+    old_tokens = (await db.execute(deactivate_stmt)).scalars().all()
+    for old_token in old_tokens:
+        old_token.is_active = False
+
+    consent_token = AdminConsentToken(
+        id=uuid4(),
+        org_id=tenant.org_id,
+        tenant_id=tenant.id,
+        consent_type="AZURE",
+        access_token_encrypted=encrypted_access_token,
+        refresh_token_encrypted=encrypted_refresh_token,
+        token_type="Bearer",
+        expires_at=expires_at.replace(tzinfo=None),
+        granted_by=current_user.get("email"),
+        scope="https://management.azure.com/.default offline_access",
+        is_active=True,
+    )
+    db.add(consent_token)
+    await db.commit()
 
     return {"tenantId": str(tenant.id), "tenantName": tenant.display_name}
+
+
+# ============ Admin Consent Status Endpoints ============
+
+@app.get("/api/v1/admin-consent/m365/status", response_model=Optional[AdminConsentResponse])
+async def get_m365_admin_consent_status(
+    current_user: dict = Depends(get_current_user_from_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the current M365 admin consent status for the organization."""
+    org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
+    
+    stmt = select(AdminConsentToken).where(
+        AdminConsentToken.org_id == org_id,
+        AdminConsentToken.consent_type == "M365",
+        AdminConsentToken.is_active == True,
+    ).order_by(AdminConsentToken.consented_at.desc()).limit(1)
+    
+    result = await db.execute(stmt)
+    token = result.scalar_one_or_none()
+    
+    if token is None:
+        return None
+    
+    return AdminConsentResponse.model_validate(token)
+
+
+@app.get("/api/v1/admin-consent/azure/status", response_model=Optional[AdminConsentResponse])
+async def get_azure_admin_consent_status(
+    current_user: dict = Depends(get_current_user_from_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the current Azure admin consent status for the organization."""
+    org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
+    
+    stmt = select(AdminConsentToken).where(
+        AdminConsentToken.org_id == org_id,
+        AdminConsentToken.consent_type == "AZURE",
+        AdminConsentToken.is_active == True,
+    ).order_by(AdminConsentToken.consented_at.desc()).limit(1)
+    
+    result = await db.execute(stmt)
+    token = result.scalar_one_or_none()
+    
+    if token is None:
+        return None
+    
+    return AdminConsentResponse.model_validate(token)
 
 
 @app.post("/api/v1/auth/refresh", response_model=RefreshTokenResponse)
