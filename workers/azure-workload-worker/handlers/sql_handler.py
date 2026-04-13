@@ -68,89 +68,100 @@ class SqlBackupHandler:
 
         self._log(f"Starting SQL backup: {db_name} on server {server_name} (RG={rg})")
 
-        # Get our SP credentials for SQL data-plane auth
-        # Our SP is Entra admin of this SQL server (assigned during discovery)
-        sp_client_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
-        sp_client_secret = settings.MICROSOFT_CLIENT_SECRET or settings.AZURE_AD_CLIENT_SECRET
+        try:
+            # Get our SP credentials for SQL data-plane auth
+            # Our SP is Entra admin of this SQL server (assigned during discovery)
+            sp_client_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
+            sp_client_secret = settings.MICROSOFT_CLIENT_SECRET or settings.AZURE_AD_CLIENT_SECRET
 
-        if not sp_client_id or not sp_client_secret:
-            raise ValueError(
-                f"No SP credentials configured. Set MICROSOFT_CLIENT_ID/SECRET or AZURE_AD_CLIENT_ID/SECRET."
+            if not sp_client_id or not sp_client_secret:
+                raise ValueError(
+                    f"No SP credentials configured. Set MICROSOFT_CLIENT_ID/SECRET or AZURE_AD_CLIENT_ID/SECRET."
+                )
+
+            # Phase 1: Connect and stream data
+            data_result = await self._stream_tables(
+                resource, tenant, snapshot, rg, server_name, db_name,
+                sp_client_id, sp_client_secret
             )
 
-        # Phase 1: Connect and stream data
-        data_result = await self._stream_tables(
-            resource, tenant, snapshot, rg, server_name, db_name,
-            sp_client_id, sp_client_secret
-        )
+            # Phase 2: Capture schema
+            schema_result = await self._capture_schema(
+                resource, tenant, snapshot, rg, server_name, db_name,
+                sp_client_id, sp_client_secret
+            )
 
-        # Phase 2: Capture schema
-        schema_result = await self._capture_schema(
-            resource, tenant, snapshot, rg, server_name, db_name,
-            sp_client_id, sp_client_secret
-        )
+            # Phase 3: Capture configuration
+            config_result = await self._capture_configuration(
+                sql_mgmt, resource, tenant, snapshot, rg, server_name, db_name
+            )
 
-        # Phase 3: Capture configuration
-        config_result = await self._capture_configuration(
-            sql_mgmt, resource, tenant, snapshot, rg, server_name, db_name
-        )
+            # Finalize
+            total_size = data_result.get("total_bytes", 0) + schema_result.get("size_bytes", 0) + config_result.get("size_bytes", 0)
 
-        # Finalize
-        total_size = data_result.get("total_bytes", 0) + schema_result.get("size_bytes", 0) + config_result.get("size_bytes", 0)
+            # Record last backup time on RESOURCE for next incremental
+            resource.extra_data = {
+                **(resource.extra_data or {}),
+                "last_full_backup_at": datetime.now(timezone.utc).isoformat(),
+                "last_backup_rows": data_result.get("rows_count", 0),
+            }
 
-        # Record last backup time on RESOURCE for next incremental
-        resource.extra_data = {
-            **(resource.extra_data or {}),
-            "last_full_backup_at": datetime.now(timezone.utc).isoformat(),
-            "last_backup_rows": data_result.get("rows_count", 0),
-        }
+            # Set blob_path on snapshot for recovery panel indexing
+            snapshot.blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/"
 
-        # Set blob_path on snapshot for recovery panel indexing
-        snapshot.blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/"
+            snapshot.extra_data = {
+                **(snapshot.extra_data or {}),
+                "mode": "AFI_STREAMING",
+                "total_size_bytes": total_size,
+                "tables_exported": data_result.get("tables_count", 0),
+                "rows_exported": data_result.get("rows_count", 0),
+                "data_blob_prefix": data_result.get("blob_prefix", ""),
+                "schema_blob": schema_result.get("blob_path", ""),
+                "config_blob": config_result.get("blob_path", ""),
+                "server_name": server_name,
+                "database_name": db_name,
+                "resource_group": rg,
+                "subscription_id": resource.azure_subscription_id,
+                "auth_method": "ActiveDirectoryServicePrincipal",
+                "backup_timestamp": datetime.now(timezone.utc).isoformat(),
+                "last_full_backup_at": datetime.now(timezone.utc).isoformat(),
+            }
 
-        snapshot.extra_data = {
-            **(snapshot.extra_data or {}),
-            "mode": "AFI_STREAMING",
-            "total_size_bytes": total_size,
-            "tables_exported": data_result.get("tables_count", 0),
-            "rows_exported": data_result.get("rows_count", 0),
-            "data_blob_prefix": data_result.get("blob_prefix", ""),
-            "schema_blob": schema_result.get("blob_path", ""),
-            "config_blob": config_result.get("blob_path", ""),
-            "server_name": server_name,
-            "database_name": db_name,
-            "resource_group": rg,
-            "subscription_id": resource.azure_subscription_id,
-            "auth_method": "ActiveDirectoryServicePrincipal",
-            "backup_timestamp": datetime.now(timezone.utc).isoformat(),
-            "last_full_backup_at": datetime.now(timezone.utc).isoformat(),
-        }
+            # Format size in human-readable units
+            if total_size >= 1024 * 1024 * 1024:
+                size_str = f"{total_size / (1024**3):.2f} GB"
+            elif total_size >= 1024 * 1024:
+                size_str = f"{total_size / (1024**2):.2f} MB"
+            elif total_size >= 1024:
+                size_str = f"{total_size / 1024:.1f} KB"
+            else:
+                size_str = f"{total_size} bytes"
 
-        # Format size in human-readable units
-        if total_size >= 1024 * 1024 * 1024:
-            size_str = f"{total_size / (1024**3):.2f} GB"
-        elif total_size >= 1024 * 1024:
-            size_str = f"{total_size / (1024**2):.2f} MB"
-        elif total_size >= 1024:
-            size_str = f"{total_size / 1024:.1f} KB"
-        else:
-            size_str = f"{total_size} bytes"
+            self._log(
+                f"SQL backup completed: {db_name} — "
+                f"{data_result.get('tables_count', 0)} tables, "
+                f"{data_result.get('rows_count', 0)} rows, "
+                f"{size_str} total"
+            )
 
-        self._log(
-            f"SQL backup completed: {db_name} — "
-            f"{data_result.get('tables_count', 0)} tables, "
-            f"{data_result.get('rows_count', 0)} rows, "
-            f"{size_str} total"
-        )
+            return {
+                "success": True,
+                "mode": "AFI_STREAMING",
+                "tables_exported": data_result.get("tables_count", 0),
+                "rows_exported": data_result.get("rows_count", 0),
+                "total_size_bytes": total_size,
+                "auth_method": "ActiveDirectoryServicePrincipal",
+            }
 
-        return {
-            "success": True,
-            "mode": "AFI_STREAMING",
-            "tables_exported": data_result.get("tables_count", 0),
-            "rows_exported": data_result.get("rows_count", 0),
-            "total_size_bytes": total_size,
-            "auth_method": "ActiveDirectoryServicePrincipal",
-        }
+        except Exception as e:
+            self._log(f"SQL backup FAILED for {db_name}: {e}", "ERROR")
+            raise
+        finally:
+            try:
+                await sql_mgmt.close()
+                await credential.close()
+            except Exception:
+                pass
 
     # ==================== Phase 1: Stream Tables Row-by-Row ====================
 
