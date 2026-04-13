@@ -6,7 +6,7 @@ from typing import Dict, List, Any
 from uuid import UUID
 
 from azure.identity.aio import ClientSecretCredential
-from azure.mgmt.resource.subscriptions.aio import SubscriptionClient
+from azure.mgmt.subscription.aio import SubscriptionClient
 from azure.core.exceptions import HttpResponseError
 
 from shared.config import settings
@@ -163,7 +163,7 @@ async def discover_all_azure_resources() -> List[Dict[str, Any]]:
         print("[AzureDiscovery] No Azure ARM credentials configured, skipping Azure discovery")
         return []
 
-    credential = _get_credential()
+    credential = await _get_credential()
     all_resources = []
 
     # Get subscriptions

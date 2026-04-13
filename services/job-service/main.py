@@ -18,6 +18,15 @@ from shared.schemas import (
 )
 from shared.message_bus import message_bus, create_backup_message, create_restore_message
 
+# AZ-4: Azure workload resources go to dedicated queues (not backup.*)
+AZURE_WORKLOAD_QUEUES = {
+    "AZURE_VM": "azure.vm",
+    "AZURE_SQL_DB": "azure.sql",
+    "AZURE_SQL": "azure.sql",
+    "AZURE_POSTGRESQL": "azure.postgres",
+    "AZURE_PG": "azure.postgres",
+}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -191,11 +200,15 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
 
     # Publish to RabbitMQ
     if settings.RABBITMQ_ENABLED:
-        routing_key = "backup.urgent"
+        # AZ-4: Route Azure workload resources to dedicated queues
+        resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
+        routing_key = AZURE_WORKLOAD_QUEUES.get(resource_type, "backup.urgent")
+
         msg = create_backup_message(
             job_id=str(job.id), resource_id=request.resourceId,
             tenant_id=str(resource.tenant_id), full_backup=effective_full_backup
         )
+        print(f"[JOB_SERVICE] Resource type={resource_type} → queue {routing_key}")
         print(f"[JOB_SERVICE] Publishing backup message to {routing_key}: {msg}")
         await message_bus.publish(routing_key, msg, priority=request.priority or 1)
         print(f"[JOB_SERVICE] Message published successfully")

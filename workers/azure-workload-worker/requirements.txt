@@ -1,5 +1,6 @@
 azure-identity>=1.17.0
 azure-mgmt-compute>=31.0.0
+azure-mgmt-network>=25.0.0
 azure-mgmt-sql>=3.0.1
 azure-mgmt-rdbms>=10.1.1
 azure-mgmt-resource>=23.1.0
@@ -12,3 +13,4 @@ httpx>=0.27.0
 six>=1.16.0
 fastapi>=0.100.0
 python-jose[cryptography]>=3.3.0
+aiohttp>=3.9.0

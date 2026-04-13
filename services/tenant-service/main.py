@@ -225,14 +225,34 @@ async def trigger_discovery(tenant_id: str, db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/v1/tenants/{tenant_id}/discover-azure")
 async def trigger_azure_discovery(tenant_id: str, db: AsyncSession = Depends(get_db)):
-    """Azure discovery - not yet implemented"""
+    """Trigger Azure resource discovery for a specific tenant.
+    Publishes to discovery.azure queue for the discovery worker to consume."""
+    import uuid as _uuid
     stmt = select(Tenant).where(Tenant.id == UUID(tenant_id))
     result = await db.execute(stmt)
     tenant = result.scalar_one_or_none()
-    if tenant:
-        tenant.status = TenantStatus.DISCOVERING
-        await db.flush()
-    return {"discoveryId": str(uuid4()), "resourcesFound": 0}
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    tenant.status = TenantStatus.DISCOVERING
+    await db.commit()
+
+    # Publish to discovery.azure queue
+    from shared.message_bus import message_bus as msg_bus
+    if not msg_bus.connection:
+        await msg_bus.connect()
+
+    discovery_id = str(_uuid.uuid4())
+    await msg_bus.publish("discovery.azure", {
+        "jobId": discovery_id,
+        "tenantId": str(tenant.id),
+        "externalTenantId": tenant.external_tenant_id or "",
+        "discoveryScope": ["azure_vms", "azure_sql", "azure_postgresql"],
+        "triggeredBy": "API",
+        "triggeredAt": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).replace(tzinfo=None).isoformat(),
+    }, priority=5)
+
+    return {"discoveryId": discovery_id, "tenantId": str(tenant.id), "resourcesFound": -1}
 
 
 @app.get("/api/v1/tenants/{tenant_id}/discovery-status", response_model=DiscoveryStatus)

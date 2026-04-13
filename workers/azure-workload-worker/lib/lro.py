@@ -1,31 +1,42 @@
 """Long-running operation polling helper for Azure ARM operations."""
 import asyncio
 import time
+import logging
 from typing import Any
 
+logger = logging.getLogger("azure.lro")
 
-async def await_lro(poller, name: str, timeout_seconds: int = 14400,
-                    poll_interval: int = 30) -> Any:
+
+async def await_lro(poller, name: str, timeout_seconds: int = 3600,
+                    poll_interval: int = 15) -> Any:
     """
     Poll an Azure Long-Running Operation (LRO) with timeout and progress logging.
-
-    Args:
-        poller: Azure SDK poller object (from begin_* methods)
-        name: Human-readable name for logging (e.g., "create_restore_point/rp-abc123")
-        timeout_seconds: Maximum time to wait before raising TimeoutError (default: 4 hours)
-        poll_interval: Seconds between status checks (default: 30)
-
-    Returns:
-        The result of the LRO operation
-
-    Raises:
-        TimeoutError: If the operation exceeds timeout_seconds
+    
+    Works with both sync and async Azure SDK pollers.
     """
     start = time.monotonic()
-    while not poller.done():
-        if time.monotonic() - start > timeout_seconds:
-            raise TimeoutError(f"LRO '{name}' exceeded {timeout_seconds}s timeout")
-        elapsed = int(time.monotonic() - start)
-        print(f"[LRO] {name} in progress ({elapsed}s elapsed)")
+    
+    while True:
+        elapsed = time.monotonic() - start
+        if elapsed > timeout_seconds:
+            raise TimeoutError(f"LRO '{name}' exceeded {timeout_seconds}s timeout (ran {elapsed:.0f}s)")
+        
+        # Check if done
+        if poller.done():
+            result = poller.result()
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result
+        
+        # For async pollers, also try awaiting result() directly
+        try:
+            result = poller.result()
+            if asyncio.iscoroutine(result):
+                result = await result
+            if result is not None:
+                return result
+        except Exception:
+            pass  # Not ready yet
+        
+        logger.info("[LRO] %s in progress (%.0fs elapsed)", name, elapsed)
         await asyncio.sleep(poll_interval)
-    return await poller.result()

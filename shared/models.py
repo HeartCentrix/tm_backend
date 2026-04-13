@@ -283,6 +283,7 @@ class Snapshot(Base):
     bytes_total = Column(BigInteger, default=0)
     delta_token = Column(String)
     delta_tokens_json = Column(MutableDict.as_mutable(JSON), default=dict)  # per-folder/resource delta tokens
+    extra_data = Column(MutableDict.as_mutable(JSON), default=dict)  # VM backup metadata (config blobs, disk info, etc.)
     snapshot_label = Column(String)
     content_checksum = Column(String)  # NEW: SHA-256 of stored blob
     blob_path = Column(String)  # NEW: full Azure Blob path

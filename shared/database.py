@@ -325,6 +325,7 @@ async def init_db():
                 bytes_total BIGINT DEFAULT 0,
                 delta_token VARCHAR,
                 delta_tokens_json JSON DEFAULT '{}',
+                extra_data JSON DEFAULT '{}',
                 snapshot_label VARCHAR,
                 content_checksum VARCHAR,
                 blob_path VARCHAR,
@@ -468,6 +469,7 @@ async def init_db():
             "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replicated_at TIMESTAMP;",
             "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_error TEXT;",
             "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replication_attempts INTEGER DEFAULT 0;",
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS extra_data JSON DEFAULT '{}';",
         ]
         for stmt in add_column_statements:
             try:

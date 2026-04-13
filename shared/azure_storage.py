@@ -429,15 +429,23 @@ class AzureStorageManager:
         if not self.shards:
             raise RuntimeError("No storage shards configured")
         return self.shards[index % len(self.shards)]
+
+    def get_default_shard(self) -> AzureStorageShard:
+        """Get the first/default storage shard"""
+        if not self.shards:
+            raise RuntimeError("No storage shards configured — set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY")
+        return self.shards[0]
     
     def get_container_name(self, tenant_id: str, resource_type: str) -> str:
         """
         Generate container name following Azure naming conventions.
-        Containers must be lowercase, 3-63 chars, no special chars except hyphens.
+        Containers must be lowercase, 3-63 chars, only alphanumeric and hyphens.
         """
         # Shorten tenant/tenant ID to avoid exceeding 63 char limit
         tenant_short = tenant_id.replace("-", "")[:8]
-        return f"backup-{resource_type.lower()}-{tenant_short}"
+        # Replace underscores with hyphens (Azure container names don't allow underscores)
+        safe_type = resource_type.lower().replace("_", "-")
+        return f"backup-{safe_type}-{tenant_short}"
     
     def build_blob_path(self, tenant_id: str, resource_id: str, 
                        snapshot_id: str, item_id: str, timestamp: str = None) -> str:

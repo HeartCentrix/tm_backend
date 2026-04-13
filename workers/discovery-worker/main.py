@@ -24,7 +24,7 @@ from shared.models import (
 )
 from shared.graph_client import GraphClient
 from shared.message_bus import message_bus
-from workers.discovery_worker.azure_discovery import discover_all_azure_resources
+from azure_discovery import discover_all_azure_resources
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,6 +44,9 @@ TYPE_MAP: Dict[str, ResourceType] = {
     "ENTRA_GROUP": ResourceType.ENTRA_GROUP,
     "ENTRA_APP": ResourceType.ENTRA_APP,
     "ENTRA_DEVICE": ResourceType.ENTRA_DEVICE,
+    "AZURE_VM": ResourceType.AZURE_VM,
+    "AZURE_SQL_DB": ResourceType.AZURE_SQL_DB,
+    "AZURE_POSTGRESQL": ResourceType.AZURE_POSTGRESQL,
 }
 
 

@@ -29,6 +29,7 @@ from shared.azure_storage import azure_storage_manager
 
 from handlers.vm_handler import VmBackupHandler
 from handlers.sql_handler import SqlBackupHandler
+from handlers.sql_restore_handler import SqlRestoreHandler
 from handlers.postgres_handler import PostgresBackupHandler
 
 logging.basicConfig(
@@ -52,6 +53,7 @@ class AzureWorkloadWorker:
         self.worker_id = worker_id
         self.vm_handler = VmBackupHandler(worker_id)
         self.sql_handler = SqlBackupHandler(worker_id)
+        self.sql_restore_handler = SqlRestoreHandler(worker_id)
         self.pg_handler = PostgresBackupHandler(worker_id)
 
     async def start(self):
