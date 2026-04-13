@@ -91,6 +91,13 @@ async def auth_me(request: Request):
     return await proxy_request("auth", request.url.path, request)
 
 
+# Admin Consent status routes (existing datasource APIs handle URL/callback)
+@app.get("/api/v1/admin-consent/m365/status")
+@app.get("/api/v1/admin-consent/azure/status")
+async def admin_consent_status(request: Request):
+    return await proxy_request("auth", request.url.path, request)
+
+
 # Dashboard routes
 @app.get("/api/v1/dashboard/{rest:path}")
 async def dashboard(request: Request):

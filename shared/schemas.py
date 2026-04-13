@@ -426,3 +426,34 @@ class AccessGroupListResponse(BaseModel):
     totalElements: int
     size: int
     number: int
+
+
+# ============ Admin Consent ============
+
+class AdminConsentResponse(BaseModel):
+    """Response for admin consent status"""
+    id: str
+    consentType: str = Field(alias='consent_type')
+    grantedBy: Optional[str] = Field(default=None, alias='granted_by')
+    consentedAt: Optional[str] = Field(default=None, alias='consented_at')
+    lastUsedAt: Optional[str] = Field(default=None, alias='last_used_at')
+    isActive: bool = Field(default=True, alias='is_active')
+    scope: Optional[str] = None
+
+    @field_validator('id', mode='before')
+    @classmethod
+    def uuid_to_str(cls, v):
+        return str(v) if v else v
+
+    @field_validator('consentedAt', 'lastUsedAt', mode='before')
+    @classmethod
+    def datetime_to_str(cls, v):
+        return v.isoformat() if v else v
+
+
+class AdminConsentTokenResponse(BaseModel):
+    """Response when granting admin consent"""
+    tenantId: str
+    consentType: str
+    message: str
+    consentedAt: str

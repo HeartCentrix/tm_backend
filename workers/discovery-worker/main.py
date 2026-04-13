@@ -47,6 +47,10 @@ TYPE_MAP: Dict[str, ResourceType] = {
     "AZURE_VM": ResourceType.AZURE_VM,
     "AZURE_SQL_DB": ResourceType.AZURE_SQL_DB,
     "AZURE_POSTGRESQL": ResourceType.AZURE_POSTGRESQL,
+    "POWER_BI": ResourceType.POWER_BI,
+    "POWER_APPS": ResourceType.POWER_APPS,
+    "POWER_AUTOMATE": ResourceType.POWER_AUTOMATE,
+    "POWER_DLP": ResourceType.POWER_DLP,
 }
 
 

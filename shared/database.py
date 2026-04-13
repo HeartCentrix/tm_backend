@@ -131,13 +131,10 @@ async def init_db():
     for stmt in ensure_enum_values:
         try:
             # ALTER TYPE ADD VALUE cannot run inside a transaction — use AUTOCOMMIT
-            async with engine.connect() as ac:
-                await ac.execution_options(isolation_level="AUTOCOMMIT").execute(
-                    text(f"SET search_path TO {settings.DB_SCHEMA};")
-                )
-                await ac.execution_options(isolation_level="AUTOCOMMIT").execute(text(stmt))
+            async with engine.begin() as ac:
+                await ac.execute(text(stmt))
         except Exception:
-            pass  # Already exists
+            pass  # Already exists or not supported
 
     # Now create tables and run remaining ALTERs inside a new transaction
     async with engine.begin() as conn:
@@ -399,25 +396,7 @@ async def init_db():
             )
         """))
 
-        # 12. Access Groups
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS access_groups (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                org_id UUID REFERENCES organizations(id),
-                tenant_id UUID REFERENCES tenants(id),
-                name VARCHAR NOT NULL,
-                description VARCHAR,
-                scope VARCHAR DEFAULT 'TENANT',
-                resource_ids UUID[] DEFAULT '{}',
-                permissions JSON DEFAULT '{}',
-                member_ids UUID[] DEFAULT '{}',
-                active BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-
-        # 13. Audit Events
+        # 12. Audit Events
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS audit_events (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -442,6 +421,31 @@ async def init_db():
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_occurred ON audit_events(occurred_at DESC)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_org ON audit_events(org_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_resource ON audit_events(resource_id)"))
+
+        # 13. Admin Consent Tokens
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS admin_consent_tokens (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                org_id UUID REFERENCES organizations(id),
+                tenant_id UUID REFERENCES tenants(id),
+                consent_type VARCHAR NOT NULL,
+                access_token_encrypted BYTEA,
+                refresh_token_encrypted BYTEA,
+                token_type VARCHAR DEFAULT 'Bearer',
+                expires_at TIMESTAMP,
+                granted_by VARCHAR,
+                consented_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP,
+                is_active BOOLEAN DEFAULT TRUE,
+                scope VARCHAR,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_org ON admin_consent_tokens(org_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_tenant ON admin_consent_tokens(tenant_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_type ON admin_consent_tokens(consent_type)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_active ON admin_consent_tokens(is_active)"))
 
         # ── Add missing columns to existing tables (idempotent) ──
         add_column_statements = [

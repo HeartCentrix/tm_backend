@@ -22,6 +22,7 @@ from shared.graph_client import GraphClient
 TYPE_MAP = {
     "MAILBOX": ResourceType.MAILBOX,
     "SHARED_MAILBOX": ResourceType.SHARED_MAILBOX,
+    "ROOM_MAILBOX": ResourceType.ROOM_MAILBOX,
     "ONEDRIVE": ResourceType.ONEDRIVE,
     "SHAREPOINT_SITE": ResourceType.SHAREPOINT_SITE,
     "TEAMS_CHANNEL": ResourceType.TEAMS_CHANNEL,
@@ -30,6 +31,10 @@ TYPE_MAP = {
     "ENTRA_GROUP": ResourceType.ENTRA_GROUP,
     "ENTRA_APP": ResourceType.ENTRA_APP,
     "ENTRA_DEVICE": ResourceType.ENTRA_DEVICE,
+    "POWER_BI": ResourceType.POWER_BI,
+    "POWER_APPS": ResourceType.POWER_APPS,
+    "POWER_AUTOMATE": ResourceType.POWER_AUTOMATE,
+    "POWER_DLP": ResourceType.POWER_DLP,
 }
 
 

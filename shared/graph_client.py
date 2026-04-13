@@ -222,42 +222,89 @@ class GraphClient:
             })
         return groups
     
+    # ------------------------------------------------------------------
+    # Mailbox discovery — simple & direct:
+    #   1. Fetch all users
+    #   2. Enrich each with mailboxSettings.userPurpose
+    #   3. Build resource records based on userPurpose value
+    # ------------------------------------------------------------------
+
     async def discover_mailboxes(self) -> List[Dict[str, Any]]:
-        """Discover mailboxes by fetching users with mailboxes"""
-        # Get all users - those with mailboxLicense are mailboxes
-        users = await self.discover_users()
-        mailboxes = []
-        for u in users:
-            if u.get("email"):
-                mailboxes.append({
-                    "external_id": u["external_id"],
-                    "display_name": u["display_name"],
-                    "email": u["email"],
-                    "type": "MAILBOX",
-                    "metadata": u.get("metadata", {}),
-                })
-        return mailboxes
-    
-    async def discover_shared_mailboxes(self) -> List[Dict[str, Any]]:
-        """Discover shared mailboxes"""
-        # Shared mailboxes are users with mailbox but no license
-        result = await self._get(
+        """
+        Discover all mailboxes by enriching users with userPurpose.
+
+        userPurpose → resource type mapping:
+          "user"      → MAILBOX
+          "shared"    → SHARED_MAILBOX
+          "room"      → ROOM_MAILBOX
+          "equipment" → ROOM_MAILBOX
+          None/other  → skipped (no mailbox)
+        """
+        # Step 1: Fetch all users (no $filter — get everyone)
+        users_result = await self._get(
             f"{self.GRAPH_URL}/users",
-            params={"$filter": "mailboxSettings is not null", "$top": "999", "$count": "true"}
+            params={"$top": "999", "$count": "true",
+                    "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,accountEnabled,createdDateTime"},
         )
-        shared = []
-        for u in result.get("value", []):
-            # Filter for shared mailboxes (typically have no password/sign-in)
-            if u.get("mail") and not u.get("assignedLicenses"):
-                shared.append({
-                    "external_id": u.get("id"),
-                    "display_name": u.get("displayName", u.get("mail")),
-                    "email": u.get("mail"),
-                    "type": "SHARED_MAILBOX",
-                    "metadata": {"user_principal_name": u.get("userPrincipalName")},
-                })
-        return shared
-    
+        all_users = users_result.get("value", [])
+        mailboxes = []
+
+        # Step 2: Enrich each user with userPurpose
+        semaphore = asyncio.Semaphore(10)
+
+        async def _enrich_one_user(user: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            async with semaphore:
+                email = user.get("mail")
+                if not email:
+                    return None
+
+                try:
+                    result = await self._get(
+                        f"{self.GRAPH_URL}/users/{user['id']}/mailboxSettings",
+                        params={"$select": "userPurpose"},
+                    )
+                    purpose = result.get("userPurpose") if result else None
+                except Exception:
+                    purpose = None
+
+                # Step 3: Build resource ONLY if we have a known mailbox type
+                if purpose == "user":
+                    rtype = "MAILBOX"
+                elif purpose == "shared":
+                    rtype = "SHARED_MAILBOX"
+                elif purpose in ("room", "equipment"):
+                    rtype = "ROOM_MAILBOX"
+                else:
+                    return None  # no mailbox → skip
+
+                print(f"[GraphClient] {email} → userPurpose={purpose} → {rtype}")
+
+                return {
+                    "external_id": user.get("id"),
+                    "display_name": user.get("displayName", email),
+                    "email": email,
+                    "type": rtype,
+                    "metadata": {
+                        "user_principal_name": user.get("userPrincipalName"),
+                        "job_title": user.get("jobTitle"),
+                        "department": user.get("department"),
+                        "account_enabled": user.get("accountEnabled", True),
+                        "created_at": user.get("createdDateTime"),
+                        "mailbox_purpose": purpose,
+                    },
+                }
+
+        tasks = [_enrich_one_user(u) for u in all_users]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        for r in results:
+            if r:
+                mailboxes.append(r)
+
+        print(f"[GraphClient] discover_mailboxes: found {len(mailboxes)} mailboxes "
+              f"({[m['type'] for m in mailboxes]})")
+        return mailboxes
+
     async def discover_onedrive(self) -> List[Dict[str, Any]]:
         """Discover OneDrive sites for all users"""
         # Get all users with mailbox licenses, then fetch each user's drive
@@ -328,23 +375,153 @@ class GraphClient:
                 },
             })
         return teams
+
+    async def discover_power_platform(self) -> List[Dict[str, Any]]:
+        """Discover Power Platform resources using Power Platform Admin APIs and Power BI APIs"""
+        resources = []
+        token = await self._get_token()
+
+        # 1. Discover Power Platform Environments using Power Platform Admin API
+        try:
+            env_url = "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments"
+            headers = {"Authorization": f"Bearer {token}"}
+            async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+                resp = await client.get(env_url, headers=headers)
+                if resp.status_code == 200:
+                    env_data = resp.json()
+                    environments = env_data.get("value", [])
+                else:
+                    print(f"Error fetching Power Platform environments: {resp.status_code} {resp.text}")
+                    environments = []
+
+            for env in environments:
+                env_id = env.get("name")
+                env_props = env.get("properties", {})
+                env_name = env_props.get("displayName", env_id)
+                env_type = env_props.get("environmentType", "Unknown")
+                env_region = env_props.get("location", {}).get("name", "Unknown")
+                has_dataverse = env_props.get("linkedEnvironmentMetadata", {}).get("CommonDataService") is not None
+
+                # Add environment as a resource
+                resources.append({
+                    "external_id": f"env_{env_id}",
+                    "display_name": f"{env_name} (Environment)",
+                    "email": None,
+                    "type": "POWER_APPS",
+                    "metadata": {
+                        "environment_id": env_id,
+                        "environment_type": env_type,
+                        "region": env_region,
+                        "has_dataverse": has_dataverse,
+                        "created_time": env_props.get("createdTime"),
+                    },
+                })
+
+                # 2. Discover Power Apps in each environment
+                try:
+                    apps_url = f"https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments/{env_id}/resources/Microsoft.PowerApps"
+                    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+                        apps_resp = await client.get(apps_url, headers=headers)
+                        if apps_resp.status_code == 200:
+                            apps_data = apps_resp.json()
+                            for app in apps_data.get("value", []):
+                                app_props = app.get("properties", {})
+                                resources.append({
+                                    "external_id": f"app_{app.get('id', app.get('name'))}",
+                                    "display_name": app_props.get("displayName", app.get("name", "Unknown App")),
+                                    "email": None,
+                                    "type": "POWER_APPS",
+                                    "metadata": {
+                                        "app_id": app.get("name"),
+                                        "environment_id": env_id,
+                                        "environment_name": env_name,
+                                        "app_type": app_props.get("appType"),
+                                        "created_by": app_props.get("createdBy", {}).get("displayName"),
+                                        "created_time": app_props.get("createdTime"),
+                                        "modified_time": app_props.get("lastModifiedTime"),
+                                    },
+                                })
+                except Exception as e:
+                    print(f"Error discovering Power Apps for env {env_id}: {e}")
+
+                # 3. Discover Power Automate flows in each environment
+                try:
+                    flows_url = f"https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments/{env_id}/resources/Microsoft.Flow"
+                    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+                        flows_resp = await client.get(flows_url, headers=headers)
+                        if flows_resp.status_code == 200:
+                            flows_data = flows_resp.json()
+                            for flow in flows_data.get("value", []):
+                                flow_props = flow.get("properties", {})
+                                resources.append({
+                                    "external_id": f"flow_{flow.get('id', flow.get('name'))}",
+                                    "display_name": flow_props.get("displayName", flow.get("name", "Unknown Flow")),
+                                    "email": None,
+                                    "type": "POWER_AUTOMATE",
+                                    "metadata": {
+                                        "flow_id": flow.get("name"),
+                                        "environment_id": env_id,
+                                        "environment_name": env_name,
+                                        "state": flow_props.get("state"),
+                                        "created_by": flow_props.get("createdBy", {}).get("displayName"),
+                                        "created_time": flow_props.get("createdTime"),
+                                        "modified_time": flow_props.get("lastModifiedTime"),
+                                    },
+                                })
+                except Exception as e:
+                    print(f"Error discovering Power Automate flows for env {env_id}: {e}")
+
+        except Exception as e:
+            print(f"Error discovering Power Platform environments: {e}")
+
+        # 4. Discover Power BI workspaces via Graph API
+        try:
+            result = await self._get(
+                f"{self.GRAPH_URL}/groups",
+                params={
+                    "$filter": "resourceProvisioningOptions/Any(x:x eq 'PowerBI')",
+                    "$top": "999",
+                    "$count": "true"
+                }
+            )
+            for g in result.get("value", []):
+                resources.append({
+                    "external_id": f"pbi_ws_{g.get('id')}",
+                    "display_name": g.get("displayName", "Unknown Power BI Workspace"),
+                    "email": g.get("mail"),
+                    "type": "POWER_BI",
+                    "metadata": {
+                        "workspace_id": g.get("id"),
+                        "mail_enabled": g.get("mailEnabled"),
+                        "security_enabled": g.get("securityEnabled"),
+                        "visibility": g.get("visibility"),
+                        "description": g.get("description"),
+                    },
+                })
+        except Exception as e:
+            print(f"Error discovering Power BI workspaces: {e}")
+
+        return resources
     
     async def discover_all(self) -> List[Dict[str, Any]]:
         """Run full discovery and return all resources"""
         all_resources = []
-        
+
         try:
             all_resources.extend(await self.discover_users())
         except Exception as e:
             print(f"Error discovering users: {e}")
-        
+
         try:
             all_resources.extend(await self.discover_groups())
         except Exception as e:
             print(f"Error discovering groups: {e}")
-        
+
         try:
-            all_resources.extend(await self.discover_mailboxes())
+            mailboxes = await self.discover_mailboxes()
+            all_resources.extend(mailboxes)
+            print(f"[GraphClient] discover_mailboxes() returned {len(mailboxes)} resources: "
+                  f"{[m['type'] for m in mailboxes]}")
         except Exception as e:
             print(f"Error discovering mailboxes: {e}")
 
@@ -357,12 +534,17 @@ class GraphClient:
             all_resources.extend(await self.discover_sharepoint())
         except Exception as e:
             print(f"Error discovering SharePoint: {e}")
-        
+
         try:
             all_resources.extend(await self.discover_teams())
         except Exception as e:
             print(f"Error discovering Teams: {e}")
-        
+
+        try:
+            all_resources.extend(await self.discover_power_platform())
+        except Exception as e:
+            print(f"Error discovering Power Platform: {e}")
+
         # Deduplicate: same external_id AND same type
         seen = set()
         unique = []
