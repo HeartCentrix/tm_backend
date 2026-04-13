@@ -75,17 +75,17 @@ class VmBackupHandler:
         """
         backup_start = time.monotonic()
         credential = get_arm_credential()
-        compute_client = ComputeManagementClient(credential, resource.azure_subscription_id)
-        network_client = NetworkManagementClient(credential, resource.azure_subscription_id)
-
+        sub_id = resource.azure_subscription_id
         rg_name = resource.azure_resource_group
         vm_name = resource.external_id
-        sub_id = resource.azure_subscription_id
 
         if not rg_name or not vm_name:
             raise ValueError(f"VM resource missing azure_resource_group or external_id: {resource.id}")
 
         self._log(f"Starting VM backup: {vm_name} in {rg_name} (sub={sub_id[:8]}...)")
+
+        compute_client = ComputeManagementClient(credential, sub_id)
+        network_client = NetworkManagementClient(credential, sub_id)
 
         try:
             # === Phase 1: Capture VM Configuration (with ETag caching) ===
@@ -186,6 +186,14 @@ class VmBackupHandler:
             snapshot.extra_data = snapshot.extra_data or {}
             snapshot.extra_data["error"] = str(e)[:1000]
             raise
+        finally:
+            # Close Azure SDK clients AND credential to release aiohttp connections
+            try:
+                await compute_client.close()
+                await network_client.close()
+                await credential.close()
+            except Exception:
+                pass  # Best effort cleanup
 
     # ==================== Phase 1: VM Configuration Capture (Cached) ====================
 
