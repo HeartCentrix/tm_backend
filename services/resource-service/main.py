@@ -91,6 +91,20 @@ async def list_resources(
         policy_result = await db.execute(policy_stmt)
         policies = {str(p.id): p.name for p in policy_result.scalars().all()}
 
+    # Get backup counts for all resources in one query
+    resource_ids = [r[0] for r in rows]
+    backup_counts = {}
+    if resource_ids:
+        counts_query = text("""
+            SELECT resource_id, COUNT(*) as backup_count
+            FROM snapshots
+            WHERE resource_id = ANY(:resource_ids)
+            AND status = 'COMPLETED'
+            GROUP BY resource_id
+        """)
+        counts_result = await db.execute(counts_query, {"resource_ids": resource_ids})
+        backup_counts = {str(row[0]): row[1] for row in counts_result.fetchall()}
+
     def map_kind(t):
         m = {"MAILBOX": "office_user", "SHARED_MAILBOX": "shared_mailbox", "ROOM_MAILBOX": "room_mailbox",
              "ONEDRIVE": "onedrive", "SHAREPOINT_SITE": "sharepoint_site", "TEAMS_CHANNEL": "teams_channel",
@@ -120,6 +134,7 @@ async def list_resources(
     for r in rows:
         storage_bytes = r[9] or 0
         has_backup = r[10] is not None  # last_backup_at is not None
+        backup_count = backup_counts.get(str(r[0]), 0)
         items.append({
             "id": str(r[0]), "tenant_id": str(r[1]), "owner": None,
             "kind": map_kind(r[2]),
@@ -128,7 +143,7 @@ async def list_resources(
             "data": r[6] or {},
             "archived": r[8] == "ARCHIVED", "deleted": r[8] == "PENDING_DELETION",
             "protections": [{"policy_id": str(r[7])}] if r[7] else None,
-            "usage": {"resource_id": str(r[0]), "tenant_id": str(r[1]), "backups": 0,
+            "usage": {"resource_id": str(r[0]), "tenant_id": str(r[1]), "backups": backup_count,
                       "size": storage_bytes, "size_delta_year": 0, "size_delta_month": 0, "size_delta_week": 0},
             "backupSize": format_backup_size(storage_bytes) if has_backup else None,
             "status": map_status(r[8]),
@@ -204,10 +219,25 @@ async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] 
             return f"{bytes_val / 1024:.2f} KB"
         return f"{bytes_val} B"
 
+    # Get backup counts for all resources in one query
+    resource_ids = [row[0] for row in rows]
+    backup_counts = {}
+    if resource_ids:
+        counts_query = text("""
+            SELECT resource_id, COUNT(*) as backup_count
+            FROM snapshots
+            WHERE resource_id = ANY(:resource_ids)
+            AND status = 'COMPLETED'
+            GROUP BY resource_id
+        """)
+        counts_result = await db.execute(counts_query, {"resource_ids": resource_ids})
+        backup_counts = {str(r[0]): r[1] for r in counts_result.fetchall()}
+
     items = []
     for row in rows:
         storage_bytes = row[9] or 0
         has_backup = row[10] is not None
+        backup_count = backup_counts.get(str(row[0]), 0)
         items.append({
             "id": str(row[0]), "tenant_id": str(row[1]), "owner": None,
             "kind": map_kind(row[2]),
@@ -216,7 +246,7 @@ async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] 
             "data": row[6] or {},
             "archived": row[8] == "ARCHIVED", "deleted": row[8] == "PENDING_DELETION",
             "protections": None,
-            "usage": {"resource_id": str(row[0]), "tenant_id": str(row[1]), "backups": 0,
+            "usage": {"resource_id": str(row[0]), "tenant_id": str(row[1]), "backups": backup_count,
                       "size": storage_bytes, "size_delta_year": 0, "size_delta_month": 0, "size_delta_week": 0},
             "backupSize": format_backup_size(storage_bytes) if has_backup else None,
             "status": "protected" if row[8] == "ACTIVE" else "discovered",
@@ -292,7 +322,7 @@ async def assign_policy(resource_id: str, request: AssignPolicyRequest, db: Asyn
         raise HTTPException(status_code=404, detail="Resource not found")
     resource.sla_policy_id = UUID(request.policyId)
     resource.status = ResourceStatus.ACTIVE
-    await db.flush()
+    await db.commit()
 
 
 @app.post("/api/v1/resources/{resource_id}/unassign-policy", status_code=204)
@@ -303,7 +333,7 @@ async def unassign_policy(resource_id: str, db: AsyncSession = Depends(get_db)):
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     resource.sla_policy_id = None
-    await db.flush()
+    await db.commit()
 
 
 @app.post("/api/v1/resources/{resource_id}/archive", status_code=204)
@@ -314,7 +344,7 @@ async def archive_resource(resource_id: str, db: AsyncSession = Depends(get_db))
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     resource.status = ResourceStatus.ARCHIVED
-    await db.flush()
+    await db.commit()
 
 
 @app.post("/api/v1/resources/{resource_id}/unarchive", status_code=204)
@@ -325,7 +355,7 @@ async def unarchive_resource(resource_id: str, db: AsyncSession = Depends(get_db
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     resource.status = ResourceStatus.ACTIVE
-    await db.flush()
+    await db.commit()
 
 
 @app.delete("/api/v1/resources/{resource_id}", status_code=204)
@@ -336,7 +366,7 @@ async def delete_resource(resource_id: str, db: AsyncSession = Depends(get_db)):
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     resource.status = ResourceStatus.PENDING_DELETION
-    await db.flush()
+    await db.commit()
 
 
 @app.post("/api/v1/resources/bulk-assign-policy", status_code=200)
