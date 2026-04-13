@@ -454,6 +454,10 @@ async def init_db():
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_active ON admin_consent_tokens(is_active)"))
 
         # ── Add missing columns to existing tables (idempotent) ──
+        # Use advisory lock so only ONE service runs ALTERs at a time (prevents deadlock)
+        # Lock ID: 1234567890 — arbitrary, must be consistent across all services
+        await conn.execute(text("SELECT pg_advisory_xact_lock(1234567890);"))
+        
         add_column_statements = [
             "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS customer_id VARCHAR;",
             "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_subscription_id VARCHAR;",
@@ -496,6 +500,9 @@ async def init_db():
 
         # ── Convert VARCHAR columns to enum types (each in its own top-level transaction) ──
         # DROP DEFAULT first for columns that have defaults, otherwise PG can't auto-cast
+        # Also under advisory lock to prevent deadlock
+        await conn.execute(text("SELECT pg_advisory_xact_lock(1234567890);"))
+        
         alter_statements = [
             """ALTER TABLE tenants ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE tenanttype USING type::tenanttype, ALTER COLUMN type SET DEFAULT 'M365'::tenanttype;""",
             """ALTER TABLE tenants ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE tenantstatus USING status::tenantstatus, ALTER COLUMN status SET DEFAULT 'PENDING'::tenantstatus;""",

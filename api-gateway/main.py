@@ -36,9 +36,10 @@ app.add_middleware(
 
 
 async def proxy_request(service: str, path: str, request: Request):
-    """Forward request to microservice"""
+    """Forward request to microservice with retry logic"""
     from fastapi.responses import Response
-    
+    import asyncio
+
     service_url = SERVICES.get(service)
     if not service_url:
         raise HTTPException(status_code=502, detail="Service not found")
@@ -52,21 +53,33 @@ async def proxy_request(service: str, path: str, request: Request):
     if "content-type" in request.headers:
         headers["Content-Type"] = request.headers["content-type"]
 
-    async with httpx.AsyncClient() as client:
-        response = await client.request(
-            method=request.method,
-            url=url,
-            headers=headers,
-            params=request.query_params,
-            content=await request.body(),
-            timeout=30.0,
-        )
-        
-        return Response(
-            content=response.content,
-            status_code=response.status_code,
-            media_type=response.headers.get("content-type", "application/json"),
-        )
+    # Retry up to 3 times with exponential backoff
+    last_error = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.request(
+                    method=request.method,
+                    url=url,
+                    headers=headers,
+                    params=request.query_params,
+                    content=await request.body(),
+                    timeout=30.0,
+                )
+
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    media_type=response.headers.get("content-type", "application/json"),
+                )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            last_error = e
+            if attempt < 2:
+                await asyncio.sleep(1 * (attempt + 1))
+
+    # All retries failed
+    print(f"[GATEWAY] Failed to reach {service} at {url} after 3 attempts: {last_error}")
+    raise HTTPException(status_code=503, detail=f"Service '{service}' unavailable")
 
 
 # Auth routes

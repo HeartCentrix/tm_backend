@@ -75,13 +75,14 @@ class PostgresBackupHandler:
             backup_retention = getattr(server, 'backup', None)
             retention_days = getattr(backup_retention, 'backup_retention_days', 7) if backup_retention else 7
 
-            snapshot.extra_data = snapshot.extra_data or {}
-            snapshot.extra_data.update({
+            snapshot.blob_path = f"{resource.external_id}/{snapshot.id.hex[:12]}/"
+            snapshot.extra_data = {
+                **(snapshot.extra_data or {}),
                 "mode": "NATIVE_PITR",
                 "server_name": server_name,
                 "retention_days": retention_days,
                 "backup_storage_redundancy": getattr(backup_retention, 'geo_redundant_backup', 'Disabled') if backup_retention else 'Unknown',
-            })
+            }
 
             print(f"[{self.worker_id}] [PG NATIVE PITR] {resource.display_name} — retention={retention_days}d")
             return {"success": True, "mode": "NATIVE_PITR", "size_bytes": 0, "retention_days": retention_days}
@@ -183,14 +184,15 @@ class PostgresBackupHandler:
             blob_client = shard.get_async_client().get_blob_client(container, blob_path)
             await blob_client.upload_blob(content, overwrite=True)
 
-            snapshot.extra_data = snapshot.extra_data or {}
-            snapshot.extra_data.update({
+            snapshot.blob_path = blob_path
+            snapshot.extra_data = {
+                **(snapshot.extra_data or {}),
                 "mode": "PG_DUMP",
                 "blob_path": blob_path,
                 "dump_size_bytes": dump_size,
                 "server_name": server_name,
                 "database_name": db_name,
-            })
+            }
 
             print(f"[{self.worker_id}] [PG DUMP COMPLETE] {resource.display_name} — {dump_size} bytes")
             return {"success": True, "mode": "PG_DUMP", "size_bytes": dump_size}
