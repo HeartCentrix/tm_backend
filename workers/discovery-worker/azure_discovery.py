@@ -1,193 +1,152 @@
-"""Azure Resource Discovery — discovers VMs, SQL DBs, and PostgreSQL servers via ARM API."""
-import asyncio
-import uuid
-from datetime import datetime, timezone
-from typing import Dict, List, Any
-from uuid import UUID
+"""
+Azure Resource Discovery — Afi-Style (Delegated ARM Access)
 
-from azure.identity.aio import ClientSecretCredential
-from azure.mgmt.subscription.aio import SubscriptionClient
-from azure.core.exceptions import HttpResponseError
+Discovers VMs, SQL databases, and PostgreSQL servers via ARM API.
+During discovery, automatically assigns our SP as Entra admin of SQL servers
+so backup can use our SP's credentials (no customer SQL passwords needed).
+"""
+import asyncio
+import httpx
+import json
+import importlib
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
 
 from shared.config import settings
+from shared.models import Tenant, TenantStatus
+from shared.database import async_session_factory
 
 
-async def _get_credential() -> ClientSecretCredential:
-    """Get Azure credential for ARM API access."""
-    return ClientSecretCredential(
-        client_id=settings.EFFECTIVE_ARM_CLIENT_ID,
-        client_secret=settings.EFFECTIVE_ARM_CLIENT_SECRET,
-        tenant_id=settings.EFFECTIVE_ARM_TENANT_ID,
-    )
+async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
+    """
+    Enumerate all subscriptions, VMs, SQL servers, Postgres servers
+    accessible via the admin's delegated ARM access.
 
+    As we discover SQL servers, we auto-assign our SP as Entra admin
+    (requires Directory.ReadWrite.All).
+    """
+    arm_token = await _get_arm_access_token(tenant)
 
-async def _list_subscriptions(credential) -> List[Dict]:
-    """List all Azure subscriptions the credential has access to."""
-    async with SubscriptionClient(credential) as sub_client:
-        subs = []
-        async for sub in sub_client.subscriptions.list():
-            subs.append({
-                "subscription_id": sub.subscription_id,
-                "display_name": sub.display_name,
-                "state": sub.state,
+    async with httpx.AsyncClient() as client:
+        headers = {"Authorization": f"Bearer {arm_token}"}
+
+        # List subscriptions
+        subs_resp = await client.get(
+            "https://management.azure.com/subscriptions?api-version=2022-12-01",
+            headers=headers,
+        )
+        subscriptions = subs_resp.json().get("value", [])
+
+        discovered = {"subscriptions": [], "vms": [], "sql_dbs": [], "postgres_servers": []}
+
+        for sub in subscriptions:
+            sub_id = sub["subscriptionId"]
+            discovered["subscriptions"].append({
+                "id": sub_id, "display_name": sub.get("displayName", ""),
             })
-    return subs
 
-
-async def discover_azure_vms(credential, subscription_id: str) -> List[Dict[str, Any]]:
-    """Discover all VMs in a subscription."""
-    from azure.mgmt.compute.aio import ComputeManagementClient
-    vms = []
-    try:
-        async with ComputeManagementClient(credential, subscription_id) as compute:
-            async for vm in compute.virtual_machines.list_all():
-                vms.append({
-                    "external_id": vm.name,
-                    "display_name": vm.name,
-                    "type": "AZURE_VM",
-                    "azure_subscription_id": subscription_id,
-                    "azure_resource_group": vm.id.split("/")[4] if vm.id else "",
-                    "azure_region": vm.location,
-                    "metadata": {
-                        "vm_size": getattr(vm.hardware_profile, 'vm_size', None),
-                        "os_type": getattr(getattr(vm.storage_profile, 'os_disk', None), 'os_type', None),
-                        "power_state": "unknown",  # Would need instance view
-                    },
+            # VMs
+            vms_resp = await client.get(
+                f"https://management.azure.com/subscriptions/{sub_id}"
+                f"/providers/Microsoft.Compute/virtualMachines?api-version=2023-09-01",
+                headers=headers,
+            )
+            for vm in vms_resp.json().get("value", []):
+                discovered["vms"].append({
+                    "id": vm.get("id", ""),
+                    "name": vm.get("name", ""),
+                    "location": vm.get("location", ""),
+                    "resource_group": vm.get("id", "").split("/")[4],
+                    "subscription_id": sub_id,
+                    "type": "Microsoft.Compute/virtualMachines",
                 })
-    except HttpResponseError as e:
-        print(f"[AzureDiscovery] Failed to discover VMs in {subscription_id}: {e}")
-    return vms
 
+            # SQL servers
+            sql_resp = await client.get(
+                f"https://management.azure.com/subscriptions/{sub_id}"
+                f"/providers/Microsoft.Sql/servers?api-version=2022-05-01-preview",
+                headers=headers,
+            )
+            sql_servers = sql_resp.json().get("value", [])
 
-async def discover_azure_sql_databases(credential, subscription_id: str) -> List[Dict[str, Any]]:
-    """Discover all SQL databases across all servers in a subscription."""
-    from azure.mgmt.sql.aio import SqlManagementClient
-    from azure.mgmt.resource import ResourceManagementClient
-    databases = []
-    try:
-        async with SqlManagementClient(credential, subscription_id) as sql_client:
-            # Try listing servers across the subscription first
-            servers_list = []
-            try:
-                async for server in sql_client.servers.list():
-                    servers_list.append(server)
-            except (HttpResponseError, NotImplementedError):
-                # Fallback: enumerate resource groups, then list servers per RG
-                async with ResourceManagementClient(credential, subscription_id) as rg_client:
-                    async for rg in rg_client.resource_groups.list():
-                        try:
-                            async for server in sql_client.servers.list_by_resource_group(rg.name):
-                                servers_list.append(server)
-                        except HttpResponseError:
-                            pass
-
-            for server in servers_list:
-                server_name = server.name
-                rg = server.id.split("/")[4] if server.id else ""
+            for server in sql_servers:
+                # Auto-assign our SP as Entra admin — the magic step
                 try:
-                    async for db in sql_client.databases.list_by_server(rg, server_name):
-                        # Skip system databases
-                        if db.name in ("master",):
-                            continue
-                        databases.append({
-                            "external_id": db.name,
-                            "display_name": f"{server_name}/{db.name}",
-                            "type": "AZURE_SQL_DB",
-                            "azure_subscription_id": subscription_id,
-                            "azure_resource_group": rg,
-                            "azure_region": server.location,
-                            "metadata": {
-                                "server_name": server_name,
-                                "sku": getattr(db.sku, 'name', None),
-                                "collation": getattr(db, 'collation', None),
-                                "max_size_bytes": getattr(db, 'max_size_bytes', None),
-                            },
+                    # Dynamic import due to hyphenated module name
+                    provisioning = importlib.import_module("services.tenant-service.azure_provisioning")
+                    await provisioning.ensure_sql_server_backup_ready(tenant, server, arm_token)
+                except Exception as e:
+                    print(f"[AzureDiscovery] Warning: Failed to provision SQL server {server.get('name')}: {e}")
+
+                # Enumerate DBs on this server
+                server_id = server.get("id", "")
+                server_fqdn = server.get("properties", {}).get("fullyQualifiedDomainName", "")
+                server_rg = server_id.split("/")[4] if server_id else ""
+
+                dbs_resp = await client.get(
+                    f"https://management.azure.com{server_id}"
+                    f"/databases?api-version=2022-05-01-preview",
+                    headers=headers,
+                )
+                for db in dbs_resp.json().get("value", []):
+                    db_name = db.get("name", "")
+                    if db_name != "master":
+                        discovered["sql_dbs"].append({
+                            "server_id": server_id,
+                            "server_fqdn": server_fqdn,
+                            "server_name": server.get("name", ""),
+                            "database_name": db_name,
+                            "database_id": db.get("id", ""),
+                            "resource_group": server_rg,
+                            "subscription_id": sub_id,
+                            "type": "Microsoft.Sql/servers/databases",
+                            "location": server.get("location", ""),
                         })
-                except HttpResponseError:
-                    pass  # Server may not have accessible databases
-    except HttpResponseError as e:
-        print(f"[AzureDiscovery] Failed to discover SQL DBs in {subscription_id}: {e}")
-    return databases
 
-
-async def discover_azure_postgresql(credential, subscription_id: str) -> List[Dict[str, Any]]:
-    """Discover all PostgreSQL flexible servers in a subscription."""
-    from azure.mgmt.rdbms.postgresql_flexibleservers.aio import PostgreSQLManagementClient
-    from azure.mgmt.resource import ResourceManagementClient
-    servers = []
-    try:
-        async with PostgreSQLManagementClient(credential, subscription_id) as pg_client:
-            # Try listing across subscription first
-            servers_list = []
-            try:
-                async for server in pg_client.servers.list():
-                    servers_list.append(server)
-            except (HttpResponseError, NotImplementedError):
-                # Fallback: enumerate resource groups
-                async with ResourceManagementClient(credential, subscription_id) as rg_client:
-                    async for rg in rg_client.resource_groups.list():
-                        try:
-                            async for server in pg_client.servers.list_by_resource_group(rg.name):
-                                servers_list.append(server)
-                        except HttpResponseError:
-                            pass
-
-            for server in servers_list:
-                # Extract resource group from server ID
-                rg = server.id.split("/")[4] if server.id else ""
-                servers.append({
-                    "external_id": server.name,
-                    "display_name": server.name,
-                    "type": "AZURE_POSTGRESQL",
-                    "azure_subscription_id": subscription_id,
-                    "azure_resource_group": rg,
-                    "azure_region": server.location,
-                    "metadata": {
-                        "server_name": server.name,
-                        "version": getattr(server, 'version', None),
-                        "sku": getattr(getattr(server, 'sku', None), 'name', None),
-                        "storage_mb": getattr(getattr(server, 'storage', None), 'storage_size_mb', None),
-                    },
+            # Postgres Flexible Servers
+            pg_resp = await client.get(
+                f"https://management.azure.com/subscriptions/{sub_id}"
+                f"/providers/Microsoft.DBforPostgreSQL/flexibleServers"
+                f"?api-version=2023-03-01-preview",
+                headers=headers,
+            )
+            for pg in pg_resp.json().get("value", []):
+                discovered["postgres_servers"].append({
+                    "id": pg.get("id", ""),
+                    "name": pg.get("name", ""),
+                    "location": pg.get("location", ""),
+                    "resource_group": pg.get("id", "").split("/")[4],
+                    "subscription_id": sub_id,
+                    "type": "Microsoft.DBforPostgreSQL/flexibleServers",
                 })
-    except HttpResponseError as e:
-        print(f"[AzureDiscovery] Failed to discover PostgreSQL in {subscription_id}: {e}")
-    return servers
+
+    return discovered
 
 
-async def discover_all_azure_resources() -> List[Dict[str, Any]]:
-    """
-    Discover all Azure resources (VMs, SQL DBs, PostgreSQL) across all accessible subscriptions.
-    Returns a list of resource-shaped dicts ready for upsert into the Resource table.
-    """
-    if not settings.EFFECTIVE_ARM_CLIENT_ID or not settings.EFFECTIVE_ARM_CLIENT_SECRET:
-        print("[AzureDiscovery] No Azure ARM credentials configured, skipping Azure discovery")
-        return []
+async def _get_arm_access_token(tenant: Tenant) -> str:
+    """Get ARM access token using admin's refresh token or SP credentials."""
+    # If tenant has a refresh token from admin consent, use it
+    if tenant.azure_refresh_token_encrypted:
+        from shared.security import decrypt_secret
+        from shared.azure_auth import AzureTokenManager
 
-    credential = await _get_credential()
-    all_resources = []
+        token_manager = AzureTokenManager()
+        return await token_manager.get_arm_access_token(tenant)
 
-    # Get subscriptions
-    try:
-        subscriptions = await _list_subscriptions(credential)
-        print(f"[AzureDiscovery] Found {len(subscriptions)} accessible subscription(s)")
-    except Exception as e:
-        print(f"[AzureDiscovery] Failed to list subscriptions: {e}")
-        return []
+    # Fallback: use our own SP credentials
+    client_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
+    client_secret = settings.MICROSOFT_CLIENT_SECRET or settings.AZURE_AD_CLIENT_SECRET
+    tenant_id = tenant.external_tenant_id or "common"
 
-    # For each subscription, discover resources in parallel
-    tasks = []
-    for sub in subscriptions:
-        sub_id = sub["subscription_id"]
-        tasks.append(discover_azure_vms(credential, sub_id))
-        tasks.append(discover_azure_sql_databases(credential, sub_id))
-        tasks.append(discover_azure_postgresql(credential, sub_id))
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for result in results:
-        if isinstance(result, list):
-            all_resources.extend(result)
-        elif isinstance(result, Exception):
-            print(f"[AzureDiscovery] Discovery task failed: {result}")
-
-    print(f"[AzureDiscovery] Total Azure resources discovered: {len(all_resources)}")
-    return all_resources
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "scope": "https://management.azure.com/.default",
+                "grant_type": "client_credentials",
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["access_token"]
