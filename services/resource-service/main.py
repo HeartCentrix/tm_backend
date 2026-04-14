@@ -585,7 +585,7 @@ async def create_policy(request: dict, db: AsyncSession = Depends(get_db)):
         is_default=get_val("isDefault", "is_default", False),
     )
     db.add(policy)
-    await db.flush()
+    await db.commit()
 
     # Notify scheduler to reschedule jobs with updated policy
     await notify_scheduler_reschedule()
@@ -627,7 +627,7 @@ async def update_policy(policy_id: str, request: dict, db: AsyncSession = Depend
             setattr(policy, snake_key, val)
     
     policy.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    await db.flush()
+    await db.commit()
 
     # Notify scheduler to reschedule jobs with updated policy
     await notify_scheduler_reschedule()
@@ -643,7 +643,7 @@ async def delete_policy(policy_id: str, db: AsyncSession = Depends(get_db)):
     if not policy:
         raise HTTPException(status_code=404, detail="Policy not found")
     await db.delete(policy)
-    await db.flush()
+    await db.commit()
 
     # Notify scheduler to reschedule jobs without this policy
     await notify_scheduler_reschedule()

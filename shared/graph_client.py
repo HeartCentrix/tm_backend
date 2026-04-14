@@ -188,6 +188,7 @@ class GraphClient:
         result = await self._get(f"{self.GRAPH_URL}/users", params={"$top": "999", "$count": "true"})
         users = []
         for u in result.get("value", []):
+            is_enabled = u.get("accountEnabled", True)
             users.append({
                 "external_id": u.get("id"),
                 "display_name": u.get("displayName", u.get("mail", u.get("userPrincipalName", "Unknown"))),
@@ -197,9 +198,10 @@ class GraphClient:
                     "user_principal_name": u.get("userPrincipalName"),
                     "job_title": u.get("jobTitle"),
                     "department": u.get("department"),
-                    "account_enabled": u.get("accountEnabled", True),
+                    "account_enabled": is_enabled,
                     "created_at": u.get("createdDateTime"),
                 },
+                "_account_enabled": is_enabled,  # For discovery worker to filter
             })
         return users
     
@@ -292,6 +294,7 @@ class GraphClient:
                         "created_at": user.get("createdDateTime"),
                         "mailbox_purpose": purpose,
                     },
+                    "_account_enabled": user.get("accountEnabled", True),  # For discovery worker
                 }
 
         tasks = [_enrich_one_user(u) for u in all_users]
@@ -329,9 +332,15 @@ class GraphClient:
                             "web_url": drive_result.get("webUrl"),
                             "quota": drive_result.get("quota", {}),
                         },
+                        "_account_enabled": u.get("_account_enabled", True),  # For discovery worker
                     })
+                # If drive not found (404), skip — discovery worker will mark stale resources
             except Exception as e:
-                print(f"Error discovering OneDrive for user {u.get('email')}: {e}")
+                if "404" in str(e) or "423" in str(e):
+                    # Resource not found or locked — discovery worker will handle it
+                    pass
+                else:
+                    print(f"Error discovering OneDrive for user {u.get('email')}: {e}")
         return drives
     
     async def discover_sharepoint(self) -> List[Dict[str, Any]]:

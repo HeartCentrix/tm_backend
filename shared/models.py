@@ -77,6 +77,7 @@ class ResourceStatus(str, enum.Enum):
     ARCHIVED = "ARCHIVED"
     SUSPENDED = "SUSPENDED"
     PENDING_DELETION = "PENDING_DELETION"
+    INACCESSIBLE = "INACCESSIBLE"  # Resource not found (404) or locked (423) in source system
 
 
 class JobType(str, enum.Enum):
@@ -104,8 +105,8 @@ class SnapshotType(str, enum.Enum):
 
 
 class SnapshotStatus(str, enum.Enum):
-    RUNNING = "IN_PROGRESS"
-    COMPLETE = "COMPLETED"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     PARTIAL = "PARTIAL"
     PENDING_DELETION = "PENDING_DELETION"
@@ -282,7 +283,7 @@ class Snapshot(Base):
     resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id"), nullable=False, index=True)
     job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id"))
     type = Column(SAEnum(SnapshotType), default=SnapshotType.INCREMENTAL)
-    status = Column(SAEnum(SnapshotStatus), default=SnapshotStatus.RUNNING)
+    status = Column(SAEnum(SnapshotStatus), default=SnapshotStatus.IN_PROGRESS)
     started_at = Column(DateTime, default=utcnow)
     completed_at = Column(DateTime)
     duration_secs = Column(Integer)

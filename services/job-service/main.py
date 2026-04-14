@@ -173,6 +173,15 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
 
+    # Prevent backup on inaccessible/suspended/deleted resources
+    status_val = resource.status.value if hasattr(resource.status, 'value') else str(resource.status)
+    if status_val in ("INACCESSIBLE", "SUSPENDED", "PENDING_DELETION"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Resource is {status_val} and cannot be backed up. "
+                   f"Run discovery first to restore access or remove the resource."
+        )
+
     # Require SLA policy assignment
     if not resource.sla_policy_id:
         raise HTTPException(
@@ -249,12 +258,24 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
     if request and request.resourceIds:
         # Fetch all resources with tenant info
         resources_map = {}
+        inaccessible_resources = []
         for rid in request.resourceIds:
             res_stmt = select(Resource).where(Resource.id == UUID(rid))
             res_result = await db.execute(res_stmt)
             res = res_result.scalar_one_or_none()
             if res:
-                resources_map[rid] = res
+                status_val = res.status.value if hasattr(res.status, 'value') else str(res.status)
+                if status_val in ("INACCESSIBLE", "SUSPENDED", "PENDING_DELETION"):
+                    inaccessible_resources.append({"id": rid, "status": status_val})
+                else:
+                    resources_map[rid] = res
+
+        if not resources_map and inaccessible_resources:
+            raise HTTPException(
+                status_code=422,
+                detail=f"All requested resources are inaccessible: "
+                       f"{', '.join(r['id'] + '(' + r['status'] + ')' for r in inaccessible_resources)}"
+            )
 
         if not resources_map:
             raise HTTPException(status_code=404, detail="No valid resources found")
@@ -340,6 +361,15 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
         res = res_result.scalar_one_or_none()
         if not res:
             raise HTTPException(status_code=404, detail="Resource not found")
+
+        # Prevent backup on inaccessible/suspended/deleted resources
+        status_val = res.status.value if hasattr(res.status, 'value') else str(res.status)
+        if status_val in ("INACCESSIBLE", "SUSPENDED", "PENDING_DELETION"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Resource is {status_val} and cannot be backed up. "
+                       f"Run discovery first to restore access or remove the resource."
+            )
 
         # Require SLA policy assignment
         if not res.sla_policy_id:

@@ -223,6 +223,15 @@ async def trigger_single_backup(resource_id: str, full_backup: bool = False):
         if not resource:
             return {"error": "Resource not found"}, 404
 
+        # Prevent manual backup on inaccessible resources
+        status_val = resource.status.value if hasattr(resource.status, 'value') else str(resource.status)
+        if status_val in ("INACCESSIBLE", "SUSPENDED", "PENDING_DELETION"):
+            return {
+                "error": f"Resource is {status_val} and cannot be backed up. "
+                         f"Run discovery first to restore access or remove the resource.",
+                "resource_status": status_val,
+            }, 422
+
         job_id = uuid.uuid4()
 
         # Create job record
