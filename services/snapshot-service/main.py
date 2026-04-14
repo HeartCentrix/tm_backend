@@ -86,6 +86,23 @@ async def get_snapshot_folders(
     ]
 
 
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/content-types")
+async def get_snapshot_content_types(
+    snapshot_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get distinct content types available in a snapshot."""
+    stmt = (
+        select(distinct(SnapshotItem.item_type))
+        .where(SnapshotItem.snapshot_id == UUID(snapshot_id))
+        .order_by(SnapshotItem.item_type)
+    )
+    result = await db.execute(stmt)
+    types = [row[0] for row in result.fetchall() if row[0]]
+
+    return {"contentTypes": types}
+
+
 @app.get("/api/v1/resources/snapshots/{snapshot_id}", response_model=SnapshotResponse)
 async def get_snapshot(snapshot_id: str, db: AsyncSession = Depends(get_db)):
     stmt = select(Snapshot).where(Snapshot.id == UUID(snapshot_id))
@@ -109,9 +126,13 @@ async def list_snapshot_items(
     snapshot_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1),
+    itemType: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
+    if itemType:
+        filters.append(SnapshotItem.item_type == itemType)
+    
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     stmt = select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size)
     result = await db.execute(stmt)
