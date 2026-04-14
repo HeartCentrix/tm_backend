@@ -1,10 +1,13 @@
 """Microsoft Graph API client for resource discovery"""
 import asyncio
+import logging
 import httpx
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 import hashlib
 import time
+
+logger = logging.getLogger(__name__)
 
 # Timeout constants — tuned for Graph API and token endpoint behavior
 _DEFAULT_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=10.0)
@@ -364,15 +367,16 @@ class GraphClient:
         return sites
     
     async def discover_teams(self) -> List[Dict[str, Any]]:
-        """Discover Teams channels and chats"""
-        # Get all teams (groups with resourceProvisioningOptions containing "Team")
+        """Discover Teams groups (for channels) and all chats (1-on-1 and group)"""
+        resources = []
+
+        # 1. Discover Teams groups (for channel backups)
         result = await self._get(
             f"{self.GRAPH_URL}/groups",
             params={"$filter": "resourceProvisioningOptions/Any(x:x eq 'Team')", "$top": "999"}
         )
-        teams = []
         for g in result.get("value", []):
-            teams.append({
+            resources.append({
                 "external_id": g.get("id"),
                 "display_name": g.get("displayName", "Unknown Team"),
                 "email": g.get("mail"),
@@ -383,7 +387,167 @@ class GraphClient:
                     "visibility": g.get("visibility"),
                 },
             })
-        return teams
+
+        # 2. Discover all chats (1-on-1 and group chats)
+        # Note: GET /chats (global) does NOT support app-only auth.
+        # We use GET /users/{id}/chats per-user, which DOES support app-only with Chat.Read.All.
+        try:
+            import time
+
+            # Fetch all users first
+            users_result = await self._get(
+                f"{self.GRAPH_URL}/users",
+                params={"$top": "999", "$select": "id,userPrincipalName,displayName"}
+            )
+            all_users = users_result.get("value", [])
+            # Follow pagination
+            while users_result.get("@odata.nextLink"):
+                users_result = await self._get(users_result["@odata.nextLink"])
+                all_users.extend(users_result.get("value", []))
+
+            _chat_semaphore = asyncio.Semaphore(10)  # Max 10 concurrent Graph API calls
+
+            async def _fetch_chat_members(chat_id: str) -> tuple:
+                """Fetch members for a single chat (with semaphore)."""
+                async with _chat_semaphore:
+                    try:
+                        members_result = await self._get(
+                            f"{self.GRAPH_URL}/chats/{chat_id}/members"
+                        )
+                        emails = []
+                        names = []
+                        for m in members_result.get("value", []):
+                            email = m.get("email")
+                            display_name = m.get("displayName")
+                            if email:
+                                emails.append(email)
+                            if display_name:
+                                names.append(display_name)
+                        return emails, names
+                    except Exception:
+                        return [], []
+
+            def _build_chat_resource(chat: Dict) -> Dict:
+                """Build a TEAMS_CHAT resource dict from a chat object."""
+                chat_id = chat.get("id")
+                chat_type = chat.get("chatType", "unknown")
+                topic = chat.get("topic")
+                return {
+                    "chat_id": chat_id,
+                    "chat_type": chat_type,
+                    "topic": topic,
+                    "createdDateTime": chat.get("createdDateTime"),
+                    "lastUpdatedDateTime": chat.get("lastUpdatedDateTime"),
+                }
+
+            async def _process_user_chats(user: Dict):
+                """Fetch and process all chats for a single user."""
+                user_id = user.get("id")
+                if not user_id:
+                    return []
+
+                user_chats_raw = []
+                try:
+                    async with _chat_semaphore:
+                        chats_result = await self._get(
+                            f"{self.GRAPH_URL}/users/{user_id}/chats",
+                            params={"$top": "999"}
+                        )
+                    user_chats_raw.extend(chats_result.get("value", []))
+
+                    # Follow pagination
+                    while chats_result.get("@odata.nextLink"):
+                        async with _chat_semaphore:
+                            chats_result = await self._get(chats_result["@odata.nextLink"])
+                        user_chats_raw.extend(chats_result.get("value", []))
+                except Exception:
+                    pass  # Skip users where we can't access chats
+
+                return user_chats_raw
+
+            # Phase 1: Fetch all user chats in parallel (bounded concurrency)
+            logger.info("Discovering Teams chats for %d users...", len(all_users))
+            start_time = time.time()
+            user_chat_tasks = [_process_user_chats(u) for u in all_users]
+            user_chat_results = await asyncio.gather(*user_chat_tasks, return_exceptions=True)
+
+            # Collect all unique chats
+            all_chats: Dict[str, Dict] = {}  # chat_id -> chat object
+            for result in user_chat_results:
+                if isinstance(result, Exception):
+                    continue
+                for chat in result:
+                    chat_id = chat.get("id")
+                    if chat_id and chat_id not in all_chats:
+                        all_chats[chat_id] = chat
+
+            elapsed1 = time.time() - start_time
+            logger.info("Found %d unique chats across users in %.1fs", len(all_chats), elapsed1)
+
+            # Phase 2: Fetch members for all chats in parallel (bounded concurrency)
+            start_time2 = time.time()
+            all_chat_ids = list(all_chats.keys())
+            member_tasks = [_fetch_chat_members(cid) for cid in all_chat_ids]
+            member_results = await asyncio.gather(*member_tasks, return_exceptions=True)
+
+            chat_members: Dict[str, tuple] = {}
+            for i, chat_id in enumerate(all_chat_ids):
+                result = member_results[i]
+                if isinstance(result, Exception):
+                    chat_members[chat_id] = ([], [])
+                else:
+                    chat_members[chat_id] = result
+
+            elapsed2 = time.time() - start_time2
+            logger.info("Fetched members for %d chats in %.1fs", len(all_chats), elapsed2)
+
+            # Phase 3: Build resource dicts (CPU-bound, no network)
+            for chat_id, chat in all_chats.items():
+                chat_type = chat.get("chatType", "unknown")
+                topic = chat.get("topic")
+                member_emails, member_names = chat_members.get(chat_id, ([], []))
+
+                # Build display name
+                if chat_type == "oneOnOne":
+                    if topic:
+                        display_name = topic
+                    elif member_names:
+                        display_name = " | ".join(member_names)
+                    else:
+                        display_name = f"1-on-1 Chat ({chat_id[:8]})"
+                else:
+                    if topic:
+                        display_name = topic
+                    elif member_names:
+                        display_name = f"Group: {', '.join(member_names[:3])}"
+                        if len(member_names) > 3:
+                            display_name += f" +{len(member_names) - 3} more"
+                    else:
+                        display_name = f"Group Chat ({chat_id[:8]})"
+
+                resources.append({
+                    "external_id": chat_id,
+                    "display_name": display_name,
+                    "email": None,
+                    "type": "TEAMS_CHAT",
+                    "metadata": {
+                        "chatType": chat_type,
+                        "topic": topic,
+                        "memberCount": len(member_names),
+                        "memberEmails": member_emails,
+                        "memberNames": member_names,
+                        "createdDateTime": chat.get("createdDateTime"),
+                        "lastUpdatedDateTime": chat.get("lastUpdatedDateTime"),
+                    },
+                })
+
+            total_elapsed = time.time() - start_time
+            logger.info("Teams chat discovery complete: %d chats in %.1fs", len(all_chats), total_elapsed)
+
+        except Exception as e:
+            logger.warning(f"Failed to discover Teams chats: {e}")
+
+        return resources
 
     async def discover_power_platform(self) -> List[Dict[str, Any]]:
         """Discover Power Platform resources using Power Platform Admin APIs and Power BI APIs"""
@@ -513,46 +677,36 @@ class GraphClient:
         return resources
     
     async def discover_all(self) -> List[Dict[str, Any]]:
-        """Run full discovery and return all resources"""
+        """Run full discovery in PARALLEL and return all resources"""
         all_resources = []
 
-        try:
-            all_resources.extend(await self.discover_users())
-        except Exception as e:
-            print(f"Error discovering users: {e}")
+        async def _safe_discover(name, coro):
+            """Run a discovery coroutine safely, catching errors."""
+            try:
+                result = await coro
+                return result
+            except Exception as e:
+                print(f"Error discovering {name}: {e}")
+                return []
 
-        try:
-            all_resources.extend(await self.discover_groups())
-        except Exception as e:
-            print(f"Error discovering groups: {e}")
+        # Run ALL discovery endpoints in parallel (Graph API, users, groups, mailboxes,
+        # OneDrive, SharePoint, Teams chats/channels, Power Platform)
+        tasks = [
+            _safe_discover("users", self.discover_users()),
+            _safe_discover("groups", self.discover_groups()),
+            _safe_discover("mailboxes", self.discover_mailboxes()),
+            _safe_discover("onedrive", self.discover_onedrive()),
+            _safe_discover("sharepoint", self.discover_sharepoint()),
+            _safe_discover("teams", self.discover_teams()),
+            _safe_discover("power_platform", self.discover_power_platform()),
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        try:
-            mailboxes = await self.discover_mailboxes()
-            all_resources.extend(mailboxes)
-            print(f"[GraphClient] discover_mailboxes() returned {len(mailboxes)} resources: "
-                  f"{[m['type'] for m in mailboxes]}")
-        except Exception as e:
-            print(f"Error discovering mailboxes: {e}")
-
-        try:
-            all_resources.extend(await self.discover_onedrive())
-        except Exception as e:
-            print(f"Error discovering OneDrive: {e}")
-
-        try:
-            all_resources.extend(await self.discover_sharepoint())
-        except Exception as e:
-            print(f"Error discovering SharePoint: {e}")
-
-        try:
-            all_resources.extend(await self.discover_teams())
-        except Exception as e:
-            print(f"Error discovering Teams: {e}")
-
-        try:
-            all_resources.extend(await self.discover_power_platform())
-        except Exception as e:
-            print(f"Error discovering Power Platform: {e}")
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"Discovery task failed: {result}")
+            elif isinstance(result, list):
+                all_resources.extend(result)
 
         # Deduplicate: same external_id AND same type
         seen = set()
@@ -652,7 +806,7 @@ class GraphClient:
         if delta_token:
             url = delta_token
 
-        params = {"$top": "999", "$expand": "replies,hostedContents"}
+        params = {"$top": "999"}
         result = await self._get(url, params=params)
         return result
 
@@ -681,13 +835,11 @@ class GraphClient:
 
     async def get_chat_messages(self, chat_id: str, delta_token: str = None) -> Dict[str, Any]:
         """
-        Get messages from a Teams chat using delta API.
-        Graph API: GET /chats/{chat-id}/messages/delta
+        Get messages from a Teams chat.
+        Note: /messages/delta is NOT supported for chat messages (MS Graph limitation).
+        Graph API: GET /chats/{chat-id}/messages
         """
-        url = f"{self.GRAPH_URL}/chats/{chat_id}/messages/delta"
-        if delta_token:
-            url = delta_token
-
+        url = f"{self.GRAPH_URL}/chats/{chat_id}/messages"
         params = {"$top": "999"}
         result = await self._get(url, params=params)
         return result
@@ -879,45 +1031,6 @@ class GraphClient:
                 await asyncio.sleep(2 ** attempt)
         # Final attempt failed — check if this item type is fundamentally non-downloadable
         raise RuntimeError(f"Could not obtain downloadUrl for item {item_id}: {last_error}")
-
-    async def get_channel_messages_delta(self, team_id: str, channel_id: str, delta_token: str = None) -> Dict[str, Any]:
-        """
-        Get Teams channel messages using delta API.
-        Graph API: GET /teams/{team-id}/channels/{channel-id}/messages/delta
-        """
-        url = f"{self.GRAPH_URL}/teams/{team_id}/channels/{channel_id}/messages/delta"
-        if delta_token:
-            url = delta_token
-
-        params = {"$top": "999", "$expand": "replies,hostedContents"}
-        result = await self._get(url, params=params)
-        return result
-
-    async def get_teams_chats_delta(self, delta_token: str = None) -> Dict[str, Any]:
-        """
-        Get all Teams chats using delta API.
-        Graph API: GET /chats/delta
-        """
-        url = f"{self.GRAPH_URL}/chats/delta"
-        if delta_token:
-            url = delta_token
-
-        params = {"$top": "999", "$expand": "members"}
-        result = await self._get(url, params=params)
-        return result
-
-    async def get_chat_messages_delta(self, chat_id: str, delta_token: str = None) -> Dict[str, Any]:
-        """
-        Get Teams chat messages using delta API.
-        Graph API: GET /chats/{chat-id}/messages/delta
-        """
-        url = f"{self.GRAPH_URL}/chats/{chat_id}/messages/delta"
-        if delta_token:
-            url = delta_token
-
-        params = {"$top": "999"}
-        result = await self._get(url, params=params)
-        return result
 
     async def get_group_mailbox_messages(self, group_id: str, delta_token: str = None) -> Dict[str, Any]:
         """

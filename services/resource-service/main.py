@@ -58,27 +58,37 @@ async def list_resources(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1),
     status: Optional[str] = Query(None),
+    types: Optional[str] = Query(None),  # comma-separated resource types
     db: AsyncSession = Depends(get_db),
 ):
     status_clause = "AND status = :rstatus" if status else ""
+    type_clause = ""
+    if types:
+        type_list = [t.strip() for t in types.split(",")]
+        placeholders = ", ".join([f":rt{i}" for i in range(len(type_list))])
+        type_clause = f"AND type IN ({placeholders})"
     query = text(f"""
         SELECT id, tenant_id, type, external_id, display_name, email, metadata, sla_policy_id,
                status, storage_bytes, last_backup_at, last_backup_status, created_at
         FROM resources
-        WHERE tenant_id = :rtenant {status_clause}
+        WHERE tenant_id = :rtenant {status_clause} {type_clause}
         ORDER BY created_at DESC
         LIMIT :rlimit OFFSET :roffset
     """)
     params = {"rtenant": tenantId, "rlimit": size, "roffset": (page - 1) * size}
     if status:
         params["rstatus"] = status
-    
+    if types:
+        type_list = [t.strip() for t in types.split(",")]
+        for i, t in enumerate(type_list):
+            params[f"rt{i}"] = t
+
     result = await db.execute(query, params)
     rows = result.fetchall()
-    
+
     # Count
     count_query = text(f"""
-        SELECT count(*) FROM resources WHERE tenant_id = :rtenant {status_clause}
+        SELECT count(*) FROM resources WHERE tenant_id = :rtenant {status_clause} {type_clause}
     """)
     count_result = await db.execute(count_query, params)
     total = count_result.scalar() or 0
@@ -110,7 +120,10 @@ async def list_resources(
              "ONEDRIVE": "onedrive", "SHAREPOINT_SITE": "sharepoint_site", "TEAMS_CHANNEL": "teams_channel",
              "TEAMS_CHAT": "teams_chat", "ENTRA_USER": "entra_user", "ENTRA_GROUP": "entra_group",
              "ENTRA_APP": "entra_app", "ENTRA_DEVICE": "entra_device", "AZURE_VM": "azure_vm",
-             "AZURE_SQL_DB": "azure_sql", "AZURE_POSTGRESQL": "azure_postgresql"}
+             "AZURE_SQL_DB": "azure_sql", "AZURE_POSTGRESQL": "azure_postgresql", "AZURE_POSTGRESQL_SINGLE": "azure_postgresql",
+             "RESOURCE_GROUP": "resource_group", "DYNAMIC_GROUP": "dynamic_group",
+             "POWER_BI": "power_bi", "POWER_APPS": "power_apps", "POWER_AUTOMATE": "power_automate",
+             "POWER_DLP": "power_dlp", "COPILOT": "copilot", "PLANNER": "planner"}
         return m.get(t, t.lower() if t else "unknown")
 
     def map_status(s):
@@ -202,7 +215,10 @@ async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] 
              "ONEDRIVE": "onedrive", "SHAREPOINT_SITE": "sharepoint_site", "TEAMS_CHANNEL": "teams_channel",
              "TEAMS_CHAT": "teams_chat", "ENTRA_USER": "entra_user", "ENTRA_GROUP": "entra_group",
              "ENTRA_APP": "entra_app", "ENTRA_DEVICE": "entra_device", "AZURE_VM": "azure_vm",
-             "AZURE_SQL_DB": "azure_sql", "AZURE_POSTGRESQL": "azure_postgresql"}
+             "AZURE_SQL_DB": "azure_sql", "AZURE_POSTGRESQL": "azure_postgresql", "AZURE_POSTGRESQL_SINGLE": "azure_postgresql",
+             "RESOURCE_GROUP": "resource_group", "DYNAMIC_GROUP": "dynamic_group",
+             "POWER_BI": "power_bi", "POWER_APPS": "power_apps", "POWER_AUTOMATE": "power_automate",
+             "POWER_DLP": "power_dlp", "COPILOT": "copilot", "PLANNER": "planner"}
         return m.get(t, t.lower() if t else "unknown")
 
     def map_status(s):
