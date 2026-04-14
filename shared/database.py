@@ -183,7 +183,6 @@ async def init_db():
                 azure_refresh_token_updated_at TIMESTAMP,
                 azure_subscriptions_cached JSON DEFAULT '[]',
                 azure_sql_servers_configured JSON DEFAULT '[]',
-                extra_data JSON,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
