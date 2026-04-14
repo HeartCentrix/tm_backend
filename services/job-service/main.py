@@ -12,7 +12,7 @@ from sqlalchemy import select, func
 
 from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot
+from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot, SlaPolicy
 from shared.schemas import (
     JobResponse, JobListResponse, TriggerBackupRequest, TriggerBulkBackupRequest
 )

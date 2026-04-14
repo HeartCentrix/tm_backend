@@ -25,7 +25,7 @@ from sqlalchemy import select, or_, text
 
 from shared.config import settings
 from shared.database import async_session_factory, init_db
-from shared.models import Tenant, Snapshot, SnapshotItem, SlaPolicy
+from shared.models import Tenant, Resource, Snapshot, SnapshotItem, SlaPolicy
 from shared.azure_storage import azure_storage_manager, apply_legal_hold, apply_lifecycle_policy, AzureStorageShard
 from shared.security import decrypt_secret
 
@@ -95,14 +95,27 @@ async def scan_and_replicate():
 
             for snapshot in snapshots:
                 try:
-                    tenant = await session.get(Tenant, snapshot.tenant_id)
+                    # Get resource first, then tenant (Snapshot doesn't have tenant_id directly)
+                    resource = await session.get(Resource, snapshot.resource_id)
+                    if not resource:
+                        snapshot.dr_replication_status = "failed"
+                        snapshot.dr_error = "Resource not found"
+                        snapshot.dr_replication_attempts = (snapshot.dr_replication_attempts or 0) + 1
+                        fail_count += 1
+                        logger.error(
+                            "[scan_and_replicate] Snapshot %s — resource %s not found",
+                            snapshot.id, snapshot.resource_id,
+                        )
+                        continue
+
+                    tenant = await session.get(Tenant, resource.tenant_id)
                     if not tenant:
                         snapshot.dr_replication_status = "skipped"
                         snapshot.dr_error = "Tenant not found"
                         skip_count += 1
                         logger.warning(
                             "[scan_and_replicate] Snapshot %s — tenant %s not found, marking skipped",
-                            snapshot.id, snapshot.tenant_id,
+                            snapshot.id, resource.tenant_id,
                         )
                         continue
 

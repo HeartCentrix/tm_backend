@@ -276,7 +276,7 @@ class BackupWorker:
             await self.complete_snapshot(session, snapshot, result)
 
             await self.update_job_status(session, job_id, JobStatus.COMPLETED, result)
-            await self.update_resource_backup_info(session, resource, job_id, snapshot.id)
+            await self.update_resource_backup_info(session, resource, job_id, snapshot.id, result)
 
             # Log audit event
             await self.audit_logger.log(
@@ -471,6 +471,12 @@ class BackupWorker:
                     async with async_session_factory() as sess:
                         sess.merge(resource)
                         await sess.commit()
+                        
+                        # Update resource backup info (storage_bytes, last_backup_*)
+                        await self.update_resource_backup_info(sess, resource, job_id, snapshot.id, {
+                            "item_count": total_success,
+                            "bytes_added": res_bytes,
+                        })
 
                     total_success = server_copy_ok + streaming_ok
                     return {"item_count": total_success, "bytes_added": res_bytes}
@@ -815,6 +821,12 @@ class BackupWorker:
                         async with async_session_factory() as sess:
                             sess.merge(resource)
                             await sess.commit()
+                            
+                            # Update resource backup info (storage_bytes, last_backup_*)
+                            await self.update_resource_backup_info(sess, resource, job_id, snapshot.id, {
+                                "item_count": total_items,
+                                "bytes_added": total_bytes,
+                            })
 
                     return {"item_count": total_items, "bytes_added": total_bytes}
                 except Exception as e:
@@ -1089,6 +1101,12 @@ class BackupWorker:
             async with async_session_factory() as session:
                 session.add_all(db_items)
                 await session.commit()
+                
+                # Update resource backup info (storage_bytes, last_backup_*)
+                await self.update_resource_backup_info(session, resource, job_id, snapshot.id, {
+                    "item_count": item_count,
+                    "bytes_added": bytes_added,
+                })
 
         print(f"[{self.worker_id}] [ENTRA_{resource_type} COMPLETE] {resource.display_name} — {item_count} items, {bytes_added} bytes")
         return {"item_count": item_count, "bytes_added": bytes_added}
@@ -1203,6 +1221,14 @@ class BackupWorker:
             item_count, bytes_added = await self._backup_single_chat(resource, tenant, snapshot, graph_client)
 
         print(f"[{self.worker_id}] [TEAMS COMPLETE] {resource.display_name} — {item_count} messages, {bytes_added} bytes")
+        
+        # Update resource backup info (storage_bytes, last_backup_*)
+        async with async_session_factory() as sess:
+            await self.update_resource_backup_info(sess, resource, job_id, snapshot.id, {
+                "item_count": item_count,
+                "bytes_added": bytes_added,
+            })
+        
         return {"item_count": item_count, "bytes_added": bytes_added}
 
     async def _backup_teams_chat_resource(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
@@ -1211,6 +1237,14 @@ class BackupWorker:
         print(f"[{self.worker_id}] [TEAMS_CHAT START] {resource.display_name} ({resource.external_id})")
         item_count, bytes_added = await self._backup_single_chat(resource, tenant, snapshot, graph_client)
         print(f"[{self.worker_id}] [TEAMS_CHAT COMPLETE] {resource.display_name} — {item_count} messages, {bytes_added} bytes")
+        
+        # Update resource backup info (storage_bytes, last_backup_*)
+        async with async_session_factory() as sess:
+            await self.update_resource_backup_info(sess, resource, job_id, snapshot.id, {
+                "item_count": item_count,
+                "bytes_added": bytes_added,
+            })
+        
         return {"item_count": item_count, "bytes_added": bytes_added}
 
     async def _backup_single_chat(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
@@ -1766,10 +1800,21 @@ class BackupWorker:
         return {"item_count": total_items, "bytes_added": total_bytes, "new_delta_token": new_delta}
 
     async def update_resource_backup_info(self, session: AsyncSession, resource: Resource,
-                                          job_id: uuid.UUID, snapshot_id: uuid.UUID):
+                                          job_id: uuid.UUID, snapshot_id: uuid.UUID,
+                                          result: Dict = None):
         """Update resource with last backup information — uses targeted UPDATE
         to avoid overwriting extra_data (delta_token) set by complete_snapshot."""
         from sqlalchemy import update as sa_update
+        
+        # Calculate new storage_bytes from backup result
+        storage_bytes = resource.storage_bytes or 0
+        if result:
+            bytes_added = result.get("bytes_added", 0)
+            bytes_removed = result.get("bytes_removed", 0) or 0
+            net_change = bytes_added - bytes_removed
+            storage_bytes = max(0, storage_bytes + net_change)
+            print(f"[{self.worker_id}] Updated storage_bytes for {resource.id}: {resource.storage_bytes} -> {storage_bytes} bytes (added {bytes_added}, removed {bytes_removed})")
+        
         new_status = ResourceStatus.ACTIVE if resource.status == ResourceStatus.DISCOVERED else resource.status
         await session.execute(
             sa_update(Resource)
@@ -1779,6 +1824,7 @@ class BackupWorker:
                 last_backup_at=datetime.utcnow(),
                 last_backup_status="COMPLETED",
                 status=new_status,
+                storage_bytes=storage_bytes,
             )
         )
         await session.commit()

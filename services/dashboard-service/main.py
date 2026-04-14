@@ -8,7 +8,7 @@ from fastapi import FastAPI, Depends, Query
 from sqlalchemy import select, func
 
 from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Resource, Job, JobType, JobStatus
+from shared.models import Resource, Job, JobType, JobStatus, Snapshot
 
 
 @asynccontextmanager
@@ -152,17 +152,40 @@ async def get_backup_size(
     filters = []
     if tenantId:
         filters.append(Resource.tenant_id == UUID(tenantId))
-    
+
+    # Get current total storage bytes
     total = (await db.execute(select(func.sum(Resource.storage_bytes)).where(*filters))).scalar() or 0
-    
+    total = int(total) if total else 0
+
+    # Get real daily backup sizes from snapshots over the last 30 days
     daily_data = []
     for i in range(30):
         date = (datetime.now(timezone.utc) - timedelta(days=29-i)).date()
-        daily_data.append({"date": date.isoformat(), "bytes": int(total * (0.7 + 0.3 * (i / 30)))})
-    
+        # Use naive datetime (without timezone) to match PostgreSQL TIMESTAMP WITHOUT TIME ZONE
+        date_start = datetime.combine(date, datetime.min.time())
+        date_end = datetime.combine(date, datetime.max.time())
+        
+        # Sum bytes_added from all completed snapshots for this day
+        day_bytes = (await db.execute(
+            select(func.sum(Snapshot.bytes_added))
+            .join(Resource, Snapshot.resource_id == Resource.id)
+            .where(
+                Snapshot.status == "COMPLETED",
+                Snapshot.created_at >= date_start,
+                Snapshot.created_at <= date_end,
+                *filters
+            )
+        )).scalar() or 0
+        
+        daily_data.append({
+            "date": date.isoformat(),
+            "bytes": int(day_bytes)
+        })
+
+    # Calculate changes
     one_day = daily_data[-1]["bytes"] - daily_data[-2]["bytes"] if len(daily_data) > 1 else 0
     one_month = daily_data[-1]["bytes"] - daily_data[0]["bytes"] if daily_data else 0
-    
+
     return {
         "total": format_bytes(total),
         "oneDayChange": format_bytes(abs(one_day)) + (" ↑" if one_day > 0 else " ↓"),
