@@ -179,6 +179,7 @@ async def job(request: Request):
 
 # Snapshot routes
 @app.get("/api/v1/resources/snapshots/folders")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/content-types")
 async def snapshot_folders(request: Request):
     return await proxy_request("snapshot", request.url.path, request)
 
