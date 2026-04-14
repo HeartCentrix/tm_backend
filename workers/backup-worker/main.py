@@ -249,11 +249,24 @@ class BackupWorker:
             }
 
             handler = handlers.get(resource_type, self._backup_metadata_only)
-            
+
             try:
                 print(f"[{self.worker_id}] Calling handler for {resource_type}: {resource.display_name}")
                 result = await handler(graph_client, resource, snapshot, tenant, message)
             except Exception as e:
+                error_str = str(e).lower()
+                # Detect 404/423 errors — resource no longer exists or is locked
+                is_inaccessible = any(kw in error_str for kw in [
+                    "not found", "404", "resource_not_found",
+                    "locked", "423", "account_locked",
+                    "authorization_failed", "access_denied",
+                ])
+                
+                if is_inaccessible:
+                    print(f"[{self.worker_id}] Resource {resource.display_name} is INACCESSIBLE (404/423) — marking to skip future backups")
+                    resource.status = "INACCESSIBLE"
+                    await session.commit()
+                
                 print(f"[{self.worker_id}] Handler FAILED for {resource_type}: {resource.display_name} — {e}")
                 import traceback
                 traceback.print_exc()
@@ -1059,10 +1072,11 @@ class BackupWorker:
         db_items = []
         for (item_type, item_id, item_data, content_bytes, content_hash, blob_path), result in zip(item_metas_entra, upload_results):
             if isinstance(result, dict) and result.get("success"):
+                item_name = item_data.get("displayName") or item_data.get("subject") or item_data.get("mail") or item_data.get("userPrincipalName") or item_data.get("mailNickname") or item_data.get("id", "unknown")
                 db_items.append(SnapshotItem(
                     snapshot_id=snapshot.id, tenant_id=tenant.id,
                     external_id=item_id, item_type=item_type,
-                    name=item_data.get("displayName", item_data.get("subject", item_id)),
+                    name=item_name,
                     content_hash=content_hash, content_size=len(content_bytes),
                     blob_path=blob_path, metadata={"raw": item_data}, content_checksum=content_hash,
                 ))
@@ -1752,7 +1766,7 @@ class BackupWorker:
         if files_failed > 0:
             snapshot.status = SnapshotStatus.PARTIAL
         else:
-            snapshot.status = SnapshotStatus.COMPLETE
+            snapshot.status = SnapshotStatus.COMPLETED
 
         # Calculate duration
         if snapshot.started_at:
@@ -1793,7 +1807,7 @@ class BackupWorker:
                 resource_id=resource.id,
                 job_id=job_id,
                 type=SnapshotType.INCREMENTAL,
-                status=SnapshotStatus.RUNNING,
+                status=SnapshotStatus.IN_PROGRESS,
                 started_at=datetime.utcnow(),
                 snapshot_label=message.get("snapshotLabel", "scheduled"),
             )

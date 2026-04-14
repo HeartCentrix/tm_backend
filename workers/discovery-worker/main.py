@@ -96,6 +96,7 @@ async def discover_tenant(tenant_id: UUID) -> int:
             logger.info("Discovered %d resources for tenant %s.", len(resources), tenant.display_name)
 
             count = 0
+            discovered_ids = set()
             for r in resources:
                 rtype_str = r.get("type", "ENTRA_USER")
                 rtype = TYPE_MAP.get(rtype_str, ResourceType.ENTRA_USER)
@@ -112,7 +113,8 @@ async def discover_tenant(tenant_id: UUID) -> int:
                 existing_resource = existing.scalar_one_or_none()
 
                 if existing_resource is None:
-                    # Insert new resource
+                    # Check if account is disabled/locked — mark as INACCESSIBLE
+                    is_enabled = r.get("_account_enabled", True)
                     resource = Resource(
                         id=uuid.uuid4(),
                         tenant_id=tenant.id,
@@ -121,18 +123,44 @@ async def discover_tenant(tenant_id: UUID) -> int:
                         display_name=r.get("display_name", "Unknown"),
                         email=r.get("email"),
                         metadata=r.get("metadata", {}),
-                        status=ResourceStatus.DISCOVERED,
+                        status=ResourceStatus.DISCOVERED if is_enabled else "INACCESSIBLE",
                         discovered_at=datetime.now(timezone.utc).replace(tzinfo=None),
                     )
                     db.add(resource)
+                    discovered_ids.add(resource.id)
                 else:
                     # Update existing resource
                     existing_resource.display_name = r.get("display_name", existing_resource.display_name)
                     existing_resource.email = r.get("email") or existing_resource.email
                     existing_resource.metadata = r.get("metadata", existing_resource.metadata)
                     existing_resource.discovered_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    # If previously marked inaccessible, restore to DISCOVERED
+                    if existing_resource.status == "INACCESSIBLE":
+                        existing_resource.status = ResourceStatus.DISCOVERED
+                    discovered_ids.add(existing_resource.id)
 
                 count += 1
+
+            # Mark resources that were NOT found during this discovery as INACCESSIBLE
+            if discovered_ids:
+                await db.execute(
+                    select(Resource).where(
+                        Resource.tenant_id == tenant.id,
+                        Resource.id.notin_(discovered_ids),
+                        Resource.status.in_([ResourceStatus.DISCOVERED, ResourceStatus.ACTIVE]),
+                    ).with_for_update()
+                )
+                # Get resources that are no longer discovered
+                stale_result = await db.execute(
+                    select(Resource).where(
+                        Resource.tenant_id == tenant.id,
+                        ~Resource.id.in_(discovered_ids),
+                        Resource.status.in_([ResourceStatus.DISCOVERED, ResourceStatus.ACTIVE]),
+                    )
+                )
+                stale_resources = stale_result.scalars().all()
+                for sr in stale_resources:
+                    sr.status = "INACCESSIBLE"
 
             tenant.status = TenantStatus.ACTIVE
             tenant.last_discovery_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -337,7 +365,7 @@ async def discover_azure_tenant(tenant_id: UUID) -> int:
 
             # Upsert PostgreSQL
             for pg in discovered["postgres_servers"]:
-                rtype = ResourceType.AZURE_POSTGRESQL_SINGLE if "servers" in pg.get("type", "").split("/")[-1] else ResourceType.AZURE_POSTGRESQL
+                rtype = ResourceType.AZURE_POSTGRESQL_SINGLE if pg.get("type", "") == "Microsoft.DBforPostgreSQL/servers" else ResourceType.AZURE_POSTGRESQL
                 ext_id = pg.get("name", pg.get("id", ""))
                 db_name = pg.get("database_name", "postgres")
                 metadata = {

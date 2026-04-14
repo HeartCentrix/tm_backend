@@ -160,7 +160,7 @@ class AzureWorkloadWorker:
                 resource_id=resource.id,
                 job_id=job_id,
                 type=job.spec.get("fullBackup", False) and "FULL" or "INCREMENTAL",
-                status=SnapshotStatus.RUNNING,
+                status=SnapshotStatus.IN_PROGRESS,
                 started_at=datetime.utcnow(),
                 snapshot_label=job.spec.get("note", "azure-workload-backup"),
             )
@@ -182,7 +182,7 @@ class AzureWorkloadWorker:
 
                 # Update snapshot
                 if result.get("success"):
-                    snapshot.status = SnapshotStatus.COMPLETE
+                    snapshot.status = SnapshotStatus.COMPLETED
                     snapshot.item_count = result.get("disks_copied", 1)
                     snapshot.bytes_added = result.get("size_bytes", 0)
                 else:
@@ -207,8 +207,18 @@ class AzureWorkloadWorker:
                             resource.display_name, resource_id)
 
             except Exception as e:
-                logger.exception("[%s] Handler FAILED for %s (%s): %s",
-                                 self.worker_id, resource_type, resource_id, e)
+                error_str = str(e).lower()
+                # Detect 404/423 errors — resource no longer exists or is locked
+                is_inaccessible = any(kw in error_str for kw in [
+                    "not found", "404", "resourcenotfound", "parentresourcenotfound",
+                    "locked", "423", "authorizationfailed",
+                ])
+                
+                if is_inaccessible:
+                    logger.warning("[%s] Resource %s is INACCESSIBLE (404/423) — marking to skip future backups",
+                                   self.worker_id, resource_id)
+                    resource.status = "INACCESSIBLE"
+                
                 snapshot.status = SnapshotStatus.FAILED
                 job.status = JobStatus.FAILED
                 job.error_message = str(e)

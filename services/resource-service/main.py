@@ -292,7 +292,7 @@ async def assign_policy(resource_id: str, request: AssignPolicyRequest, db: Asyn
         raise HTTPException(status_code=404, detail="Resource not found")
     resource.sla_policy_id = UUID(request.policyId)
     resource.status = ResourceStatus.ACTIVE
-    await db.flush()
+    await db.commit()
 
 
 @app.post("/api/v1/resources/{resource_id}/unassign-policy", status_code=204)
@@ -303,7 +303,7 @@ async def unassign_policy(resource_id: str, db: AsyncSession = Depends(get_db)):
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     resource.sla_policy_id = None
-    await db.flush()
+    await db.commit()
 
 
 @app.post("/api/v1/resources/{resource_id}/archive", status_code=204)
@@ -314,7 +314,7 @@ async def archive_resource(resource_id: str, db: AsyncSession = Depends(get_db))
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     resource.status = ResourceStatus.ARCHIVED
-    await db.flush()
+    await db.commit()
 
 
 @app.post("/api/v1/resources/{resource_id}/unarchive", status_code=204)
@@ -325,7 +325,7 @@ async def unarchive_resource(resource_id: str, db: AsyncSession = Depends(get_db
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     resource.status = ResourceStatus.ACTIVE
-    await db.flush()
+    await db.commit()
 
 
 @app.delete("/api/v1/resources/{resource_id}", status_code=204)
@@ -336,7 +336,7 @@ async def delete_resource(resource_id: str, db: AsyncSession = Depends(get_db)):
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     resource.status = ResourceStatus.PENDING_DELETION
-    await db.flush()
+    await db.commit()
 
 
 @app.post("/api/v1/resources/bulk-assign-policy", status_code=200)
@@ -543,7 +543,7 @@ async def create_policy(request: dict, db: AsyncSession = Depends(get_db)):
         is_default=get_val("isDefault", "is_default", False),
     )
     db.add(policy)
-    await db.flush()
+    await db.commit()
 
     # Notify scheduler to reschedule jobs with updated policy
     await notify_scheduler_reschedule()
@@ -585,7 +585,7 @@ async def update_policy(policy_id: str, request: dict, db: AsyncSession = Depend
             setattr(policy, snake_key, val)
     
     policy.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    await db.flush()
+    await db.commit()
 
     # Notify scheduler to reschedule jobs with updated policy
     await notify_scheduler_reschedule()
@@ -601,7 +601,7 @@ async def delete_policy(policy_id: str, db: AsyncSession = Depends(get_db)):
     if not policy:
         raise HTTPException(status_code=404, detail="Policy not found")
     await db.delete(policy)
-    await db.flush()
+    await db.commit()
 
     # Notify scheduler to reschedule jobs without this policy
     await notify_scheduler_reschedule()

@@ -45,8 +45,10 @@ async def init_db():
     Everything is idempotent (IF NOT EXISTS / EXCEPTION duplicate_object).
     No separate migration script or init_db.py needed.
     """
+    # Advisory lock — serialize init across all concurrent service instances
+    # Prevents race condition on CREATE TABLE IF NOT EXISTS (pg_type_typname_nsp_index)
     async with engine.begin() as conn:
-        # Create schema if not exists
+        await conn.execute(text("SELECT pg_advisory_xact_lock(1234567890);"))
         await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {settings.DB_SCHEMA}"))
         await conn.execute(text(f"SET search_path TO {settings.DB_SCHEMA}"))
 
@@ -59,13 +61,13 @@ async def init_db():
                 CREATE TYPE tenanttype AS ENUM ('M365', 'AZURE', 'BOTH');
             EXCEPTION WHEN duplicate_object THEN null; END $$;""",
             """DO $$ BEGIN
-                CREATE TYPE tenantstatus AS ENUM ('PENDING', 'ACTIVE', 'DISCONNECTED', 'SUSPENDED', 'PENDING_DELETION', 'DISCOVERING');
+                CREATE TYPE tenantstatus AS ENUM ('PENDING', 'ACTIVE', 'DISCONNECTED', 'SUSPENDED', 'PENDING_DELETION', 'DISCOVERING', 'PENDING_DISCOVERY');
             EXCEPTION WHEN duplicate_object THEN null; END $$;""",
             """DO $$ BEGIN
-                CREATE TYPE resourcetype AS ENUM ('MAILBOX', 'SHARED_MAILBOX', 'ROOM_MAILBOX', 'ONEDRIVE', 'SHAREPOINT_SITE', 'TEAMS_CHANNEL', 'TEAMS_CHAT', 'ENTRA_USER', 'ENTRA_GROUP', 'ENTRA_APP', 'ENTRA_SERVICE_PRINCIPAL', 'ENTRA_DEVICE', 'AZURE_VM', 'AZURE_SQL_DB', 'AZURE_POSTGRESQL', 'RESOURCE_GROUP', 'DYNAMIC_GROUP', 'POWER_BI', 'POWER_APPS', 'POWER_AUTOMATE', 'POWER_DLP', 'COPILOT', 'PLANNER', 'TODO', 'ONENOTE');
+                CREATE TYPE resourcetype AS ENUM ('MAILBOX', 'SHARED_MAILBOX', 'ROOM_MAILBOX', 'ONEDRIVE', 'SHAREPOINT_SITE', 'TEAMS_CHANNEL', 'TEAMS_CHAT', 'ENTRA_USER', 'ENTRA_GROUP', 'ENTRA_APP', 'ENTRA_SERVICE_PRINCIPAL', 'ENTRA_DEVICE', 'AZURE_VM', 'AZURE_SQL_DB', 'AZURE_POSTGRESQL', 'AZURE_POSTGRESQL_SINGLE', 'RESOURCE_GROUP', 'DYNAMIC_GROUP', 'POWER_BI', 'POWER_APPS', 'POWER_AUTOMATE', 'POWER_DLP', 'COPILOT', 'PLANNER', 'TODO', 'ONENOTE');
             EXCEPTION WHEN duplicate_object THEN null; END $$;""",
             """DO $$ BEGIN
-                CREATE TYPE resourcestatus AS ENUM ('DISCOVERED', 'ACTIVE', 'ARCHIVED', 'SUSPENDED', 'PENDING_DELETION');
+                CREATE TYPE resourcestatus AS ENUM ('DISCOVERED', 'ACTIVE', 'ARCHIVED', 'SUSPENDED', 'PENDING_DELETION', 'INACCESSIBLE');
             EXCEPTION WHEN duplicate_object THEN null; END $$;""",
             """DO $$ BEGIN
                 CREATE TYPE jobtype AS ENUM ('BACKUP', 'RESTORE', 'EXPORT', 'DISCOVERY', 'DELETE');
@@ -91,6 +93,8 @@ async def init_db():
         "ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'PARTIAL';",
         "ALTER TYPE snapshotstatus ADD VALUE IF NOT EXISTS 'PENDING_DELETION';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_SERVICE_PRINCIPAL';",
+        "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'AZURE_POSTGRESQL_SINGLE';",
+        "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'PENDING_DISCOVERY';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'QUEUED';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'RUNNING';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'COMPLETED';",
@@ -137,7 +141,9 @@ async def init_db():
             pass  # Already exists or not supported
 
     # Now create tables and run remaining ALTERs inside a new transaction
+    # Advisory lock prevents race condition on CREATE TABLE IF NOT EXISTS
     async with engine.begin() as conn:
+        await conn.execute(text("SELECT pg_advisory_xact_lock(1234567890);"))
         await conn.execute(text(f"SET search_path TO {settings.DB_SCHEMA};"))
 
         # ── CREATE TABLE IF NOT EXISTS (13 tables + indexes) ──
