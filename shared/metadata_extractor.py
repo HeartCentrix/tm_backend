@@ -180,9 +180,52 @@ class MetadataExtractor:
             "chat_id": resource.external_id,
             "display_name": resource.display_name,
             "chat_type": extra_data.get("chatType"),
-            "members": extra_data.get("members", []),
+            "member_count": extra_data.get("memberCount"),
+            "member_emails": extra_data.get("memberEmails", []),
+            "member_names": extra_data.get("memberNames", []),
             "created_at": extra_data.get("createdDateTime"),
             "last_updated_at": extra_data.get("lastUpdatedDateTime"),
+        }
+
+    @staticmethod
+    def extract_teams_chat_message_metadata(message: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract Teams chat message metadata"""
+        body = message.get("body", {})
+        from_info = message.get("from", {})
+        user = from_info.get("user", {})
+
+        return {
+            "type": "teams_chat_message",
+            "message_id": message.get("id"),
+            "message_type": message.get("messageType"),
+            "created_at": message.get("createdDateTime"),
+            "last_modified_at": message.get("lastModifiedDateTime"),
+            "deleted_at": message.get("deletedDateTime"),
+            "subject": message.get("subject"),
+            "importance": message.get("importance"),
+            "locale": message.get("locale"),
+            "web_url": message.get("webUrl"),
+            "body": {
+                "content_type": body.get("contentType"),
+                "content_preview": body.get("content", "")[:500] if body.get("content") else "",
+            },
+            "from": {
+                "user_id": user.get("id"),
+                "display_name": user.get("displayName"),
+                "tenant_id": user.get("tenantId"),
+            },
+            "has_attachments": message.get("hasAttachments", False),
+            "attachments": [
+                {
+                    "id": att.get("id"),
+                    "name": att.get("name"),
+                    "content_type": att.get("contentType"),
+                    "content_url": att.get("contentUrl"),
+                }
+                for att in message.get("attachments", [])
+            ],
+            "channel_identity": message.get("channelIdentity"),
+            "policy_violation": message.get("policyViolation"),
         }
 
     # ==================== Entra ID Metadata ====================

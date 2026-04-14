@@ -1114,7 +1114,7 @@ class BackupWorker:
                 ch_id = ch.get("id")
                 ch_name = ch.get("displayName", ch_id)
                 print(f"[{self.worker_id}]   [CHANNEL_MSG] {ch_name} — fetching messages...")
-                msgs = await graph_client.get_channel_messages_delta(team_id, ch_id)
+                msgs = await graph_client.get_channel_messages(team_id, ch_id)
                 msg_list = msgs.get("value", [])
                 print(f"[{self.worker_id}]   [CHANNEL_MSG] {ch_name} — {len(msg_list)} messages")
 
@@ -1122,6 +1122,7 @@ class BackupWorker:
                 ch_bytes = 0
                 upload_tasks = []
                 item_metas = []
+                reply_msg_ids = set()  # Track which message IDs are replies
 
                 for msg in msg_list:
                     msg_id = msg.get("id", str(uuid.uuid4()))
@@ -1133,30 +1134,62 @@ class BackupWorker:
                     upload_tasks.append(upload_blob_with_retry(container, bp, content_bytes, shard))
                     item_metas.append((msg_id, msg, content_bytes, content_hash, bp, ch_id, ch_name))
 
+                    # Fetch replies for this message (if it has replies)
+                    reply_count = msg.get("replyCount", 0)
+                    if reply_count > 0:
+                        try:
+                            replies = await graph_client.get_channel_messages_replies(team_id, ch_id, msg_id)
+                            reply_list = replies.get("value", [])
+                            for reply in reply_list:
+                                reply_id = reply.get("id", str(uuid.uuid4()))
+                                reply_content_bytes = json.dumps(reply).encode()
+                                reply_content_hash = hashlib.sha256(reply_content_bytes).hexdigest()
+                                reply_bp = azure_storage_manager.build_blob_path(
+                                    str(tenant.id), str(resource.id), str(snapshot.id),
+                                    f"ch_{ch_id}_msg_{msg_id}_reply_{reply_id}"
+                                )
+                                upload_tasks.append(upload_blob_with_retry(container, reply_bp, reply_content_bytes, shard))
+                                item_metas.append((reply_id, reply, reply_content_bytes, reply_content_hash, reply_bp, ch_id, ch_name))
+                                reply_msg_ids.add(reply_id)
+                        except Exception as e:
+                            print(f"[{self.worker_id}]   [CHANNEL_REPLY] Failed to fetch replies for {msg_id}: {e}")
+
                 upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
 
                 db_items = []
-                for (msg_id, msg, content_bytes, content_hash, bp, ch_id, ch_name), res in zip(item_metas, upload_results):
+                for (mid, mdata, mbytes, mhash, mbp, cid, cname), res in zip(item_metas, upload_results):
                     if isinstance(res, dict) and res.get("success"):
+                        # Determine if this is a reply or a top-level message
+                        is_reply = mid in reply_msg_ids
                         db_items.append(SnapshotItem(
                             snapshot_id=snapshot.id,
                             tenant_id=tenant.id,
-                            external_id=msg_id,
-                            item_type="TEAMS_MESSAGE",
-                            name=msg.get("subject") or msg.get("body", {}).get("content", "")[:100] or msg_id,
-                            folder_path=f"channels/{ch_name}",
-                            content_hash=content_hash,
-                            content_size=len(content_bytes),
-                            blob_path=bp,
-                            metadata={"raw": msg, "channelId": ch_id, "channelName": ch_name},
-                            content_checksum=content_hash,
+                            external_id=mid,
+                            item_type="TEAMS_MESSAGE_REPLY" if is_reply else "TEAMS_MESSAGE",
+                            name=mdata.get("subject") or mdata.get("body", {}).get("content", "")[:100] or mid,
+                            folder_path=f"channels/{cname}",
+                            content_hash=mhash,
+                            content_size=len(mbytes),
+                            blob_path=mbp,
+                            metadata={"raw": mdata, "channelId": cid, "channelName": cname, "isReply": is_reply},
+                            content_checksum=mhash,
                         ))
-                        ch_bytes += len(content_bytes)
+                        ch_bytes += len(mbytes)
 
                 if db_items:
                     async with async_session_factory() as sess:
                         sess.add_all(db_items)
                         await sess.commit()
+
+                # Save channel delta token for incremental backup
+                channel_delta = msgs.get("@odata.deltaLink")
+                if channel_delta:
+                    async with async_session_factory() as sess:
+                        r = await sess.get(Resource, resource.id)
+                        if r:
+                            r.extra_data = r.extra_data or {}
+                            r.extra_data.setdefault("channel_delta_tokens", {})[ch_id] = channel_delta
+                            await sess.commit()
 
                 return len(db_items), ch_bytes
 
@@ -1190,7 +1223,7 @@ class BackupWorker:
         chat_topic = resource.display_name or chat_id
 
         print(f"[{self.worker_id}]   [CHAT_MSG] {chat_topic} — fetching messages (delta)...")
-        chat_msgs = await graph_client.get_chat_messages_delta(chat_id, delta_token)
+        chat_msgs = await graph_client.get_chat_messages(chat_id, delta_token)
         msg_list = chat_msgs.get("value", [])
         print(f"[{self.worker_id}]   [CHAT_MSG] {chat_topic} — {len(msg_list)} messages")
 

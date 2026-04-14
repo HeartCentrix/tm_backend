@@ -52,8 +52,10 @@ async def run_tenant_discovery(db: AsyncSession, tenant: Tenant) -> int:
 
     count = 0
     for r in resources:
+        rtype = TYPE_MAP.get(r.get("type", "ENTRA_USER"), ResourceType.ENTRA_USER)
         existing_stmt = select(Resource).where(
             Resource.tenant_id == tenant.id,
+            Resource.type == rtype,
             Resource.external_id == r["external_id"],
         )
         existing_result = await db.execute(existing_stmt)

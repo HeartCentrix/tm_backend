@@ -285,6 +285,10 @@ async def datasource_callback(
         tenant.graph_client_id = settings.MICROSOFT_CLIENT_ID
         tenant.graph_client_secret_encrypted = encrypted_secret
         tenant.status = TenantStatus.ACTIVE
+        # If existing tenant is AZURE type, upgrade to BOTH (M365 + Azure connected)
+        if tenant.type == TenantType.AZURE:
+            tenant.type = TenantType.BOTH
+            print(f"[auth-service] Upgraded tenant {tenant.id} from AZURE to BOTH")
 
     await db.flush()
     tenant_id = tenant.id
