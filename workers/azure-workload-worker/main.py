@@ -173,7 +173,7 @@ class AzureWorkloadWorker:
                     result = await self.vm_handler.backup(resource, tenant, snapshot, message)
                 elif resource_type in ("AZURE_SQL_DB", "AZURE_SQL"):
                     result = await self.sql_handler.backup(resource, tenant, snapshot, message)
-                elif resource_type in ("AZURE_POSTGRESQL", "AZURE_PG"):
+                elif resource_type in ("AZURE_POSTGRESQL", "AZURE_POSTGRESQL_SINGLE", "AZURE_PG"):
                     result = await self.pg_handler.backup(resource, tenant, snapshot, message)
                 else:
                     logger.warning("[%s] Unknown Azure resource type: %s for %s",

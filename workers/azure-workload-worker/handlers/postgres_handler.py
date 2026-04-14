@@ -1,205 +1,547 @@
-"""Azure Database for PostgreSQL Flexible Server Backup Handler.
+"""Azure PostgreSQL Backup Handler (2026).
 
-Two modes:
-1. Native backup via Azure Backup API (managed by Azure)
-2. pg_dump streaming export to blob storage (portable backup)
+Supports both:
+- Flexible Server (2026 standard): Microsoft.DBforPostgreSQL/flexibleServers
+- Single Server (deprecated): Microsoft.DBforPostgreSQL/servers
 
-For large databases, prefer native Azure backup (faster, point-in-time).
-For portability, use pg_dump streaming.
+Both use Azure AD authentication via Service Principal — no stored passwords.
+Streaming table exports to plain .sql files (viewable in Azure Portal).
+
+Files stored UNCOMPRESSED (.sql) so they can be viewed directly
+in Azure Portal's Blob Storage viewer.
 """
 import asyncio
-import subprocess
-import tempfile
-import os
+import asyncpg
+import time
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from azure.mgmt.rdbms.postgresql_flexibleservers.aio import PostgreSQLManagementClient
-from azure.core.exceptions import HttpResponseError
+from azure.mgmt.rdbms.postgresql.aio import PostgreSQLManagementClient as SingleServerClient
+from azure.identity.aio import ClientSecretCredential
 
 from shared.models import Resource, Tenant, Snapshot
 from shared.azure_storage import azure_storage_manager
-from shared.security import decrypt_secret
 from shared.config import settings
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
-from lro import await_lro
-from arm_credentials import get_arm_credential
+
+
+# Timestamp column names to detect for incremental backup
+TIMESTAMP_COLUMNS = [
+    "updated_at", "updatedat", "updateddate",
+    "modified_at", "modifiedat", "modifieddate",
+    "last_modified", "lastmodified",
+]
+
+# Azure AD token scope for PostgreSQL
+# Flexible Server: https://ossrdbms-aad.database.windows.net/.default
+# Single Server: same scope but different connection format
+PG_AAD_SCOPE = "https://ossrdbms-aad.database.windows.net/.default"
 
 
 class PostgresBackupHandler:
-    """Backup Azure PostgreSQL flexible servers via native backup or pg_dump."""
+    """Backup Azure PostgreSQL servers via Afi-style streaming export."""
 
     def __init__(self, worker_id: str = "azure-pg-worker"):
         self.worker_id = worker_id
 
+    def _log(self, message: str, level: str = "INFO"):
+        prefix = f"[{self.worker_id}] [PG]"
+        print(f"{prefix} {message}")
+
+    def _get_server_type(self, resource: Resource) -> str:
+        """
+        Detect PostgreSQL server type from resource type.
+
+        2026 Standard:
+        - AZURE_POSTGRESQL = Flexible Server (primary)
+        - AZURE_POSTGRESQL_SINGLE = Single Server (deprecated, legacy)
+        """
+        rtype = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
+        if rtype in ("AZURE_POSTGRESQL_SINGLE", "AZURE_PG_SINGLE"):
+            return "SINGLE"
+        return "FLEXIBLE"
+
     async def backup(self, resource: Resource, tenant: Tenant,
                      snapshot: Snapshot, msg: Dict) -> Dict:
         """
-        Two-mode backup:
-        - mode=NATIVE: Use Azure's native PostgreSQL backup API
-        - mode=PG_DUMP: Stream pg_dump to blob storage
+        Afi-style PostgreSQL backup:
+        - Phase 1: Connect and stream tables to .sql files
+        - Phase 2: Capture schema (CREATE TABLE statements)
+        - Phase 3: Capture server configuration
         """
-        mode = msg.get("pg_mode", "NATIVE")
-
-        if mode == "NATIVE":
-            return await self._native_backup(resource, tenant, snapshot)
-        elif mode == "PG_DUMP":
-            return await self._pg_dump_backup(resource, tenant, snapshot, msg)
-        else:
-            raise ValueError(f"Unknown PostgreSQL backup mode: {mode}")
-
-    async def _native_backup(self, resource: Resource, tenant: Tenant,
-                              snapshot: Snapshot) -> Dict:
-        """
-        Azure PostgreSQL Flexible Server doesn't have a direct backup API.
-        Instead, we record the point-in-time restore capability which Azure
-        manages automatically (7-35 days retention based on tier).
-        """
-        server_name = resource.extra_data.get("server_name", "")
-        if not server_name:
-            raise ValueError(f"No server_name found in resource {resource.external_id} metadata")
-
-        # Azure automatically manages PITR for flexible servers (7-35 days based on tier)
-        # We just record the earliest/latest restore window
-        credential = get_arm_credential()
-        pg_client = PostgreSQLManagementClient(credential, resource.azure_subscription_id)
-
-        try:
-            server = await pg_client.servers.get(
-                resource_group_name=resource.azure_resource_group,
-                server_name=server_name,
-            )
-
-            # Azure stores backup metadata on the server
-            backup_retention = getattr(server, 'backup', None)
-            retention_days = getattr(backup_retention, 'backup_retention_days', 7) if backup_retention else 7
-
-            snapshot.blob_path = f"{resource.external_id}/{snapshot.id.hex[:12]}/"
-            snapshot.extra_data = {
-                **(snapshot.extra_data or {}),
-                "mode": "NATIVE_PITR",
-                "server_name": server_name,
-                "retention_days": retention_days,
-                "backup_storage_redundancy": getattr(backup_retention, 'geo_redundant_backup', 'Disabled') if backup_retention else 'Unknown',
-            }
-
-            print(f"[{self.worker_id}] [PG NATIVE PITR] {resource.display_name} — retention={retention_days}d")
-            return {"success": True, "mode": "NATIVE_PITR", "size_bytes": 0, "retention_days": retention_days}
-
-        except HttpResponseError as e:
-            raise RuntimeError(f"Failed to query PostgreSQL server {server_name}: {e}") from e
-
-    async def _pg_dump_backup(self, resource: Resource, tenant: Tenant,
-                               snapshot: Snapshot, msg: Dict) -> Dict:
-        """
-        Stream pg_dump output to Azure blob storage.
-        Requires database credentials stored in tenant.extra_data.
-        """
+        server_type = self._get_server_type(resource)
         server_name = resource.extra_data.get("server_name", "")
         db_name = resource.extra_data.get("database_name", resource.external_id)
+        rg = resource.azure_resource_group or ""
+        sub_id = resource.azure_subscription_id
 
         if not server_name:
-            raise ValueError(f"No server_name found in resource {resource.external_id} metadata")
+            raise ValueError(f"No server_name found in resource {resource.external_id}")
 
-        # Get credentials
-        pg_user = None
-        pg_password = None
-        user_key = "azure_pg_user_encrypted"
-        pass_key = "azure_pg_password_encrypted"
+        self._log(f"Starting PostgreSQL {server_type} backup: {db_name} on server {server_name} (RG={rg})")
 
-        if tenant.extra_data and user_key in tenant.extra_data:
-            pg_user = decrypt_secret(tenant.extra_data[user_key])
-        if tenant.extra_data and pass_key in tenant.extra_data:
-            pg_password = decrypt_secret(tenant.extra_data[pass_key])
-
-        if not pg_user or not pg_password:
-            raise ValueError(
-                f"PostgreSQL credentials not found in tenant {tenant.id}. "
-                f"Set {user_key} and {pass_key} in tenant.extra_data"
-            )
-
-        # Build connection string
-        host = f"{server_name}.postgres.database.azure.com"
-        conn_str = f"postgresql://{pg_user}:{pg_password}@{host}:5432/{db_name}?sslmode=require"
-
-        # pg_dump to temp file, then upload
-        blob_name = f"{resource.external_id}_{snapshot.id.hex[:12]}_{int(time.time())}.sql.gz"
-        container = azure_storage_manager.get_container_name(str(tenant.id), "azure-postgresql")
-
-        print(f"[{self.worker_id}] [PG DUMP] Starting pg_dump for {resource.display_name}...")
-
-        with tempfile.NamedTemporaryFile(suffix=".sql.gz", delete=False) as tmp:
-            tmp_path = tmp.name
+        conn = None
 
         try:
-            # Run pg_dump with gzip compression
-            process = await asyncio.create_subprocess_exec(
-                "pg_dump",
-                "-h", host,
-                "-p", "5432",
-                "-U", pg_user,
-                "-d", db_name,
-                "-Fc",  # Custom format (compressed, supports parallel restore)
-                "-f", tmp_path,
-                env={
-                    **os.environ,
-                    "PGPASSWORD": pg_password,
-                    "PGSSLMODE": "require",
-                },
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await process.communicate()
+            # Phase 1: Get Azure AD connection and stream tables
+            conn = await self._get_azure_ad_connection(server_name, db_name, server_type, resource)
 
-            if process.returncode != 0:
-                err_msg = stderr.decode() if stderr else "Unknown error"
-                raise RuntimeError(f"pg_dump failed: {err_msg}")
-
-            # Get file size
-            dump_size = os.path.getsize(tmp_path)
-
-            # Upload to Azure blob
-            shard = azure_storage_manager.get_default_shard()
-            await shard.ensure_container(container)
-            blob_path = f"{resource.external_id}/{blob_name}"
-
-            with open(tmp_path, 'rb') as f:
-                content = f.read()
-
-            await shard.copy_from_url_sync(
-                # pg_dump writes to local file, we upload directly
-                source_url="",  # Not applicable for local file
-                container_name=container,
-                blob_path=blob_path,
-                source_size=dump_size,
-                metadata={
-                    "source_server": server_name,
-                    "database_name": db_name,
-                    "dump_format": "custom",
-                },
+            data_result = await self._stream_tables(
+                resource, tenant, snapshot, conn, server_name, db_name
             )
 
-            # Actually upload the file properly
-            blob_client = shard.get_async_client().get_blob_client(container, blob_path)
-            await blob_client.upload_blob(content, overwrite=True)
+            # Phase 2: Capture schema
+            schema_result = await self._capture_schema(
+                conn, server_name, db_name, snapshot, resource
+            )
 
-            snapshot.blob_path = blob_path
-            snapshot.extra_data = {
-                **(snapshot.extra_data or {}),
-                "mode": "PG_DUMP",
-                "blob_path": blob_path,
-                "dump_size_bytes": dump_size,
-                "server_name": server_name,
-                "database_name": db_name,
+            # Phase 3: Capture configuration
+            config_result = await self._capture_configuration(
+                server_name, sub_id, rg, snapshot, resource, server_type
+            )
+
+            # Finalize
+            total_size = data_result.get("total_bytes", 0) + schema_result.get("size_bytes", 0) + config_result.get("size_bytes", 0)
+
+            # Record last backup time on RESOURCE for incremental
+            resource.extra_data = {
+                **(resource.extra_data or {}),
+                "last_full_backup_at": datetime.now(timezone.utc).isoformat(),
+                "last_backup_rows": data_result.get("rows_count", 0),
             }
 
-            print(f"[{self.worker_id}] [PG DUMP COMPLETE] {resource.display_name} — {dump_size} bytes")
-            return {"success": True, "mode": "PG_DUMP", "size_bytes": dump_size}
+            # Set blob_path for recovery panel
+            snapshot.blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/"
 
+            snapshot.extra_data = {
+                **(snapshot.extra_data or {}),
+                "mode": "AFI_STREAMING",
+                "server_type": server_type,
+                "total_size_bytes": total_size,
+                "tables_exported": data_result.get("tables_count", 0),
+                "rows_exported": data_result.get("rows_count", 0),
+                "schema_blob": schema_result.get("blob_path", ""),
+                "config_blob": config_result.get("blob_path", ""),
+                "server_name": server_name,
+                "database_name": db_name,
+                "resource_group": rg,
+                "subscription_id": sub_id,
+                "auth_method": "AzureADServicePrincipal",
+                "backup_timestamp": datetime.now(timezone.utc).isoformat(),
+                "last_full_backup_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+            size_str = self._format_size(total_size)
+
+            self._log(
+                f"PostgreSQL {server_type} backup completed: {db_name} — "
+                f"{data_result.get('tables_count', 0)} tables, "
+                f"{data_result.get('rows_count', 0)} rows, "
+                f"{size_str} total"
+            )
+
+            return {
+                "success": True,
+                "mode": "AFI_STREAMING",
+                "server_type": server_type,
+                "tables_exported": data_result.get("tables_count", 0),
+                "rows_exported": data_result.get("rows_count", 0),
+                "total_size_bytes": total_size,
+                "auth_method": "AzureADServicePrincipal",
+            }
+
+        except Exception as e:
+            self._log(f"PostgreSQL backup FAILED for {db_name}: {e}", "ERROR")
+            raise
         finally:
-            # Clean up temp file
             try:
-                os.unlink(tmp_path)
-            except OSError:
+                if conn:
+                    await conn.close()
+            except Exception:
                 pass
+
+    async def _get_azure_ad_connection(self, server_name: str, db_name: str, server_type: str, resource: Resource):
+        """
+        Connect to PostgreSQL using Azure AD authentication (no stored passwords).
+
+        Uses our Service Principal to get an Azure AD access token for PostgreSQL.
+
+        Flexible Server (2026 standard):
+        - User: `azure_ad_admin` (special username for Azure AD auth)
+        - Password: Azure AD access token
+
+        Single Server (deprecated):
+        - User: `username@servername`
+        - Password: Azure AD access token
+        """
+        sp_client_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
+        sp_client_secret = settings.MICROSOFT_CLIENT_SECRET or settings.AZURE_AD_CLIENT_SECRET
+        sp_tenant_id = settings.MICROSOFT_TENANT_ID or settings.AZURE_AD_TENANT_ID
+
+        if not sp_client_id or not sp_client_secret or not sp_tenant_id:
+            raise ValueError(
+                f"SP credentials not configured. "
+                f"Set MICROSOFT_CLIENT_ID/SECRET/TENANT_ID or AZURE_AD_CLIENT_ID/SECRET/TENANT_ID."
+            )
+
+        # Get Azure AD access token for PostgreSQL
+        credential = ClientSecretCredential(
+            client_id=sp_client_id,
+            client_secret=sp_client_secret,
+            tenant_id=sp_tenant_id,
+        )
+
+        try:
+            token_result = await credential.get_token(PG_AAD_SCOPE)
+            access_token = token_result.token
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to get Azure AD token for PostgreSQL: {e}. "
+                f"Ensure the SP is registered as Azure AD admin of this PostgreSQL server."
+            )
+        finally:
+            await credential.close()
+
+        # Build connection parameters based on server type
+        host = f"{server_name}.postgres.database.azure.com"
+
+        if server_type == "FLEXIBLE":
+            # Flexible Server: Azure AD auth uses the SP's client ID as username
+            # The SP must be registered as Azure AD admin via ARM API during discovery
+            user = sp_client_id
+        else:
+            # Single Server (deprecated): need original admin user + server suffix
+            admin_user = resource.extra_data.get("admin_user", "pgadmin")
+            user = f"{admin_user}@{server_name}"
+
+        self._log(f"Connecting to {host}/{db_name} using Azure AD auth ({server_type})")
+
+        conn = await asyncpg.connect(
+            host=host,
+            port=5432,
+            user=user,
+            password=access_token,
+            database=db_name,
+            ssl="require",
+            timeout=30.0,
+        )
+
+        self._log(f"Connected to PostgreSQL {server_type}: {db_name}")
+        return conn
+
+    async def _stream_tables(self, resource: Resource, tenant: Tenant,
+                              snapshot: Snapshot, conn, server_name: str,
+                              db_name: str) -> Dict:
+        """
+        Stream data row-by-row from all tables into per-table .sql files.
+
+        Incremental support:
+        - Checks for timestamp columns (updated_at, modified_at, etc.)
+        - Filters rows WHERE timestamp_col >= last_backup_time
+        - Falls back to full export if no timestamp column found
+        """
+        total_bytes = 0
+        total_rows = 0
+        tables_count = 0
+
+        # Get incremental watermark
+        last_backup_time = resource.last_backup_at
+        if last_backup_time and last_backup_time.tzinfo is None:
+            last_backup_time = last_backup_time.replace(tzinfo=timezone.utc)
+
+        # Discover all tables
+        tables = await conn.fetch("""
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_type = 'BASE TABLE'
+              AND table_schema NOT IN ('pg_catalog', 'information_schema')
+              AND table_schema !~ '^pg_toast'
+            ORDER BY table_schema, table_name
+        """)
+
+        self._log(f"  Phase 1: Found {len(tables)} tables in {db_name}")
+
+        if last_backup_time:
+            self._log(f"  Incremental backup since {last_backup_time}")
+        else:
+            self._log(f"  Full backup (no previous backup recorded)")
+
+        # Export each table
+        for table_row in tables:
+            schema = table_row["table_schema"]
+            table = table_row["table_name"]
+            full_table = f'"{schema}"."{table}"'
+
+            start = time.monotonic()
+
+            # Check for incremental timestamp column
+            timestamp_col = None
+            if last_backup_time:
+                timestamp_col = await self._find_timestamp_column(conn, schema, table)
+
+            # Build query
+            if timestamp_col:
+                query = f'SELECT * FROM {full_table} WHERE "{timestamp_col}" >= $1 ORDER BY "{timestamp_col}"'
+                rows = await conn.fetch(query, last_backup_time)
+                self._log(f"    Incremental export for {full_table} via [{timestamp_col}]")
+            else:
+                query = f"SELECT * FROM {full_table}"
+                rows = await conn.fetch(query)
+
+            # Generate INSERT statements as plain .sql
+            sql_lines = [f"-- Table: {full_table}"]
+            sql_lines.append(f"-- Exported at: {datetime.now(timezone.utc).isoformat()}")
+            sql_lines.append(f"-- Rows: {len(rows)}")
+            sql_lines.append("")
+
+            if rows:
+                columns = list(rows[0].keys())
+                col_list = ", ".join(f'"{c}"' for c in columns)
+
+                for row in rows:
+                    values = []
+                    for col in columns:
+                        val = row[col]
+                        if val is None:
+                            values.append("NULL")
+                        elif isinstance(val, (int, float)):
+                            values.append(str(val))
+                        elif isinstance(val, datetime):
+                            values.append(f"'{val.isoformat()}'")
+                        elif isinstance(val, bool):
+                            values.append("TRUE" if val else "FALSE")
+                        else:
+                            escaped = str(val).replace("'", "''")
+                            values.append(f"'{escaped}'")
+
+                    sql_lines.append(f"INSERT INTO {full_table} ({col_list}) VALUES ({', '.join(values)});")
+
+            sql_content = "\n".join(sql_lines) + "\n"
+            sql_bytes = len(sql_content.encode("utf-8"))
+
+            # Upload to blob
+            blob_name = f"{schema}_{table}.sql"
+            blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/data/{blob_name}"
+
+            shard = azure_storage_manager.get_default_shard()
+            container = azure_storage_manager.get_container_name(str(tenant.id), "azure-postgresql")
+            await shard._ensure_container(container)
+
+            blob_client = shard.get_async_client().get_blob_client(container, blob_path)
+            await blob_client.upload_blob(sql_content.encode("utf-8"), overwrite=True)
+
+            elapsed = time.monotonic() - start
+            tables_count += 1
+            total_rows += len(rows)
+            total_bytes += sql_bytes
+
+            size_str = self._format_size(sql_bytes)
+            self._log(f"  ✓ Table {full_table}: {len(rows)} rows, {size_str} in {elapsed:.1f}s")
+
+        return {
+            "tables_count": tables_count,
+            "rows_count": total_rows,
+            "total_bytes": total_bytes,
+        }
+
+    async def _find_timestamp_column(self, conn, schema: str, table: str) -> Optional[str]:
+        """Find a timestamp column suitable for incremental filtering."""
+        cols = await conn.fetch("""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = $2
+              AND data_type IN ('timestamp with time zone', 'timestamp without time zone', 'date')
+            ORDER BY
+                CASE column_name
+                    WHEN 'updated_at' THEN 1
+                    WHEN 'updatedat' THEN 2
+                    WHEN 'updateddate' THEN 3
+                    WHEN 'modified_at' THEN 4
+                    WHEN 'modifiedat' THEN 5
+                    WHEN 'last_modified' THEN 6
+                    WHEN 'lastmodified' THEN 7
+                    WHEN 'created_at' THEN 8
+                    ELSE 99
+                END
+        """, schema, table)
+
+        for col in cols:
+            col_name = col["column_name"].lower()
+            if col_name in [c.lower() for c in TIMESTAMP_COLUMNS]:
+                return col["column_name"]
+
+        return None
+
+    async def _capture_schema(self, conn, server_name: str, db_name: str,
+                               snapshot: Snapshot, resource: Resource) -> Dict:
+        """Capture CREATE TABLE statements for all tables."""
+        shard = azure_storage_manager.get_default_shard()
+        container = azure_storage_manager.get_container_name(str(resource.tenant_id), "azure-postgresql")
+        await shard._ensure_container(container)
+
+        tables = await conn.fetch("""
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_type = 'BASE TABLE'
+              AND table_schema NOT IN ('pg_catalog', 'information_schema')
+              AND table_schema !~ '^pg_toast'
+            ORDER BY table_schema, table_name
+        """)
+
+        schema_lines = [f"-- Schema export for database: {db_name}"]
+        schema_lines.append(f"-- Exported at: {datetime.now(timezone.utc).isoformat()}")
+        schema_lines.append("")
+
+        for table_row in tables:
+            schema = table_row["table_schema"]
+            table = table_row["table_name"]
+
+            columns = await conn.fetch("""
+                SELECT column_name, data_type, character_maximum_length,
+                       is_nullable, column_default, numeric_precision, numeric_scale
+                FROM information_schema.columns
+                WHERE table_schema = $1 AND table_name = $2
+                ORDER BY ordinal_position
+            """, schema, table)
+
+            schema_lines.append(f"-- Table: {schema}.{table}")
+            schema_lines.append(f"CREATE TABLE IF NOT EXISTS \"{schema}\".\"{table}\" (")
+
+            col_defs = []
+            for col in columns:
+                dtype = col["data_type"].upper()
+                if col["character_maximum_length"]:
+                    dtype += f"({col['character_maximum_length']})"
+                elif col["numeric_precision"]:
+                    if col["numeric_scale"]:
+                        dtype += f"({col['numeric_precision']},{col['numeric_scale']})"
+                    else:
+                        dtype += f"({col['numeric_precision']})"
+
+                nullable = "" if col["is_nullable"] == "NO" else " NULL"
+                default = f" DEFAULT {col['column_default']}" if col["column_default"] else ""
+
+                col_defs.append(f'    "{col["column_name"]}" {dtype}{nullable}{default}')
+
+            schema_lines.append(",\n".join(col_defs))
+            schema_lines.append(");\n")
+
+        schema_content = "\n".join(schema_lines) + "\n"
+        schema_bytes = len(schema_content.encode("utf-8"))
+
+        schema_blob_name = f"{db_name}-schema.sql"
+        schema_blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/schema/{schema_blob_name}"
+
+        blob_client = shard.get_async_client().get_blob_client(container, schema_blob_path)
+        await blob_client.upload_blob(schema_content.encode("utf-8"), overwrite=True)
+
+        self._log(f"  Phase 2: Schema captured: {len(tables)} tables, {self._format_size(schema_bytes)}")
+
+        return {"blob_path": schema_blob_path, "size_bytes": schema_bytes}
+
+    async def _capture_configuration(self, server_name: str, sub_id: str,
+                                      rg: str, snapshot: Snapshot,
+                                      resource: Resource, server_type: str) -> Dict:
+        """Capture Azure PostgreSQL server configuration via ARM API."""
+        try:
+            credential = ClientSecretCredential(
+                client_id=settings.EFFECTIVE_ARM_CLIENT_ID,
+                client_secret=settings.EFFECTIVE_ARM_CLIENT_SECRET,
+                tenant_id=settings.EFFECTIVE_ARM_TENANT_ID,
+            )
+
+            if server_type == "FLEXIBLE":
+                pg_client = PostgreSQLManagementClient(credential, sub_id)
+                server = await pg_client.servers.get(
+                    resource_group_name=rg,
+                    server_name=server_name,
+                )
+                config = {
+                    "server_type": "FLEXIBLE",
+                    "server_name": server_name,
+                    "resource_group": rg,
+                    "subscription_id": sub_id,
+                    "location": getattr(server, "location", "unknown"),
+                    "sku": getattr(getattr(server, "sku", None), "name", "unknown"),
+                    "tier": getattr(getattr(server, "sku", None), "tier", "unknown"),
+                    "version": getattr(server, "version", "unknown"),
+                    "state": getattr(server, "state", "unknown"),
+                    "storage_mb": getattr(getattr(server, "storage", None), "storage_size_mb", 0),
+                    "backup_retention_days": getattr(
+                        getattr(server, "backup", None), "backup_retention_days", 7
+                    ),
+                    "geo_redundant_backup": getattr(
+                        getattr(server, "backup", None), "geo_redundant_backup", "Disabled"
+                    ),
+                    "replication_role": getattr(server, "replication_role", "None"),
+                    "high_availability": getattr(
+                        getattr(server, "high_availability", None), "mode", "Disabled"
+                    ),
+                }
+            else:
+                # Single Server (deprecated)
+                pg_client = SingleServerClient(credential, sub_id)
+                server = await pg_client.servers.get(
+                    resource_group_name=rg,
+                    server_name=server_name,
+                )
+                config = {
+                    "server_type": "SINGLE (DEPRECATED)",
+                    "server_name": server_name,
+                    "resource_group": rg,
+                    "subscription_id": sub_id,
+                    "location": getattr(server, "location", "unknown"),
+                    "sku": getattr(getattr(server, "sku", None), "name", "unknown"),
+                    "version": getattr(server, "version", "unknown"),
+                    "state": getattr(server, "user_visible_state", "unknown"),
+                    "storage_mb": getattr(server, "storage_mb", 0),
+                    "backup_retention_days": getattr(server, "backup_retention_days", 7),
+                    "geo_redundant_backup": getattr(server, "geo_redundant_backup", "Disabled"),
+                    "ssl_enforcement": getattr(server, "ssl_enforcement", "Unknown"),
+                }
+
+            config["captured_at"] = datetime.now(timezone.utc).isoformat()
+
+            await pg_client.close()
+            await credential.close()
+
+        except Exception as e:
+            config = {
+                "server_type": server_type,
+                "server_name": server_name,
+                "resource_group": rg,
+                "error": str(e),
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        config_content = f"-- PostgreSQL Server Configuration ({server_type})\n-- Captured: {config['captured_at']}\n\n"
+        config_content += "-- Server Metadata:\n"
+        for key, value in config.items():
+            config_content += f"--   {key}: {value}\n"
+
+        config_bytes = len(config_content.encode("utf-8"))
+
+        shard = azure_storage_manager.get_default_shard()
+        container = azure_storage_manager.get_container_name(str(resource.tenant_id), "azure-postgresql")
+        await shard._ensure_container(container)
+
+        db_name = resource.extra_data.get("database_name", resource.external_id)
+        config_blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/config/{server_name}-config.json"
+
+        blob_client = shard.get_async_client().get_blob_client(container, config_blob_path)
+        await blob_client.upload_blob(config_content.encode("utf-8"), overwrite=True)
+
+        self._log(f"  Phase 3: Configuration captured: {self._format_size(config_bytes)}")
+
+        return {"blob_path": config_blob_path, "size_bytes": config_bytes}
+
+    def _format_size(self, size_bytes: int) -> str:
+        """Human-readable file size."""
+        if size_bytes >= 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024**3):.2f} GB"
+        elif size_bytes >= 1024 * 1024:
+            return f"{size_bytes / (1024**2):.2f} MB"
+        elif size_bytes >= 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        else:
+            return f"{size_bytes} bytes"

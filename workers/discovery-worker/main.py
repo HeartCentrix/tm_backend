@@ -337,12 +337,16 @@ async def discover_azure_tenant(tenant_id: UUID) -> int:
 
             # Upsert PostgreSQL
             for pg in discovered["postgres_servers"]:
-                rtype = ResourceType.AZURE_POSTGRESQL
+                rtype = ResourceType.AZURE_POSTGRESQL_SINGLE if "servers" in pg.get("type", "").split("/")[-1] else ResourceType.AZURE_POSTGRESQL
                 ext_id = pg.get("name", pg.get("id", ""))
+                db_name = pg.get("database_name", "postgres")
                 metadata = {
+                    "server_name": pg.get("name", ""),
                     "server_id": pg.get("id", ""),
+                    "database_name": db_name,
                     "location": pg.get("location", ""),
                     "subscription_id": pg.get("subscription_id", ""),
+                    "type": pg.get("type", ""),
                 }
 
                 existing = await db.execute(
@@ -360,7 +364,7 @@ async def discover_azure_tenant(tenant_id: UUID) -> int:
                         tenant_id=tenant.id,
                         type=rtype,
                         external_id=ext_id,
-                        display_name=pg.get("name", "Unknown"),
+                        display_name=f"{pg.get('name', 'Unknown')}/{db_name}",
                         extra_data=metadata,
                         status=ResourceStatus.DISCOVERED,
                         discovered_at=datetime.now(timezone.utc).replace(tzinfo=None),

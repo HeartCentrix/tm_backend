@@ -24,6 +24,7 @@ AZURE_WORKLOAD_QUEUES = {
     "AZURE_SQL_DB": "azure.sql",
     "AZURE_SQL": "azure.sql",
     "AZURE_POSTGRESQL": "azure.postgres",
+    "AZURE_POSTGRESQL_SINGLE": "azure.postgres",
     "AZURE_PG": "azure.postgres",
 }
 

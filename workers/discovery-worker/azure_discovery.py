@@ -8,7 +8,6 @@ so backup can use our SP's credentials (no customer SQL passwords needed).
 import asyncio
 import httpx
 import json
-import importlib
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
@@ -72,9 +71,9 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
             for server in sql_servers:
                 # Auto-assign our SP as Entra admin — the magic step
                 try:
-                    # Dynamic import due to hyphenated module name
-                    provisioning = importlib.import_module("services.tenant-service.azure_provisioning")
-                    await provisioning.ensure_sql_server_backup_ready(tenant, server, arm_token)
+                    # Dynamic import — directory has hyphen, Python converts to underscore
+                    from services.tenant_service.azure_provisioning import ensure_sql_server_backup_ready
+                    await ensure_sql_server_backup_ready(tenant, server, arm_token)
                 except Exception as e:
                     print(f"[AzureDiscovery] Warning: Failed to provision SQL server {server.get('name')}: {e}")
 
@@ -103,7 +102,7 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
                             "location": server.get("location", ""),
                         })
 
-            # Postgres Flexible Servers
+            # PostgreSQL Flexible Servers (2026 standard)
             pg_resp = await client.get(
                 f"https://management.azure.com/subscriptions/{sub_id}"
                 f"/providers/Microsoft.DBforPostgreSQL/flexibleServers"
@@ -111,13 +110,69 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
                 headers=headers,
             )
             for pg in pg_resp.json().get("value", []):
+                pg_name = pg.get("name", "")
+                pg_id = pg.get("id", "")
+                pg_rg = pg_id.split("/")[4] if pg_id else ""
+
+                # Auto-assign our SP as Azure AD admin — the magic step
+                try:
+                    from services.tenant_service.azure_provisioning import ensure_pg_server_backup_ready
+                    await ensure_pg_server_backup_ready(tenant, pg, arm_token)
+                except Exception as e:
+                    print(f"[AzureDiscovery] Warning: Failed to provision PostgreSQL server {pg_name}: {e}")
+
+                # Enumerate databases on this server
+                dbs_resp = await client.get(
+                    f"https://management.azure.com{pg_id}"
+                    f"/databases?api-version=2023-03-01-preview",
+                    headers=headers,
+                )
+                for db in dbs_resp.json().get("value", []):
+                    db_name = db.get("name", "")
+                    if db_name not in ("postgres", "azure_maintenance", "azure_sys"):
+                        discovered["postgres_servers"].append({
+                            "id": pg_id,
+                            "name": pg_name,
+                            "location": pg.get("location", ""),
+                            "resource_group": pg_rg,
+                            "subscription_id": sub_id,
+                            "type": "Microsoft.DBforPostgreSQL/flexibleServers",
+                            "database_name": db_name,
+                        })
+
+                # If no databases found, add the server itself with default database
+                if not discovered["postgres_servers"] or all(p.get("server_id") != pg_id for p in discovered["postgres_servers"]):
+                    discovered["postgres_servers"].append({
+                        "id": pg_id,
+                        "name": pg_name,
+                        "location": pg.get("location", ""),
+                        "resource_group": pg_rg,
+                        "subscription_id": sub_id,
+                        "type": "Microsoft.DBforPostgreSQL/flexibleServers",
+                        "database_name": "postgres",  # Default database
+                    })
+
+            # PostgreSQL Single Servers (deprecated, but still discover for legacy customers)
+            # Note: Microsoft is retiring Single Server, customers should migrate to Flexible
+            single_pg_resp = await client.get(
+                f"https://management.azure.com/subscriptions/{sub_id}"
+                f"/providers/Microsoft.DBforPostgreSQL/servers"
+                f"?api-version=2017-12-01",
+                headers=headers,
+            )
+            for pg in single_pg_resp.json().get("value", []):
+                pg_name = pg.get("name", "")
+                pg_id = pg.get("id", "")
+                pg_rg = pg_id.split("/")[4] if pg_id else ""
+
                 discovered["postgres_servers"].append({
-                    "id": pg.get("id", ""),
-                    "name": pg.get("name", ""),
+                    "id": pg_id,
+                    "name": pg_name,
                     "location": pg.get("location", ""),
-                    "resource_group": pg.get("id", "").split("/")[4],
+                    "resource_group": pg_rg,
                     "subscription_id": sub_id,
-                    "type": "Microsoft.DBforPostgreSQL/flexibleServers",
+                    "type": "Microsoft.DBforPostgreSQL/servers",  # Single Server (deprecated)
+                    "database_name": pg.get("properties", {}).get("fullyQualifiedDomainName", pg_name),
                 })
 
     return discovered
