@@ -58,6 +58,7 @@ class ResourceType(str, enum.Enum):
     AZURE_VM = "AZURE_VM"
     AZURE_SQL_DB = "AZURE_SQL_DB"
     AZURE_POSTGRESQL = "AZURE_POSTGRESQL"
+    AZURE_POSTGRESQL_SINGLE = "AZURE_POSTGRESQL_SINGLE"
     RESOURCE_GROUP = "RESOURCE_GROUP"
     DYNAMIC_GROUP = "DYNAMIC_GROUP"
     POWER_BI = "POWER_BI"
@@ -157,6 +158,7 @@ class Tenant(Base):
     azure_refresh_token_updated_at = Column(DateTime(timezone=True), nullable=True)
     azure_subscriptions_cached = Column(JSON, default=dict, nullable=False)
     azure_sql_servers_configured = Column(JSON, default=dict, nullable=False)
+    azure_pg_servers_configured = Column(JSON, default=dict, nullable=False)
     extra_data = Column(MutableDict.as_mutable(JSON), default=dict, nullable=True)
 
 

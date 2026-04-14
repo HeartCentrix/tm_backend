@@ -72,6 +72,64 @@ async def ensure_sql_server_backup_ready(tenant: Tenant, server: Dict, arm_token
     return True
 
 
+async def ensure_pg_server_backup_ready(tenant: Tenant, server: Dict, arm_token: str) -> bool:
+    """
+    For a newly-discovered PostgreSQL Flexible Server, assign our SP as Azure AD admin.
+    This makes PostgreSQL backup "just work" with no customer credentials.
+
+    API: PUT /subscriptions/{subId}/resourceGroups/{rg}/providers/Microsoft.DBforPostgreSQL/
+         flexibleServers/{serverName}/administrators/{objectId}?api-version=2025-08-01
+    
+    The {objectId} in the URL is the SP's object ID (GUID), not a literal string.
+    """
+    server_name = server.get("name", "")
+    pg_configured = getattr(tenant, 'azure_pg_servers_configured', None) or {}
+    if isinstance(pg_configured, dict):
+        server_list = pg_configured.get("servers", [])
+    else:
+        server_list = pg_configured if pg_configured else []
+
+    if server_name in server_list:
+        return True  # already done
+
+    our_sp_object_id = await _get_our_sp_object_id_in_tenant(tenant)
+
+    # PUT /.../administrators/{objectId} — objectId is the SP's GUID
+    async with httpx.AsyncClient() as client:
+        url = (
+            f"https://management.azure.com{server['id']}"
+            f"/administrators/{our_sp_object_id}?api-version=2025-08-01"
+        )
+        payload = {
+            "properties": {
+                "principalName": settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID,
+                "principalType": "ServicePrincipal",
+                "tenantId": tenant.external_tenant_id,
+            }
+        }
+        resp = await client.put(url, json=payload,
+                                 headers={"Authorization": f"Bearer {arm_token}"})
+        if resp.status_code not in (200, 201, 202):
+            print(f"[AzureProvisioning] Failed to set PostgreSQL Entra admin for {server_name}: {resp.status_code} {resp.text[:300]}")
+            return False
+
+    # Track so we don't retry
+    async with async_session_factory() as session:
+        t = await session.get(Tenant, tenant.id)
+        if t:
+            current = getattr(t, 'azure_pg_servers_configured', None) or {}
+            if isinstance(current, dict):
+                server_list = current.get("servers", [])
+            else:
+                server_list = current if current else []
+            server_list.append(server_name)
+            t.azure_pg_servers_configured = {"servers": server_list}
+            await session.commit()
+
+    print(f"[AzureProvisioning] ✓ PostgreSQL server {server_name} configured for backup (SP as Entra admin)")
+    return True
+
+
 async def _get_our_sp_object_id_in_tenant(tenant: Tenant) -> str:
     """Find OUR app's SP object ID inside the customer's tenant.
     Each tenant has its own object ID for the same multi-tenant app."""
