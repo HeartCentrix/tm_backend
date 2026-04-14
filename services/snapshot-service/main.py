@@ -210,7 +210,7 @@ async def list_resources_with_backups(
             func.count(Snapshot.id).label("snapshot_count"),
             func.sum(Snapshot.item_count).label("total_items"),
         )
-        .where(Snapshot.status == SnapshotStatus.COMPLETE)
+        .where(Snapshot.status == SnapshotStatus.COMPLETED)
         .where(Snapshot.resource_id.in_(resource_ids))
         .group_by(Snapshot.resource_id)
     )
@@ -281,7 +281,7 @@ async def search_snapshot_items(
     """Search snapshot items for a resource with optional filters."""
     snapshot_ids_stmt = select(Snapshot.id).where(
         Snapshot.resource_id == UUID(resource_id),
-        Snapshot.status == SnapshotStatus.COMPLETE,
+        Snapshot.status == SnapshotStatus.COMPLETED,
     )
     if snapshot_id:
         snapshot_ids_stmt = snapshot_ids_stmt.where(Snapshot.id == UUID(snapshot_id))
