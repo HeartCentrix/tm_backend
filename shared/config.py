@@ -143,6 +143,7 @@ class Settings:
         self.DELTA_TOKEN_URL = os.getenv("DELTA_TOKEN_URL", "http://delta-token:8010")
         self.PROGRESS_TRACKER_URL = os.getenv("PROGRESS_TRACKER_URL", "http://progress-tracker:8011")
         self.AUDIT_SERVICE_URL = os.getenv("AUDIT_SERVICE_URL", "http://audit-service:8012")
+        self.REPORT_SERVICE_URL = os.getenv("REPORT_SERVICE_URL", "http://report-service:8014")
 
     def _parse_graph_apps(self) -> List[dict]:
         """Parse multiple Graph app registrations from env vars."""

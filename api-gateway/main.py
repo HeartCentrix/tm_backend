@@ -16,6 +16,7 @@ SERVICES = {
     "dashboard": settings.DASHBOARD_SERVICE_URL,
     "alert": settings.ALERT_SERVICE_URL,
     "scheduler": settings.BACKUP_SCHEDULER_URL,
+    "report": settings.REPORT_SERVICE_URL,
     "graph-proxy": settings.GRAPH_PROXY_URL,
     "delta-token": settings.DELTA_TOKEN_URL,
     "progress": settings.PROGRESS_TRACKER_URL,
@@ -240,6 +241,17 @@ async def alert(request: Request):
 @app.post("/api/v1/policies/{policy_id}/auto-assign")
 async def policy(request: Request):
     return await proxy_request("resource", request.url.path, request)
+
+
+# Report Configuration routes
+@app.get("/api/v1/reports/config")
+@app.post("/api/v1/reports/config")
+@app.put("/api/v1/reports/config")
+@app.get("/api/v1/reports/history")
+@app.get("/api/v1/reports/history/{report_id}")
+@app.post("/api/v1/reports/generate")
+async def report_proxy(request: Request):
+    return await proxy_request("report", request.url.path, request)
 
 
 # Access Control routes

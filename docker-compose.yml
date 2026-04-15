@@ -239,6 +239,23 @@ services:
     networks:
       - tm-network
 
+  report-service:
+    build:
+      context: .
+      dockerfile: services/report-service/Dockerfile
+    container_name: tm_vault_report_service
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+    ports:
+      - "8014:8014"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
   backup-worker:
     build:
       context: .
