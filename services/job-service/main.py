@@ -592,6 +592,16 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
     job = Job(id=uuid4(), type=JobType.EXPORT, status=JobStatus.QUEUED, priority=5, spec=request)
     db.add(job)
     await db.flush()
+    if settings.RABBITMQ_ENABLED:
+        msg = create_restore_message(
+            job_id=str(job.id),
+            restore_type=request.get("restoreType", "EXPORT_ZIP"),
+            snapshot_ids=request.get("snapshotIds", []),
+            item_ids=request.get("itemIds", []),
+            resource_id=None, tenant_id=None, spec=request,
+        )
+        msg["queue"] = "export.normal"
+        await message_bus.publish("export.normal", msg, priority=5)
     return {"jobId": str(job.id)}
 
 
@@ -609,6 +619,21 @@ async def get_export_status(job_id: str, db: AsyncSession = Depends(get_db)):
 async def get_export_download_url(job_id: str):
     return {"url": f"/api/v1/exports/{job_id}/download"}
 
+
+@app.get("/api/v1/exports/{job_id}/download")
+async def download_export(job_id: str, db: AsyncSession = Depends(get_db)):
+    """Stream export data for a completed export job."""
+    job = await db.get(Job, uuid.UUID(job_id))
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(status_code=202, detail=f"Job not ready: {job.status.value}")
+    import json as _json
+    result = job.result or {}
+    data = result.get("data") or []
+    content = _json.dumps({"jobId": job_id, "exportType": result.get("export_type", "JSON"), "exportedCount": result.get("exported_count", len(data)), "items": data}, indent=2).encode()
+    return StreamingResponse(iter([content]), media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="export-{job_id[:8]}.json"'})
 
 @app.get("/api/v1/dlq/stats")
 async def get_dlq_stats():

@@ -353,3 +353,238 @@ async def search_snapshot_items(
         totalElements=total,
         size=size, number=page,
     )
+
+
+# ==================== Content-Type-Specific Endpoints ====================
+
+def _get_blob_client():
+    from shared.config import settings as _s
+    from azure.storage.blob import BlobServiceClient as _BSC
+    if _s.AZURE_STORAGE_ACCOUNT_NAME and _s.AZURE_STORAGE_ACCOUNT_KEY:
+        conn = (f"DefaultEndpointsProtocol=https;AccountName={_s.AZURE_STORAGE_ACCOUNT_NAME};"
+                f"AccountKey={_s.AZURE_STORAGE_ACCOUNT_KEY};EndpointSuffix=core.windows.net")
+        return _BSC.from_connection_string(conn)
+    return None
+
+
+async def _read_blob(blob_path: str) -> dict:
+    import json as _j, asyncio
+    client = _get_blob_client()
+    if not client or not blob_path:
+        return {}
+    try:
+        # blob_path = {tenant_id}/{resource_id}/{snapshot_id}/{date}/{item_id}
+        # Container = backup-{workload}-{tenant_id[:8]}, blob key = full blob_path
+        parts = blob_path.split("/")
+        tenant_short = parts[0][:8] if parts else ""
+        for container in [f"backup-mailbox-{tenant_short}", f"backup-files-{tenant_short}",
+                          f"backup-teams-{tenant_short}", f"backup-entra-{tenant_short}"]:
+            try:
+                blob = client.get_blob_client(container=container, blob=blob_path)
+                data = await asyncio.get_event_loop().run_in_executor(None, lambda b=blob: b.download_blob().readall())
+                return _j.loads(data.decode("utf-8"))
+            except Exception:
+                continue
+        return {}
+    except Exception as e:
+        print(f"[snapshot-service] blob read error {blob_path}: {e}")
+        return {}
+
+
+def _raw(item) -> dict:
+    meta = item.extra_data or {}
+    return meta.get("raw") or meta.get("structured") or (meta if meta else {})
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")
+async def get_item_content(snapshot_id: str, item_id: str, db: AsyncSession = Depends(get_db)):
+    item = await db.get(SnapshotItem, UUID(item_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    raw = _raw(item)
+    if raw and len(raw) > 2:
+        return {"source": "metadata", "content": raw}
+    if item.blob_path:
+        blob_content = await _read_blob(item.blob_path)
+        if blob_content:
+            return {"source": "blob", "content": blob_content}
+    return {"source": "none", "content": {}}
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/emails")
+async def list_snapshot_emails(
+    snapshot_id: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(500, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return emails with from/to/cc/subject/body/date extracted from metadata."""
+    filters = [
+        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.item_type == "EMAIL",
+    ]
+    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
+    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
+
+    def fmt(i):
+        raw = _raw(i)
+        from_addr = raw.get("from", {}).get("emailAddress", {})
+        to_list = [r.get("emailAddress", {}) for r in raw.get("toRecipients", [])]
+        cc_list = [r.get("emailAddress", {}) for r in raw.get("ccRecipients", [])]
+        return {
+            "id": str(i.id),
+            "snapshotId": str(i.snapshot_id),
+            "externalId": i.external_id,
+            "itemType": i.item_type,
+            "subject": raw.get("subject") or i.name,
+            "from": f"{from_addr.get('name', '')} <{from_addr.get('address', '')}>".strip(" <>") or None,
+            "to": "; ".join(f"{r.get('name','')} <{r.get('address','')}>".strip(" <>") for r in to_list),
+            "cc": "; ".join(f"{r.get('name','')} <{r.get('address','')}>".strip(" <>") for r in cc_list),
+            "date": raw.get("sentDateTime") or raw.get("receivedDateTime") or (i.created_at.isoformat() if i.created_at else None),
+            "bodyPreview": raw.get("bodyPreview") or "",
+            "body": raw.get("body", {}).get("content") or "",
+            "bodyContentType": raw.get("body", {}).get("contentType") or "text",
+            "hasAttachments": raw.get("hasAttachments", False),
+            "attachments": raw.get("attachments", []),
+            "folderPath": i.folder_path,
+            "contentSize": i.content_size or 0,
+            "isDeleted": i.is_deleted or False,
+            "createdAt": i.created_at.isoformat() if i.created_at else "",
+            "name": raw.get("subject") or i.name or "",
+            "metadata": {"raw": raw},
+        }
+
+    return {"content": [fmt(i) for i in items], "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/messages")
+async def list_snapshot_messages(
+    snapshot_id: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(500, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return Teams messages with sender/body/date extracted from metadata."""
+    CHAT_TYPES = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
+    filters = [
+        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.item_type.in_(CHAT_TYPES),
+    ]
+    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
+    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
+
+    def fmt(i):
+        raw = _raw(i)
+        sender = raw.get("from", {}).get("user", {})
+        return {
+            "id": str(i.id),
+            "snapshotId": str(i.snapshot_id),
+            "externalId": i.external_id,
+            "itemType": i.item_type,
+            "sender": sender.get("displayName") or i.name,
+            "senderEmail": sender.get("userPrincipalName") or sender.get("email") or "",
+            "body": raw.get("body", {}).get("content") or "",
+            "bodyContentType": raw.get("body", {}).get("contentType") or "text",
+            "date": raw.get("createdDateTime") or raw.get("lastModifiedDateTime") or (i.created_at.isoformat() if i.created_at else None),
+            "chatTopic": (i.extra_data or {}).get("chatTopic") or "",
+            "channelName": (i.extra_data or {}).get("channelName") or "",
+            "folderPath": i.folder_path,
+            "attachments": raw.get("attachments", []),
+            "mentions": raw.get("mentions", []),
+            "isDeleted": bool(raw.get("deletedDateTime")),
+            "isReply": i.item_type == "TEAMS_MESSAGE_REPLY",
+            "contentSize": i.content_size or 0,
+            "createdAt": i.created_at.isoformat() if i.created_at else "",
+            "name": sender.get("displayName") or i.name or "",
+            "metadata": {"raw": raw},
+        }
+
+    return {"content": [fmt(i) for i in items], "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/calendar")
+async def list_snapshot_calendar(
+    snapshot_id: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(500, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return calendar events with start/end/location/attendees extracted from metadata."""
+    filters = [
+        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.item_type == "CALENDAR_EVENT",
+    ]
+    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
+    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
+
+    def fmt(i):
+        raw = _raw(i)
+        organizer = raw.get("organizer", {}).get("emailAddress", {})
+        return {
+            "id": str(i.id),
+            "snapshotId": str(i.snapshot_id),
+            "externalId": i.external_id,
+            "itemType": i.item_type,
+            "subject": raw.get("subject") or i.name,
+            "start": raw.get("start", {}).get("dateTime") or raw.get("start", {}).get("date"),
+            "end": raw.get("end", {}).get("dateTime") or raw.get("end", {}).get("date"),
+            "timeZone": raw.get("start", {}).get("timeZone") or "UTC",
+            "isAllDay": raw.get("isAllDay", False),
+            "location": raw.get("location", {}).get("displayName") or "",
+            "organizer": f"{organizer.get('name','')} <{organizer.get('address','')}>".strip(" <>") or None,
+            "attendees": raw.get("attendees", []),
+            "body": raw.get("body", {}).get("content") or "",
+            "bodyContentType": raw.get("body", {}).get("contentType") or "text",
+            "isOnlineMeeting": raw.get("isOnlineMeeting", False),
+            "recurrence": raw.get("recurrence"),
+            "showAs": raw.get("showAs") or "",
+            "folderPath": i.folder_path,
+            "contentSize": i.content_size or 0,
+            "isDeleted": i.is_deleted or False,
+            "createdAt": i.created_at.isoformat() if i.created_at else "",
+            "name": raw.get("subject") or i.name or "",
+            "metadata": {"raw": raw},
+        }
+
+    return {"content": [fmt(i) for i in items], "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
+
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")
+async def get_item_content(
+    snapshot_id: str,
+    item_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the raw content of a snapshot item, reading from blob if metadata is empty."""
+    from shared.azure_storage import azure_storage_manager
+    item = await db.get(SnapshotItem, UUID(item_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    # Try metadata first
+    meta = item.extra_data or {}
+    raw = meta.get("raw") or meta.get("structured")
+    if raw:
+        return {"source": "metadata", "content": raw}
+
+    # Fall back to blob
+    if item.blob_path and azure_storage_manager.shards:
+        try:
+            shard = azure_storage_manager.get_shard_for_resource(
+                str(item.snapshot_id), str(item.tenant_id or "")
+            )
+            parts = item.blob_path.split("/", 1)
+            container, path = (parts[0], parts[1]) if len(parts) == 2 else ("mailbox", item.blob_path)
+            data = await shard.download_blob(container, path)
+            if data:
+                import json as _json
+                try:
+                    content = _json.loads(data.decode("utf-8"))
+                    return {"source": "blob", "content": content}
+                except Exception:
+                    from fastapi.responses import Response
+                    return Response(content=data, media_type="application/octet-stream")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Blob read failed: {e}")
+
+    return {"source": "none", "content": {}}

@@ -52,7 +52,7 @@ class RestoreWorker:
                 else:
                     raise
 
-        queues = [("restore.urgent", 10), ("restore.normal", 30), ("restore.low", 50)]
+        queues = [("restore.urgent", 10), ("restore.normal", 30), ("restore.low", 50), ("export.normal", 50)]
         await asyncio.gather(*[asyncio.create_task(self.consume_queue(q, p)) for q, p in queues])
 
     async def consume_queue(self, queue_name: str, prefetch_count: int):
@@ -214,15 +214,23 @@ class RestoreWorker:
     async def export_as_zip(self, session, items, message, spec):
         zip_buffer = io.BytesIO()
         exported = 0
+        items_data = []
 
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             for item in items:
                 try:
                     raw = (item.extra_data or {}).get("raw", {})
+                    # If metadata is empty, read raw JSON from blob
+                    if not raw and item.blob_path:
+                        blob_bytes = await self._download_blob(item.blob_path)
+                        if blob_bytes:
+                            try:
+                                raw = json.loads(blob_bytes.decode('utf-8'))
+                            except Exception:
+                                raw = {}
                     if item.item_type == "EMAIL":
                         zf.writestr(f"emails/{item.name or item.external_id}.eml", self._create_eml_from_json(raw))
                     elif item.item_type in ("FILE", "ONEDRIVE_FILE", "SHAREPOINT_FILE"):
-                        # Try to get actual binary from blob
                         content = await self._download_blob(item.blob_path) if item.blob_path else None
                         if content:
                             zf.writestr(f"files/{item.name or item.external_id}", content)
@@ -231,6 +239,7 @@ class RestoreWorker:
                     else:
                         zf.writestr(f"items/{item.item_type}/{item.external_id}.json", json.dumps(raw, indent=2))
                     exported += 1
+                    items_data.append({"id": str(item.id), "type": item.item_type, "name": item.name, "content": raw})
                 except Exception as e:
                     print(f"[{self.worker_id}] Export failed for {item.id}: {e}")
 
@@ -252,6 +261,7 @@ class RestoreWorker:
             "export_type": "ZIP",
             "download_url": f"/api/v1/exports/{message.get('jobId')}/download",
             "blob_path": blob_name,
+            "data": items_data,
         }
 
     async def export_download(self, session, items, message, spec):
