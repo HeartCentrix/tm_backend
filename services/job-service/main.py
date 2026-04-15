@@ -8,13 +8,13 @@ import asyncio
 
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 
 from shared.config import settings
-from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot, SlaPolicy
+from shared.database import get_db, close_db, AsyncSession, engine
+from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot, SlaPolicy, ResourceType, ResourceStatus
 from shared.schemas import (
-    JobResponse, JobListResponse, TriggerBackupRequest, TriggerBulkBackupRequest
+    JobResponse, JobListResponse, TriggerBackupRequest, TriggerBulkBackupRequest, TriggerDatasourceBackupRequest
 )
 from shared.message_bus import message_bus, create_backup_message, create_restore_message
 
@@ -28,10 +28,132 @@ AZURE_WORKLOAD_QUEUES = {
     "AZURE_PG": "azure.postgres",
 }
 
+M365_RESOURCE_TYPES = [
+    ResourceType.MAILBOX,
+    ResourceType.SHARED_MAILBOX,
+    ResourceType.ROOM_MAILBOX,
+    ResourceType.ONEDRIVE,
+    ResourceType.SHAREPOINT_SITE,
+    ResourceType.TEAMS_CHANNEL,
+    ResourceType.TEAMS_CHAT,
+    ResourceType.ENTRA_USER,
+    ResourceType.ENTRA_GROUP,
+    ResourceType.ENTRA_APP,
+    ResourceType.ENTRA_DEVICE,
+    ResourceType.ENTRA_SERVICE_PRINCIPAL,
+    ResourceType.POWER_BI,
+    ResourceType.POWER_APPS,
+    ResourceType.POWER_AUTOMATE,
+    ResourceType.POWER_DLP,
+    ResourceType.COPILOT,
+    ResourceType.PLANNER,
+    ResourceType.TODO,
+    ResourceType.ONENOTE,
+]
+
+AZURE_RESOURCE_TYPES = [
+    ResourceType.AZURE_VM,
+    ResourceType.AZURE_SQL_DB,
+    ResourceType.AZURE_POSTGRESQL,
+    ResourceType.AZURE_POSTGRESQL_SINGLE,
+    ResourceType.RESOURCE_GROUP,
+]
+
+
+async def _create_batch_backup_jobs(
+    resources_map: Dict[str, Resource],
+    db: AsyncSession,
+    full_backup: bool = True,
+    priority: int = 1,
+    note: Optional[str] = None,
+    trigger_label: str = "MANUAL_BATCH",
+):
+    if not resources_map:
+        raise HTTPException(status_code=404, detail="No valid resources found")
+
+    resources_without_sla = [rid for rid, res in resources_map.items() if not res.sla_policy_id]
+    if resources_without_sla:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Resources must have SLA policies assigned. {len(resources_without_sla)} resource(s) missing policy: {', '.join(resources_without_sla[:5])}"
+        )
+
+    tenant_groups: Dict[UUID, List[str]] = {}
+    for rid, res in resources_map.items():
+        tenant_groups.setdefault(res.tenant_id, []).append(rid)
+
+    jobs_created = []
+    pending_publishes = []
+
+    for tenant_id, resource_ids in tenant_groups.items():
+        has_previous_backup = any(resources_map[rid].last_backup_at is not None for rid in resource_ids)
+        effective_full_backup = (full_backup or False) and not has_previous_backup
+
+        job = Job(
+            id=uuid4(), type=JobType.BACKUP,
+            tenant_id=tenant_id,
+            resource_id=None,
+            batch_resource_ids=[UUID(rid) for rid in resource_ids],
+            status=JobStatus.QUEUED, priority=priority,
+            progress_pct=0, items_processed=0, bytes_processed=0,
+            spec={
+                "triggered_by": trigger_label,
+                "resource_count": len(resource_ids),
+                "fullBackup": effective_full_backup,
+                "note": note,
+            },
+        )
+        db.add(job)
+        jobs_created.append({
+            "jobId": str(job.id),
+            "status": "QUEUED",
+            "resourceId": "BATCH",
+            "resourceCount": len(resource_ids),
+        })
+
+        if settings.RABBITMQ_ENABLED:
+            from shared.message_bus import create_mass_backup_message
+            first_res = resources_map[resource_ids[0]]
+            resource_type = first_res.type.value if hasattr(first_res.type, 'value') else str(first_res.type)
+            pending_publishes.append(create_mass_backup_message(
+                job_id=str(job.id),
+                tenant_id=str(tenant_id),
+                resource_type=resource_type,
+                resource_ids=resource_ids,
+                sla_policy_id=None,
+                full_backup=effective_full_backup,
+            ))
+
+    await db.commit()
+
+    for msg in pending_publishes:
+        await message_bus.publish("backup.urgent", msg, priority=priority)
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post("http://audit-service:8012/api/v1/audit/log", json={
+                "action": "BACKUP_TRIGGERED",
+                "tenant_id": str(list(tenant_groups.keys())[0]),
+                "org_id": None,
+                "actor_type": "USER",
+                "resource_id": None,
+                "resource_type": "BATCH",
+                "resource_name": f"Batch backup: {len(resources_map)} resources",
+                "outcome": "SUCCESS",
+                "job_id": jobs_created[0]["jobId"] if jobs_created else None,
+                "details": {"resourceCount": len(resources_map), "batch": True, "fullBackup": full_backup, "note": note},
+            })
+    except Exception:
+        pass
+
+    return jobs_created
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
     await message_bus.connect()
     yield
     await message_bus.disconnect()
@@ -277,83 +399,14 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
                        f"{', '.join(r['id'] + '(' + r['status'] + ')' for r in inaccessible_resources)}"
             )
 
-        if not resources_map:
-            raise HTTPException(status_code=404, detail="No valid resources found")
-
-        # Filter out resources without SLA policy
-        resources_without_sla = [rid for rid, res in resources_map.items() if not res.sla_policy_id]
-        if resources_without_sla:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Resources must have SLA policies assigned. {len(resources_without_sla)} resource(s) missing policy: {', '.join(resources_without_sla[:5])}"
-            )
-
-        # Group resources by tenant for batch processing
-        tenant_groups: Dict[uuid.UUID, List[str]] = {}
-        for rid, res in resources_map.items():
-            tenant_groups.setdefault(res.tenant_id, []).append(rid)
-
-        jobs_created = []
-        pending_publishes = []  # collect publish payloads; send AFTER commit
-
-        # For each tenant, create a single mass backup job
-        for tenant_id, resource_ids in tenant_groups.items():
-            has_previous_backup = any(resources_map[rid].last_backup_at is not None for rid in resource_ids)
-            effective_full_backup = (request.fullBackup or False) and not has_previous_backup
-            print(f"[JOB_SERVICE] Batch backup for {len(resource_ids)} resources, fullBackup={effective_full_backup}")
-
-            job = Job(
-                id=uuid4(), type=JobType.BACKUP,
-                tenant_id=tenant_id,
-                resource_id=None,
-                batch_resource_ids=[UUID(rid) for rid in resource_ids],
-                status=JobStatus.QUEUED, priority=1,
-                progress_pct=0, items_processed=0, bytes_processed=0,
-                spec={"triggered_by": "MANUAL_BATCH", "resource_count": len(resource_ids), "fullBackup": effective_full_backup},
-            )
-            db.add(job)
-            jobs_created.append({"jobId": str(job.id), "status": "QUEUED", "resourceId": "BATCH", "resourceCount": len(resource_ids)})
-
-            if settings.RABBITMQ_ENABLED:
-                from shared.message_bus import create_mass_backup_message
-                first_res = resources_map[resource_ids[0]]
-                resource_type = first_res.type.value if hasattr(first_res.type, 'value') else str(first_res.type)
-                pending_publishes.append(create_mass_backup_message(
-                    job_id=str(job.id),
-                    tenant_id=str(tenant_id),
-                    resource_type=resource_type,
-                    resource_ids=resource_ids,
-                    sla_policy_id=None,
-                    full_backup=effective_full_backup
-                ))
-
-        # Commit ALL jobs first so workers always find them in DB
-        await db.commit()
-
-        # Now publish — jobs are visible to workers
-        for msg in pending_publishes:
-            await message_bus.publish("backup.urgent", msg, priority=1)
-
-        # Log audit event
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post("http://audit-service:8012/api/v1/audit/log", json={
-                    "action": "BACKUP_TRIGGERED",
-                    "tenant_id": str(list(tenant_groups.keys())[0]),
-                    "org_id": None,
-                    "actor_type": "USER",
-                    "resource_id": None,
-                    "resource_type": "BATCH",
-                    "resource_name": f"Batch backup: {len(resources_map)} resources",
-                    "outcome": "SUCCESS",
-                    "job_id": jobs_created[0]["jobId"] if jobs_created else None,
-                    "details": {"resourceCount": len(resources_map), "batch": True, "fullBackup": effective_full_backup},
-                })
-        except Exception:
-            pass
-
-        return jobs_created
+        return await _create_batch_backup_jobs(
+            resources_map=resources_map,
+            db=db,
+            full_backup=request.fullBackup or False,
+            priority=request.priority or 1,
+            note=request.note,
+            trigger_label="MANUAL_BATCH",
+        )
 
     elif resource_id:
         res_stmt = select(Resource).where(Resource.id == UUID(resource_id))
@@ -401,6 +454,43 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
 
         return {"jobId": str(job.id), "status": "QUEUED", "resourceId": resource_id}
     return {"error": "No resources provided"}
+
+
+@app.post("/api/v1/backups/trigger-datasource")
+async def trigger_datasource_backup(request: TriggerDatasourceBackupRequest, db: AsyncSession = Depends(get_db)):
+    service_key = (request.serviceType or "").lower()
+    resource_types = M365_RESOURCE_TYPES if service_key == "m365" else AZURE_RESOURCE_TYPES if service_key == "azure" else None
+    if resource_types is None:
+        raise HTTPException(status_code=400, detail="Unsupported serviceType. Expected 'm365' or 'azure'.")
+
+    stmt = select(Resource).where(
+        Resource.tenant_id == UUID(request.tenantId),
+        Resource.type.in_(resource_types),
+        Resource.sla_policy_id.is_not(None),
+        Resource.status.notin_([
+            ResourceStatus.INACCESSIBLE,
+            ResourceStatus.SUSPENDED,
+            ResourceStatus.PENDING_DELETION,
+        ]),
+    )
+    result = await db.execute(stmt)
+    resources = result.scalars().all()
+
+    if not resources:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No backup-eligible {service_key.upper()} resources found for this datasource. Make sure discovery has run and SLA policies are assigned."
+        )
+
+    resources_map = {str(resource.id): resource for resource in resources}
+    return await _create_batch_backup_jobs(
+        resources_map=resources_map,
+        db=db,
+        full_backup=request.fullBackup or False,
+        priority=request.priority or 1,
+        note=request.note,
+        trigger_label=f"MANUAL_DATASOURCE_{service_key.upper()}",
+    )
 
 
 @app.post("/api/v1/jobs/restore")

@@ -5,20 +5,35 @@ from uuid import UUID
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Depends, Query
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 
-from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Resource, Job, JobType, JobStatus, Snapshot
+from shared.database import get_db, close_db, AsyncSession, engine
+from shared.models import Resource, Job, JobType, JobStatus, Snapshot, ResourceType, ResourceStatus
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    # Dashboard is read-only and should not run heavyweight schema migration logic
+    # during startup. That path can block on application traffic from other services
+    # and leave the container stuck in "Waiting for application startup".
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
     yield
     await close_db()
 
 
 app = FastAPI(title="Dashboard Service", version="1.0.0", lifespan=lifespan)
+
+
+PROTECTION_BUCKETS = {
+    "users": {ResourceType.MAILBOX, ResourceType.ONEDRIVE},
+    "sharedMailboxes": {ResourceType.SHARED_MAILBOX},
+    "rooms": {ResourceType.ROOM_MAILBOX},
+    "sharepointSites": {ResourceType.SHAREPOINT_SITE},
+    "groupsAndTeams": {ResourceType.TEAMS_CHANNEL, ResourceType.TEAMS_CHAT, ResourceType.ENTRA_GROUP, ResourceType.DYNAMIC_GROUP},
+    "entraId": {ResourceType.ENTRA_USER, ResourceType.ENTRA_APP, ResourceType.ENTRA_DEVICE, ResourceType.ENTRA_SERVICE_PRINCIPAL},
+    "powerPlatform": {ResourceType.POWER_BI, ResourceType.POWER_APPS, ResourceType.POWER_AUTOMATE, ResourceType.POWER_DLP},
+}
 
 
 def format_bytes(bytes_val: int) -> str:
@@ -66,15 +81,16 @@ async def get_24hour_status(
     tenantId: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    yesterday = datetime.now(timezone.utc) - timedelta(hours=24)
+    # Use naive datetime to match TIMESTAMP WITHOUT TIME ZONE
+    yesterday = datetime.utcnow() - timedelta(hours=24)
     filters = [Job.type == JobType.BACKUP, Job.created_at >= yesterday]
     if tenantId:
         filters.append(Job.tenant_id == UUID(tenantId))
-    
+
     success = (await db.execute(select(func.count()).where(Job.status == JobStatus.COMPLETED, *filters))).scalar() or 0
     warnings = (await db.execute(select(func.count()).where(Job.status.in_([JobStatus.RUNNING, JobStatus.QUEUED]), *filters))).scalar() or 0
     failures = (await db.execute(select(func.count()).where(Job.status == JobStatus.FAILED, *filters))).scalar() or 0
-    
+
     return {"success": success, "warnings": warnings, "failures": failures}
 
 
@@ -83,7 +99,8 @@ async def get_7day_status(
     tenantId: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    # Use naive datetime to match TIMESTAMP WITHOUT TIME ZONE
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
     filters = [Job.type == JobType.BACKUP, Job.created_at >= seven_days_ago]
     if tenantId:
         filters.append(Job.tenant_id == UUID(tenantId))
@@ -101,8 +118,22 @@ async def get_7day_status(
     )
     result = await db.execute(stmt)
     rows = result.all()
+
+    # Build a dict of existing data
+    data_by_date = {str(r.date): {"success": r.success or 0, "warnings": r.warnings or 0, "failures": r.failures or 0} for r in rows}
     
-    daily_status = [{"date": r.date.isoformat(), "success": r.success or 0, "warnings": r.warnings or 0, "failures": r.failures or 0} for r in rows]
+    # Fill all 7 days, padding missing days with zeros
+    daily_status = []
+    for i in range(7):
+        date = (datetime.utcnow() - timedelta(days=6-i)).date()
+        date_str = date.isoformat()
+        daily_status.append({
+            "date": date_str,
+            "success": data_by_date.get(date_str, {}).get("success", 0),
+            "warnings": data_by_date.get(date_str, {}).get("warnings", 0),
+            "failures": data_by_date.get(date_str, {}).get("failures", 0),
+        })
+    
     total_backups = sum(d["success"] + d["warnings"] + d["failures"] for d in daily_status)
     total_success = sum(d["success"] for d in daily_status)
     
@@ -121,25 +152,48 @@ async def get_protection_status(
     tenantId: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    filters = []
+    filters = [Resource.status.in_([ResourceStatus.DISCOVERED, ResourceStatus.ACTIVE])]
     if tenantId:
         filters.append(Resource.tenant_id == UUID(tenantId))
-    
-    total = (await db.execute(select(func.count(Resource.id)).where(*filters))).scalar() or 0
-    protected = (await db.execute(select(func.count(Resource.id)).where(Resource.sla_policy_id.isnot(None), *filters))).scalar() or 0
-    percentage = round(protected / total * 100, 2) if total > 0 else 0
-    
-    def item(protected, total):
+
+    stmt = (
+        select(
+            Resource.type,
+            func.count(Resource.id).label("total"),
+            func.count(Resource.id).filter(Resource.sla_policy_id.isnot(None)).label("protected"),
+        )
+        .where(*filters)
+        .group_by(Resource.type)
+    )
+    rows = (await db.execute(stmt)).all()
+
+    totals_by_type = {
+        row.type: {"total": row.total or 0, "protected": row.protected or 0}
+        for row in rows
+    }
+
+    def bucket_item(bucket_name: str):
+        total = 0
+        protected = 0
+        for resource_type in PROTECTION_BUCKETS[bucket_name]:
+            values = totals_by_type.get(resource_type, {"total": 0, "protected": 0})
+            total += values["total"]
+            protected += values["protected"]
         return {"protectedCount": protected, "total": total}
-    
+
+    bucket_values = {name: bucket_item(name) for name in PROTECTION_BUCKETS}
+    total = sum(item["total"] for item in bucket_values.values())
+    protected = sum(item["protectedCount"] for item in bucket_values.values())
+    percentage = round(protected / total * 100, 2) if total > 0 else 0
+
     return {
-        "users": item(protected, total),
-        "sharedMailboxes": item(0, 0),
-        "rooms": item(0, 0),
-        "sharepointSites": item(0, 0),
-        "groupsAndTeams": item(0, 0),
-        "entraId": item(0, 0),
-        "powerPlatform": item(0, 0),
+        "users": bucket_values["users"],
+        "sharedMailboxes": bucket_values["sharedMailboxes"],
+        "rooms": bucket_values["rooms"],
+        "sharepointSites": bucket_values["sharepointSites"],
+        "groupsAndTeams": bucket_values["groupsAndTeams"],
+        "entraId": bucket_values["entraId"],
+        "powerPlatform": bucket_values["powerPlatform"],
         "percentage": percentage,
     }
 
@@ -156,15 +210,21 @@ async def get_backup_size(
     # Get current total storage bytes
     total = (await db.execute(select(func.sum(Resource.storage_bytes)).where(*filters))).scalar() or 0
     total = int(total) if total else 0
+    
+    # Get ALL-TIME total bytes backed up (sum of all bytes_added from all completed snapshots)
+    all_time_stmt = select(func.sum(Snapshot.bytes_added)).join(Resource, Snapshot.resource_id == Resource.id).where(Snapshot.status == "COMPLETED", *filters)
+    all_time_total = (await db.execute(all_time_stmt)).scalar() or 0
+    all_time_total = int(all_time_total) if all_time_total else 0
 
-    # Get real daily backup sizes from snapshots over the last 30 days
+    # Calculate cumulative daily storage for last 30 days
+    # For each day, sum all bytes_added from snapshots up to and including that day
     daily_data = []
+    running_total = 0
     for i in range(30):
-        date = (datetime.now(timezone.utc) - timedelta(days=29-i)).date()
-        # Use naive datetime (without timezone) to match PostgreSQL TIMESTAMP WITHOUT TIME ZONE
+        date = (datetime.utcnow() - timedelta(days=29-i)).date()
         date_start = datetime.combine(date, datetime.min.time())
         date_end = datetime.combine(date, datetime.max.time())
-        
+
         # Sum bytes_added from all completed snapshots for this day
         day_bytes = (await db.execute(
             select(func.sum(Snapshot.bytes_added))
@@ -176,20 +236,23 @@ async def get_backup_size(
                 *filters
             )
         )).scalar() or 0
+        day_bytes = int(day_bytes) if day_bytes else 0
         
+        running_total += day_bytes
         daily_data.append({
             "date": date.isoformat(),
-            "bytes": int(day_bytes)
+            "bytes": running_total  # Cumulative total up to this day
         })
 
-    # Calculate changes
-    one_day = daily_data[-1]["bytes"] - daily_data[-2]["bytes"] if len(daily_data) > 1 else 0
-    one_month = daily_data[-1]["bytes"] - daily_data[0]["bytes"] if daily_data else 0
+    # Calculate real changes (not mock data)
+    last_7_days_bytes = sum(d["bytes"] for d in daily_data[-7:])
+    seven_day_change = daily_data[-1]["bytes"] - (daily_data[-8]["bytes"] if len(daily_data) > 7 else 0)
+    one_day_change = daily_data[-1]["bytes"] - (daily_data[-2]["bytes"] if len(daily_data) > 1 else 0)
 
     return {
         "total": format_bytes(total),
-        "oneDayChange": format_bytes(abs(one_day)) + (" ↑" if one_day > 0 else " ↓"),
-        "oneMonthChange": format_bytes(abs(one_month)) + (" ↑" if one_month > 0 else " ↓"),
-        "oneYearChange": format_bytes(int(total * 0.5)) + " ↑",
+        "oneDayChange": format_bytes(abs(one_day_change)) + (" ↑" if one_day_change > 0 else " ↓"),
+        "oneMonthChange": format_bytes(abs(seven_day_change)) + (" ↑" if seven_day_change > 0 else " ↓"),
+        "allTimeTotal": format_bytes(all_time_total),
         "dailyData": daily_data,
     }
