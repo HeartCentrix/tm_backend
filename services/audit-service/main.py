@@ -19,13 +19,13 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, desc, and_, text
+from sqlalchemy import select, func, desc, and_, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 import httpx
 
 from shared.database import async_session_factory, Base
-from shared.models import AuditEvent, Resource, Tenant, Organization, Job, JobStatus, SlaPolicy
+from shared.models import AuditEvent, Resource, Tenant, Organization, Job, JobStatus, SlaPolicy, ResourceType
 from shared.config import settings
 from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
@@ -78,6 +78,55 @@ ACTIONS = {
     "RANSOMWARE_SIGNAL": "AI ransomware signal detected",
 }
 
+M365_RESOURCE_TYPES = {
+    ResourceType.MAILBOX,
+    ResourceType.SHARED_MAILBOX,
+    ResourceType.ROOM_MAILBOX,
+    ResourceType.ONEDRIVE,
+    ResourceType.SHAREPOINT_SITE,
+    ResourceType.TEAMS_CHANNEL,
+    ResourceType.TEAMS_CHAT,
+    ResourceType.ENTRA_USER,
+    ResourceType.ENTRA_GROUP,
+    ResourceType.ENTRA_APP,
+    ResourceType.ENTRA_DEVICE,
+    ResourceType.ENTRA_SERVICE_PRINCIPAL,
+    ResourceType.POWER_BI,
+    ResourceType.POWER_APPS,
+    ResourceType.POWER_AUTOMATE,
+    ResourceType.POWER_DLP,
+    ResourceType.COPILOT,
+    ResourceType.PLANNER,
+    ResourceType.TODO,
+    ResourceType.ONENOTE,
+    ResourceType.DYNAMIC_GROUP,
+}
+
+AZURE_RESOURCE_TYPES = {
+    ResourceType.AZURE_VM,
+    ResourceType.AZURE_SQL_DB,
+    ResourceType.AZURE_POSTGRESQL,
+    ResourceType.AZURE_POSTGRESQL_SINGLE,
+    ResourceType.RESOURCE_GROUP,
+}
+
+
+def _parse_service_type(service_type: Optional[str]) -> Optional[str]:
+    if not service_type:
+        return None
+    normalized = service_type.lower()
+    if normalized not in ("m365", "azure"):
+        raise HTTPException(status_code=400, detail="Unsupported serviceType. Expected 'm365' or 'azure'.")
+    return normalized
+
+
+def _resource_types_for_service(service_type: Optional[str]):
+    if service_type == "m365":
+        return M365_RESOURCE_TYPES
+    if service_type == "azure":
+        return AZURE_RESOURCE_TYPES
+    return None
+
 
 @app.get("/health")
 async def health():
@@ -87,6 +136,7 @@ async def health():
 @app.get("/api/v1/activity")
 async def list_activities(
     tenantId: Optional[str] = Query(None),
+    serviceType: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     operation: Optional[str] = Query(None),
@@ -99,6 +149,9 @@ async def list_activities(
     Maps jobs to the frontend's expected ActivityItem format.
     """
     async with async_session_factory() as db:
+        service_key = _parse_service_type(serviceType)
+        service_resource_types = _resource_types_for_service(service_key)
+
         # Build status filter
         status_map = {
             "Done": JobStatus.COMPLETED,
@@ -107,8 +160,8 @@ async def list_activities(
             "Canceled": JobStatus.CANCELLED,
         }
 
-        stmt = select(Job).order_by(desc(Job.created_at))
-        count_stmt = select(func.count()).select_from(Job)
+        stmt = select(Job).select_from(Job).outerjoin(Resource, Job.resource_id == Resource.id).order_by(desc(Job.created_at))
+        count_stmt = select(func.count()).select_from(Job).outerjoin(Resource, Job.resource_id == Resource.id)
 
         filters = []
         if tenantId:
@@ -122,6 +175,13 @@ async def list_activities(
             filters.append(Job.type == op_upper)
         if status and status in status_map:
             filters.append(Job.status == status_map[status])
+        if service_key and service_resource_types:
+            filters.append(
+                or_(
+                    and_(Job.resource_id.is_not(None), Resource.type.in_(service_resource_types)),
+                    and_(Job.resource_id.is_(None), func.json_extract_path_text(Job.spec, "triggered_by") == f"MANUAL_DATASOURCE_{service_key.upper()}"),
+                )
+            )
 
         if filters:
             stmt = stmt.where(and_(*filters))
@@ -176,6 +236,8 @@ async def list_activities(
 
 @app.get("/api/v1/activity/export")
 async def export_activity_csv(
+    tenantId: Optional[str] = Query(None),
+    serviceType: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     operation: Optional[str] = Query(None),
@@ -190,8 +252,13 @@ async def export_activity_csv(
     }
 
     async with async_session_factory() as db:
-        stmt = select(Job).order_by(desc(Job.created_at))
+        service_key = _parse_service_type(serviceType)
+        service_resource_types = _resource_types_for_service(service_key)
+
+        stmt = select(Job).select_from(Job).outerjoin(Resource, Job.resource_id == Resource.id).order_by(desc(Job.created_at))
         filters = []
+        if tenantId:
+            filters.append(Job.tenant_id == uuid.UUID(tenantId))
         if start_date:
             filters.append(Job.created_at >= datetime.fromisoformat(start_date))
         if end_date:
@@ -200,6 +267,13 @@ async def export_activity_csv(
             filters.append(Job.type == operation.upper())
         if status and status in status_map:
             filters.append(Job.status == status_map[status])
+        if service_key and service_resource_types:
+            filters.append(
+                or_(
+                    and_(Job.resource_id.is_not(None), Resource.type.in_(service_resource_types)),
+                    and_(Job.resource_id.is_(None), func.json_extract_path_text(Job.spec, "triggered_by") == f"MANUAL_DATASOURCE_{service_key.upper()}"),
+                )
+            )
 
         if filters:
             stmt = stmt.where(and_(*filters))

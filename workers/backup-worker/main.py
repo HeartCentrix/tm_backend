@@ -459,7 +459,7 @@ class BackupWorker:
                     if failed_items:
                         snapshot.delta_tokens_json["failed_items"] = failed_items[:100]  # cap at 100
                     async with async_session_factory() as sess:
-                        sess.merge(snapshot)
+                        await sess.merge(snapshot)
                         await sess.commit()
 
                     # Update delta token
@@ -468,17 +468,17 @@ class BackupWorker:
                         resource.extra_data = resource.extra_data or {}
                         resource.extra_data["delta_token"] = new_delta
 
+                    total_success = server_copy_ok + streaming_ok
                     async with async_session_factory() as sess:
-                        sess.merge(resource)
+                        await sess.merge(resource)
                         await sess.commit()
-                        
+
                         # Update resource backup info (storage_bytes, last_backup_*)
                         await self.update_resource_backup_info(sess, resource, job_id, snapshot.id, {
                             "item_count": total_success,
                             "bytes_added": res_bytes,
                         })
 
-                    total_success = server_copy_ok + streaming_ok
                     return {"item_count": total_success, "bytes_added": res_bytes}
                 except Exception as e:
                     print(f"[{self.worker_id}] File backup failed for {resource.id}: {e}")

@@ -463,15 +463,52 @@ async def trigger_datasource_backup(request: TriggerDatasourceBackupRequest, db:
     if resource_types is None:
         raise HTTPException(status_code=400, detail="Unsupported serviceType. Expected 'm365' or 'azure'.")
 
-    stmt = select(Resource).where(
+    excluded_statuses = [
+        ResourceStatus.INACCESSIBLE,
+        ResourceStatus.SUSPENDED,
+        ResourceStatus.PENDING_DELETION,
+    ]
+    scoped_filters = [
         Resource.tenant_id == UUID(request.tenantId),
         Resource.type.in_(resource_types),
+    ]
+    summary_stmt = select(
+        func.count(Resource.id).label("total_discovered"),
+        func.count(Resource.id).filter(
+            Resource.sla_policy_id.is_not(None),
+            Resource.status.notin_(excluded_statuses),
+        ).label("eligible"),
+        func.count(Resource.id).filter(Resource.sla_policy_id.is_(None)).label("skip_no_sla"),
+        func.count(Resource.id).filter(
+            Resource.sla_policy_id.is_not(None),
+            Resource.status == ResourceStatus.INACCESSIBLE,
+        ).label("skip_inaccessible"),
+        func.count(Resource.id).filter(
+            Resource.sla_policy_id.is_not(None),
+            Resource.status == ResourceStatus.SUSPENDED,
+        ).label("skip_suspended"),
+        func.count(Resource.id).filter(
+            Resource.sla_policy_id.is_not(None),
+            Resource.status == ResourceStatus.PENDING_DELETION,
+        ).label("skip_pending_deletion"),
+    ).where(*scoped_filters)
+    summary = (await db.execute(summary_stmt)).one()
+    skipped_by_reason = {
+        "no_sla": int(summary.skip_no_sla or 0),
+        "inaccessible": int(summary.skip_inaccessible or 0),
+        "suspended": int(summary.skip_suspended or 0),
+        "pending_deletion": int(summary.skip_pending_deletion or 0),
+    }
+    print(
+        f"[JOB_SERVICE] DATASOURCE_BACKUP_SUMMARY tenant={request.tenantId} service={service_key} "
+        f"discovered={int(summary.total_discovered or 0)} eligible={int(summary.eligible or 0)} "
+        f"skipped_total={sum(skipped_by_reason.values())} skipped_by_reason={skipped_by_reason}"
+    )
+
+    stmt = select(Resource).where(
+        *scoped_filters,
         Resource.sla_policy_id.is_not(None),
-        Resource.status.notin_([
-            ResourceStatus.INACCESSIBLE,
-            ResourceStatus.SUSPENDED,
-            ResourceStatus.PENDING_DELETION,
-        ]),
+        Resource.status.notin_(excluded_statuses),
     )
     result = await db.execute(stmt)
     resources = result.scalars().all()
