@@ -1,7 +1,9 @@
 """API Gateway - Routes requests to microservices"""
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 import httpx
 
 from shared.config import settings
@@ -22,8 +24,18 @@ SERVICES = {
     "audit": settings.AUDIT_SERVICE_URL,
 }
 
+GATEWAY_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
+GATEWAY_LIMITS = httpx.Limits(max_keepalive_connections=20, max_connections=100)
 
-app = FastAPI(title="TM Vault API Gateway", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http_client = httpx.AsyncClient(timeout=GATEWAY_TIMEOUT, limits=GATEWAY_LIMITS)
+    yield
+    await app.state.http_client.aclose()
+
+
+app = FastAPI(title="TM Vault API Gateway", version="1.0.0", lifespan=lifespan)
 
 # CORS
 app.add_middleware(
@@ -37,7 +49,6 @@ app.add_middleware(
 
 async def proxy_request(service: str, path: str, request: Request):
     """Forward request to microservice with retry logic"""
-    from fastapi.responses import Response
     import asyncio
 
     service_url = SERVICES.get(service)
@@ -55,27 +66,38 @@ async def proxy_request(service: str, path: str, request: Request):
 
     # Retry up to 3 times with exponential backoff
     last_error = None
+    client: httpx.AsyncClient = request.app.state.http_client
     for attempt in range(3):
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    params=request.query_params,
-                    content=await request.body(),
-                    timeout=30.0,
-                )
+            response = await client.request(
+                method=request.method,
+                url=url,
+                headers=headers,
+                params=request.query_params,
+                content=await request.body(),
+            )
 
-                return Response(
-                    content=response.content,
-                    status_code=response.status_code,
-                    media_type=response.headers.get("content-type", "application/json"),
-                )
-        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                media_type=response.headers.get("content-type", "application/json"),
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
             last_error = e
             if attempt < 2:
                 await asyncio.sleep(1 * (attempt + 1))
+        except httpx.ReadTimeout as e:
+            last_error = e
+            if attempt < 1:
+                await asyncio.sleep(1)
+            else:
+                return JSONResponse(
+                    status_code=504,
+                    content={"detail": f"Service '{service}' timed out"},
+                )
+        except httpx.RequestError as e:
+            last_error = e
+            break
 
     # All retries failed
     print(f"[GATEWAY] Failed to reach {service} at {url} after 3 attempts: {last_error}")

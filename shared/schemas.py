@@ -270,6 +270,14 @@ class TriggerBulkBackupRequest(BaseModel):
     note: Optional[str] = None
 
 
+class TriggerDatasourceBackupRequest(BaseModel):
+    tenantId: str
+    serviceType: str
+    fullBackup: Optional[bool] = True
+    priority: Optional[int] = 1
+    note: Optional[str] = None
+
+
 # ============ Snapshot ============
 
 class SnapshotResponse(BaseModel):

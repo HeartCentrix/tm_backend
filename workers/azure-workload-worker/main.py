@@ -199,6 +199,17 @@ class AzureWorkloadWorker:
                 resource.last_backup_job_id = job_id
                 resource.last_backup_at = datetime.utcnow()
                 resource.last_backup_status = "COMPLETED" if result.get("success") else "FAILED"
+                
+                # Update storage_bytes from backup result
+                bytes_added = result.get("size_bytes", 0) or result.get("total_size_bytes", 0) or 0
+                bytes_removed = result.get("bytes_removed", 0) or 0
+                net_change = bytes_added - bytes_removed
+                current_storage = resource.storage_bytes or 0
+                resource.storage_bytes = max(0, current_storage + net_change)
+                
+                logger.info("[%s] Updated storage_bytes for %s: %s -> %s bytes (added %s, removed %s)",
+                            self.worker_id, resource.id, current_storage, resource.storage_bytes,
+                            bytes_added, bytes_removed)
 
                 await session.commit()
                 logger.info("[%s] Backup %s for %s (%s)",
