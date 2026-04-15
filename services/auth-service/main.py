@@ -2,7 +2,7 @@
 from contextlib import asynccontextmanager
 from typing import Optional
 from uuid import UUID, uuid4
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 import secrets
 
@@ -12,13 +12,16 @@ from sqlalchemy import select, String
 
 from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession, async_session_factory
-from shared.models import PlatformUser, UserRoleMapping, Organization, UserRole, Tenant, TenantType, TenantStatus, AdminConsentToken
+from shared.models import PlatformUser, UserRoleMapping, Organization, UserRole, Tenant, TenantType, TenantStatus, AdminConsentToken, Resource, ResourceType
+from shared.power_bi_client import PowerBIClient
 from shared.security import create_access_token, create_refresh_token, decode_token, get_current_user_from_token
 from shared.schemas import (
     UserResponse, LoginResponse, RefreshTokenRequest, RefreshTokenResponse,
     MicrosoftAuthUrlResponse, OAuthCallbackRequest,
     DatasourceConsentRequest, DatasourceCallbackResponse,
     AdminConsentResponse, AdminConsentTokenResponse,
+    PowerBIOAuthCallbackRequest,
+    PowerBIReadinessResponse,
 )
 
 
@@ -30,6 +33,35 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Auth Service", version="1.0.0", lifespan=lifespan)
+
+
+def _power_bi_error_detail(exc: Exception) -> str:
+    message = str(exc)
+    if "AADSTS" in message or "access token" in message.lower():
+        return "The configured Power BI app could not get an access token. Check the client ID, client secret, and tenant ID."
+    if "403" in message:
+        return (
+            "Power BI or Fabric denied access. Enable service principal access in the Fabric admin portal "
+            "and add the app or its security group to the target workspaces."
+        )
+    if "401" in message:
+        return "Power BI authentication failed. Recheck the app credentials and tenant selection."
+    if "404" in message:
+        return "Power BI API access was attempted, but the tenant or workspace endpoint was not found."
+    return message or "Power BI readiness check failed."
+
+
+def _power_bi_authorize_scopes() -> str:
+    return " ".join(dict.fromkeys((
+        f"openid profile email {PowerBIClient.POWER_BI_DELEGATED_SCOPE} {PowerBIClient.FABRIC_DELEGATED_SCOPE}"
+    ).split()))
+
+
+def _power_bi_code_redeem_scopes() -> str:
+    # The token endpoint can only redeem scopes from a single resource at a time.
+    # We redeem the code for a Power BI token + refresh token, then use that refresh
+    # token to mint Fabric tokens later when the worker needs them.
+    return " ".join(dict.fromkeys(PowerBIClient.POWER_BI_DELEGATED_SCOPE.split()))
 
 
 @app.get("/health")
@@ -85,6 +117,38 @@ async def get_azure_datasource_url(state: Optional[str] = Query(None)):
     # The MICROSOFT_AUTH_URL uses the specific tenant ID which only works for
     # users within that tenant. For external Azure tenants connecting as datasources,
     # we need /organizations to accept any Azure AD tenant.
+    auth_url = f"https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?{urlencode(params)}"
+    return MicrosoftAuthUrlResponse(url=auth_url, state=csrf_state)
+
+
+@app.get("/api/v1/auth/power-bi/url", response_model=MicrosoftAuthUrlResponse)
+async def get_power_bi_url(
+    tenant_id: str = Query(..., alias="tenantId"),
+    state: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_user_from_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Initiate delegated Power BI/Fabric onboarding similar to AFI's service-user flow."""
+    org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
+    stmt = select(Tenant).where(Tenant.id == UUID(tenant_id))
+    if org_id:
+        stmt = stmt.where(Tenant.org_id == org_id)
+    tenant = (await db.execute(stmt)).scalar_one_or_none()
+    if tenant is None:
+        raise HTTPException(404, "Tenant not found")
+    if not settings.EFFECTIVE_POWER_BI_CLIENT_ID or not settings.EFFECTIVE_POWER_BI_CLIENT_SECRET:
+        raise HTTPException(400, "Power BI onboarding is not configured on this deployment.")
+
+    csrf_state = state or secrets.token_urlsafe(32)
+    params = {
+        "client_id": settings.EFFECTIVE_POWER_BI_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": f"{settings.FRONTEND_URL}/power-bi-callback",
+        "response_mode": "query",
+        "scope": _power_bi_authorize_scopes(),
+        "state": csrf_state,
+        "prompt": "consent",
+    }
     auth_url = f"https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?{urlencode(params)}"
     return MicrosoftAuthUrlResponse(url=auth_url, state=csrf_state)
 
@@ -508,6 +572,128 @@ async def azure_datasource_callback(
     return {"tenantId": str(tenant.id), "tenantName": tenant.display_name, "discoveryStatus": discovery_status}
 
 
+@app.post("/api/v1/auth/power-bi/callback", response_model=AdminConsentTokenResponse)
+async def power_bi_callback(
+    callback: PowerBIOAuthCallbackRequest,
+    current_user: dict = Depends(get_current_user_from_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Store delegated Power BI/Fabric refresh token for AFI-style service-user onboarding."""
+    org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
+    stmt = select(Tenant).where(Tenant.id == UUID(callback.tenantId))
+    if org_id:
+        stmt = stmt.where(Tenant.org_id == org_id)
+    tenant = (await db.execute(stmt)).scalar_one_or_none()
+    if tenant is None:
+        raise HTTPException(404, "Tenant not found")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        token_response = await client.post(
+            "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+            data={
+                "client_id": settings.EFFECTIVE_POWER_BI_CLIENT_ID,
+                "client_secret": settings.EFFECTIVE_POWER_BI_CLIENT_SECRET,
+                "code": callback.code,
+                "redirect_uri": f"{settings.FRONTEND_URL}/power-bi-callback",
+                "grant_type": "authorization_code",
+                "scope": _power_bi_code_redeem_scopes(),
+            },
+        )
+        if token_response.status_code != 200:
+            raise HTTPException(400, f"Power BI sign-in failed: {token_response.text}")
+        tokens = token_response.json()
+
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        raise HTTPException(400, "Power BI onboarding did not return a refresh token. Make sure offline access was granted.")
+
+    delegated_client = PowerBIClient(
+        tenant.external_tenant_id or settings.EFFECTIVE_POWER_BI_TENANT_ID,
+        client_id=settings.EFFECTIVE_POWER_BI_CLIENT_ID,
+        client_secret=settings.EFFECTIVE_POWER_BI_CLIENT_SECRET,
+        refresh_token=refresh_token,
+    )
+    try:
+        workspaces = await delegated_client.list_workspaces()
+    except Exception as exc:
+        raise HTTPException(400, f"Power BI access validation failed: {_power_bi_error_detail(exc)}")
+
+    from shared.security import encrypt_secret
+    encrypted_access_token = encrypt_secret(tokens["access_token"]) if tokens.get("access_token") else None
+    encrypted_refresh_token = encrypt_secret(refresh_token)
+
+    deactivate_stmt = select(AdminConsentToken).where(
+        AdminConsentToken.tenant_id == tenant.id,
+        AdminConsentToken.consent_type == "POWER_BI",
+        AdminConsentToken.is_active == True,
+    )
+    old_tokens = (await db.execute(deactivate_stmt)).scalars().all()
+    for old_token in old_tokens:
+        old_token.is_active = False
+
+    consent_token = AdminConsentToken(
+        id=uuid4(),
+        org_id=tenant.org_id,
+        tenant_id=tenant.id,
+        consent_type="POWER_BI",
+        access_token_encrypted=encrypted_access_token,
+        refresh_token_encrypted=encrypted_refresh_token,
+        token_type=tokens.get("token_type", "Bearer"),
+        expires_at=(datetime.now(timezone.utc) + timedelta(seconds=tokens.get("expires_in", 3600))).replace(tzinfo=None),
+        granted_by=current_user.get("email"),
+        scope=tokens.get("scope"),
+        is_active=True,
+    )
+    db.add(consent_token)
+
+    tenant.extra_data = tenant.extra_data or {}
+    tenant.extra_data["power_bi_auth_mode"] = "DELEGATED_SERVICE_USER"
+    tenant.extra_data["power_bi_consented_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    tenant.extra_data["power_bi_workspace_count_hint"] = len(workspaces)
+    tenant.extra_data["power_bi_uses_dedicated_app"] = bool(settings.POWER_BI_CLIENT_ID)
+
+    id_token = tokens.get("id_token")
+    if id_token:
+        try:
+            from jose import jwt
+            claims = jwt.get_unverified_claims(id_token)
+            tenant.extra_data["power_bi_service_user_email"] = claims.get("preferred_username") or claims.get("email")
+            tenant.extra_data["power_bi_service_user_name"] = claims.get("name")
+        except Exception:
+            pass
+
+    await PowerBIClient.persist_refresh_token(db, tenant, delegated_client.refresh_token or refresh_token)
+
+    await db.commit()
+
+    from shared.message_bus import message_bus as msg_bus
+    if not msg_bus.connection:
+        await msg_bus.connect()
+    try:
+        await msg_bus.publish(
+            "discovery.m365",
+            {
+                "jobId": str(uuid4()),
+                "tenantId": str(tenant.id),
+                "externalTenantId": tenant.external_tenant_id,
+                "discoveryScope": ["power_platform"],
+                "triggeredBy": str(current_user["id"]),
+                "triggeredAt": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            },
+            priority=5,
+        )
+    except Exception:
+        # Best-effort only; user can still run discovery manually.
+        pass
+
+    return AdminConsentTokenResponse(
+        tenantId=str(tenant.id),
+        consentType="POWER_BI",
+        message="Power BI service user connected successfully.",
+        consentedAt=consent_token.consented_at.isoformat() if consent_token.consented_at else datetime.now(timezone.utc).isoformat(),
+    )
+
+
 # ============ Admin Consent Status Endpoints ============
 
 @app.get("/api/v1/admin-consent/m365/status", response_model=Optional[AdminConsentResponse])
@@ -552,8 +738,204 @@ async def get_azure_admin_consent_status(
     
     if token is None:
         return None
-    
+
     return AdminConsentResponse.model_validate(token)
+
+
+@app.get("/api/v1/admin-consent/power-bi/readiness", response_model=PowerBIReadinessResponse)
+async def get_power_bi_readiness(
+    tenant_id: str = Query(..., alias="tenantId"),
+    current_user: dict = Depends(get_current_user_from_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Summarize whether Power BI backup onboarding is ready for this tenant."""
+    org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
+
+    tenant_stmt = select(Tenant).where(Tenant.id == UUID(tenant_id))
+    if org_id:
+        tenant_stmt = tenant_stmt.where(Tenant.org_id == org_id)
+    tenant = (await db.execute(tenant_stmt)).scalar_one_or_none()
+    if tenant is None:
+        raise HTTPException(404, "Tenant not found")
+
+    checks = []
+    recommended_actions = []
+
+    creds_configured = bool(settings.EFFECTIVE_POWER_BI_CLIENT_ID and settings.EFFECTIVE_POWER_BI_CLIENT_SECRET)
+    if creds_configured:
+        checks.append({
+            "key": "credentials",
+            "label": "App credentials",
+            "status": "ready",
+            "detail": "A Power BI-capable app registration is configured for this deployment.",
+        })
+    else:
+        checks.append({
+            "key": "credentials",
+            "label": "App credentials",
+            "status": "action_required",
+            "detail": "No Power BI app credentials are configured. Add POWER_BI_* values or reuse the primary Microsoft app credentials.",
+        })
+        recommended_actions.append("Configure POWER_BI_CLIENT_ID / POWER_BI_CLIENT_SECRET / POWER_BI_TENANT_ID, or make sure the primary Microsoft app credentials are present.")
+
+    consent_stmt = select(AdminConsentToken).where(
+        AdminConsentToken.org_id == org_id,
+        AdminConsentToken.consent_type == "M365",
+        AdminConsentToken.is_active == True,
+    ).order_by(AdminConsentToken.consented_at.desc()).limit(1)
+    m365_token = (await db.execute(consent_stmt)).scalar_one_or_none()
+    if m365_token:
+        checks.append({
+            "key": "m365_consent",
+            "label": "Microsoft 365 admin consent",
+            "status": "ready",
+            "detail": "Tenant admin consent is already stored for the Microsoft 365 datasource.",
+        })
+    else:
+        checks.append({
+            "key": "m365_consent",
+            "label": "Microsoft 365 admin consent",
+            "status": "action_required",
+            "detail": "Grant Microsoft 365 admin consent first so the tenant is connected before Power BI discovery runs.",
+        })
+        recommended_actions.append("Grant Microsoft 365 admin consent from Settings before testing Power BI discovery.")
+
+    power_bi_consent_stmt = select(AdminConsentToken).where(
+        AdminConsentToken.tenant_id == tenant.id,
+        AdminConsentToken.consent_type == "POWER_BI",
+        AdminConsentToken.is_active == True,
+    ).order_by(AdminConsentToken.consented_at.desc()).limit(1)
+    power_bi_token = (await db.execute(power_bi_consent_stmt)).scalar_one_or_none()
+    delegated_refresh_token = PowerBIClient.get_refresh_token_from_tenant(tenant)
+    auth_mode = "DELEGATED_SERVICE_USER" if delegated_refresh_token else "APP_ONLY"
+
+    if power_bi_token and delegated_refresh_token:
+        service_user = (tenant.extra_data or {}).get("power_bi_service_user_email") or power_bi_token.granted_by or "service user"
+        checks.append({
+            "key": "power_bi_connection",
+            "label": "Power BI service-user connection",
+            "status": "ready",
+            "detail": f"Connected as {service_user}. TMVault will prefer delegated Power BI auth for discovery and backup.",
+        })
+    else:
+        checks.append({
+            "key": "power_bi_connection",
+            "label": "Power BI service-user connection",
+            "status": "warning",
+            "detail": "No delegated Power BI service user is connected yet. TMVault will fall back to the app-only setup.",
+        })
+        recommended_actions.append("Click 'Connect service user' to use the simpler AFI-style Power BI onboarding flow.")
+
+    discovered_power_bi = (await db.execute(
+        select(Resource).where(
+            Resource.tenant_id == tenant.id,
+            Resource.type == ResourceType.POWER_BI,
+        )
+    )).scalars().all()
+    discovered_workspace_count = len(discovered_power_bi)
+
+    accessible_workspace_count = 0
+    api_access_ok = False
+    admin_api_ok = False
+
+    if creds_configured:
+        client = PowerBIClient(
+            tenant.external_tenant_id or settings.EFFECTIVE_POWER_BI_TENANT_ID,
+            refresh_token=delegated_refresh_token,
+        )
+        try:
+            workspaces = await client.list_workspaces()
+            accessible_workspace_count = len(workspaces)
+            api_access_ok = True
+            mode_label = "service user" if delegated_refresh_token else "app"
+            detail = f"The connected {mode_label} can list {accessible_workspace_count} Power BI workspace(s) in this tenant."
+            if accessible_workspace_count == 0:
+                if delegated_refresh_token:
+                    detail = "The connected service user authenticated successfully, but it does not currently have access to any Power BI workspaces."
+                    recommended_actions.append("Grant the connected service user access to at least one Power BI workspace, or create a shared workspace for backup testing.")
+                else:
+                    detail = "The app can talk to Power BI, but it does not currently have access to any workspaces."
+                    recommended_actions.append("Add the app or its security group to at least one Power BI workspace as Member or Admin.")
+            checks.append({
+                "key": "workspace_api",
+                "label": "Workspace API access",
+                "status": "ready" if accessible_workspace_count > 0 else "action_required",
+                "detail": detail,
+            })
+        except Exception as exc:
+            checks.append({
+                "key": "workspace_api",
+                "label": "Workspace API access",
+                "status": "action_required",
+                "detail": _power_bi_error_detail(exc),
+            })
+            recommended_actions.append(
+                "Verify the Power BI connection has the right Fabric role and workspace access, then reconnect if needed."
+                if delegated_refresh_token
+                else "In the Fabric admin portal, allow the service principal to use Fabric public APIs and add it to the target workspaces."
+            )
+
+        if api_access_ok:
+            try:
+                await client.list_modified_workspace_ids(datetime.utcnow() - timedelta(days=1))
+                admin_api_ok = True
+                checks.append({
+                    "key": "admin_api",
+                    "label": "Admin API access",
+                    "status": "ready",
+                    "detail": "Read-only admin APIs are available for richer discovery and faster change detection.",
+                })
+            except Exception as exc:
+                checks.append({
+                    "key": "admin_api",
+                    "label": "Admin API access",
+                    "status": "warning",
+                    "detail": _power_bi_error_detail(exc),
+                })
+                recommended_actions.append(
+                    "Enable read-only admin APIs in the Fabric admin portal so TMVault can do richer discovery and faster incremental checks."
+                )
+
+    discovery_status = "ready" if discovered_workspace_count > 0 else "warning"
+    discovery_detail = (
+        f"{discovered_workspace_count} Power BI workspace resource(s) are already discovered in TMVault."
+        if discovered_workspace_count > 0
+        else "No Power BI workspace resources have been discovered in TMVault yet. Run discovery after access is ready."
+    )
+    checks.append({
+        "key": "discovery",
+        "label": "TMVault discovery",
+        "status": discovery_status,
+        "detail": discovery_detail,
+    })
+    if discovered_workspace_count == 0:
+        recommended_actions.append("Run Power Platform discovery after the Power BI checks above are green.")
+
+    status = "ready"
+    if any(check["status"] == "action_required" for check in checks):
+        status = "action_required"
+    elif any(check["status"] == "warning" for check in checks):
+        status = "warning"
+
+    summary = "Power BI backup is ready."
+    if status == "action_required":
+        summary = "Power BI still needs setup before discovery and backup will work cleanly."
+    elif status == "warning":
+        summary = "Power BI is partially ready, but some capabilities are limited."
+    if auth_mode == "DELEGATED_SERVICE_USER" and status == "ready":
+        summary = "Power BI backup is ready with AFI-style service-user onboarding."
+
+    return PowerBIReadinessResponse(
+        tenantId=str(tenant.id),
+        status=status,
+        summary=summary,
+        authMode=auth_mode,
+        usesDedicatedApp=bool(settings.POWER_BI_CLIENT_ID),
+        accessibleWorkspaceCount=accessible_workspace_count,
+        discoveredWorkspaceCount=discovered_workspace_count,
+        checks=checks,
+        recommendedActions=list(dict.fromkeys(recommended_actions)),
+    )
 
 
 @app.post("/api/v1/auth/refresh", response_model=RefreshTokenResponse)

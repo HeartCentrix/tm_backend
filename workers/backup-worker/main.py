@@ -22,7 +22,7 @@ import uuid
 import hashlib
 import os
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import aio_pika
 from aio_pika import IncomingMessage
@@ -41,6 +41,13 @@ from shared.config import settings
 from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
 from shared.metadata_extractor import MetadataExtractor
+from shared.power_bi_client import PowerBIClient
+from shared.power_bi_snapshot import (
+    POWER_BI_INCREMENTAL_STRATEGY_VERSION,
+    assemble_power_bi_items,
+    build_power_bi_item_key,
+    should_force_power_bi_full_snapshot,
+)
 from shared.azure_storage import (
     azure_storage_manager,
     server_side_copy_with_retry,
@@ -234,7 +241,7 @@ class BackupWorker:
                 "TODO": self._backup_metadata_only,
                 "ONENOTE": self._backup_metadata_only,
                 "COPILOT": self._backup_metadata_only,
-                "POWER_BI": self._backup_metadata_only,
+                "POWER_BI": self.backup_power_bi_workspace,
                 "POWER_APPS": self._backup_metadata_only,
                 "POWER_AUTOMATE": self._backup_metadata_only,
                 "POWER_DLP": self._backup_metadata_only,
@@ -902,6 +909,8 @@ class BackupWorker:
                         return await self._backup_entra_resource(resource, tenant, snapshot, graph_client, job_id)
                     elif resource_type.startswith("TEAMS"):
                         return await self._backup_teams_resource(resource, tenant, snapshot, graph_client, job_id)
+                    elif resource_type == "POWER_BI":
+                        return await self.backup_power_bi_workspace(graph_client, resource, snapshot, tenant, message)
                     else:
                         return await self._backup_metadata_only(graph_client, resource, snapshot, tenant, message)
                 except Exception as e:
@@ -1309,6 +1318,655 @@ class BackupWorker:
                     await sess.commit()
 
         return len(db_items), bytes_added
+
+    async def backup_power_bi_workspace(
+        self,
+        graph_client: GraphClient,
+        resource: Resource,
+        snapshot: Snapshot,
+        tenant: Tenant,
+        message: Dict,
+    ) -> Dict:
+        """Backup a Power BI workspace with artifact-level incrementals."""
+        workspace_id = self._extract_power_bi_workspace_id(resource)
+        if not workspace_id:
+            raise ValueError(f"POWER_BI resource {resource.id} is missing workspace_id metadata")
+
+        power_bi_client = self.get_power_bi_client(tenant)
+        previous_state = await self._get_power_bi_previous_state(resource.id, exclude_snapshot_id=snapshot.id)
+
+        force_full = bool(
+            message.get("forceFullBackup")
+            or message.get("fullBackup")
+            or message.get("full_backup")
+        )
+        snapshot_type = SnapshotType.INCREMENTAL
+        full_reason = "incremental_ok"
+        if force_full:
+            snapshot_type = SnapshotType.FULL
+            full_reason = "forced_by_request"
+        else:
+            should_force_full, full_reason = should_force_power_bi_full_snapshot(
+                latest_full_created_at=previous_state["latest_full_created_at"],
+                latest_snapshot_extra=previous_state["latest_snapshot_extra"],
+                max_age_days=settings.POWER_BI_FULL_SNAPSHOT_DAYS,
+            )
+            if should_force_full:
+                snapshot_type = SnapshotType.FULL
+
+        snapshot.type = snapshot_type
+        snapshot.extra_data = {
+            **(snapshot.extra_data or {}),
+            "workspace_id": workspace_id,
+            "incremental_strategy_version": POWER_BI_INCREMENTAL_STRATEGY_VERSION,
+            "previous_snapshot_id": previous_state["latest_snapshot_id"],
+            "base_full_snapshot_id": (
+                str(snapshot.id)
+                if snapshot_type == SnapshotType.FULL
+                else previous_state["base_full_snapshot_id"]
+            ),
+            "full_reason": full_reason,
+        }
+
+        artifacts, capabilities = await self._collect_power_bi_artifacts(
+            power_bi_client,
+            workspace_id,
+            resource.display_name,
+        )
+
+        current_artifacts = {
+            build_power_bi_item_key(artifact["item_type"], artifact["external_id"]): artifact
+            for artifact in artifacts
+        }
+        previous_items = previous_state["items"]
+        container = azure_storage_manager.get_container_name(str(tenant.id), "power-bi")
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+
+        db_items: List[SnapshotItem] = []
+        bytes_added = 0
+        manual_actions: List[str] = []
+        unsupported_artifacts: List[str] = []
+
+        for artifact_key, artifact in current_artifacts.items():
+            previous_item = previous_items.get(artifact_key)
+            should_materialize = snapshot_type == SnapshotType.FULL or self._power_bi_artifact_changed(previous_item, artifact)
+            if not should_materialize:
+                continue
+
+            payload, blob_bytes = await self._build_power_bi_artifact_payload(
+                power_bi_client,
+                workspace_id,
+                artifact,
+            )
+            content_hash = hashlib.sha256(blob_bytes).hexdigest()
+            previous_checksum = getattr(previous_item, "content_checksum", None) if previous_item else None
+            if previous_checksum and previous_checksum == content_hash:
+                continue
+
+            if not payload["restore_supported"]:
+                unsupported_artifacts.append(f"{artifact['item_type']}:{artifact['name']}")
+            manual_actions.extend(payload["manual_actions"])
+
+            blob_path = azure_storage_manager.build_blob_path(
+                str(tenant.id),
+                str(resource.id),
+                str(snapshot.id),
+                artifact["blob_id"],
+            )
+            result = await upload_blob_with_retry(container, blob_path, blob_bytes, shard)
+            if not result.get("success"):
+                raise RuntimeError(f"Failed to upload Power BI artifact {artifact['name']}: {result.get('error')}")
+
+            db_items.append(
+                SnapshotItem(
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    external_id=artifact["external_id"],
+                    item_type=artifact["item_type"],
+                    name=artifact["name"],
+                    folder_path=artifact["folder_path"],
+                    content_hash=content_hash,
+                    content_checksum=content_hash,
+                    content_size=len(blob_bytes),
+                    blob_path=blob_path,
+                    extra_data=payload["summary"],
+                    is_deleted=False,
+                )
+            )
+            bytes_added += len(blob_bytes)
+
+        if snapshot_type == SnapshotType.INCREMENTAL:
+            for artifact_key, previous_item in previous_items.items():
+                if artifact_key in current_artifacts:
+                    continue
+
+                tombstone_summary = {
+                    **(getattr(previous_item, "extra_data", {}) or {}),
+                    "workspace_id": workspace_id,
+                    "tombstone": True,
+                    "restore_supported": False,
+                    "manual_actions": ["Artifact was deleted in the source workspace."],
+                }
+                db_items.append(
+                    SnapshotItem(
+                        snapshot_id=snapshot.id,
+                        tenant_id=tenant.id,
+                        external_id=previous_item.external_id,
+                        item_type=previous_item.item_type,
+                        name=previous_item.name,
+                        folder_path=previous_item.folder_path,
+                        content_size=0,
+                        extra_data=tombstone_summary,
+                        is_deleted=True,
+                    )
+                )
+
+        if db_items:
+            async with async_session_factory() as item_session:
+                item_session.add_all(db_items)
+                if power_bi_client.refresh_token:
+                    tenant_record = await item_session.get(Tenant, tenant.id)
+                    if tenant_record:
+                        await PowerBIClient.persist_refresh_token(item_session, tenant_record, power_bi_client.refresh_token)
+                await item_session.commit()
+        elif power_bi_client.refresh_token:
+            async with async_session_factory() as item_session:
+                tenant_record = await item_session.get(Tenant, tenant.id)
+                if tenant_record:
+                    await PowerBIClient.persist_refresh_token(item_session, tenant_record, power_bi_client.refresh_token)
+                    await item_session.commit()
+
+        snapshot.extra_data = {
+            **(snapshot.extra_data or {}),
+            "admin_scan_available": capabilities["admin_scan_available"],
+            "partial_governance_capture": not capabilities["governance_complete"],
+            "assembled_artifact_count": len(current_artifacts),
+            "manual_actions": sorted(set(manual_actions)),
+            "unsupported_artifacts": sorted(set(unsupported_artifacts)),
+        }
+
+        return {
+            "item_count": len(db_items),
+            "bytes_added": bytes_added,
+            "manual_actions": sorted(set(manual_actions)),
+            "unsupported_artifacts": sorted(set(unsupported_artifacts)),
+        }
+
+    def _extract_power_bi_workspace_id(self, resource: Resource) -> Optional[str]:
+        metadata = resource.extra_data or {}
+        workspace_id = metadata.get("workspace_id")
+        if workspace_id:
+            return workspace_id
+        if resource.external_id and resource.external_id.startswith("pbi_ws_"):
+            return resource.external_id.replace("pbi_ws_", "", 1)
+        return resource.external_id
+
+    async def _get_power_bi_previous_state(
+        self,
+        resource_id: uuid.UUID,
+        *,
+        exclude_snapshot_id: Optional[uuid.UUID] = None,
+    ) -> Dict[str, Any]:
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(Snapshot).where(
+                    Snapshot.resource_id == resource_id,
+                    Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
+                ).order_by(Snapshot.created_at.asc())
+            )
+            snapshots = [snapshot for snapshot in result.scalars().all() if snapshot.id != exclude_snapshot_id]
+
+            if not snapshots:
+                return {
+                    "items": {},
+                    "latest_snapshot_id": None,
+                    "latest_snapshot_extra": None,
+                    "base_full_snapshot_id": None,
+                    "latest_full_created_at": None,
+                }
+
+            snapshot_ids = [snapshot.id for snapshot in snapshots]
+            items_result = await session.execute(
+                select(SnapshotItem).where(SnapshotItem.snapshot_id.in_(snapshot_ids))
+            )
+            assembled_items = assemble_power_bi_items(snapshots, items_result.scalars().all())
+            latest_snapshot = snapshots[-1]
+            latest_full = next((snapshot for snapshot in reversed(snapshots) if snapshot.type == SnapshotType.FULL), None)
+
+            return {
+                "items": {
+                    build_power_bi_item_key(item.item_type, item.external_id): item
+                    for item in assembled_items
+                },
+                "latest_snapshot_id": str(latest_snapshot.id),
+                "latest_snapshot_extra": latest_snapshot.extra_data or {},
+                "base_full_snapshot_id": (
+                    (latest_snapshot.extra_data or {}).get("base_full_snapshot_id")
+                    or (str(latest_full.id) if latest_full else None)
+                ),
+                "latest_full_created_at": latest_full.created_at if latest_full else None,
+            }
+
+    async def _collect_power_bi_artifacts(
+        self,
+        power_bi_client: PowerBIClient,
+        workspace_id: str,
+        workspace_name: str,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, bool]]:
+        artifacts: List[Dict[str, Any]] = []
+        capabilities = {
+            "admin_scan_available": False,
+            "governance_complete": False,
+        }
+
+        try:
+            scan_result = await power_bi_client.scan_workspaces([workspace_id])
+            workspaces = scan_result.get("workspaces", [])
+            if workspaces:
+                capabilities["admin_scan_available"] = True
+                capabilities["governance_complete"] = True
+                artifacts.extend(self._power_bi_artifacts_from_scan(workspaces[0]))
+        except Exception as exc:
+            logger.warning("Power BI admin scan unavailable for workspace %s: %s", workspace_id, exc)
+
+        if not artifacts:
+            artifacts.extend(await self._power_bi_artifacts_from_workspace_apis(power_bi_client, workspace_id, workspace_name))
+
+        dataset_runtime_artifacts: List[Dict[str, Any]] = []
+        for artifact in artifacts:
+            if artifact["item_type"] == "POWER_BI_SEMANTIC_MODEL":
+                dataset_runtime_artifacts.extend(
+                    await self._power_bi_dataset_runtime_artifacts(
+                        power_bi_client,
+                        workspace_id,
+                        artifact["external_id"],
+                        artifact["name"],
+                    )
+                )
+
+        deduped = {
+            build_power_bi_item_key(artifact["item_type"], artifact["external_id"]): artifact
+            for artifact in [*artifacts, *dataset_runtime_artifacts]
+        }
+
+        return list(deduped.values()), capabilities
+
+    def _power_bi_artifacts_from_scan(self, workspace: Dict[str, Any]) -> List[Dict[str, Any]]:
+        workspace_id = workspace.get("id")
+        workspace_name = workspace.get("name", workspace_id)
+        artifacts = [
+            self._build_power_bi_artifact_descriptor(
+                item_type="POWER_BI_WORKSPACE",
+                external_id=workspace_id,
+                name=workspace_name,
+                folder_path="workspace",
+                artifact=workspace,
+                restore_supported=False,
+            )
+        ]
+
+        permissions_payload = {
+            "workspaceUsers": workspace.get("users", []),
+            "reportUsers": {
+                report.get("id"): report.get("users", [])
+                for report in workspace.get("reports", [])
+                if report.get("users")
+            },
+            "datasetUsers": {
+                dataset.get("id"): dataset.get("users", [])
+                for dataset in workspace.get("datasets", [])
+                if dataset.get("users")
+            },
+            "dashboardUsers": {
+                dashboard.get("id"): dashboard.get("users", [])
+                for dashboard in workspace.get("dashboards", [])
+                if dashboard.get("users")
+            },
+        }
+        artifacts.append(
+            self._build_power_bi_artifact_descriptor(
+                item_type="POWER_BI_PERMISSIONS",
+                external_id=f"{workspace_id}:permissions",
+                name="Permissions",
+                folder_path="settings",
+                artifact=permissions_payload,
+                restore_supported=False,
+            )
+        )
+
+        for report in workspace.get("reports", []):
+            is_paginated = report.get("reportType") == "PaginatedReport"
+            artifacts.append(
+                self._build_power_bi_artifact_descriptor(
+                    item_type="POWER_BI_PAGINATED_REPORT" if is_paginated else "POWER_BI_REPORT",
+                    external_id=report.get("id"),
+                    name=report.get("name", report.get("id")),
+                    folder_path="reports",
+                    artifact=report,
+                    restore_supported=True,
+                    definition_supported=True,
+                    definition_format=report.get("format"),
+                    fabric_item_type="PaginatedReport" if is_paginated else "Report",
+                )
+            )
+
+        for dataset in workspace.get("datasets", []):
+            dataset_id = dataset.get("id")
+            artifacts.append(
+                self._build_power_bi_artifact_descriptor(
+                    item_type="POWER_BI_SEMANTIC_MODEL",
+                    external_id=dataset_id,
+                    name=dataset.get("name", dataset_id),
+                    folder_path="semantic-models",
+                    artifact=dataset,
+                    restore_supported=True,
+                    definition_supported=True,
+                    definition_format="TMDL",
+                    fabric_item_type="SemanticModel",
+                )
+            )
+            if dataset.get("datasourceUsages") or dataset.get("misconfiguredDatasourceUsages"):
+                artifacts.append(
+                    self._build_power_bi_artifact_descriptor(
+                        item_type="POWER_BI_DATASOURCE",
+                        external_id=f"{dataset_id}:datasources",
+                        name=f"{dataset.get('name', dataset_id)} datasources",
+                        folder_path="settings",
+                        artifact={
+                            "datasetId": dataset_id,
+                            "datasourceUsages": dataset.get("datasourceUsages", []),
+                            "misconfiguredDatasourceUsages": dataset.get("misconfiguredDatasourceUsages", []),
+                        },
+                        restore_supported=False,
+                    )
+                )
+            if dataset.get("upstreamDataflows") or dataset.get("upstreamDatasets") or dataset.get("upstreamDatamarts"):
+                artifacts.append(
+                    self._build_power_bi_artifact_descriptor(
+                        item_type="POWER_BI_LINEAGE",
+                        external_id=f"{dataset_id}:lineage",
+                        name=f"{dataset.get('name', dataset_id)} lineage",
+                        folder_path="settings",
+                        artifact={
+                            "datasetId": dataset_id,
+                            "upstreamDataflows": dataset.get("upstreamDataflows", []),
+                            "upstreamDatasets": dataset.get("upstreamDatasets", []),
+                            "upstreamDatamarts": dataset.get("upstreamDatamarts", []),
+                        },
+                        restore_supported=False,
+                    )
+                )
+
+        for dataflow in workspace.get("dataflows", []):
+            dataflow_id = dataflow.get("objectId") or dataflow.get("id")
+            artifacts.append(
+                self._build_power_bi_artifact_descriptor(
+                    item_type="POWER_BI_DATAFLOW",
+                    external_id=dataflow_id,
+                    name=dataflow.get("name", dataflow_id),
+                    folder_path="dataflows",
+                    artifact=dataflow,
+                    restore_supported=True,
+                    definition_supported=True,
+                    fabric_item_type="Dataflow",
+                )
+            )
+
+        for dashboard in workspace.get("dashboards", []):
+            dashboard_id = dashboard.get("id")
+            artifacts.append(
+                self._build_power_bi_artifact_descriptor(
+                    item_type="POWER_BI_DASHBOARD",
+                    external_id=dashboard_id,
+                    name=dashboard.get("displayName", dashboard_id),
+                    folder_path="dashboards",
+                    artifact=dashboard,
+                    restore_supported=False,
+                )
+            )
+            for tile in dashboard.get("tiles", []):
+                tile_id = tile.get("id")
+                artifacts.append(
+                    self._build_power_bi_artifact_descriptor(
+                        item_type="POWER_BI_TILE",
+                        external_id=f"{dashboard_id}:{tile_id}",
+                        name=tile.get("title", tile_id),
+                        folder_path=f"dashboards/{dashboard.get('displayName', dashboard_id)}",
+                        artifact={"dashboardId": dashboard_id, **tile},
+                        restore_supported=False,
+                    )
+                )
+
+        return artifacts
+
+    async def _power_bi_dataset_runtime_artifacts(
+        self,
+        power_bi_client: PowerBIClient,
+        workspace_id: str,
+        dataset_id: str,
+        dataset_name: str,
+    ) -> List[Dict[str, Any]]:
+        artifacts: List[Dict[str, Any]] = []
+
+        try:
+            datasources = await power_bi_client.get_dataset_datasources(workspace_id, dataset_id)
+            artifacts.append(
+                self._build_power_bi_artifact_descriptor(
+                    item_type="POWER_BI_DATASOURCE",
+                    external_id=f"{dataset_id}:datasources",
+                    name=f"{dataset_name} datasources",
+                    folder_path="settings",
+                    artifact={"datasetId": dataset_id, "datasources": datasources},
+                    restore_supported=False,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Failed to collect Power BI datasources for %s: %s", dataset_id, exc)
+
+        try:
+            refresh_schedule = await power_bi_client.get_dataset_refresh_schedule(workspace_id, dataset_id)
+            artifacts.append(
+                self._build_power_bi_artifact_descriptor(
+                    item_type="POWER_BI_REFRESH_SCHEDULE",
+                    external_id=f"{dataset_id}:refresh-schedule",
+                    name=f"{dataset_name} refresh schedule",
+                    folder_path="settings",
+                    artifact={"datasetId": dataset_id, "refreshSchedule": refresh_schedule},
+                    restore_supported=False,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Failed to collect Power BI refresh schedule for %s: %s", dataset_id, exc)
+
+        return artifacts
+
+    async def _power_bi_artifacts_from_workspace_apis(
+        self,
+        power_bi_client: PowerBIClient,
+        workspace_id: str,
+        workspace_name: str,
+    ) -> List[Dict[str, Any]]:
+        artifacts = [
+            self._build_power_bi_artifact_descriptor(
+                item_type="POWER_BI_WORKSPACE",
+                external_id=workspace_id,
+                name=workspace_name,
+                folder_path="workspace",
+                artifact={"id": workspace_id, "name": workspace_name},
+                restore_supported=False,
+            )
+        ]
+
+        reports = await power_bi_client.list_reports_in_group(workspace_id)
+        for report in reports:
+            is_paginated = report.get("reportType") == "PaginatedReport"
+            artifacts.append(
+                self._build_power_bi_artifact_descriptor(
+                    item_type="POWER_BI_PAGINATED_REPORT" if is_paginated else "POWER_BI_REPORT",
+                    external_id=report.get("id"),
+                    name=report.get("name", report.get("id")),
+                    folder_path="reports",
+                    artifact=report,
+                    restore_supported=True,
+                    definition_supported=True,
+                    fabric_item_type="PaginatedReport" if is_paginated else "Report",
+                )
+            )
+
+        dashboards = await power_bi_client.list_dashboards_in_group(workspace_id)
+        for dashboard in dashboards:
+            dashboard_id = dashboard.get("id")
+            artifacts.append(
+                self._build_power_bi_artifact_descriptor(
+                    item_type="POWER_BI_DASHBOARD",
+                    external_id=dashboard_id,
+                    name=dashboard.get("displayName", dashboard_id),
+                    folder_path="dashboards",
+                    artifact=dashboard,
+                    restore_supported=False,
+                )
+            )
+            tiles = await power_bi_client.list_tiles_in_group(workspace_id, dashboard_id)
+            for tile in tiles:
+                artifacts.append(
+                    self._build_power_bi_artifact_descriptor(
+                        item_type="POWER_BI_TILE",
+                        external_id=f"{dashboard_id}:{tile.get('id')}",
+                        name=tile.get("title", tile.get("id")),
+                        folder_path=f"dashboards/{dashboard.get('displayName', dashboard_id)}",
+                        artifact={"dashboardId": dashboard_id, **tile},
+                        restore_supported=False,
+                    )
+                )
+
+        datasets = await power_bi_client.list_datasets_in_group(workspace_id)
+        for dataset in datasets:
+            dataset_id = dataset.get("id")
+            artifacts.append(
+                self._build_power_bi_artifact_descriptor(
+                    item_type="POWER_BI_SEMANTIC_MODEL",
+                    external_id=dataset_id,
+                    name=dataset.get("name", dataset_id),
+                    folder_path="semantic-models",
+                    artifact=dataset,
+                    restore_supported=True,
+                    definition_supported=True,
+                    definition_format="TMDL",
+                    fabric_item_type="SemanticModel",
+                )
+            )
+
+        try:
+            dataflows = await power_bi_client.list_dataflows_in_group(workspace_id)
+            for dataflow in dataflows:
+                dataflow_id = dataflow.get("objectId") or dataflow.get("id")
+                artifacts.append(
+                    self._build_power_bi_artifact_descriptor(
+                        item_type="POWER_BI_DATAFLOW",
+                        external_id=dataflow_id,
+                        name=dataflow.get("name", dataflow_id),
+                        folder_path="dataflows",
+                        artifact=dataflow,
+                        restore_supported=True,
+                        definition_supported=True,
+                        fabric_item_type="Dataflow",
+                    )
+                )
+        except Exception as exc:
+            logger.warning("Failed to list Power BI dataflows for workspace %s: %s", workspace_id, exc)
+
+        return artifacts
+
+    def _build_power_bi_artifact_descriptor(
+        self,
+        *,
+        item_type: str,
+        external_id: str,
+        name: str,
+        folder_path: str,
+        artifact: Dict[str, Any],
+        restore_supported: bool,
+        definition_supported: bool = False,
+        definition_format: Optional[str] = None,
+        fabric_item_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        external_id = str(external_id)
+        return {
+            "item_type": item_type,
+            "external_id": external_id,
+            "name": name or external_id,
+            "folder_path": folder_path,
+            "artifact": artifact,
+            "restore_supported": restore_supported,
+            "definition_supported": definition_supported,
+            "definition_format": definition_format,
+            "fabric_item_type": fabric_item_type,
+            "blob_id": f"{item_type.lower()}_{external_id}",
+            "change_token": self._power_bi_change_token(artifact),
+        }
+
+    def _power_bi_change_token(self, artifact: Dict[str, Any]) -> str:
+        token_parts = [
+            artifact.get("modifiedDateTime") or artifact.get("createdDateTime") or artifact.get("createdDate") or "",
+            artifact.get("modifiedBy") or artifact.get("createdBy") or artifact.get("configuredBy") or "",
+            artifact.get("datasetId") or artifact.get("id") or artifact.get("objectId") or "",
+            artifact.get("name") or artifact.get("displayName") or "",
+            str(len(artifact.get("tiles", []))) if isinstance(artifact.get("tiles"), list) else "",
+            str(len(artifact.get("datasourceUsages", []))) if isinstance(artifact.get("datasourceUsages"), list) else "",
+        ]
+        return "|".join(str(part) for part in token_parts)
+
+    def _power_bi_artifact_changed(self, previous_item: Optional[SnapshotItem], artifact: Dict[str, Any]) -> bool:
+        if previous_item is None:
+            return True
+        previous_summary = getattr(previous_item, "extra_data", {}) or {}
+        return previous_summary.get("change_token") != artifact["change_token"]
+
+    async def _build_power_bi_artifact_payload(
+        self,
+        power_bi_client: PowerBIClient,
+        workspace_id: str,
+        artifact: Dict[str, Any],
+    ) -> tuple[Dict[str, Any], bytes]:
+        definition = None
+        restore_supported = artifact["restore_supported"]
+        manual_actions: List[str] = []
+
+        if artifact["definition_supported"] and artifact.get("fabric_item_type"):
+            try:
+                definition = await power_bi_client.get_item_definition(
+                    workspace_id,
+                    artifact["external_id"],
+                    format=artifact.get("definition_format"),
+                )
+            except Exception as exc:
+                restore_supported = False
+                manual_actions.append(f"Definition capture unavailable: {exc}")
+
+        payload = {
+            "artifact": artifact["artifact"],
+            "definition": definition,
+            "capturedAt": datetime.utcnow().isoformat(),
+            "restoreSupported": restore_supported,
+            "definitionFormat": artifact.get("definition_format"),
+            "fabricItemType": artifact.get("fabric_item_type"),
+        }
+        blob_bytes = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        summary = {
+            "workspace_id": workspace_id,
+            "change_token": artifact["change_token"],
+            "restore_supported": restore_supported,
+            "definition_supported": artifact["definition_supported"],
+            "definition_format": artifact.get("definition_format"),
+            "fabric_item_type": artifact.get("fabric_item_type"),
+            "artifact": artifact["artifact"],
+            "manual_actions": manual_actions,
+        }
+        return {
+            "summary": summary,
+            "restore_supported": restore_supported,
+            "manual_actions": manual_actions,
+        }, blob_bytes
 
     async def _backup_metadata_only(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                                     tenant: Tenant, message: Dict) -> Dict:
@@ -1879,16 +2537,30 @@ class BackupWorker:
             tenant_id=tenant.external_tenant_id,
         )
 
-    async def create_snapshot(self, resource: Resource, message: Dict, job_id: uuid.UUID) -> Snapshot:
+    def get_power_bi_client(self, tenant: Tenant) -> PowerBIClient:
+        return PowerBIClient(
+            tenant_id=tenant.external_tenant_id or settings.EFFECTIVE_POWER_BI_TENANT_ID,
+            refresh_token=PowerBIClient.get_refresh_token_from_tenant(tenant),
+        )
+
+    async def create_snapshot(
+        self,
+        resource: Resource,
+        message: Dict,
+        job_id: uuid.UUID,
+        snapshot_type: SnapshotType = SnapshotType.INCREMENTAL,
+        extra_data: Optional[Dict[str, Any]] = None,
+    ) -> Snapshot:
         async with async_session_factory() as session:
             snapshot = Snapshot(
                 id=uuid.uuid4(),
                 resource_id=resource.id,
                 job_id=job_id,
-                type=SnapshotType.INCREMENTAL,
+                type=snapshot_type,
                 status=SnapshotStatus.IN_PROGRESS,
                 started_at=datetime.utcnow(),
                 snapshot_label=message.get("snapshotLabel", "scheduled"),
+                extra_data=extra_data or {},
             )
             session.add(snapshot)
             await session.commit()

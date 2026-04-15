@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import hashlib
 import time
 
+from shared.power_bi_client import PowerBIClient
+
 logger = logging.getLogger(__name__)
 
 # Timeout constants — tuned for Graph API and token endpoint behavior
@@ -24,10 +26,11 @@ class GraphClient:
         "https://graph.microsoft.com/.default"
     ]
 
-    def __init__(self, client_id: str, client_secret: str, tenant_id: str):
+    def __init__(self, client_id: str, client_secret: str, tenant_id: str, power_bi_refresh_token: Optional[str] = None):
         self.client_id = client_id
         self.client_secret = client_secret
         self.tenant_id = tenant_id
+        self.power_bi_refresh_token = power_bi_refresh_token
         self._access_token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
 
@@ -670,28 +673,33 @@ class GraphClient:
         except Exception as e:
             print(f"Error discovering Power Platform environments: {e}")
 
-        # 4. Discover Power BI workspaces via Graph API
+        # 4. Discover Power BI workspaces via Power BI REST API
         try:
-            result = await self._get(
-                f"{self.GRAPH_URL}/groups",
-                params={
-                    "$filter": "resourceProvisioningOptions/Any(x:x eq 'PowerBI')",
-                    "$top": "999",
-                    "$count": "true"
-                }
+            power_bi_client = PowerBIClient(
+                tenant_id=self.tenant_id,
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                refresh_token=self.power_bi_refresh_token,
             )
-            for g in result.get("value", []):
+            workspaces = await power_bi_client.list_workspaces()
+            self.power_bi_refresh_token = power_bi_client.refresh_token
+            for workspace in workspaces:
+                workspace_id = workspace.get("id")
+                if not workspace_id:
+                    continue
                 resources.append({
-                    "external_id": f"pbi_ws_{g.get('id')}",
-                    "display_name": g.get("displayName", "Unknown Power BI Workspace"),
-                    "email": g.get("mail"),
+                    "external_id": f"pbi_ws_{workspace_id}",
+                    "display_name": workspace.get("name", "Unknown Power BI Workspace"),
+                    "email": None,
                     "type": "POWER_BI",
                     "metadata": {
-                        "workspace_id": g.get("id"),
-                        "mail_enabled": g.get("mailEnabled"),
-                        "security_enabled": g.get("securityEnabled"),
-                        "visibility": g.get("visibility"),
-                        "description": g.get("description"),
+                        "workspace_id": workspace_id,
+                        "workspace_type": workspace.get("type"),
+                        "is_on_dedicated_capacity": workspace.get("isOnDedicatedCapacity"),
+                        "capacity_id": workspace.get("capacityId"),
+                        "description": workspace.get("description"),
+                        "state": workspace.get("state"),
+                        "default_dataset_storage_format": workspace.get("defaultDatasetStorageFormat"),
                     },
                 })
         except Exception as e:
@@ -1203,13 +1211,17 @@ class GraphClient:
 
     async def get_power_bi_workspaces(self) -> Dict[str, Any]:
         """
-        Get Power BI workspaces.
-        Graph API: GET /groups (filtered for Power BI)
+        Get Power BI workspaces via Power BI REST API.
         """
-        return await self._get(f"{self.GRAPH_URL}/groups", params={
-            "$filter": "resourceProvisioningOptions/Any(x:x eq 'PowerBI')",
-            "$top": "999"
-        })
+        power_bi_client = PowerBIClient(
+            tenant_id=self.tenant_id,
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+            refresh_token=self.power_bi_refresh_token,
+        )
+        workspaces = await power_bi_client.list_workspaces()
+        self.power_bi_refresh_token = power_bi_client.refresh_token
+        return {"value": workspaces}
 
     async def get_onenote_notebooks(self, user_id: str) -> Dict[str, Any]:
         """

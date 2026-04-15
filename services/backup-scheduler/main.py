@@ -28,6 +28,7 @@ from shared.models import (
 )
 from shared.message_bus import message_bus, create_mass_backup_message, create_backup_message
 from shared.config import settings
+from shared.power_bi_client import PowerBIClient
 
 app = FastAPI(title="Backup Scheduler Service", version="3.0.0")
 
@@ -327,6 +328,57 @@ async def dispatch_policy_backups(policy_id: str):
         if not enabled_resources:
             print(f"[SCHEDULER] No enabled resources for policy '{policy.name}' after flag filtering")
             return
+
+        power_bi_resources = [resource for resource in enabled_resources if resource.type == ResourceType.POWER_BI]
+        if power_bi_resources:
+            tenant_result = await session.execute(
+                select(Tenant).where(Tenant.id.in_({resource.tenant_id for resource in power_bi_resources}))
+            )
+            tenants_map = {tenant.id: tenant for tenant in tenant_result.scalars().all()}
+
+            filtered_power_bi_ids = set()
+            resources_by_tenant: Dict[str, List[Resource]] = {}
+            for resource in power_bi_resources:
+                resources_by_tenant.setdefault(str(resource.tenant_id), []).append(resource)
+
+            for tenant_id, tenant_resources in resources_by_tenant.items():
+                tenant = tenants_map.get(uuid.UUID(tenant_id))
+                if not tenant:
+                    filtered_power_bi_ids.update(str(resource.id) for resource in tenant_resources)
+                    continue
+
+                resources_without_backup = [resource for resource in tenant_resources if resource.last_backup_at is None]
+                filtered_power_bi_ids.update(str(resource.id) for resource in resources_without_backup)
+
+                resources_with_backup = [resource for resource in tenant_resources if resource.last_backup_at is not None]
+                if not resources_with_backup:
+                    continue
+
+                min_last_backup = min(resource.last_backup_at for resource in resources_with_backup if resource.last_backup_at)
+                modified_since = max(min_last_backup, datetime.utcnow() - timedelta(days=30))
+                if modified_since > datetime.utcnow() - timedelta(minutes=31):
+                    modified_since = datetime.utcnow() - timedelta(minutes=31)
+
+                try:
+                    client = PowerBIClient(
+                        tenant.external_tenant_id or settings.EFFECTIVE_POWER_BI_TENANT_ID,
+                        refresh_token=PowerBIClient.get_refresh_token_from_tenant(tenant),
+                    )
+                    modified_workspace_ids = set(await client.list_modified_workspace_ids(modified_since))
+                    for resource in resources_with_backup:
+                        workspace_id = (resource.extra_data or {}).get("workspace_id")
+                        if not workspace_id and resource.external_id and resource.external_id.startswith("pbi_ws_"):
+                            workspace_id = resource.external_id.replace("pbi_ws_", "", 1)
+                        if workspace_id in modified_workspace_ids:
+                            filtered_power_bi_ids.add(str(resource.id))
+                except Exception as exc:
+                    print(f"[SCHEDULER] Power BI modified-workspace prefilter unavailable for tenant {tenant.display_name}: {exc}")
+                    filtered_power_bi_ids.update(str(resource.id) for resource in tenant_resources)
+
+            enabled_resources = [
+                resource for resource in enabled_resources
+                if resource.type != ResourceType.POWER_BI or str(resource.id) in filtered_power_bi_ids
+            ]
 
         print(f"[SCHEDULER] Found {len(enabled_resources)} resources to backup for policy '{policy.name}'")
 

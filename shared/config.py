@@ -126,6 +126,13 @@ class Settings:
         self.MICROSOFT_AUTH_URL = os.getenv("MICROSOFT_AUTH_URL", f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/authorize")
         self.MICROSOFT_TOKEN_URL = os.getenv("MICROSOFT_TOKEN_URL", f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/token")
 
+        # Dedicated Power BI / Fabric app credentials (optional).
+        # Falls back to the primary Microsoft app when not provided.
+        self.POWER_BI_CLIENT_ID = os.getenv("POWER_BI_CLIENT_ID", "")
+        self.POWER_BI_CLIENT_SECRET = os.getenv("POWER_BI_CLIENT_SECRET", "")
+        self.POWER_BI_TENANT_ID = os.getenv("POWER_BI_TENANT_ID", "")
+        self.POWER_BI_FULL_SNAPSHOT_DAYS = int(os.getenv("POWER_BI_FULL_SNAPSHOT_DAYS", "7"))
+
         # Datasource OAuth URLs (multi-tenant for connecting other orgs)
         self.DATASOURCE_AUTH_URL = os.getenv("DATASOURCE_AUTH_URL", f"https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize")
         self.DATASOURCE_TOKEN_URL = os.getenv("DATASOURCE_TOKEN_URL", f"https://login.microsoftonline.com/organizations/oauth2/v2.0/token")
@@ -194,6 +201,18 @@ class Settings:
     @property
     def MICROSOFT_TENANT_ID(self) -> str:
         return self.GRAPH_APPS[0]["tenant_id"] if self.GRAPH_APPS else "common"
+
+    @property
+    def EFFECTIVE_POWER_BI_CLIENT_ID(self) -> str:
+        return self.POWER_BI_CLIENT_ID or self.MICROSOFT_CLIENT_ID
+
+    @property
+    def EFFECTIVE_POWER_BI_CLIENT_SECRET(self) -> str:
+        return self.POWER_BI_CLIENT_SECRET or self.MICROSOFT_CLIENT_SECRET
+
+    @property
+    def EFFECTIVE_POWER_BI_TENANT_ID(self) -> str:
+        return self.POWER_BI_TENANT_ID or self.MICROSOFT_TENANT_ID
 
     # ARM credentials fallback to Graph app if not explicitly set
     @property

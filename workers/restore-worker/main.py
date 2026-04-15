@@ -30,6 +30,8 @@ from shared.message_bus import message_bus
 from shared.config import settings
 from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
+from shared.power_bi_client import PowerBIClient
+from shared.azure_storage import azure_storage_manager
 
 
 class RestoreWorker:
@@ -210,6 +212,13 @@ class RestoreWorker:
 
             graph_client = await self.get_graph_client(tenant)
 
+            resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+            if resource_type == "POWER_BI":
+                power_bi_result = await self._restore_power_bi_items(session, resource, resource_items, tenant)
+                restored_count += power_bi_result.get("restored_count", 0)
+                failed_count += power_bi_result.get("failed_count", 0)
+                continue
+
             # Route by item type
             for item in resource_items:
                 try:
@@ -279,6 +288,10 @@ class RestoreWorker:
             raise ValueError("Target tenant not found")
 
         graph_client = await self.get_graph_client(tenant)
+
+        target_resource_type = target_resource.type.value if hasattr(target_resource.type, "value") else str(target_resource.type)
+        if target_resource_type == "POWER_BI":
+            return await self._restore_power_bi_items(session, target_resource, items, tenant)
 
         for item in items:
             try:
@@ -382,9 +395,11 @@ class RestoreWorker:
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for item in items:
                 try:
-                    # Get item content from metadata
-                    metadata = item.metadata or {}
-                    raw_data = metadata.get("raw", {})
+                    metadata = self._get_item_metadata(item)
+                    raw_data = self._load_snapshot_item_payload(
+                        item,
+                        "power-bi" if item.item_type.startswith("POWER_BI") else "files",
+                    )
 
                     # Create file based on item type
                     if item.item_type in ("EMAIL",):
@@ -406,6 +421,11 @@ class RestoreWorker:
                         zip_file.writestr(
                             f"teams_messages/{item.external_id}.json",
                             json.dumps(raw_data, indent=2)
+                        )
+                    elif item.item_type.startswith("POWER_BI"):
+                        zip_file.writestr(
+                            f"power_bi/{item.item_type}/{item.external_id}.json",
+                            json.dumps(raw_data, indent=2),
                         )
                     else:
                         # Generic JSON export
@@ -447,13 +467,17 @@ class RestoreWorker:
         """Export items as direct download (JSON)"""
         export_data = []
         for item in items:
-            metadata = item.metadata or {}
+            metadata = self._get_item_metadata(item)
+            raw_data = self._load_snapshot_item_payload(
+                item,
+                "power-bi" if item.item_type.startswith("POWER_BI") else "files",
+            )
             export_data.append({
                 "id": str(item.id),
                 "type": item.item_type,
                 "name": item.name,
                 "external_id": item.external_id,
-                "content": metadata.get("raw", {}),
+                "content": raw_data,
                 "structured_metadata": metadata.get("structured", {}),
             })
 
@@ -472,7 +496,7 @@ class RestoreWorker:
         item: SnapshotItem
     ):
         """Restore email to Exchange mailbox via Graph API"""
-        metadata = item.metadata or {}
+        metadata = self._get_item_metadata(item)
         raw_data = metadata.get("raw", {})
 
         user_id = resource.external_id
@@ -506,7 +530,7 @@ class RestoreWorker:
         item: SnapshotItem
     ):
         """Restore file to OneDrive via Graph API"""
-        metadata = item.metadata or {}
+        metadata = self._get_item_metadata(item)
         raw_data = metadata.get("raw", {})
 
         user_id = resource.external_id
@@ -536,7 +560,7 @@ class RestoreWorker:
         item: SnapshotItem
     ):
         """Restore file to SharePoint site via Graph API"""
-        metadata = item.metadata or {}
+        metadata = self._get_item_metadata(item)
         raw_data = metadata.get("raw", {})
 
         site_id = resource.external_id
@@ -564,7 +588,7 @@ class RestoreWorker:
         item: SnapshotItem
     ):
         """Restore Entra ID user profile via Graph API"""
-        metadata = item.metadata or {}
+        metadata = self._get_item_metadata(item)
         raw_data = metadata.get("raw", {})
 
         user_id = resource.external_id
@@ -594,7 +618,7 @@ class RestoreWorker:
         item: SnapshotItem
     ):
         """Restore Entra ID group via Graph API"""
-        metadata = item.metadata or {}
+        metadata = self._get_item_metadata(item)
         raw_data = metadata.get("raw", {})
 
         group_id = resource.external_id
@@ -612,7 +636,145 @@ class RestoreWorker:
             update_payload
         )
 
+    async def _restore_power_bi_items(
+        self,
+        session: AsyncSession,
+        target_resource: Resource,
+        items: List[SnapshotItem],
+        tenant: Tenant,
+    ) -> Dict[str, Any]:
+        workspace_id = self._extract_power_bi_workspace_id(target_resource)
+        if not workspace_id:
+            raise ValueError(f"POWER_BI target resource {target_resource.id} is missing workspace_id")
+
+        power_bi_client = self.get_power_bi_client(tenant)
+        existing_items = await power_bi_client.list_fabric_items(workspace_id)
+        existing_lookup = {
+            (item.get("type"), item.get("displayName")): item
+            for item in existing_items
+            if item.get("type") and item.get("displayName")
+        }
+
+        restore_priority = {
+            "POWER_BI_DATAFLOW": 10,
+            "POWER_BI_SEMANTIC_MODEL": 20,
+            "POWER_BI_REPORT": 30,
+            "POWER_BI_PAGINATED_REPORT": 31,
+            "POWER_BI_DASHBOARD": 40,
+            "POWER_BI_TILE": 41,
+        }
+        ordered_items = sorted(items, key=lambda item: restore_priority.get(item.item_type, 100))
+
+        restored_count = 0
+        failed_count = 0
+        manual_actions: List[str] = []
+        semantic_model_map: Dict[str, str] = {}
+
+        for item in ordered_items:
+            metadata = self._get_item_metadata(item)
+            if item.is_deleted:
+                manual_actions.append(f"{item.name}: source artifact is deleted and cannot be replayed directly.")
+                continue
+
+            if not metadata.get("restore_supported"):
+                manual_actions.extend(metadata.get("manual_actions", []) or [f"{item.name}: manual restore required."])
+                continue
+
+            try:
+                payload = self._load_snapshot_item_payload(item, "power-bi")
+                definition = payload.get("definition")
+                artifact = payload.get("artifact", {})
+                fabric_item_type = metadata.get("fabric_item_type")
+                display_name = artifact.get("displayName") or artifact.get("name") or item.name
+
+                if not definition or not fabric_item_type:
+                    manual_actions.append(f"{item.name}: definition payload missing, manual restore required.")
+                    continue
+
+                existing = existing_lookup.get((fabric_item_type, display_name))
+                if existing:
+                    await power_bi_client.update_item_definition(
+                        workspace_id,
+                        existing["id"],
+                        definition,
+                        update_metadata=True,
+                    )
+                    restored_item_id = existing["id"]
+                else:
+                    created = await power_bi_client.create_item(
+                        workspace_id,
+                        display_name=display_name,
+                        item_type=fabric_item_type,
+                        definition=definition,
+                        description=artifact.get("description"),
+                    )
+                    restored_item_id = created.get("id")
+                    existing_lookup[(fabric_item_type, display_name)] = {
+                        "id": restored_item_id,
+                        "displayName": display_name,
+                        "type": fabric_item_type,
+                    }
+
+                if item.item_type == "POWER_BI_SEMANTIC_MODEL":
+                    semantic_model_map[item.external_id] = restored_item_id
+
+                if item.item_type in ("POWER_BI_REPORT", "POWER_BI_PAGINATED_REPORT"):
+                    original_dataset_id = artifact.get("datasetId")
+                    rebound_dataset_id = semantic_model_map.get(original_dataset_id)
+                    if rebound_dataset_id:
+                        await power_bi_client.rebind_report_in_group(
+                            workspace_id,
+                            restored_item_id,
+                            rebound_dataset_id,
+                        )
+                    else:
+                        manual_actions.append(
+                            f"{display_name}: semantic model rebind required because the referenced dataset was not restored in this run."
+                        )
+
+                restored_count += 1
+            except Exception as exc:
+                print(f"[{self.worker_id}] Failed to restore Power BI item {item.id}: {exc}")
+                failed_count += 1
+
+        if power_bi_client.refresh_token:
+            tenant_record = await session.get(Tenant, tenant.id)
+            if tenant_record:
+                await PowerBIClient.persist_refresh_token(session, tenant_record, power_bi_client.refresh_token)
+
+        return {
+            "restored_count": restored_count,
+            "failed_count": failed_count,
+            "manual_actions": sorted(set(manual_actions)),
+            "restore_type": "POWER_BI",
+        }
+
     # ==================== Utility Methods ====================
+
+    def _extract_power_bi_workspace_id(self, resource: Resource) -> Optional[str]:
+        metadata = resource.extra_data or {}
+        workspace_id = metadata.get("workspace_id")
+        if workspace_id:
+            return workspace_id
+        if resource.external_id and resource.external_id.startswith("pbi_ws_"):
+            return resource.external_id.replace("pbi_ws_", "", 1)
+        return resource.external_id
+
+    def _get_item_metadata(self, item: SnapshotItem) -> Dict[str, Any]:
+        return getattr(item, "extra_data", None) or getattr(item, "metadata", None) or {}
+
+    def _load_snapshot_item_payload(self, item: SnapshotItem, resource_type: str) -> Dict[str, Any]:
+        metadata = self._get_item_metadata(item)
+        if metadata.get("raw"):
+            return metadata["raw"]
+
+        if not self.blob_service_client or not item.blob_path:
+            return {}
+
+        container_name = azure_storage_manager.get_container_name(str(item.tenant_id), resource_type)
+        blob_client = self.blob_service_client.get_blob_client(container=container_name, blob=item.blob_path)
+        payload_bytes = blob_client.download_blob().readall()
+        return json.loads(payload_bytes.decode("utf-8"))
 
     def _create_eml_from_json(self, email_data: Dict) -> str:
         """Create EML file content from email JSON"""
@@ -642,6 +804,12 @@ class RestoreWorker:
             client_id=app.client_id,
             client_secret=app.client_secret,
             tenant_id=tenant.external_tenant_id,
+        )
+
+    def get_power_bi_client(self, tenant: Tenant) -> PowerBIClient:
+        return PowerBIClient(
+            tenant_id=tenant.external_tenant_id or settings.EFFECTIVE_POWER_BI_TENANT_ID,
+            refresh_token=PowerBIClient.get_refresh_token_from_tenant(tenant),
         )
 
     async def update_job_status(

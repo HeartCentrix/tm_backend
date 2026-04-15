@@ -18,6 +18,7 @@ from sqlalchemy import select, text
 
 from shared.config import settings
 from shared.database import async_session_factory, init_db
+from shared.power_bi_client import PowerBIClient
 from shared.models import (
     Tenant, TenantStatus, TenantType,
     Resource, ResourceStatus, ResourceType,
@@ -84,15 +85,25 @@ async def discover_tenant(tenant_id: UUID) -> int:
                 logger.warning("No Microsoft credentials. Skipping tenant %s.", tenant_id)
                 return 0
 
+            power_bi_refresh_token = PowerBIClient.get_refresh_token_from_tenant(tenant)
             logger.info(
-                "Starting discovery for tenant %s (%s) using app-only auth...",
-                tenant.display_name, tenant_id,
+                "Starting discovery for tenant %s (%s) using %s auth for Power BI...",
+                tenant.display_name,
+                tenant_id,
+                "delegated service-user" if power_bi_refresh_token else "app-only",
             )
             tenant.status = TenantStatus.DISCOVERING
             await db.flush()
 
-            graph = GraphClient(client_id, client_secret, ext_tenant_id)
+            graph = GraphClient(
+                client_id,
+                client_secret,
+                ext_tenant_id,
+                power_bi_refresh_token=power_bi_refresh_token,
+            )
             resources = await graph.discover_all()
+            if power_bi_refresh_token and graph.power_bi_refresh_token and graph.power_bi_refresh_token != power_bi_refresh_token:
+                await PowerBIClient.persist_refresh_token(db, tenant, graph.power_bi_refresh_token)
             logger.info("Discovered %d resources for tenant %s.", len(resources), tenant.display_name)
 
             count = 0

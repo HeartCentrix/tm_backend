@@ -465,3 +465,28 @@ class AdminConsentTokenResponse(BaseModel):
     consentType: str
     message: str
     consentedAt: str
+
+
+class PowerBIOAuthCallbackRequest(BaseModel):
+    tenantId: str
+    code: str
+    state: Optional[str] = None
+
+
+class PowerBIReadinessCheckResponse(BaseModel):
+    key: str
+    label: str
+    status: str
+    detail: str
+
+
+class PowerBIReadinessResponse(BaseModel):
+    tenantId: str
+    status: str
+    summary: str
+    authMode: str
+    usesDedicatedApp: bool
+    accessibleWorkspaceCount: int
+    discoveredWorkspaceCount: int
+    checks: List[PowerBIReadinessCheckResponse]
+    recommendedActions: List[str]
