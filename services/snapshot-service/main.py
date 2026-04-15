@@ -1,3 +1,4 @@
+import asyncio
 """Snapshot Service - Manages snapshots and snapshot items"""
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -386,14 +387,14 @@ async def _read_blob(blob_path: str) -> dict:
             except Exception:
                 continue
         return {}
-    except Exception as e:
-        print(f"[snapshot-service] blob read error {blob_path}: {e}")
+    except Exception:
         return {}
 
 
 def _raw(item) -> dict:
     meta = item.extra_data or {}
-    return meta.get("raw") or meta.get("structured") or (meta if meta else {})
+    r = meta.get("raw") or meta.get("structured") or meta
+    return r if isinstance(r, dict) else {}
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")
@@ -472,19 +473,30 @@ async def list_snapshot_messages(
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
 
-    def fmt(i):
+    sem = asyncio.Semaphore(20)
+
+    async def fmt(i):
         raw = _raw(i)
-        sender = raw.get("from", {}).get("user", {})
+        # Read blob concurrently if metadata is empty
+        if (not raw or len(raw) <= 2) and i.blob_path:
+            async with sem:
+                raw = await _read_blob(i.blob_path) or {}
+        if not isinstance(raw, dict): raw = {}
+        _from = raw.get("from") or {}
+        sender_obj = (_from.get("user") or _from.get("application") or {}) if isinstance(_from, dict) else {}
+        body_obj = raw.get("body", {})
+        # Fallback: name column stores the body text
+        body_text = body_obj.get("content") or (i.name if i.name and i.name != "<systemEventMessage/>" else "")
         return {
             "id": str(i.id),
             "snapshotId": str(i.snapshot_id),
             "externalId": i.external_id,
             "itemType": i.item_type,
-            "sender": sender.get("displayName") or i.name,
-            "senderEmail": sender.get("userPrincipalName") or sender.get("email") or "",
-            "body": raw.get("body", {}).get("content") or "",
-            "bodyContentType": raw.get("body", {}).get("contentType") or "text",
-            "date": raw.get("createdDateTime") or raw.get("lastModifiedDateTime") or (i.created_at.isoformat() if i.created_at else None),
+            "sender": sender_obj.get("displayName") or "",
+            "senderEmail": sender_obj.get("userPrincipalName") or sender_obj.get("email") or "",
+            "body": body_text,
+            "bodyContentType": body_obj.get("contentType") or "html",
+            "date": raw.get("createdDateTime") or (i.created_at.isoformat() if i.created_at else None),
             "chatTopic": (i.extra_data or {}).get("chatTopic") or "",
             "channelName": (i.extra_data or {}).get("channelName") or "",
             "folderPath": i.folder_path,
@@ -494,11 +506,12 @@ async def list_snapshot_messages(
             "isReply": i.item_type == "TEAMS_MESSAGE_REPLY",
             "contentSize": i.content_size or 0,
             "createdAt": i.created_at.isoformat() if i.created_at else "",
-            "name": sender.get("displayName") or i.name or "",
+            "name": sender_obj.get("displayName") or "",
             "metadata": {"raw": raw},
         }
 
-    return {"content": [fmt(i) for i in items], "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
+    results = await asyncio.gather(*[fmt(i) for i in items])
+    return {"content": list(results), "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/calendar")
