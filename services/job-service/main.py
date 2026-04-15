@@ -1,6 +1,7 @@
 """Job Service - Manages jobs, backup triggers, restore, and exports"""
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, List
+import uuid
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 import json
@@ -466,7 +467,6 @@ async def trigger_datasource_backup(request: TriggerDatasourceBackupRequest, db:
     stmt = select(Resource).where(
         Resource.tenant_id == UUID(request.tenantId),
         Resource.type.in_(resource_types),
-        Resource.sla_policy_id.is_not(None),
         Resource.status.notin_([
             ResourceStatus.INACCESSIBLE,
             ResourceStatus.SUSPENDED,
@@ -479,7 +479,7 @@ async def trigger_datasource_backup(request: TriggerDatasourceBackupRequest, db:
     if not resources:
         raise HTTPException(
             status_code=404,
-            detail=f"No backup-eligible {service_key.upper()} resources found for this datasource. Make sure discovery has run and SLA policies are assigned."
+            detail=f"No backup-eligible {service_key.upper()} resources found for this datasource. Make sure discovery has run first."
         )
 
     resources_map = {str(resource.id): resource for resource in resources}

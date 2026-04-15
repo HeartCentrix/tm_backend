@@ -193,6 +193,7 @@ async def resource(request: Request):
 @app.post("/api/v1/backups/trigger")
 @app.post("/api/v1/backups/trigger-user/{resource_id}")
 @app.post("/api/v1/backups/trigger-bulk")
+@app.post("/api/v1/backups/trigger-datasource")
 @app.get("/api/v1/dlq/stats")
 @app.post("/api/v1/dlq/{dlq_name}/purge")
 @app.post("/api/v1/dlq/{dlq_name}/requeue")

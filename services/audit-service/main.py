@@ -35,13 +35,60 @@ app = FastAPI(title="Audit Log Service", version="1.0.0")
 
 # Action codes
 
+# In-memory cache for running job progress (refreshed every second)
+_running_job_cache: Dict[str, dict] = {}
+
+
+def _fmt_bytes(b: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} PB"
+
+
+def _compute_details(job: Job) -> str:
+    """Compute details string using data_backed_up/total_data formula."""
+    if job.error_message:
+        return job.error_message
+    cached = _running_job_cache.get(str(job.id), {})
+    data_backed_up = cached.get("data_backed_up", job.bytes_processed or 0)
+    total_data = cached.get("total_data") or (job.result.get("total_bytes", 0) if job.result else 0)
+    if total_data > 0:
+        pct = min(100, int((data_backed_up / total_data) * 100))
+        return f"{pct}% ({_fmt_bytes(data_backed_up)} / {_fmt_bytes(total_data)})"
+    if data_backed_up > 0:
+        return f"{_fmt_bytes(data_backed_up)} backed up"
+    return f"Progress: {job.progress_pct or 0}%"
+
+
+async def _refresh_running_jobs():
+    """Background task: refresh data_backed_up/total_data for RUNNING jobs every second."""
+    while True:
+        try:
+            async with async_session_factory() as db:
+                result = await db.execute(select(Job).where(Job.status == JobStatus.RUNNING))
+                running_jobs = result.scalars().all()
+                new_cache = {
+                    str(job.id): {
+                        "data_backed_up": job.bytes_processed or 0,
+                        "total_data": (job.result.get("total_bytes", 0) if job.result else 0),
+                    }
+                    for job in running_jobs
+                }
+                _running_job_cache.clear()
+                _running_job_cache.update(new_cache)
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
 
 @app.on_event("startup")
 async def startup():
     """Initialize message bus and start consumer on startup"""
     await message_bus.connect()
-    # Start audit event consumer in background
     asyncio.create_task(consume_audit_events())
+    asyncio.create_task(_refresh_running_jobs())
 
 
 @app.on_event("shutdown")
@@ -155,15 +202,20 @@ async def list_activities(
                 if resource:
                     resource_name = resource.display_name
 
-            items.append({
-                "id": str(job.id),
-                "start_time": job.created_at.isoformat() if job.created_at else "",
-                "operation": job.type.value if hasattr(job.type, 'value') else str(job.type),
-                "object": resource_name,
-                "status": status_reverse_map.get(job.status, "In Progress"),
-                "finish_time": job.completed_at.isoformat() if job.completed_at else "",
-                "details": job.error_message or f"Progress: {job.progress_pct}%",
-            })
+            cached = _running_job_cache.get(str(job.id), {})
+            data_backed_up = cached.get("data_backed_up", job.bytes_processed or 0)
+            total_data = cached.get("total_data") or (job.result.get("total_bytes", 0) if job.result else 0)
+            items.append({
+                "id": str(job.id),
+                "start_time": job.created_at.isoformat() if job.created_at else "",
+                "operation": job.type.value if hasattr(job.type, 'value') else str(job.type),
+                "object": resource_name,
+                "status": status_reverse_map.get(job.status, "In Progress"),
+                "finish_time": job.completed_at.isoformat() if job.completed_at else "",
+                "details": _compute_details(job),
+                "data_backed_up": data_backed_up,
+                "total_data": total_data,
+            })
 
         return {
             "items": items,
@@ -221,7 +273,7 @@ async def export_activity_csv(
                 str(job.resource_id) if job.resource_id else "Bulk",
                 job.status.value if hasattr(job.status, 'value') else str(job.status),
                 job.completed_at.isoformat() if job.completed_at else "",
-                job.error_message or f"Progress: {job.progress_pct}%",
+                _compute_details(job),
             ])
 
         output.seek(0)
