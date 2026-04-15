@@ -7,10 +7,10 @@ import csv
 import io
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Response
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 
 from shared.config import settings
-from shared.database import get_db, init_db, close_db, AsyncSession
+from shared.database import get_db, close_db, AsyncSession, engine
 from shared.models import Tenant, TenantType, TenantStatus, Organization, Resource, ResourceStatus, ResourceType, SlaPolicy
 from shared.schemas import (
     TenantResponse, TenantCreateRequest, DiscoveryStatus, TenantInfoResponse,
@@ -84,7 +84,9 @@ async def run_tenant_discovery(db: AsyncSession, tenant: Tenant) -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    # Keep startup lightweight so worker boot does not block tenant reads.
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
     yield
     await close_db()
 

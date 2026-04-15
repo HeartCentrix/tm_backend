@@ -6,6 +6,10 @@ from sqlalchemy import text
 
 from shared.config import settings
 
+SCHEMA_INIT_LOCK_ID = 1234567890
+DDL_LOCK_TIMEOUT = "2000ms"
+DDL_STATEMENT_TIMEOUT = "30000ms"
+
 # Append search_path to the connection
 engine = create_async_engine(
     settings.DATABASE_URL,
@@ -46,44 +50,56 @@ async def init_db():
     No separate migration script or init_db.py needed.
     """
     # Advisory lock — serialize init across all concurrent service instances
-    # Prevents race condition on CREATE TABLE IF NOT EXISTS (pg_type_typname_nsp_index)
-    async with engine.begin() as conn:
-        await conn.execute(text("SELECT pg_advisory_xact_lock(1234567890);"))
-        await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {settings.DB_SCHEMA}"))
-        await conn.execute(text(f"SET search_path TO {settings.DB_SCHEMA}"))
+    # Prevents race conditions on bootstrap, and try-lock avoids queuing behind
+    # another init attempt while live traffic is using the same tables.
+    try:
+        async with engine.begin() as conn:
+            locked = (
+                await conn.execute(text(f"SELECT pg_try_advisory_xact_lock({SCHEMA_INIT_LOCK_ID});"))
+            ).scalar()
+            if not locked:
+                return
 
-        # ── Enum Types (idempotent) ──
-        enum_statements = [
-            """DO $$ BEGIN
-                CREATE TYPE userrole AS ENUM ('SUPER_ADMIN', 'ORG_ADMIN', 'TENANT_ADMIN', 'BACKUP_OPERATOR', 'RESTORE_OPERATOR', 'CONTENT_VIEWER', 'USER');
-            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
-            """DO $$ BEGIN
-                CREATE TYPE tenanttype AS ENUM ('M365', 'AZURE', 'BOTH');
-            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
-            """DO $$ BEGIN
-                CREATE TYPE tenantstatus AS ENUM ('PENDING', 'ACTIVE', 'DISCONNECTED', 'SUSPENDED', 'PENDING_DELETION', 'DISCOVERING', 'PENDING_DISCOVERY');
-            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
-            """DO $$ BEGIN
-                CREATE TYPE resourcetype AS ENUM ('MAILBOX', 'SHARED_MAILBOX', 'ROOM_MAILBOX', 'ONEDRIVE', 'SHAREPOINT_SITE', 'TEAMS_CHANNEL', 'TEAMS_CHAT', 'ENTRA_USER', 'ENTRA_GROUP', 'ENTRA_APP', 'ENTRA_SERVICE_PRINCIPAL', 'ENTRA_DEVICE', 'AZURE_VM', 'AZURE_SQL_DB', 'AZURE_POSTGRESQL', 'AZURE_POSTGRESQL_SINGLE', 'RESOURCE_GROUP', 'DYNAMIC_GROUP', 'POWER_BI', 'POWER_APPS', 'POWER_AUTOMATE', 'POWER_DLP', 'COPILOT', 'PLANNER', 'TODO', 'ONENOTE');
-            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
-            """DO $$ BEGIN
-                CREATE TYPE resourcestatus AS ENUM ('DISCOVERED', 'ACTIVE', 'ARCHIVED', 'SUSPENDED', 'PENDING_DELETION', 'INACCESSIBLE');
-            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
-            """DO $$ BEGIN
-                CREATE TYPE jobtype AS ENUM ('BACKUP', 'RESTORE', 'EXPORT', 'DISCOVERY', 'DELETE');
-            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
-            """DO $$ BEGIN
-                CREATE TYPE jobstatus AS ENUM ('QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'RETRYING');
-            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
-            """DO $$ BEGIN
-                CREATE TYPE snapshottype AS ENUM ('FULL', 'INCREMENTAL', 'PREEMPTIVE', 'MANUAL');
-            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
-            """DO $$ BEGIN
-                CREATE TYPE snapshotstatus AS ENUM ('IN_PROGRESS', 'COMPLETED', 'FAILED', 'PARTIAL', 'PENDING_DELETION');
-            EXCEPTION WHEN duplicate_object THEN null; END $$;""",
-        ]
-        for stmt in enum_statements:
-            await conn.execute(text(stmt))
+            await conn.execute(text(f"SET LOCAL lock_timeout = '{DDL_LOCK_TIMEOUT}'"))
+            await conn.execute(text(f"SET LOCAL statement_timeout = '{DDL_STATEMENT_TIMEOUT}'"))
+            await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {settings.DB_SCHEMA}"))
+            await conn.execute(text(f"SET search_path TO {settings.DB_SCHEMA}"))
+
+            # ── Enum Types (idempotent) ──
+            enum_statements = [
+                """DO $$ BEGIN
+                    CREATE TYPE userrole AS ENUM ('SUPER_ADMIN', 'ORG_ADMIN', 'TENANT_ADMIN', 'BACKUP_OPERATOR', 'RESTORE_OPERATOR', 'CONTENT_VIEWER', 'USER');
+                EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+                """DO $$ BEGIN
+                    CREATE TYPE tenanttype AS ENUM ('M365', 'AZURE', 'BOTH');
+                EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+                """DO $$ BEGIN
+                    CREATE TYPE tenantstatus AS ENUM ('PENDING', 'ACTIVE', 'DISCONNECTED', 'SUSPENDED', 'PENDING_DELETION', 'DISCOVERING', 'PENDING_DISCOVERY');
+                EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+                """DO $$ BEGIN
+                    CREATE TYPE resourcetype AS ENUM ('MAILBOX', 'SHARED_MAILBOX', 'ROOM_MAILBOX', 'ONEDRIVE', 'SHAREPOINT_SITE', 'TEAMS_CHANNEL', 'TEAMS_CHAT', 'ENTRA_USER', 'ENTRA_GROUP', 'ENTRA_APP', 'ENTRA_SERVICE_PRINCIPAL', 'ENTRA_DEVICE', 'AZURE_VM', 'AZURE_SQL_DB', 'AZURE_POSTGRESQL', 'AZURE_POSTGRESQL_SINGLE', 'RESOURCE_GROUP', 'DYNAMIC_GROUP', 'POWER_BI', 'POWER_APPS', 'POWER_AUTOMATE', 'POWER_DLP', 'COPILOT', 'PLANNER', 'TODO', 'ONENOTE');
+                EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+                """DO $$ BEGIN
+                    CREATE TYPE resourcestatus AS ENUM ('DISCOVERED', 'ACTIVE', 'ARCHIVED', 'SUSPENDED', 'PENDING_DELETION', 'INACCESSIBLE');
+                EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+                """DO $$ BEGIN
+                    CREATE TYPE jobtype AS ENUM ('BACKUP', 'RESTORE', 'EXPORT', 'DISCOVERY', 'DELETE');
+                EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+                """DO $$ BEGIN
+                    CREATE TYPE jobstatus AS ENUM ('QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'RETRYING');
+                EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+                """DO $$ BEGIN
+                    CREATE TYPE snapshottype AS ENUM ('FULL', 'INCREMENTAL', 'PREEMPTIVE', 'MANUAL');
+                EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+                """DO $$ BEGIN
+                    CREATE TYPE snapshotstatus AS ENUM ('IN_PROGRESS', 'COMPLETED', 'FAILED', 'PARTIAL', 'PENDING_DELETION');
+                EXCEPTION WHEN duplicate_object THEN null; END $$;""",
+            ]
+            for stmt in enum_statements:
+                await conn.execute(text(stmt))
+    except Exception as e:
+        print(f"[DB INIT] Skipping bootstrap phase due to lock/timeout: {e}")
+        return
 
     # ── Ensure ALL enum values exist (must run OUTSIDE transaction — ALTER TYPE ADD VALUE can't be in a tx block) ──
     ensure_enum_values = [
@@ -136,30 +152,40 @@ async def init_db():
         try:
             # ALTER TYPE ADD VALUE cannot run inside a transaction — use AUTOCOMMIT
             async with engine.begin() as ac:
+                await ac.execute(text(f"SET LOCAL lock_timeout = '{DDL_LOCK_TIMEOUT}'"))
+                await ac.execute(text(f"SET LOCAL statement_timeout = '{DDL_STATEMENT_TIMEOUT}'"))
                 await ac.execute(text(stmt))
         except Exception:
             pass  # Already exists or not supported
 
     # Now create tables and run remaining ALTERs inside a new transaction
     # Advisory lock prevents race condition on CREATE TABLE IF NOT EXISTS
-    async with engine.begin() as conn:
-        await conn.execute(text("SELECT pg_advisory_xact_lock(1234567890);"))
-        await conn.execute(text(f"SET search_path TO {settings.DB_SCHEMA};"))
+    try:
+        async with engine.begin() as conn:
+            locked = (
+                await conn.execute(text(f"SELECT pg_try_advisory_xact_lock({SCHEMA_INIT_LOCK_ID});"))
+            ).scalar()
+            if not locked:
+                return
 
-        # ── CREATE TABLE IF NOT EXISTS (13 tables + indexes) ──
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS organizations (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                name VARCHAR NOT NULL,
-                slug VARCHAR UNIQUE NOT NULL,
-                storage_region VARCHAR,
-                encryption_mode VARCHAR DEFAULT 'TMVAULT_MANAGED',
-                storage_quota_bytes BIGINT DEFAULT 536870912000,
-                storage_bytes_used BIGINT DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
+            await conn.execute(text(f"SET LOCAL lock_timeout = '{DDL_LOCK_TIMEOUT}'"))
+            await conn.execute(text(f"SET LOCAL statement_timeout = '{DDL_STATEMENT_TIMEOUT}'"))
+            await conn.execute(text(f"SET search_path TO {settings.DB_SCHEMA};"))
+
+            # ── CREATE TABLE IF NOT EXISTS (13 tables + indexes) ──
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS organizations (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    name VARCHAR NOT NULL,
+                    slug VARCHAR UNIQUE NOT NULL,
+                    storage_region VARCHAR,
+                    encryption_mode VARCHAR DEFAULT 'TMVAULT_MANAGED',
+                    storage_quota_bytes BIGINT DEFAULT 536870912000,
+                    storage_bytes_used BIGINT DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
 
         # 2. Tenants
         await conn.execute(text("""
@@ -560,8 +586,10 @@ async def init_db():
             except Exception:
                 pass  # Already converted
 
-        # Sync ORM models (for any remaining ORM-specific configurations)
-        await conn.run_sync(Base.metadata.create_all)
+            # Sync ORM models (for any remaining ORM-specific configurations)
+            await conn.run_sync(Base.metadata.create_all)
+    except Exception as e:
+        print(f"[DB INIT] Skipping schema sync phase due to lock/timeout: {e}")
 
 
 async def close_db():

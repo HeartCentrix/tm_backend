@@ -86,6 +86,7 @@ async def health():
 
 @app.get("/api/v1/activity")
 async def list_activities(
+    tenantId: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     operation: Optional[str] = Query(None),
@@ -110,6 +111,8 @@ async def list_activities(
         count_stmt = select(func.count()).select_from(Job)
 
         filters = []
+        if tenantId:
+            filters.append(Job.tenant_id == uuid.UUID(tenantId))
         if start_date:
             filters.append(Job.created_at >= datetime.fromisoformat(start_date))
         if end_date:

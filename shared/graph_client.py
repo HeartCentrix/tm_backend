@@ -189,8 +189,13 @@ class GraphClient:
     async def discover_users(self) -> List[Dict[str, Any]]:
         """Fetch all users from Entra ID"""
         result = await self._get(f"{self.GRAPH_URL}/users", params={"$top": "999", "$count": "true"})
+        all_value = result.get("value", [])
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_value.extend(result.get("value", []))
+
         users = []
-        for u in result.get("value", []):
+        for u in all_value:
             is_enabled = u.get("accountEnabled", True)
             users.append({
                 "external_id": u.get("id"),
@@ -211,8 +216,13 @@ class GraphClient:
     async def discover_groups(self) -> List[Dict[str, Any]]:
         """Fetch all groups from Entra ID"""
         result = await self._get(f"{self.GRAPH_URL}/groups", params={"$top": "999", "$count": "true"})
+        all_value = result.get("value", [])
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_value.extend(result.get("value", []))
+
         groups = []
-        for g in result.get("value", []):
+        for g in all_value:
             groups.append({
                 "external_id": g.get("id"),
                 "display_name": g.get("displayName", "Unknown"),
@@ -252,6 +262,9 @@ class GraphClient:
                     "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,accountEnabled,createdDateTime"},
         )
         all_users = users_result.get("value", [])
+        while "@odata.nextLink" in users_result:
+            users_result = await self._get(users_result["@odata.nextLink"])
+            all_users.extend(users_result.get("value", []))
         mailboxes = []
 
         # Step 2: Enrich each user with userPurpose
@@ -352,8 +365,13 @@ class GraphClient:
             f"{self.GRAPH_URL}/sites",
             params={"$search": '"contentclass:STS_Site" AND NOT "contentclass:STS_MySite"', "$top": "999"}
         )
+        all_value = result.get("value", [])
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_value.extend(result.get("value", []))
+
         sites = []
-        for site in result.get("value", []):
+        for site in all_value:
             sites.append({
                 "external_id": site.get("id", "").replace(",", "/"),
                 "display_name": site.get("displayName") or site.get("name", "Unknown Site"),
@@ -375,7 +393,12 @@ class GraphClient:
             f"{self.GRAPH_URL}/groups",
             params={"$filter": "resourceProvisioningOptions/Any(x:x eq 'Team')", "$top": "999"}
         )
-        for g in result.get("value", []):
+        all_teams = result.get("value", [])
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_teams.extend(result.get("value", []))
+
+        for g in all_teams:
             resources.append({
                 "external_id": g.get("id"),
                 "display_name": g.get("displayName", "Unknown Team"),
@@ -761,6 +784,15 @@ class GraphClient:
         # No $select or $expand — delta endpoint ignores them
         params = {"$top": "999"}
         result = await self._get(url, params=params)
+        all_value = result.get("value", [])
+
+        # Follow pagination
+        while "@odata.nextLink" in result:
+            next_url = result["@odata.nextLink"]
+            result = await self._get(next_url)
+            all_value.extend(result.get("value", []))
+
+        result["value"] = all_value
         return result
 
     async def get_sharepoint_site_lists(self, site_id: str) -> Dict[str, Any]:
@@ -781,6 +813,15 @@ class GraphClient:
 
         params = {"$expand": "fields", "$top": "999"}
         result = await self._get(url, params=params)
+        all_value = result.get("value", [])
+
+        # Follow pagination
+        while "@odata.nextLink" in result:
+            next_url = result["@odata.nextLink"]
+            result = await self._get(next_url)
+            all_value.extend(result.get("value", []))
+
+        result["value"] = all_value
         return result
 
     async def get_site_permissions(self, site_id: str) -> Dict[str, Any]:
@@ -795,7 +836,17 @@ class GraphClient:
         Get channels in a Teams team.
         Graph API: GET /teams/{team-id}/channels
         """
-        return await self._get(f"{self.GRAPH_URL}/teams/{team_id}/channels", params={"$top": "999"})
+        result = await self._get(f"{self.GRAPH_URL}/teams/{team_id}/channels", params={"$top": "999"})
+        all_value = result.get("value", [])
+
+        # Follow pagination
+        while "@odata.nextLink" in result:
+            next_url = result["@odata.nextLink"]
+            result = await self._get(next_url)
+            all_value.extend(result.get("value", []))
+
+        result["value"] = all_value
+        return result
 
     async def get_channel_messages(self, team_id: str, channel_id: str, delta_token: str = None) -> Dict[str, Any]:
         """
@@ -808,6 +859,15 @@ class GraphClient:
 
         params = {"$top": "999"}
         result = await self._get(url, params=params)
+        all_value = result.get("value", [])
+
+        # Follow pagination
+        while "@odata.nextLink" in result:
+            next_url = result["@odata.nextLink"]
+            result = await self._get(next_url)
+            all_value.extend(result.get("value", []))
+
+        result["value"] = all_value
         return result
 
     async def get_channel_messages_replies(self, team_id: str, channel_id: str, message_id: str) -> Dict[str, Any]:
@@ -831,6 +891,15 @@ class GraphClient:
 
         params = {"$top": "999", "$expand": "members,permission"}
         result = await self._get(url, params=params)
+        all_value = result.get("value", [])
+
+        # Follow pagination
+        while "@odata.nextLink" in result:
+            next_url = result["@odata.nextLink"]
+            result = await self._get(next_url)
+            all_value.extend(result.get("value", []))
+
+        result["value"] = all_value
         return result
 
     async def get_chat_messages(self, chat_id: str, delta_token: str = None) -> Dict[str, Any]:
@@ -842,6 +911,15 @@ class GraphClient:
         url = f"{self.GRAPH_URL}/chats/{chat_id}/messages"
         params = {"$top": "999"}
         result = await self._get(url, params=params)
+        all_value = result.get("value", [])
+
+        # Follow pagination
+        while "@odata.nextLink" in result:
+            next_url = result["@odata.nextLink"]
+            result = await self._get(next_url)
+            all_value.extend(result.get("value", []))
+
+        result["value"] = all_value
         return result
 
     async def get_group_profile(self, group_id: str) -> Dict[str, Any]:
@@ -901,21 +979,39 @@ class GraphClient:
         Get Entra ID application registrations.
         Graph API: GET /applications
         """
-        return await self._get(f"{self.GRAPH_URL}/applications", params={"$top": "999"})
+        result = await self._get(f"{self.GRAPH_URL}/applications", params={"$top": "999"})
+        all_value = result.get("value", [])
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_value.extend(result.get("value", []))
+        result["value"] = all_value
+        return result
 
     async def get_entra_service_principals(self) -> Dict[str, Any]:
         """
         Get service principals.
         Graph API: GET /servicePrincipals
         """
-        return await self._get(f"{self.GRAPH_URL}/servicePrincipals", params={"$top": "999"})
+        result = await self._get(f"{self.GRAPH_URL}/servicePrincipals", params={"$top": "999"})
+        all_value = result.get("value", [])
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_value.extend(result.get("value", []))
+        result["value"] = all_value
+        return result
 
     async def get_entra_devices(self) -> Dict[str, Any]:
         """
         Get registered devices.
         Graph API: GET /devices
         """
-        return await self._get(f"{self.GRAPH_URL}/devices", params={"$top": "999"})
+        result = await self._get(f"{self.GRAPH_URL}/devices", params={"$top": "999"})
+        all_value = result.get("value", [])
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_value.extend(result.get("value", []))
+        result["value"] = all_value
+        return result
 
     async def get_user_mailbox_settings(self, user_id: str) -> Dict[str, Any]:
         """
@@ -942,11 +1038,20 @@ class GraphClient:
 
         params = {"$top": "999"}
         result = await self._get(url, params=params)
+        all_value = result.get("value", [])
+
+        # Follow pagination
+        while "@odata.nextLink" in result:
+            next_url = result["@odata.nextLink"]
+            result = await self._get(next_url)
+            all_value.extend(result.get("value", []))
+
+        result["value"] = all_value
         return result
 
     async def get_messages_delta(self, user_id: str, delta_token: str = None) -> Dict[str, Any]:
         """
-        Get mailbox messages.
+        Get mailbox messages with full pagination.
         NOTE: Graph API does NOT support delta/change tracking on messages with app-only auth.
         Falls back to regular /messages endpoint with $top pagination.
         Graph API: GET /users/{id}/messages
@@ -954,6 +1059,15 @@ class GraphClient:
         url = f"{self.GRAPH_URL}/users/{user_id}/messages"
         params = {"$top": "999"}
         result = await self._get(url, params=params)
+        all_value = result.get("value", [])
+
+        # Follow pagination
+        while "@odata.nextLink" in result:
+            next_url = result["@odata.nextLink"]
+            result = await self._get(next_url)
+            all_value.extend(result.get("value", []))
+
+        result["value"] = all_value
         return result
 
     async def get_drive_items_delta(self, drive_id: str, delta_token: str = None) -> Dict[str, Any]:
@@ -974,6 +1088,15 @@ class GraphClient:
         # No $select or $expand — delta endpoint ignores them and returns empty
         params = {"$top": "999"}
         result = await self._get(url, params=params)
+        all_value = result.get("value", [])
+
+        # Follow pagination
+        while "@odata.nextLink" in result:
+            next_url = result["@odata.nextLink"]
+            result = await self._get(next_url)
+            all_value.extend(result.get("value", []))
+
+        result["value"] = all_value
         return result
 
     async def get_user_onedrive_root(self, user_id: str) -> Dict[str, Any]:
@@ -1043,6 +1166,15 @@ class GraphClient:
 
         params = {"$top": "999"}
         result = await self._get(url, params=params)
+        all_value = result.get("value", [])
+
+        # Follow pagination
+        while "@odata.nextLink" in result:
+            next_url = result["@odata.nextLink"]
+            result = await self._get(next_url)
+            all_value.extend(result.get("value", []))
+
+        result["value"] = all_value
         return result
 
     async def get_planner_tasks(self, user_id: str = None, plan_id: str = None) -> Dict[str, Any]:
@@ -1056,8 +1188,18 @@ class GraphClient:
             url = f"{self.GRAPH_URL}/users/{user_id}/planner/tasks"
         else:
             return {"value": []}
-        
-        return await self._get(url, params={"$top": "999"})
+
+        result = await self._get(url, params={"$top": "999"})
+        all_value = result.get("value", [])
+
+        # Follow pagination
+        while "@odata.nextLink" in result:
+            next_url = result["@odata.nextLink"]
+            result = await self._get(next_url)
+            all_value.extend(result.get("value", []))
+
+        result["value"] = all_value
+        return result
 
     async def get_power_bi_workspaces(self) -> Dict[str, Any]:
         """
