@@ -2058,6 +2058,21 @@ class BackupWorker:
             progress_pct = int(item_pct * 0.7 + byte_pct * 0.3)
         else:
             progress_pct = item_pct
+        # Persist directly to DB so progress survives progress-tracker restarts
+        try:
+            async with async_session_factory() as session:
+                job = await session.get(Job, uuid.UUID(job_id))
+                if job:
+                    job.progress_pct = progress_pct
+                    job.items_processed = items_processed
+                    job.bytes_processed = bytes_processed
+                    if job.status not in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+                        job.status = JobStatus.RUNNING
+                    await session.commit()
+        except Exception as e:
+            print(f"[{self.worker_id}] DB progress update failed: {e}")
+
+        # Also notify progress-tracker (best-effort, for real-time SSE/cache)
         await self.progress_reporter.report(
             resource_id=resource_id, job_id=job_id, status="RUNNING",
             progress_pct=progress_pct, processed_items=items_processed,
