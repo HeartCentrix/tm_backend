@@ -56,6 +56,7 @@ ACTIONS = {
     "BACKUP_COMPLETED": "Backup completed successfully",
     "BACKUP_FAILED": "Backup failed permanently",
     "BACKUP_PREEMPTIVE": "Preemptive backup triggered (AI detection)",
+    "BACKUP_SKIPPED_SLA_SCOPE": "Scheduled backup skipped because the assigned SLA does not cover the resource workload",
     "RESTORE_TRIGGERED": "Restore job triggered",
     "RESTORE_COMPLETED": "Restore completed",
     "RESTORE_FAILED": "Restore failed",
@@ -77,6 +78,8 @@ ACTIONS = {
     "LOGIN_FAILED": "User login failed",
     "RANSOMWARE_SIGNAL": "AI ransomware signal detected",
 }
+
+WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE"}
 
 M365_RESOURCE_TYPES = {
     ResourceType.MAILBOX,
@@ -151,6 +154,7 @@ async def list_activities(
     async with async_session_factory() as db:
         service_key = _parse_service_type(serviceType)
         service_resource_types = _resource_types_for_service(service_key)
+        service_type_values = {rt.value if hasattr(rt, "value") else str(rt) for rt in service_resource_types} if service_resource_types else None
 
         # Build status filter
         status_map = {
@@ -159,6 +163,8 @@ async def list_activities(
             "Failed": JobStatus.FAILED,
             "Canceled": JobStatus.CANCELLED,
         }
+        include_job_items = status != "Warning"
+        include_warning_items = (not operation or operation.upper() == "BACKUP") and (not status or status == "Warning")
 
         stmt = select(Job).select_from(Job).outerjoin(Resource, Job.resource_id == Resource.id).order_by(desc(Job.created_at))
         count_stmt = select(func.count()).select_from(Job).outerjoin(Resource, Job.resource_id == Resource.id)
@@ -183,18 +189,44 @@ async def list_activities(
                 )
             )
 
-        if filters:
-            stmt = stmt.where(and_(*filters))
-            count_stmt = count_stmt.where(and_(*filters))
+        jobs: List[Job] = []
+        job_total = 0
+        if include_job_items:
+            if filters:
+                stmt = stmt.where(and_(*filters))
+                count_stmt = count_stmt.where(and_(*filters))
 
-        # Total count
-        total_result = await db.execute(count_stmt)
-        total = total_result.scalar() or 0
+            # Fetch enough rows so warning items can be merged into the same paginated feed.
+            fetch_limit = max(size, page * size)
+            stmt = stmt.limit(fetch_limit)
+            total_result = await db.execute(count_stmt)
+            job_total = total_result.scalar() or 0
+            result = await db.execute(stmt)
+            jobs = result.scalars().all()
 
-        # Paginated results
-        stmt = stmt.offset((page - 1) * size).limit(size)
-        result = await db.execute(stmt)
-        jobs = result.scalars().all()
+        warning_filters = [AuditEvent.action.in_(WARNING_ACTIVITY_ACTIONS)]
+        if tenantId:
+            warning_filters.append(AuditEvent.tenant_id == uuid.UUID(tenantId))
+        if start_date:
+            warning_filters.append(AuditEvent.occurred_at >= datetime.fromisoformat(start_date))
+        if end_date:
+            warning_filters.append(AuditEvent.occurred_at <= datetime.fromisoformat(end_date))
+        if service_type_values:
+            warning_filters.append(AuditEvent.resource_type.in_(service_type_values))
+
+        warning_events: List[AuditEvent] = []
+        warning_total = 0
+        if include_warning_items:
+            warning_stmt = (
+                select(AuditEvent)
+                .where(and_(*warning_filters))
+                .order_by(desc(AuditEvent.occurred_at))
+                .limit(max(size, page * size))
+            )
+            warning_count_stmt = select(func.count()).select_from(AuditEvent).where(and_(*warning_filters))
+            warning_total = (await db.execute(warning_count_stmt)).scalar() or 0
+            warning_result = await db.execute(warning_stmt)
+            warning_events = warning_result.scalars().all()
 
         # Map jobs to ActivityItem format
         status_reverse_map = {
@@ -225,8 +257,25 @@ async def list_activities(
                 "details": job.error_message or f"Progress: {job.progress_pct}%",
             })
 
+        for event in warning_events:
+            details = event.details or {}
+            items.append({
+                "id": f"audit-{event.id}",
+                "start_time": event.occurred_at.isoformat() if event.occurred_at else "",
+                "operation": "BACKUP",
+                "object": event.resource_name or event.resource_type or "Unknown resource",
+                "status": "Warning",
+                "finish_time": event.occurred_at.isoformat() if event.occurred_at else "",
+                "details": details.get("message") or "Backup skipped because the assigned SLA does not cover this resource type.",
+            })
+
+        items.sort(key=lambda item: item["start_time"] or "", reverse=True)
+        total = job_total + warning_total
+        start_index = (page - 1) * size
+        paginated_items = items[start_index:start_index + size]
+
         return {
-            "items": items,
+            "items": paginated_items,
             "total": total,
             "page": page,
             "size": size,

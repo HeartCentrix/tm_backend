@@ -26,7 +26,12 @@ from shared.models import (
     Resource, SlaPolicy, Tenant, Job, Organization, Snapshot,
     ResourceType, ResourceStatus, JobType, JobStatus, SnapshotType, TenantStatus, TenantType
 )
-from shared.message_bus import message_bus, create_mass_backup_message, create_backup_message
+from shared.message_bus import (
+    message_bus,
+    create_mass_backup_message,
+    create_backup_message,
+    create_audit_event_message,
+)
 from shared.config import settings
 from shared.power_bi_client import PowerBIClient
 
@@ -65,6 +70,54 @@ RESOURCE_TYPE_TO_SLA_FLAG: Dict[str, str] = {
     "AZURE_SQL_DB": "backup_azure_sql",
     "AZURE_POSTGRESQL": "backup_azure_postgresql",
     "AZURE_POSTGRESQL_SINGLE": "backup_azure_postgresql",
+}
+
+RESOURCE_TYPE_DISPLAY_NAMES: Dict[str, str] = {
+    "MAILBOX": "Exchange mailboxes",
+    "SHARED_MAILBOX": "shared mailboxes",
+    "ROOM_MAILBOX": "room mailboxes",
+    "ONEDRIVE": "OneDrive",
+    "SHAREPOINT_SITE": "SharePoint",
+    "TEAMS_CHANNEL": "Teams channel data",
+    "TEAMS_CHAT": "Teams chats",
+    "ENTRA_USER": "Entra user data",
+    "ENTRA_GROUP": "Entra group data",
+    "ENTRA_APP": "Entra app data",
+    "ENTRA_SERVICE_PRINCIPAL": "Entra service principal data",
+    "ENTRA_DEVICE": "Entra device data",
+    "ENTRA_ROLE": "Entra role data",
+    "ENTRA_ADMIN_UNIT": "Entra administrative unit data",
+    "ENTRA_AUDIT_LOG": "Entra audit data",
+    "INTUNE_MANAGED_DEVICE": "Intune managed devices",
+    "POWER_BI": "Power BI",
+    "POWER_APPS": "Power Apps",
+    "POWER_AUTOMATE": "Power Automate",
+    "POWER_DLP": "Power DLP",
+    "COPILOT": "Copilot",
+    "PLANNER": "Planner",
+    "TODO": "Microsoft To Do",
+    "ONENOTE": "OneNote",
+    "AZURE_VM": "Azure virtual machines",
+    "AZURE_SQL_DB": "Azure SQL databases",
+    "AZURE_POSTGRESQL": "Azure PostgreSQL",
+    "AZURE_POSTGRESQL_SINGLE": "Azure PostgreSQL",
+}
+
+SLA_FLAG_DISPLAY_NAMES: Dict[str, str] = {
+    "backup_exchange": "Exchange",
+    "backup_onedrive": "OneDrive and OneNote",
+    "backup_sharepoint": "SharePoint",
+    "backup_teams": "Teams channels",
+    "backup_teams_chats": "Teams chats",
+    "backup_entra_id": "Entra ID",
+    "backup_power_platform": "Power Platform",
+    "backup_copilot": "Copilot",
+    "planner": "Planner",
+    "tasks": "Tasks",
+    "group_mailbox": "group mailbox",
+    "backup_azure_vm": "Virtual machines",
+    "backup_azure_sql": "Azure SQL databases",
+    "backup_azure_postgresql": "Azure PostgreSQL servers",
 }
 
 # AZ-4: Azure workload queue routing
@@ -128,6 +181,53 @@ def resource_type_enabled(resource_type: str, policy: SlaPolicy) -> bool:
         # Unknown or unsupported resource types should not be scheduled automatically.
         return False
     return getattr(policy, flag_name, True)
+
+
+def build_sla_skip_message(resource_type: str, policy: SlaPolicy) -> tuple[str, str | None, str | None]:
+    workload_name = RESOURCE_TYPE_DISPLAY_NAMES.get(resource_type, resource_type.replace("_", " ").title())
+    flag_name = RESOURCE_TYPE_TO_SLA_FLAG.get(resource_type)
+    flag_label = SLA_FLAG_DISPLAY_NAMES.get(flag_name or "", flag_name)
+
+    if flag_label:
+        message = (
+            f"Scheduled backup skipped because SLA '{policy.name}' does not cover {workload_name}. "
+            f"Enable '{flag_label}' in the policy to include this resource."
+        )
+    else:
+        message = (
+            f"Scheduled backup skipped because SLA '{policy.name}' has no workload mapping for {workload_name}."
+        )
+    return message, flag_name, flag_label
+
+
+async def publish_sla_skip_audit_events(policy: SlaPolicy, skipped_resources: List[Resource]):
+    """Emit warning audit events for resources skipped by SLA coverage filters."""
+    if not skipped_resources:
+        return
+
+    for resource in skipped_resources:
+        resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+        message, flag_name, flag_label = build_sla_skip_message(resource_type, policy)
+        audit_message = create_audit_event_message(
+            action="BACKUP_SKIPPED_SLA_SCOPE",
+            tenant_id=str(resource.tenant_id),
+            actor_type="SYSTEM",
+            resource_id=str(resource.id),
+            resource_type=resource_type,
+            resource_name=resource.display_name,
+            outcome="PARTIAL",
+            details={
+                "message": message,
+                "skip_reason": "sla_scope_mismatch",
+                "policy_id": str(policy.id),
+                "policy_name": policy.name,
+                "required_flag": flag_name,
+                "required_flag_label": flag_label,
+                "resource_status": resource.status.value if hasattr(resource.status, "value") else str(resource.status),
+                "source": "backup_scheduler",
+            },
+        )
+        await message_bus.publish("audit.events", audit_message, priority=3)
 
 
 @app.on_event("startup")
@@ -339,14 +439,19 @@ async def dispatch_policy_backups(policy_id: str):
             return
 
         # Filter resources by the policy's backup flags
-        enabled_resources = [
-            r for r in all_resources
-            if resource_type_enabled(r.type.value, policy)
-        ]
+        enabled_resources = []
+        skipped_resources = []
+        for resource in all_resources:
+            resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+            if resource_type_enabled(resource_type, policy):
+                enabled_resources.append(resource)
+            else:
+                skipped_resources.append(resource)
 
-        skipped = len(all_resources) - len(enabled_resources)
+        skipped = len(skipped_resources)
         if skipped > 0:
             print(f"[SCHEDULER] Filtered out {skipped} resources (disabled by policy flags)")
+            await publish_sla_skip_audit_events(policy, skipped_resources)
 
         if not enabled_resources:
             print(f"[SCHEDULER] No enabled resources for policy '{policy.name}' after flag filtering")

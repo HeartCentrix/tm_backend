@@ -63,6 +63,13 @@ GROUP_LINKED_TYPES = {
 }
 
 VALID_POLICY_SERVICE_TYPES = {"m365", "azure"}
+AZURE_POLICY_RESOURCE_TYPES = {
+    ResourceType.AZURE_VM,
+    ResourceType.AZURE_SQL_DB,
+    ResourceType.AZURE_POSTGRESQL,
+    ResourceType.AZURE_POSTGRESQL_SINGLE,
+    ResourceType.RESOURCE_GROUP,
+}
 
 
 def normalize_policy_service_type(value: Optional[str]) -> Optional[str]:
@@ -77,6 +84,10 @@ def normalize_policy_service_type(value: Optional[str]) -> Optional[str]:
 def tenant_policy_service_type(tenant: Tenant) -> str:
     tenant_type = tenant.type.value if hasattr(tenant.type, "value") else str(tenant.type or "")
     return "azure" if tenant_type.upper() == TenantType.AZURE.value else "m365"
+
+
+def resource_policy_service_type(resource: Resource) -> str:
+    return "azure" if resource.type in AZURE_POLICY_RESOURCE_TYPES else "m365"
 
 
 async def validate_policy_scope(
@@ -96,16 +107,21 @@ async def validate_policy_scope(
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
-    tenant_service_type = tenant_policy_service_type(tenant)
-    if policy_service_type != tenant_service_type:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{policy_service_type.upper()} SLA policies can't be assigned to {tenant_service_type.upper()} resources",
-        )
-
+    resource_service_types = set()
     for resource in resources:
         if resource.tenant_id != tenant_id:
             raise HTTPException(status_code=400, detail="All resources must belong to the same tenant as the policy")
+        resource_service_types.add(resource_policy_service_type(resource))
+
+    if len(resource_service_types) > 1:
+        raise HTTPException(status_code=400, detail="Resources must belong to a single service type")
+
+    target_service_type = next(iter(resource_service_types), tenant_policy_service_type(tenant))
+    if policy_service_type != target_service_type:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{policy_service_type.upper()} SLA policies can't be assigned to {target_service_type.upper()} resources",
+        )
 
     return policy
 
