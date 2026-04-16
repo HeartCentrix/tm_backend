@@ -330,11 +330,17 @@ async def send_email_notification(report: Dict[str, Any], recipients: List[str],
             part.add_header("Content-Disposition", f'attachment; filename="backup_details.csv"')
             msg.attach(part)
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.sendmail(SMTP_FROM, recipients, msg.as_string())
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+                server.ehlo()
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.sendmail(SMTP_FROM, recipients, msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+                server.ehlo()
+                server.starttls()
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.sendmail(SMTP_FROM, recipients, msg.as_string())
 
     try:
         await asyncio.to_thread(_send)

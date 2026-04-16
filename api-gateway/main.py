@@ -48,7 +48,7 @@ app.add_middleware(
 )
 
 
-async def proxy_request(service: str, path: str, request: Request):
+async def proxy_request(service: str, path: str, request: Request, timeout: httpx.Timeout = None):
     """Forward request to microservice with retry logic"""
     import asyncio
 
@@ -76,6 +76,7 @@ async def proxy_request(service: str, path: str, request: Request):
                 headers=headers,
                 params=request.query_params,
                 content=await request.body(),
+                timeout=timeout,
             )
 
             return Response(
@@ -281,7 +282,8 @@ async def policy(request: Request):
 @app.get("/api/v1/reports/history/{report_id}")
 @app.post("/api/v1/reports/generate")
 async def report_proxy(request: Request):
-    return await proxy_request("report", request.url.path, request)
+    return await proxy_request("report", request.url.path, request,
+                               timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0))
 
 
 # Access Control routes
