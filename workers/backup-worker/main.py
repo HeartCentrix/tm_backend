@@ -43,6 +43,7 @@ from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
 from shared.metadata_extractor import MetadataExtractor
 from shared.power_bi_client import PowerBIClient
+from shared.power_platform_client import PowerPlatformClient
 from shared.power_bi_snapshot import (
     POWER_BI_INCREMENTAL_STRATEGY_VERSION,
     assemble_power_bi_items,
@@ -239,25 +240,36 @@ class BackupWorker:
                 "ENTRA_APP": self.backup_entra_single,
                 "ENTRA_DEVICE": self.backup_entra_single,
                 "ENTRA_SERVICE_PRINCIPAL": self.backup_entra_single,
-                # Planner / Tasks / Copilot / Power Platform
+                # Planner / Tasks — dispatched to real handlers via _backup_metadata_only
                 "PLANNER": self._backup_metadata_only,
                 "TODO": self._backup_metadata_only,
                 "ONENOTE": self._backup_metadata_only,
+                # Copilot: Graph exposes very little for backup — metadata blob is the correct
+                # approach until Microsoft extends the API. Not a gap, a data-source limit.
                 "COPILOT": self._backup_metadata_only,
+                # Power Platform: POWER_BI has a real handler; the others are
+                # metadata-only until Phase 2 (Power Platform Admin API client).
                 "POWER_BI": self.backup_power_bi_workspace,
                 "POWER_APPS": self._backup_metadata_only,
                 "POWER_AUTOMATE": self._backup_metadata_only,
                 "POWER_DLP": self._backup_metadata_only,
-                # Azure workloads
-                "AZURE_VM": self._backup_metadata_only,
-                "AZURE_SQL": self._backup_metadata_only,
-                "AZURE_SQL_DB": self._backup_metadata_only,
-                "AZURE_POSTGRESQL": self._backup_metadata_only,
+                # NOTE: Azure workloads (AZURE_VM, AZURE_SQL_DB, AZURE_POSTGRESQL) are
+                # routed by backup-scheduler to azure.vm / azure.sql / azure.postgres queues
+                # and handled by azure-workload-worker. They should NEVER reach this worker;
+                # if they do, the fallback below logs a warning and stores metadata.
                 # Other
                 "RESOURCE_GROUP": self._backup_metadata_only,
                 "DYNAMIC_GROUP": self._backup_metadata_only,
             }
 
+            if resource_type not in handlers:
+                if resource_type and str(resource_type).startswith("AZURE_"):
+                    print(f"[{self.worker_id}] [ROUTING WARNING] Azure workload {resource_type} reached backup-worker; "
+                          f"scheduler should route to azure-workload-worker via azure.* queue. "
+                          f"Falling back to metadata-only for resource {resource.id}")
+                else:
+                    print(f"[{self.worker_id}] [ROUTING WARNING] No dedicated handler for {resource_type}; "
+                          f"falling back to metadata-only for resource {resource.id}")
             handler = handlers.get(resource_type, self._backup_metadata_only)
 
             try:
@@ -2037,10 +2049,13 @@ class BackupWorker:
 
     async def _backup_metadata_only(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                                     tenant: Tenant, message: Dict) -> Dict:
-        """
-        Dispatch to type-specific backup handler.
-        PLANNER / TODO / ONENOTE get real Graph API calls.
-        Everything else (Copilot, Power Platform, Azure VMs) gets metadata stored.
+        """Dispatcher for workloads routed through the 'metadata-only' entry point.
+        Misleading name kept for backward compatibility; actual coverage:
+
+          PLANNER / TODO / ONENOTE    - full Graph content backup
+          POWER_APPS / POWER_AUTOMATE - full definition backup via Power Platform Admin API
+          POWER_DLP                   - policy JSON backup
+          COPILOT and anything else   - metadata blob (Graph doesn't expose richer content yet)
         """
         resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
         obj_id = resource.external_id
@@ -2051,6 +2066,12 @@ class BackupWorker:
             return await self._backup_todo(graph_client, resource, snapshot, tenant, obj_id)
         elif resource_type == "ONENOTE":
             return await self._backup_onenote(graph_client, resource, snapshot, tenant, obj_id)
+        elif resource_type == "POWER_APPS":
+            return await self._backup_power_app(resource, snapshot, tenant)
+        elif resource_type == "POWER_AUTOMATE":
+            return await self._backup_power_flow(resource, snapshot, tenant)
+        elif resource_type == "POWER_DLP":
+            return await self._backup_power_dlp(resource, snapshot, tenant)
         else:
             return await self._store_metadata_blob(resource, snapshot, tenant, resource_type)
 
@@ -2086,254 +2107,661 @@ class BackupWorker:
 
     async def _backup_planner(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                               tenant: Tenant, obj_id: str) -> Dict:
-        """Backup Planner plans and tasks for a group."""
+        """Backup Planner plans + tasks + task details (description, checklist, references) for a group.
+
+        Item types emitted:
+          PLANNER_PLAN         - plan metadata
+          PLANNER_TASK         - task summary
+          PLANNER_TASK_DETAILS - description / checklist / references (may 404 on stale tasks)
+        Per-task failures are counted and stored in snapshot.delta_tokens_json['files_failed'];
+        fatal plan-listing errors propagate to the parent for FAILED marking."""
         print(f"[{self.worker_id}] [PLANNER START] {resource.display_name} ({obj_id})")
-        item_count = 0
         bytes_added = 0
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "planner")
-        db_items = []
+        db_items: List[SnapshotItem] = []
+        files_failed = 0
 
-        try:
-            plans = await graph_client.get_planner_plans_for_group(obj_id)
-            plan_list = plans.get("value", [])
-            print(f"[{self.worker_id}]   [PLANNER] {len(plan_list)} plans found")
+        plans = await graph_client.get_planner_plans_for_group(obj_id)
+        plan_list = plans.get("value", [])
+        print(f"[{self.worker_id}]   [PLANNER] {len(plan_list)} plans found")
 
-            for plan in plan_list:
-                plan_id = plan.get("id", str(uuid.uuid4()))
-                # Store plan metadata
-                content_bytes = json.dumps(plan).encode()
-                content_hash = hashlib.sha256(content_bytes).hexdigest()
-                blob_path = azure_storage_manager.build_blob_path(
-                    str(tenant.id), str(resource.id), str(snapshot.id), f"plan_{plan_id}"
+        for plan in plan_list:
+            plan_id = plan.get("id", str(uuid.uuid4()))
+            content_bytes = json.dumps(plan).encode()
+            content_hash = hashlib.sha256(content_bytes).hexdigest()
+            blob_path = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id), f"plan_{plan_id}"
+            )
+            r = await upload_blob_with_retry(container, blob_path, content_bytes, shard)
+            if r.get("success"):
+                db_items.append(SnapshotItem(
+                    snapshot_id=snapshot.id, tenant_id=tenant.id,
+                    external_id=plan_id, item_type="PLANNER_PLAN",
+                    name=plan.get("title", plan_id),
+                    content_hash=content_hash, content_size=len(content_bytes),
+                    blob_path=blob_path, metadata={"raw": plan}, content_checksum=content_hash,
+                ))
+                bytes_added += len(content_bytes)
+
+            try:
+                tasks = await graph_client.get_planner_tasks(plan_id=plan_id)
+            except Exception as e:
+                files_failed += 1
+                print(f"[{self.worker_id}]   [PLANNER] Tasks list failed for plan {plan_id}: {e}")
+                continue
+
+            for task in tasks.get("value", []):
+                task_id = task.get("id", str(uuid.uuid4()))
+                tb = json.dumps(task).encode()
+                th = hashlib.sha256(tb).hexdigest()
+                tp = azure_storage_manager.build_blob_path(
+                    str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}"
                 )
-                r = await upload_blob_with_retry(container, blob_path, content_bytes, shard)
-                if r.get("success"):
+                tr = await upload_blob_with_retry(container, tp, tb, shard)
+                if tr.get("success"):
                     db_items.append(SnapshotItem(
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
-                        external_id=plan_id, item_type="PLANNER_PLAN",
-                        name=plan.get("title", plan_id),
-                        content_hash=content_hash, content_size=len(content_bytes),
-                        blob_path=blob_path, metadata={"raw": plan}, content_checksum=content_hash,
+                        external_id=task_id, item_type="PLANNER_TASK",
+                        name=task.get("title", task_id),
+                        content_hash=th, content_size=len(tb),
+                        blob_path=tp, metadata={"raw": task, "planId": plan_id},
+                        content_checksum=th,
                     ))
-                    item_count += 1
-                    bytes_added += len(content_bytes)
+                    bytes_added += len(tb)
 
-                # Fetch and store tasks for this plan
+                # Fetch task details (description, checklist, references) — separate endpoint
                 try:
-                    tasks = await graph_client.get_planner_tasks(plan_id=plan_id)
-                    for task in tasks.get("value", []):
-                        task_id = task.get("id", str(uuid.uuid4()))
-                        tb = json.dumps(task).encode()
-                        th = hashlib.sha256(tb).hexdigest()
-                        tp = azure_storage_manager.build_blob_path(
-                            str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}"
-                        )
-                        tr = await upload_blob_with_retry(container, tp, tb, shard)
-                        if tr.get("success"):
-                            db_items.append(SnapshotItem(
-                                snapshot_id=snapshot.id, tenant_id=tenant.id,
-                                external_id=task_id, item_type="PLANNER_TASK",
-                                name=task.get("title", task_id),
-                                content_hash=th, content_size=len(tb),
-                                blob_path=tp, metadata={"raw": task, "planId": plan_id},
-                                content_checksum=th,
-                            ))
-                            item_count += 1
-                            bytes_added += len(tb)
+                    details = await graph_client.get_planner_task_details(task_id)
                 except Exception as e:
-                    print(f"[{self.worker_id}]   [PLANNER] Tasks fetch failed for plan {plan_id}: {e}")
+                    files_failed += 1
+                    print(f"[{self.worker_id}]   [PLANNER] Task details failed for {task_id}: {e}")
+                    continue
 
-        except Exception as e:
-            print(f"[{self.worker_id}] [PLANNER] Failed: {e}")
+                if details:
+                    db = json.dumps(details).encode()
+                    dh = hashlib.sha256(db).hexdigest()
+                    dp = azure_storage_manager.build_blob_path(
+                        str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}_details"
+                    )
+                    dr = await upload_blob_with_retry(container, dp, db, shard)
+                    if dr.get("success"):
+                        db_items.append(SnapshotItem(
+                            snapshot_id=snapshot.id, tenant_id=tenant.id,
+                            external_id=f"{task_id}:details", item_type="PLANNER_TASK_DETAILS",
+                            name=(task.get("title") or task_id) + " (details)",
+                            content_hash=dh, content_size=len(db),
+                            blob_path=dp, metadata={"taskId": task_id, "planId": plan_id},
+                            content_checksum=dh,
+                        ))
+                        bytes_added += len(db)
 
         if db_items:
             async with async_session_factory() as session:
                 session.add_all(db_items)
                 await session.commit()
 
-        print(f"[{self.worker_id}] [PLANNER COMPLETE] {resource.display_name} — {item_count} items")
-        return {"item_count": item_count, "bytes_added": bytes_added}
+        if files_failed:
+            snapshot.delta_tokens_json = {**(snapshot.delta_tokens_json or {}), "files_failed": files_failed}
+
+        print(f"[{self.worker_id}] [PLANNER COMPLETE] {resource.display_name} — {len(db_items)} items, {files_failed} failures")
+        return {"item_count": len(db_items), "bytes_added": bytes_added}
 
     async def _backup_todo(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                            tenant: Tenant, obj_id: str) -> Dict:
-        """Backup Microsoft To Do lists and tasks for a user."""
+        """Backup Microsoft To Do lists + tasks + checklistItems + linkedResources for a user.
+
+        Item types emitted:
+          TODO_LIST               - list metadata
+          TODO_TASK               - task summary (title, body, dueDate, reminders)
+          TODO_TASK_CHECKLIST     - nested subtasks
+          TODO_TASK_LINKED        - attached URLs / app references
+        Per-task failures counted in snapshot.delta_tokens_json['files_failed'];
+        fatal list errors propagate."""
         print(f"[{self.worker_id}] [TODO START] {resource.display_name} ({obj_id})")
-        item_count = 0
         bytes_added = 0
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "todo")
-        db_items = []
+        db_items: List[SnapshotItem] = []
+        files_failed = 0
 
-        try:
-            lists = await graph_client.get_user_todo_lists(obj_id)
-            list_items = lists.get("value", [])
-            print(f"[{self.worker_id}]   [TODO] {len(list_items)} task lists found")
+        async def backup_task_extras(list_id: str, task_id: str, task_title: str):
+            """Fetch checklistItems and linkedResources for a task; return (items, bytes)."""
+            nonlocal files_failed
+            extras: List[SnapshotItem] = []
+            extras_bytes = 0
 
-            async def backup_todo_list(lst):
-                list_id = lst.get("id", str(uuid.uuid4()))
-                lb = json.dumps(lst).encode()
-                lh = hashlib.sha256(lb).hexdigest()
-                lp = azure_storage_manager.build_blob_path(
-                    str(tenant.id), str(resource.id), str(snapshot.id), f"list_{list_id}"
-                )
-                lr = await upload_blob_with_retry(container, lp, lb, shard)
-                local_items = []
-                local_bytes = 0
-                if lr.get("success"):
-                    local_items.append(SnapshotItem(
-                        snapshot_id=snapshot.id, tenant_id=tenant.id,
-                        external_id=list_id, item_type="TODO_LIST",
-                        name=lst.get("displayName", list_id),
-                        content_hash=lh, content_size=len(lb),
-                        blob_path=lp, metadata={"raw": lst}, content_checksum=lh,
-                    ))
-                    local_bytes += len(lb)
-
+            for kind, fetch_fn, item_type in (
+                ("checklist", graph_client.get_user_todo_task_checklist, "TODO_TASK_CHECKLIST"),
+                ("linked",    graph_client.get_user_todo_task_linked_resources, "TODO_TASK_LINKED"),
+            ):
                 try:
-                    tasks = await graph_client.get_user_todo_tasks(obj_id, list_id)
-                    for task in tasks.get("value", []):
-                        task_id = task.get("id", str(uuid.uuid4()))
-                        tb = json.dumps(task).encode()
-                        th = hashlib.sha256(tb).hexdigest()
-                        tp = azure_storage_manager.build_blob_path(
-                            str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}"
-                        )
-                        tr = await upload_blob_with_retry(container, tp, tb, shard)
-                        if tr.get("success"):
-                            local_items.append(SnapshotItem(
-                                snapshot_id=snapshot.id, tenant_id=tenant.id,
-                                external_id=task_id, item_type="TODO_TASK",
-                                name=task.get("title", task_id),
-                                content_hash=th, content_size=len(tb),
-                                blob_path=tp, metadata={"raw": task, "listId": list_id},
-                                content_checksum=th,
-                            ))
-                            local_bytes += len(tb)
+                    payload = await fetch_fn(obj_id, list_id, task_id)
                 except Exception as e:
-                    print(f"[{self.worker_id}]   [TODO] Tasks fetch failed for list {list_id}: {e}")
+                    files_failed += 1
+                    print(f"[{self.worker_id}]   [TODO] {kind} fetch failed for task {task_id}: {e}")
+                    continue
+                values = payload.get("value", []) if isinstance(payload, dict) else []
+                if not values:
+                    continue
+                data = json.dumps({"value": values}).encode()
+                h = hashlib.sha256(data).hexdigest()
+                path = azure_storage_manager.build_blob_path(
+                    str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}_{kind}"
+                )
+                r = await upload_blob_with_retry(container, path, data, shard)
+                if r.get("success"):
+                    extras.append(SnapshotItem(
+                        snapshot_id=snapshot.id, tenant_id=tenant.id,
+                        external_id=f"{task_id}:{kind}", item_type=item_type,
+                        name=f"{task_title} ({kind})",
+                        content_hash=h, content_size=len(data),
+                        blob_path=path, metadata={"taskId": task_id, "listId": list_id, "count": len(values)},
+                        content_checksum=h,
+                    ))
+                    extras_bytes += len(data)
+            return extras, extras_bytes
 
+        async def backup_todo_list(lst):
+            nonlocal files_failed
+            list_id = lst.get("id", str(uuid.uuid4()))
+            local_items: List[SnapshotItem] = []
+            local_bytes = 0
+
+            lb = json.dumps(lst).encode()
+            lh = hashlib.sha256(lb).hexdigest()
+            lp = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id), f"list_{list_id}"
+            )
+            lr = await upload_blob_with_retry(container, lp, lb, shard)
+            if lr.get("success"):
+                local_items.append(SnapshotItem(
+                    snapshot_id=snapshot.id, tenant_id=tenant.id,
+                    external_id=list_id, item_type="TODO_LIST",
+                    name=lst.get("displayName", list_id),
+                    content_hash=lh, content_size=len(lb),
+                    blob_path=lp, metadata={"raw": lst}, content_checksum=lh,
+                ))
+                local_bytes += len(lb)
+
+            try:
+                tasks = await graph_client.get_user_todo_tasks(obj_id, list_id)
+            except Exception as e:
+                files_failed += 1
+                print(f"[{self.worker_id}]   [TODO] Tasks fetch failed for list {list_id}: {e}")
                 return local_items, local_bytes
 
-            list_results = await asyncio.gather(*[backup_todo_list(lst) for lst in list_items], return_exceptions=True)
-            for r in list_results:
-                if isinstance(r, tuple):
-                    db_items.extend(r[0])
-                    bytes_added += r[1]
-            item_count = len(db_items)
+            for task in tasks.get("value", []):
+                task_id = task.get("id", str(uuid.uuid4()))
+                tb = json.dumps(task).encode()
+                th = hashlib.sha256(tb).hexdigest()
+                tp = azure_storage_manager.build_blob_path(
+                    str(tenant.id), str(resource.id), str(snapshot.id), f"task_{task_id}"
+                )
+                tr = await upload_blob_with_retry(container, tp, tb, shard)
+                if tr.get("success"):
+                    local_items.append(SnapshotItem(
+                        snapshot_id=snapshot.id, tenant_id=tenant.id,
+                        external_id=task_id, item_type="TODO_TASK",
+                        name=task.get("title", task_id),
+                        content_hash=th, content_size=len(tb),
+                        blob_path=tp, metadata={"raw": task, "listId": list_id},
+                        content_checksum=th,
+                    ))
+                    local_bytes += len(tb)
 
-        except Exception as e:
-            print(f"[{self.worker_id}] [TODO] Failed: {e}")
+                extras, extras_bytes = await backup_task_extras(list_id, task_id, task.get("title", task_id))
+                local_items.extend(extras)
+                local_bytes += extras_bytes
+
+            return local_items, local_bytes
+
+        lists = await graph_client.get_user_todo_lists(obj_id)
+        list_items = lists.get("value", [])
+        print(f"[{self.worker_id}]   [TODO] {len(list_items)} task lists found")
+
+        list_results = await asyncio.gather(*[backup_todo_list(lst) for lst in list_items], return_exceptions=True)
+        for r in list_results:
+            if isinstance(r, tuple):
+                db_items.extend(r[0])
+                bytes_added += r[1]
+            else:
+                print(f"[{self.worker_id}]   [TODO] List task error: {r}")
 
         if db_items:
             async with async_session_factory() as session:
                 session.add_all(db_items)
                 await session.commit()
 
-        print(f"[{self.worker_id}] [TODO COMPLETE] {resource.display_name} — {item_count} items")
-        return {"item_count": item_count, "bytes_added": bytes_added}
+        if files_failed:
+            snapshot.delta_tokens_json = {**(snapshot.delta_tokens_json or {}), "files_failed": files_failed}
+
+        print(f"[{self.worker_id}] [TODO COMPLETE] {resource.display_name} — {len(db_items)} items, {files_failed} failures")
+        return {"item_count": len(db_items), "bytes_added": bytes_added}
 
     async def _backup_onenote(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                               tenant: Tenant, obj_id: str) -> Dict:
-        """Backup OneNote notebooks, sections, and pages for a user."""
+        """Backup OneNote notebooks, sections, and pages (including HTML body + inline resources) for a user.
+
+        Three item types are written:
+          ONENOTE_NOTEBOOK  - notebook metadata JSON
+          ONENOTE_SECTION   - section metadata JSON
+          ONENOTE_PAGE      - page metadata JSON
+          ONENOTE_PAGE_CONTENT - page HTML body (text/html blob)
+          ONENOTE_RESOURCE  - inline image/attachment referenced by a page
+        Partial failures (e.g. single page content 404) are logged and skipped;
+        a top-level fatal error re-raises so the parent handler can mark the
+        snapshot FAILED."""
         print(f"[{self.worker_id}] [ONENOTE START] {resource.display_name} ({obj_id})")
-        item_count = 0
+        import re
         bytes_added = 0
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "onenote")
-        db_items = []
+        db_items: List[SnapshotItem] = []
+        files_failed = 0
+        resource_url_re = re.compile(r'data-fullres-src="([^"]+)"|src="(https://graph\.microsoft\.com/[^"]+)"')
 
-        try:
-            notebooks = await graph_client.get_onenote_notebooks(obj_id)
-            nb_list = notebooks.get("value", [])
-            print(f"[{self.worker_id}]   [ONENOTE] {len(nb_list)} notebooks found")
+        async def _upload(path: str, data: bytes) -> bool:
+            r = await upload_blob_with_retry(container, path, data, shard)
+            return bool(r.get("success"))
 
-            async def backup_notebook(nb):
-                nb_id = nb.get("id", str(uuid.uuid4()))
-                nb_b = json.dumps(nb).encode()
-                nb_h = hashlib.sha256(nb_b).hexdigest()
-                nb_p = azure_storage_manager.build_blob_path(
-                    str(tenant.id), str(resource.id), str(snapshot.id), f"notebook_{nb_id}"
+        async def backup_page(user_id: str, page: Dict, nb_id: str, sec_id: str):
+            nonlocal files_failed
+            pg_id = page.get("id", str(uuid.uuid4()))
+            local_items: List[SnapshotItem] = []
+            local_bytes = 0
+
+            # 1. page metadata
+            pb = json.dumps(page).encode()
+            ph = hashlib.sha256(pb).hexdigest()
+            pp = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id), f"page_{pg_id}"
+            )
+            if await _upload(pp, pb):
+                local_items.append(SnapshotItem(
+                    snapshot_id=snapshot.id, tenant_id=tenant.id,
+                    external_id=pg_id, item_type="ONENOTE_PAGE",
+                    name=page.get("title", pg_id),
+                    content_hash=ph, content_size=len(pb), blob_path=pp,
+                    metadata={"raw": page, "sectionId": sec_id, "notebookId": nb_id},
+                    content_checksum=ph,
+                ))
+                local_bytes += len(pb)
+
+            # 2. page HTML body
+            html = None
+            try:
+                html = await graph_client.get_onenote_page_content(user_id, pg_id)
+            except Exception as e:
+                files_failed += 1
+                print(f"[{self.worker_id}]   [ONENOTE] Page content fetch failed for {pg_id}: {e}")
+
+            if html:
+                hh = hashlib.sha256(html).hexdigest()
+                hp = azure_storage_manager.build_blob_path(
+                    str(tenant.id), str(resource.id), str(snapshot.id), f"page_{pg_id}_content"
                 )
-                nb_r = await upload_blob_with_retry(container, nb_p, nb_b, shard)
-                local_items = []
-                local_bytes = 0
-                if nb_r.get("success"):
+                if await _upload(hp, html):
                     local_items.append(SnapshotItem(
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
-                        external_id=nb_id, item_type="ONENOTE_NOTEBOOK",
-                        name=nb.get("displayName", nb_id),
-                        content_hash=nb_h, content_size=len(nb_b),
-                        blob_path=nb_p, metadata={"raw": nb}, content_checksum=nb_h,
+                        external_id=f"{pg_id}:content", item_type="ONENOTE_PAGE_CONTENT",
+                        name=(page.get("title") or pg_id) + " (content)",
+                        content_hash=hh, content_size=len(html), blob_path=hp,
+                        metadata={"pageId": pg_id, "sectionId": sec_id, "notebookId": nb_id,
+                                  "mime": "text/html"},
+                        content_checksum=hh,
                     ))
-                    local_bytes += len(nb_b)
+                    local_bytes += len(html)
 
+                # 3. inline resources (images / attachments) — dedupe URLs per page
                 try:
-                    sections = await graph_client.get_onenote_sections(obj_id, nb_id)
-                    for sec in sections.get("value", []):
-                        sec_id = sec.get("id", str(uuid.uuid4()))
-                        sb = json.dumps(sec).encode()
-                        sh = hashlib.sha256(sb).hexdigest()
-                        sp = azure_storage_manager.build_blob_path(
-                            str(tenant.id), str(resource.id), str(snapshot.id), f"section_{sec_id}"
-                        )
-                        sr = await upload_blob_with_retry(container, sp, sb, shard)
-                        if sr.get("success"):
-                            local_items.append(SnapshotItem(
-                                snapshot_id=snapshot.id, tenant_id=tenant.id,
-                                external_id=sec_id, item_type="ONENOTE_SECTION",
-                                name=sec.get("displayName", sec_id),
-                                content_hash=sh, content_size=len(sb),
-                                blob_path=sp, metadata={"raw": sec, "notebookId": nb_id},
-                                content_checksum=sh,
-                            ))
-                            local_bytes += len(sb)
-
+                    urls: List[str] = []
+                    for m in resource_url_re.finditer(html.decode("utf-8", errors="replace")):
+                        u = m.group(1) or m.group(2)
+                        if u and u not in urls:
+                            urls.append(u)
+                    for u in urls:
                         try:
-                            pages = await graph_client.get_onenote_pages(obj_id, sec_id)
-                            for page in pages.get("value", []):
-                                pg_id = page.get("id", str(uuid.uuid4()))
-                                pb = json.dumps(page).encode()
-                                ph = hashlib.sha256(pb).hexdigest()
-                                pp = azure_storage_manager.build_blob_path(
-                                    str(tenant.id), str(resource.id), str(snapshot.id), f"page_{pg_id}"
-                                )
-                                pr = await upload_blob_with_retry(container, pp, pb, shard)
-                                if pr.get("success"):
-                                    local_items.append(SnapshotItem(
-                                        snapshot_id=snapshot.id, tenant_id=tenant.id,
-                                        external_id=pg_id, item_type="ONENOTE_PAGE",
-                                        name=page.get("title", pg_id),
-                                        content_hash=ph, content_size=len(pb),
-                                        blob_path=pp,
-                                        metadata={"raw": page, "sectionId": sec_id, "notebookId": nb_id},
-                                        content_checksum=ph,
-                                    ))
-                                    local_bytes += len(pb)
+                            data = await graph_client.get_onenote_resource(u)
+                            rid_match = re.search(r"resources/([^/?]+)", u)
+                            rid = rid_match.group(1) if rid_match else hashlib.md5(u.encode()).hexdigest()[:16]
+                            rhash = hashlib.sha256(data).hexdigest()
+                            rpath = azure_storage_manager.build_blob_path(
+                                str(tenant.id), str(resource.id), str(snapshot.id), f"resource_{rid}"
+                            )
+                            if await _upload(rpath, data):
+                                local_items.append(SnapshotItem(
+                                    snapshot_id=snapshot.id, tenant_id=tenant.id,
+                                    external_id=rid, item_type="ONENOTE_RESOURCE",
+                                    name=rid,
+                                    content_hash=rhash, content_size=len(data), blob_path=rpath,
+                                    metadata={"pageId": pg_id, "sourceUrl": u},
+                                    content_checksum=rhash,
+                                ))
+                                local_bytes += len(data)
                         except Exception as e:
-                            print(f"[{self.worker_id}]   [ONENOTE] Pages fetch failed for section {sec_id}: {e}")
+                            files_failed += 1
+                            print(f"[{self.worker_id}]   [ONENOTE] Resource fetch failed for {u}: {e}")
                 except Exception as e:
-                    print(f"[{self.worker_id}]   [ONENOTE] Sections fetch failed for notebook {nb_id}: {e}")
+                    print(f"[{self.worker_id}]   [ONENOTE] Resource parse failed for {pg_id}: {e}")
 
+            return local_items, local_bytes
+
+        async def backup_notebook(nb: Dict):
+            nb_id = nb.get("id", str(uuid.uuid4()))
+            local_items: List[SnapshotItem] = []
+            local_bytes = 0
+
+            nb_b = json.dumps(nb).encode()
+            nb_h = hashlib.sha256(nb_b).hexdigest()
+            nb_p = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id), f"notebook_{nb_id}"
+            )
+            if await _upload(nb_p, nb_b):
+                local_items.append(SnapshotItem(
+                    snapshot_id=snapshot.id, tenant_id=tenant.id,
+                    external_id=nb_id, item_type="ONENOTE_NOTEBOOK",
+                    name=nb.get("displayName", nb_id),
+                    content_hash=nb_h, content_size=len(nb_b), blob_path=nb_p,
+                    metadata={"raw": nb}, content_checksum=nb_h,
+                ))
+                local_bytes += len(nb_b)
+
+            try:
+                sections = await graph_client.get_onenote_sections(obj_id, nb_id)
+            except Exception as e:
+                print(f"[{self.worker_id}]   [ONENOTE] Sections fetch failed for notebook {nb_id}: {e}")
                 return local_items, local_bytes
 
-            nb_results = await asyncio.gather(*[backup_notebook(nb) for nb in nb_list], return_exceptions=True)
-            for r in nb_results:
-                if isinstance(r, tuple):
-                    db_items.extend(r[0])
-                    bytes_added += r[1]
-            item_count = len(db_items)
+            for sec in sections.get("value", []):
+                sec_id = sec.get("id", str(uuid.uuid4()))
+                sb = json.dumps(sec).encode()
+                sh = hashlib.sha256(sb).hexdigest()
+                sp = azure_storage_manager.build_blob_path(
+                    str(tenant.id), str(resource.id), str(snapshot.id), f"section_{sec_id}"
+                )
+                if await _upload(sp, sb):
+                    local_items.append(SnapshotItem(
+                        snapshot_id=snapshot.id, tenant_id=tenant.id,
+                        external_id=sec_id, item_type="ONENOTE_SECTION",
+                        name=sec.get("displayName", sec_id),
+                        content_hash=sh, content_size=len(sb), blob_path=sp,
+                        metadata={"raw": sec, "notebookId": nb_id}, content_checksum=sh,
+                    ))
+                    local_bytes += len(sb)
 
-        except Exception as e:
-            print(f"[{self.worker_id}] [ONENOTE] Failed: {e}")
+                try:
+                    pages = await graph_client.get_onenote_pages(obj_id, sec_id)
+                    page_results = await asyncio.gather(
+                        *[backup_page(obj_id, pg, nb_id, sec_id) for pg in pages.get("value", [])],
+                        return_exceptions=True,
+                    )
+                    for pr in page_results:
+                        if isinstance(pr, tuple):
+                            local_items.extend(pr[0])
+                            local_bytes += pr[1]
+                        else:
+                            print(f"[{self.worker_id}]   [ONENOTE] Page task error: {pr}")
+                except Exception as e:
+                    print(f"[{self.worker_id}]   [ONENOTE] Pages fetch failed for section {sec_id}: {e}")
+
+            return local_items, local_bytes
+
+        notebooks = await graph_client.get_onenote_notebooks(obj_id)
+        nb_list = notebooks.get("value", [])
+        print(f"[{self.worker_id}]   [ONENOTE] {len(nb_list)} notebooks found")
+
+        nb_results = await asyncio.gather(*[backup_notebook(nb) for nb in nb_list], return_exceptions=True)
+        for r in nb_results:
+            if isinstance(r, tuple):
+                db_items.extend(r[0])
+                bytes_added += r[1]
+            else:
+                print(f"[{self.worker_id}]   [ONENOTE] Notebook task error: {r}")
 
         if db_items:
             async with async_session_factory() as session:
                 session.add_all(db_items)
                 await session.commit()
 
-        print(f"[{self.worker_id}] [ONENOTE COMPLETE] {resource.display_name} — {item_count} items")
-        return {"item_count": item_count, "bytes_added": bytes_added}
+        if files_failed:
+            snapshot.delta_tokens_json = {**(snapshot.delta_tokens_json or {}), "files_failed": files_failed}
+
+        print(f"[{self.worker_id}] [ONENOTE COMPLETE] {resource.display_name} — {len(db_items)} items, {files_failed} failures")
+        return {"item_count": len(db_items), "bytes_added": bytes_added}
+
+    # ==================== Power Platform (Apps / Flows / DLP) ====================
+    #
+    # These handlers capture each object's full definition via the Power Platform
+    # Admin API (api.bap.microsoft.com / api.flow.microsoft.com). The resource's
+    # extra_data must contain 'environment_id' and 'app_id' / 'flow_id' / 'policy_id'
+    # from discovery. Without those we fall back to storing resource.extra_data only.
+    #
+    # Restore path: re-import the definition JSON via the matching import endpoint.
+    # Full .msapp package export (async + SAS download) is a Phase 2b stretch.
+
+    async def _backup_power_app(self, resource: Resource, snapshot: Snapshot, tenant: Tenant) -> Dict:
+        """Backup a single Power App's full definition."""
+        print(f"[{self.worker_id}] [POWER_APP START] {resource.display_name}")
+        meta = resource.extra_data or {}
+        env_id = meta.get("environment_id")
+        app_id = meta.get("app_id") or meta.get("appId") or resource.external_id
+        if not env_id or not app_id:
+            print(f"[{self.worker_id}] [POWER_APP] missing environment_id / app_id in extra_data; storing metadata only")
+            return await self._store_metadata_blob(resource, snapshot, tenant, "POWER_APPS")
+
+        client = self.get_power_platform_client(tenant)
+        try:
+            definition = await client.get_app(env_id, app_id)
+        except httpx.HTTPStatusError as e:
+            print(f"[{self.worker_id}] [POWER_APP] fetch failed ({e.response.status_code}): {e.response.text[:200]}")
+            raise
+
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "power-apps")
+        blob_bytes = json.dumps(definition).encode()
+        content_hash = hashlib.sha256(blob_bytes).hexdigest()
+        blob_path = azure_storage_manager.build_blob_path(
+            str(tenant.id), str(resource.id), str(snapshot.id), f"app_{app_id}_definition"
+        )
+        r = await upload_blob_with_retry(container, blob_path, blob_bytes, shard)
+        if not r.get("success"):
+            raise RuntimeError(f"Power App definition upload failed: {r.get('error')}")
+
+        items_added: List[SnapshotItem] = [SnapshotItem(
+            snapshot_id=snapshot.id, tenant_id=tenant.id,
+            external_id=app_id, item_type="POWER_APP_DEFINITION",
+            name=resource.display_name or app_id,
+            content_hash=content_hash, content_size=len(blob_bytes),
+            blob_path=blob_path,
+            metadata={"environmentId": env_id, "appId": app_id, "raw": definition.get("properties", {})},
+            content_checksum=content_hash,
+        )]
+        total_bytes = len(blob_bytes)
+
+        # Non-fatal: also export the full .zip package (includes compiled canvas XAML + assets).
+        # If the app type doesn't support package export (e.g. model-driven), export_app_package
+        # returns None; transient failures are logged and counted.
+        package_failed = False
+        try:
+            pkg_bytes = await client.export_app_package(env_id, app_id, resource.display_name)
+        except Exception as e:
+            print(f"[{self.worker_id}] [POWER_APP] package export failed for {app_id}: {e}")
+            pkg_bytes = None
+            package_failed = True
+
+        if pkg_bytes:
+            pkg_hash = hashlib.sha256(pkg_bytes).hexdigest()
+            pkg_path = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id), f"app_{app_id}_package.zip"
+            )
+            pr = await upload_blob_with_retry(container, pkg_path, pkg_bytes, shard)
+            if pr.get("success"):
+                items_added.append(SnapshotItem(
+                    snapshot_id=snapshot.id, tenant_id=tenant.id,
+                    external_id=f"{app_id}:package", item_type="POWER_APP_PACKAGE",
+                    name=(resource.display_name or app_id) + " (package)",
+                    content_hash=pkg_hash, content_size=len(pkg_bytes),
+                    blob_path=pkg_path,
+                    metadata={"environmentId": env_id, "appId": app_id, "mime": "application/zip"},
+                    content_checksum=pkg_hash,
+                ))
+                total_bytes += len(pkg_bytes)
+
+        async with async_session_factory() as session:
+            session.add_all(items_added)
+            await session.commit()
+
+        if package_failed:
+            snapshot.delta_tokens_json = {**(snapshot.delta_tokens_json or {}), "files_failed": 1}
+
+        print(f"[{self.worker_id}] [POWER_APP COMPLETE] {resource.display_name} — {len(items_added)} items, {total_bytes} bytes")
+        return {"item_count": len(items_added), "bytes_added": total_bytes}
+
+    async def _backup_power_flow(self, resource: Resource, snapshot: Snapshot, tenant: Tenant) -> Dict:
+        """Backup a Power Automate flow definition plus its connection references."""
+        print(f"[{self.worker_id}] [POWER_FLOW START] {resource.display_name}")
+        meta = resource.extra_data or {}
+        env_id = meta.get("environment_id")
+        flow_id = meta.get("flow_id") or meta.get("flowId") or resource.external_id
+        if not env_id or not flow_id:
+            print(f"[{self.worker_id}] [POWER_FLOW] missing environment_id / flow_id in extra_data; storing metadata only")
+            return await self._store_metadata_blob(resource, snapshot, tenant, "POWER_AUTOMATE")
+
+        client = self.get_power_platform_client(tenant)
+        try:
+            definition = await client.get_flow(env_id, flow_id)
+        except httpx.HTTPStatusError as e:
+            print(f"[{self.worker_id}] [POWER_FLOW] fetch failed ({e.response.status_code}): {e.response.text[:200]}")
+            raise
+        # Connections are advisory — non-fatal if endpoint doesn't return them
+        connections = await client.get_flow_connections(env_id, flow_id)
+
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "power-automate")
+
+        items_added: List[SnapshotItem] = []
+        bytes_added = 0
+
+        def_bytes = json.dumps(definition).encode()
+        def_hash = hashlib.sha256(def_bytes).hexdigest()
+        def_path = azure_storage_manager.build_blob_path(
+            str(tenant.id), str(resource.id), str(snapshot.id), f"flow_{flow_id}_definition"
+        )
+        r = await upload_blob_with_retry(container, def_path, def_bytes, shard)
+        if not r.get("success"):
+            raise RuntimeError(f"Flow definition upload failed: {r.get('error')}")
+        items_added.append(SnapshotItem(
+            snapshot_id=snapshot.id, tenant_id=tenant.id,
+            external_id=flow_id, item_type="POWER_FLOW_DEFINITION",
+            name=resource.display_name or flow_id,
+            content_hash=def_hash, content_size=len(def_bytes),
+            blob_path=def_path,
+            metadata={"environmentId": env_id, "flowId": flow_id,
+                      "state": definition.get("properties", {}).get("state"),
+                      "raw": definition.get("properties", {})},
+            content_checksum=def_hash,
+        ))
+        bytes_added += len(def_bytes)
+
+        conn_values = connections.get("value") if isinstance(connections, dict) else None
+        if conn_values:
+            conn_bytes = json.dumps({"value": conn_values}).encode()
+            conn_hash = hashlib.sha256(conn_bytes).hexdigest()
+            conn_path = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id), f"flow_{flow_id}_connections"
+            )
+            r = await upload_blob_with_retry(container, conn_path, conn_bytes, shard)
+            if r.get("success"):
+                items_added.append(SnapshotItem(
+                    snapshot_id=snapshot.id, tenant_id=tenant.id,
+                    external_id=f"{flow_id}:connections", item_type="POWER_FLOW_CONNECTIONS",
+                    name=(resource.display_name or flow_id) + " (connections)",
+                    content_hash=conn_hash, content_size=len(conn_bytes),
+                    blob_path=conn_path,
+                    metadata={"flowId": flow_id, "environmentId": env_id, "count": len(conn_values)},
+                    content_checksum=conn_hash,
+                ))
+                bytes_added += len(conn_bytes)
+
+        # Non-fatal: flow package ZIP (includes connection references + custom connector refs).
+        package_failed = False
+        try:
+            pkg_bytes = await client.export_flow_package(env_id, flow_id, resource.display_name)
+        except Exception as e:
+            print(f"[{self.worker_id}] [POWER_FLOW] package export failed for {flow_id}: {e}")
+            pkg_bytes = None
+            package_failed = True
+
+        if pkg_bytes:
+            pkg_hash = hashlib.sha256(pkg_bytes).hexdigest()
+            pkg_path = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id), f"flow_{flow_id}_package.zip"
+            )
+            pr = await upload_blob_with_retry(container, pkg_path, pkg_bytes, shard)
+            if pr.get("success"):
+                items_added.append(SnapshotItem(
+                    snapshot_id=snapshot.id, tenant_id=tenant.id,
+                    external_id=f"{flow_id}:package", item_type="POWER_FLOW_PACKAGE",
+                    name=(resource.display_name or flow_id) + " (package)",
+                    content_hash=pkg_hash, content_size=len(pkg_bytes),
+                    blob_path=pkg_path,
+                    metadata={"environmentId": env_id, "flowId": flow_id, "mime": "application/zip"},
+                    content_checksum=pkg_hash,
+                ))
+                bytes_added += len(pkg_bytes)
+
+        async with async_session_factory() as session:
+            session.add_all(items_added)
+            await session.commit()
+
+        if package_failed:
+            snapshot.delta_tokens_json = {**(snapshot.delta_tokens_json or {}), "files_failed": 1}
+
+        print(f"[{self.worker_id}] [POWER_FLOW COMPLETE] {resource.display_name} — {len(items_added)} items, {bytes_added} bytes")
+        return {"item_count": len(items_added), "bytes_added": bytes_added}
+
+    async def _backup_power_dlp(self, resource: Resource, snapshot: Snapshot, tenant: Tenant) -> Dict:
+        """Backup a Power Platform DLP policy definition (connector groups + rules)."""
+        print(f"[{self.worker_id}] [POWER_DLP START] {resource.display_name}")
+        meta = resource.extra_data or {}
+        policy_id = meta.get("policy_id") or meta.get("policyId") or resource.external_id
+        if not policy_id:
+            print(f"[{self.worker_id}] [POWER_DLP] missing policy_id in extra_data; storing metadata only")
+            return await self._store_metadata_blob(resource, snapshot, tenant, "POWER_DLP")
+
+        client = self.get_power_platform_client(tenant)
+        try:
+            definition = await client.get_dlp_policy(policy_id)
+        except httpx.HTTPStatusError as e:
+            print(f"[{self.worker_id}] [POWER_DLP] fetch failed ({e.response.status_code}): {e.response.text[:200]}")
+            raise
+
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "power-dlp")
+        blob_bytes = json.dumps(definition).encode()
+        content_hash = hashlib.sha256(blob_bytes).hexdigest()
+        blob_path = azure_storage_manager.build_blob_path(
+            str(tenant.id), str(resource.id), str(snapshot.id), f"dlp_{policy_id}"
+        )
+        r = await upload_blob_with_retry(container, blob_path, blob_bytes, shard)
+        if not r.get("success"):
+            raise RuntimeError(f"DLP policy upload failed: {r.get('error')}")
+
+        async with async_session_factory() as session:
+            session.add(SnapshotItem(
+                snapshot_id=snapshot.id, tenant_id=tenant.id,
+                external_id=policy_id, item_type="POWER_DLP_POLICY",
+                name=resource.display_name or policy_id,
+                content_hash=content_hash, content_size=len(blob_bytes),
+                blob_path=blob_path,
+                metadata={"policyId": policy_id, "raw": definition.get("properties", {})},
+                content_checksum=content_hash,
+            ))
+            await session.commit()
+
+        print(f"[{self.worker_id}] [POWER_DLP COMPLETE] {resource.display_name} — {len(blob_bytes)} bytes")
+        return {"item_count": 1, "bytes_added": len(blob_bytes)}
 
     # ==================== Single Resource Backup Handlers ====================
 
@@ -2662,6 +3090,14 @@ class BackupWorker:
             tenant_id=tenant.external_tenant_id or settings.EFFECTIVE_POWER_BI_TENANT_ID,
             refresh_token=PowerBIClient.get_refresh_token_from_tenant(tenant),
         )
+
+    def get_power_platform_client(self, tenant: Tenant) -> PowerPlatformClient:
+        """Build a Power Platform Admin API client using the tenant's Graph app credentials.
+        Falls back to the first configured Graph app if the tenant has none of its own."""
+        client_id = tenant.graph_client_id or settings.MICROSOFT_CLIENT_ID
+        client_secret = settings.MICROSOFT_CLIENT_SECRET
+        tenant_id = tenant.external_tenant_id or settings.MICROSOFT_TENANT_ID
+        return PowerPlatformClient(client_id=client_id, client_secret=client_secret, tenant_id=tenant_id)
 
     async def get_sla_policy(self, resource: Resource, message: Optional[Dict[str, Any]] = None) -> Optional[SlaPolicy]:
         policy_id = None

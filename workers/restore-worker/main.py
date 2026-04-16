@@ -31,6 +31,7 @@ from shared.config import settings
 from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
 from shared.power_bi_client import PowerBIClient
+from shared.power_platform_client import PowerPlatformClient
 from shared.azure_storage import azure_storage_manager
 
 
@@ -213,10 +214,26 @@ class RestoreWorker:
             graph_client = await self.get_graph_client(tenant)
 
             resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+            target_env_id = spec.get("targetEnvironmentId")
             if resource_type == "POWER_BI":
                 power_bi_result = await self._restore_power_bi_items(session, resource, resource_items, tenant)
                 restored_count += power_bi_result.get("restored_count", 0)
                 failed_count += power_bi_result.get("failed_count", 0)
+                continue
+            if resource_type == "POWER_APPS":
+                result = await self._restore_power_app_items(session, resource, resource_items, tenant, target_env_id)
+                restored_count += result.get("restored_count", 0)
+                failed_count += result.get("failed_count", 0)
+                continue
+            if resource_type == "POWER_AUTOMATE":
+                result = await self._restore_power_flow_items(session, resource, resource_items, tenant, target_env_id)
+                restored_count += result.get("restored_count", 0)
+                failed_count += result.get("failed_count", 0)
+                continue
+            if resource_type == "POWER_DLP":
+                result = await self._restore_power_dlp_items(session, resource, resource_items, tenant)
+                restored_count += result.get("restored_count", 0)
+                failed_count += result.get("failed_count", 0)
                 continue
 
             # Route by item type
@@ -749,6 +766,179 @@ class RestoreWorker:
             "restore_type": "POWER_BI",
         }
 
+    # ==================== Power Platform Restore (Apps / Flows / DLP) ====================
+
+    async def _restore_power_app_items(
+        self,
+        session: AsyncSession,
+        target_resource: Resource,
+        items: List[SnapshotItem],
+        tenant: Tenant,
+        target_env_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Restore Power Apps. Prefers POWER_APP_PACKAGE (full fidelity ZIP import);
+        falls back to informative failure when only POWER_APP_DEFINITION is available
+        — definition-only restore would drop compiled canvas XAML and assets.
+
+        target_env_id overrides the env stored on the item (e.g. restore to a different
+        environment); if omitted, we use the source env from the backup."""
+        client = self.get_power_platform_client(tenant)
+        restored = 0
+        failed = 0
+        manual_actions: List[str] = []
+
+        # Prefer package items; if multiple items target the same app, the package wins.
+        by_app: Dict[str, SnapshotItem] = {}
+        for item in items:
+            meta = self._get_item_metadata(item)
+            app_id = meta.get("appId") or item.external_id.split(":")[0]
+            if not app_id:
+                continue
+            existing = by_app.get(app_id)
+            if existing is None or (item.item_type == "POWER_APP_PACKAGE" and existing.item_type != "POWER_APP_PACKAGE"):
+                by_app[app_id] = item
+
+        for app_id, item in by_app.items():
+            meta = self._get_item_metadata(item)
+            env_id = target_env_id or meta.get("environmentId")
+            if not env_id:
+                manual_actions.append(f"{item.name}: cannot infer target environment; pass targetEnvironmentId in spec.")
+                failed += 1
+                continue
+
+            try:
+                if item.item_type == "POWER_APP_PACKAGE":
+                    zip_bytes = self._load_snapshot_item_bytes(item, "power-apps")
+                    if not zip_bytes:
+                        manual_actions.append(f"{item.name}: package blob is missing or empty.")
+                        failed += 1
+                        continue
+                    await client.import_app_package(env_id, zip_bytes, display_name=item.name)
+                    restored += 1
+                else:
+                    # Definition-only — we have the JSON but no compiled assets.
+                    # Power Apps has no public "create canvas app from definition JSON"
+                    # endpoint that preserves full fidelity; this path is flagged so ops
+                    # can decide whether to accept a degraded restore.
+                    manual_actions.append(
+                        f"{item.name}: only POWER_APP_DEFINITION was backed up (no package). "
+                        "Re-run backup with package export enabled before restoring."
+                    )
+                    failed += 1
+            except Exception as exc:
+                print(f"[{self.worker_id}] Power App restore failed for {app_id}: {exc}")
+                manual_actions.append(f"{item.name}: import failed — {str(exc)[:200]}")
+                failed += 1
+
+        return {
+            "restored_count": restored,
+            "failed_count": failed,
+            "manual_actions": sorted(set(manual_actions)),
+            "restore_type": "POWER_APPS",
+        }
+
+    async def _restore_power_flow_items(
+        self,
+        session: AsyncSession,
+        target_resource: Resource,
+        items: List[SnapshotItem],
+        tenant: Tenant,
+        target_env_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Restore Power Automate flows. Package import is the canonical path. If only
+        POWER_FLOW_DEFINITION is in the snapshot, we attempt a best-effort 'create flow
+        from definition' via the Flow management API — which works for simple cloud flows
+        but may lose custom connector bindings."""
+        client = self.get_power_platform_client(tenant)
+        restored = 0
+        failed = 0
+        manual_actions: List[str] = []
+
+        # Prefer package; only fall back to definition-only if no package for that flow.
+        by_flow: Dict[str, Dict[str, SnapshotItem]] = {}
+        for item in items:
+            meta = self._get_item_metadata(item)
+            flow_id = meta.get("flowId") or item.external_id.split(":")[0]
+            if not flow_id:
+                continue
+            by_flow.setdefault(flow_id, {})[item.item_type] = item
+
+        for flow_id, per_type in by_flow.items():
+            package_item = per_type.get("POWER_FLOW_PACKAGE")
+            definition_item = per_type.get("POWER_FLOW_DEFINITION")
+            chosen = package_item or definition_item
+            if not chosen:
+                continue
+            meta = self._get_item_metadata(chosen)
+            env_id = target_env_id or meta.get("environmentId")
+            if not env_id:
+                manual_actions.append(f"{chosen.name}: cannot infer target environment.")
+                failed += 1
+                continue
+
+            try:
+                if package_item:
+                    zip_bytes = self._load_snapshot_item_bytes(package_item, "power-automate")
+                    if not zip_bytes:
+                        manual_actions.append(f"{chosen.name}: flow package blob missing.")
+                        failed += 1
+                        continue
+                    await client.import_flow_package(env_id, zip_bytes, display_name=chosen.name)
+                    restored += 1
+                else:
+                    manual_actions.append(
+                        f"{chosen.name}: only POWER_FLOW_DEFINITION available; package import is required "
+                        "for full-fidelity restore. Manual recreation from definition JSON may work for simple flows."
+                    )
+                    failed += 1
+            except Exception as exc:
+                print(f"[{self.worker_id}] Flow restore failed for {flow_id}: {exc}")
+                manual_actions.append(f"{chosen.name}: import failed — {str(exc)[:200]}")
+                failed += 1
+
+        return {
+            "restored_count": restored,
+            "failed_count": failed,
+            "manual_actions": sorted(set(manual_actions)),
+            "restore_type": "POWER_AUTOMATE",
+        }
+
+    async def _restore_power_dlp_items(
+        self,
+        session: AsyncSession,
+        target_resource: Resource,
+        items: List[SnapshotItem],
+        tenant: Tenant,
+    ) -> Dict[str, Any]:
+        """Restore Power Platform DLP policies via upsert. Tenant-scoped, no env_id needed."""
+        client = self.get_power_platform_client(tenant)
+        restored = 0
+        failed = 0
+        manual_actions: List[str] = []
+
+        for item in items:
+            if item.item_type != "POWER_DLP_POLICY":
+                continue
+            try:
+                payload = self._load_snapshot_item_payload(item, "power-dlp")
+                if not payload:
+                    manual_actions.append(f"{item.name}: policy definition is empty, cannot restore.")
+                    failed += 1
+                    continue
+                await client.upsert_dlp_policy(payload)
+                restored += 1
+            except Exception as exc:
+                print(f"[{self.worker_id}] DLP restore failed for {item.id}: {exc}")
+                manual_actions.append(f"{item.name}: upsert failed — {str(exc)[:200]}")
+                failed += 1
+
+        return {
+            "restored_count": restored,
+            "failed_count": failed,
+            "manual_actions": sorted(set(manual_actions)),
+            "restore_type": "POWER_DLP",
+        }
+
     # ==================== Utility Methods ====================
 
     def _extract_power_bi_workspace_id(self, resource: Resource) -> Optional[str]:
@@ -775,6 +965,21 @@ class RestoreWorker:
         blob_client = self.blob_service_client.get_blob_client(container=container_name, blob=item.blob_path)
         payload_bytes = blob_client.download_blob().readall()
         return json.loads(payload_bytes.decode("utf-8"))
+
+    def _load_snapshot_item_bytes(self, item: SnapshotItem, workload: str) -> Optional[bytes]:
+        """Download a snapshot item's blob as raw bytes (for ZIP packages etc.)."""
+        if not self.blob_service_client or not item.blob_path:
+            return None
+        container_name = azure_storage_manager.get_container_name(str(item.tenant_id), workload)
+        blob_client = self.blob_service_client.get_blob_client(container=container_name, blob=item.blob_path)
+        return blob_client.download_blob().readall()
+
+    def get_power_platform_client(self, tenant: Tenant) -> PowerPlatformClient:
+        """Build a Power Platform Admin API client using the tenant's Graph app credentials."""
+        client_id = tenant.graph_client_id or settings.MICROSOFT_CLIENT_ID
+        client_secret = settings.MICROSOFT_CLIENT_SECRET
+        tenant_id = tenant.external_tenant_id or settings.MICROSOFT_TENANT_ID
+        return PowerPlatformClient(client_id=client_id, client_secret=client_secret, tenant_id=tenant_id)
 
     def _create_eml_from_json(self, email_data: Dict) -> str:
         """Create EML file content from email JSON"""

@@ -673,6 +673,37 @@ class GraphClient:
         except Exception as e:
             print(f"Error discovering Power Platform environments: {e}")
 
+        # 3b. Discover tenant-level DLP policies (Power Platform governance)
+        try:
+            dlp_url = "https://api.bap.microsoft.com/providers/PowerPlatform.Governance/v2/policies"
+            headers = {"Authorization": f"Bearer {token}"}
+            async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+                dlp_resp = await client.get(dlp_url, headers=headers, params={"api-version": "2020-10-01"})
+                if dlp_resp.status_code == 200:
+                    dlp_data = dlp_resp.json()
+                    for policy in dlp_data.get("value", []):
+                        policy_id = policy.get("name") or policy.get("id")
+                        policy_props = policy.get("properties", {})
+                        if not policy_id:
+                            continue
+                        resources.append({
+                            "external_id": f"dlp_{policy_id}",
+                            "display_name": policy_props.get("displayName", policy_id),
+                            "email": None,
+                            "type": "POWER_DLP",
+                            "metadata": {
+                                "policy_id": policy_id,
+                                "policy_type": policy_props.get("policyType"),
+                                "environment_type": policy_props.get("environmentType"),
+                                "created_time": policy_props.get("createdTime"),
+                                "modified_time": policy_props.get("lastModifiedTime"),
+                            },
+                        })
+                else:
+                    print(f"Error fetching DLP policies: {dlp_resp.status_code} {dlp_resp.text[:200]}")
+        except Exception as e:
+            print(f"Error discovering DLP policies: {e}")
+
         # 4. Discover Power BI workspaces via Power BI REST API
         try:
             power_bi_client = PowerBIClient(
@@ -1428,6 +1459,49 @@ class GraphClient:
         Permission: Tasks.Read.All
         """
         return await self._get(f"{self.GRAPH_URL}/groups/{group_id}/planner/plans", params={"$top": "999"})
+
+    async def get_planner_task_details(self, task_id: str) -> Dict[str, Any]:
+        """Task details: description, checklist, references, previewType.
+        Graph API: GET /planner/tasks/{task-id}/details
+        Permission: Tasks.Read.All"""
+        return await self._get(f"{self.GRAPH_URL}/planner/tasks/{task_id}/details")
+
+    async def get_user_todo_task_checklist(self, user_id: str, list_id: str, task_id: str) -> Dict[str, Any]:
+        """Checklist items nested under a To Do task.
+        Graph API: GET /users/{id}/todo/lists/{list-id}/tasks/{task-id}/checklistItems"""
+        return await self._get(
+            f"{self.GRAPH_URL}/users/{user_id}/todo/lists/{list_id}/tasks/{task_id}/checklistItems",
+            params={"$top": "999"},
+        )
+
+    async def get_user_todo_task_linked_resources(self, user_id: str, list_id: str, task_id: str) -> Dict[str, Any]:
+        """Linked resources (attached URLs / apps) on a To Do task.
+        Graph API: GET /users/{id}/todo/lists/{list-id}/tasks/{task-id}/linkedResources"""
+        return await self._get(
+            f"{self.GRAPH_URL}/users/{user_id}/todo/lists/{list_id}/tasks/{task_id}/linkedResources",
+            params={"$top": "999"},
+        )
+
+    async def _get_bytes(self, url: str) -> bytes:
+        """Authenticated GET that returns the raw response body as bytes — for non-JSON
+        endpoints like OneNote page content (text/html) or resource $value (binary).
+        Follows 302 redirects implicitly via httpx."""
+        token = await self._get_token()
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+            resp.raise_for_status()
+            return resp.content
+
+    async def get_onenote_page_content(self, user_id: str, page_id: str) -> bytes:
+        """Get the HTML body of a OneNote page (returns bytes — the endpoint emits text/html).
+        Graph API: GET /users/{id}/onenote/pages/{page-id}/content?includeinkML=true"""
+        url = f"{self.GRAPH_URL}/users/{user_id}/onenote/pages/{page_id}/content?includeinkML=true"
+        return await self._get_bytes(url)
+
+    async def get_onenote_resource(self, url: str) -> bytes:
+        """Fetch a OneNote resource (image or attachment) by its fully-qualified Graph URL.
+        URL is taken verbatim from the page HTML's data-fullres-src or src attribute."""
+        return await self._get_bytes(url)
 
     async def _paginated_get(self, path: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         """Helper for paginated GET requests"""

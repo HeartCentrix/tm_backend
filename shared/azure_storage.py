@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from azure.storage.blob import BlobServiceClient
 from azure.storage.blob.aio import BlobServiceClient as AsyncBlobServiceClient
-from azure.core.exceptions import AzureError, ResourceExistsError
+from azure.core.exceptions import AzureError, ResourceExistsError, ResourceNotFoundError
 
 from shared.config import settings
 
@@ -323,6 +323,17 @@ class AzureStorageShard:
                 "method": "stream_upload",
             }
     
+    async def download_blob(self, container_name: str, blob_path: str) -> Optional[bytes]:
+        """Download a blob's bytes. Returns None if the blob does not exist.
+        Raises AzureError for auth/network/other failures so callers can surface them."""
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        try:
+            stream = await blob_client.download_blob()
+            return await stream.readall()
+        except ResourceNotFoundError:
+            return None
+
     async def get_blob_properties(self, container_name: str, blob_path: str) -> Optional[Dict]:
         """Get blob properties including copy status"""
         try:
@@ -459,6 +470,46 @@ class AzureStorageManager:
 
 # Global singleton
 azure_storage_manager = AzureStorageManager()
+
+
+# Mirror of the workload strings the backup worker passes to get_container_name(...)
+# when writing blobs. Kept here so read and write stay in sync in one place.
+# Values are ordered: the first candidate is the primary container; later entries
+# cover secondary containers the worker may also write into (e.g. group mailboxes
+# materialized while processing an ENTRA_GROUP).
+RESOURCE_TYPE_TO_WORKLOADS: Dict[str, Tuple[str, ...]] = {
+    "MAILBOX": ("mailbox",),
+    "SHARED_MAILBOX": ("mailbox",),
+    "ROOM_MAILBOX": ("mailbox",),
+    "ONEDRIVE": ("files",),
+    "SHAREPOINT_SITE": ("files",),
+    "TEAMS_CHANNEL": ("teams",),
+    "TEAMS_CHAT": ("teams",),
+    "ENTRA_USER": ("entra",),
+    "ENTRA_GROUP": ("entra", "group-mailbox"),
+    "DYNAMIC_GROUP": ("entra", "group-mailbox"),
+    "ENTRA_APP": ("entra",),
+    "ENTRA_DEVICE": ("entra",),
+    "ENTRA_SERVICE_PRINCIPAL": ("entra",),
+    "PLANNER": ("planner",),
+    "TODO": ("todo",),
+    "ONENOTE": ("onenote",),
+    "POWER_BI": ("power-bi",),
+    "POWER_APPS": ("power-apps",),
+    "POWER_AUTOMATE": ("power-automate",),
+    "POWER_DLP": ("power-dlp",),
+    "AZURE_VM": ("azure-vm",),
+    "AZURE_SQL_DB": ("azure-sql-db",),
+    "AZURE_POSTGRESQL": ("azure-postgresql",),
+    "AZURE_POSTGRESQL_SINGLE": ("azure-postgresql-single",),
+}
+
+
+def workload_candidates_for_resource_type(resource_type: str) -> Tuple[str, ...]:
+    """Return container-workload suffixes a blob for this resource_type may live in."""
+    if not resource_type:
+        return ()
+    return RESOURCE_TYPE_TO_WORKLOADS.get(str(resource_type).upper(), ())
 
 
 async def server_side_copy_with_retry(source_url: str, container_name: str, 

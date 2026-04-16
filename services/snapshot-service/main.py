@@ -11,9 +11,13 @@ from sqlalchemy import select, func, distinct, and_, or_
 from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus
 from shared.power_bi_snapshot import assemble_power_bi_items
+from shared.azure_storage import azure_storage_manager, workload_candidates_for_resource_type
 from shared.schemas import (
     SnapshotListResponse, SnapshotResponse, SnapshotItemListResponse, SnapshotItemResponse, SnapshotDiff
 )
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -478,36 +482,58 @@ async def get_snapshot_item_detail(snapshot_id: str, item_id: str, db: AsyncSess
 
 # ==================== Content-Type-Specific Endpoints ====================
 
-def _get_blob_client():
-    from shared.config import settings as _s
-    from azure.storage.blob import BlobServiceClient as _BSC
-    if _s.AZURE_STORAGE_ACCOUNT_NAME and _s.AZURE_STORAGE_ACCOUNT_KEY:
-        conn = (f"DefaultEndpointsProtocol=https;AccountName={_s.AZURE_STORAGE_ACCOUNT_NAME};"
-                f"AccountKey={_s.AZURE_STORAGE_ACCOUNT_KEY};EndpointSuffix=core.windows.net")
-        return _BSC.from_connection_string(conn)
+
+async def _load_blob_context(db: AsyncSession, snapshot_id: str):
+    """Load the snapshot + resource + prepared shard/workload hints needed to read blobs
+    for every item in this snapshot. Returns (shard, tenant_id, candidates) or (None, None, ()).
+
+    Shard is keyed by resource_id (matching the worker's write-side call).
+    Candidates is an ordered tuple of workload suffixes for get_container_name."""
+    snapshot = await db.get(Snapshot, UUID(snapshot_id))
+    if not snapshot:
+        return None, None, ()
+    resource = await db.get(Resource, snapshot.resource_id)
+    if not resource or not azure_storage_manager.shards:
+        return None, str(resource.tenant_id) if resource else None, ()
+    resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+    shard = azure_storage_manager.get_shard_for_resource(
+        str(resource.id), str(resource.tenant_id)
+    )
+    candidates = workload_candidates_for_resource_type(resource_type)
+    return shard, str(resource.tenant_id), candidates
+
+
+async def _download_item_blob(shard, tenant_id: str, candidates: tuple, blob_path: str) -> Optional[bytes]:
+    """Try each candidate container in order, returning the first blob found.
+    Returns None if the blob is absent from every candidate container or if no
+    shard/tenant/candidates are available. Logs a warning if nothing was found."""
+    if not shard or not tenant_id or not blob_path or not candidates:
+        return None
+    tried: List[str] = []
+    for workload in candidates:
+        container = azure_storage_manager.get_container_name(tenant_id, workload)
+        tried.append(container)
+        try:
+            data = await shard.download_blob(container, blob_path)
+        except Exception as exc:
+            logger.warning("download_blob error on %s/%s: %s", container, blob_path, exc)
+            continue
+        if data is not None:
+            return data
+    logger.warning("blob not found in any candidate container %s for %s", tried, blob_path)
     return None
 
 
-async def _read_blob(blob_path: str) -> dict:
-    import json as _j, asyncio
-    client = _get_blob_client()
-    if not client or not blob_path:
+async def _read_blob_json(shard, tenant_id: str, candidates: tuple, blob_path: str) -> dict:
+    """Thin JSON wrapper around _download_item_blob. Returns {} on miss or decode failure."""
+    import json as _j
+    data = await _download_item_blob(shard, tenant_id, candidates, blob_path)
+    if not data:
         return {}
     try:
-        # blob_path = {tenant_id}/{resource_id}/{snapshot_id}/{date}/{item_id}
-        # Container = backup-{workload}-{tenant_id[:8]}, blob key = full blob_path
-        parts = blob_path.split("/")
-        tenant_short = parts[0][:8] if parts else ""
-        for container in [f"backup-mailbox-{tenant_short}", f"backup-files-{tenant_short}",
-                          f"backup-teams-{tenant_short}", f"backup-entra-{tenant_short}"]:
-            try:
-                blob = client.get_blob_client(container=container, blob=blob_path)
-                data = await asyncio.get_event_loop().run_in_executor(None, lambda b=blob: b.download_blob().readall())
-                return _j.loads(data.decode("utf-8"))
-            except Exception:
-                continue
-        return {}
-    except Exception:
+        return _j.loads(data.decode("utf-8"))
+    except Exception as exc:
+        logger.warning("blob at %s is not UTF-8 JSON: %s", blob_path, exc)
         return {}
 
 
@@ -579,6 +605,7 @@ async def list_snapshot_messages(
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
 
+    shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
     sem = asyncio.Semaphore(20)
 
     async def fmt(i):
@@ -586,7 +613,7 @@ async def list_snapshot_messages(
         # Read blob concurrently if metadata is empty
         if (not raw or len(raw) <= 2) and i.blob_path:
             async with sem:
-                raw = await _read_blob(i.blob_path)
+                raw = await _read_blob_json(shard, tenant_id, candidates, i.blob_path)
         if not isinstance(raw, dict): raw = {}
         _from = raw.get("from") or {}
         sender_obj = (_from.get("user") or _from.get("application") or {}) if isinstance(_from, dict) else {}
@@ -635,6 +662,7 @@ async def list_snapshot_calendar(
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
 
+    shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
     sem = asyncio.Semaphore(20)
 
     async def fmt(i):
@@ -642,7 +670,7 @@ async def list_snapshot_calendar(
         # Read from blob concurrently if metadata is empty
         if (not raw or len(raw) <= 2) and i.blob_path:
             async with sem:
-                raw = await _read_blob(i.blob_path)
+                raw = await _read_blob_json(shard, tenant_id, candidates, i.blob_path)
         if not isinstance(raw, dict):
             raw = {}
 
@@ -737,33 +765,30 @@ async def get_item_content(
     item_id: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """Return the raw content of a snapshot item, reading from blob if metadata is empty."""
-    from shared.azure_storage import azure_storage_manager
+    """Return the raw content of a snapshot item, reading from blob if metadata is empty.
+
+    Blob location: the worker writes to container=backup-{workload}-{tenant[:8]}
+    using blob_path={tenant}/{resource}/{snapshot}/{ts}/{item}. We derive the
+    workload from the resource type (via workload_candidates_for_resource_type)
+    rather than parsing blob_path, and we pick the shard by resource_id to match
+    the worker's write call."""
     item = await db.get(SnapshotItem, UUID(item_id))
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    # For items with a blob_path, the actual content lives in blob storage.
-    # extra_data["structured"] only holds file properties (size, mime_type, etc.),
-    # not the file content, so we must read from blob first.
     if item.blob_path and azure_storage_manager.shards:
+        shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
         try:
-            shard = azure_storage_manager.get_shard_for_resource(
-                str(item.snapshot_id), str(item.tenant_id or "")
-            )
-            parts = item.blob_path.split("/", 1)
-            container, path = (parts[0], parts[1]) if len(parts) == 2 else ("files", item.blob_path)
-            data = await shard.download_blob(container, path)
-            if data:
-                import json as _json
-                try:
-                    content = _json.loads(data.decode("utf-8"))
-                    return {"source": "blob", "content": content}
-                except Exception:
-                    from fastapi.responses import Response
-                    return Response(content=data, media_type="application/octet-stream")
+            data = await _download_item_blob(shard, tenant_id, candidates, item.blob_path)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Blob read failed: {e}")
+        if data:
+            import json as _json
+            try:
+                return {"source": "blob", "content": _json.loads(data.decode("utf-8"))}
+            except Exception:
+                from fastapi.responses import Response
+                return Response(content=data, media_type="application/octet-stream")
 
     # Fall back to inline metadata (e.g. email bodies stored directly in extra_data)
     meta = item.extra_data or {}
