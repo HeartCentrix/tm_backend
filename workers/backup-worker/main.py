@@ -271,12 +271,24 @@ class BackupWorker:
                     "locked", "423", "account_locked",
                     "authorization_failed", "access_denied",
                 ])
-                
+
                 if is_inaccessible:
                     print(f"[{self.worker_id}] Resource {resource.display_name} is INACCESSIBLE (404/423) — marking to skip future backups")
                     resource.status = "INACCESSIBLE"
                     await session.commit()
-                
+
+                # Mark snapshot FAILED so it doesn't stay IN_PROGRESS forever
+                try:
+                    await self.fail_snapshot(session, snapshot, e)
+                except Exception as fail_exc:
+                    print(f"[{self.worker_id}] Could not mark snapshot FAILED: {fail_exc}")
+
+                # Mark job FAILED so the UI sees a terminal state
+                try:
+                    await self.update_job_status(session, job_id, JobStatus.FAILED, {"error": str(e)[:2000]})
+                except Exception as job_exc:
+                    print(f"[{self.worker_id}] Could not mark job FAILED: {job_exc}")
+
                 print(f"[{self.worker_id}] Handler FAILED for {resource_type}: {resource.display_name} — {e}")
                 import traceback
                 traceback.print_exc()
@@ -2793,13 +2805,27 @@ class BackupWorker:
             await session.commit()
             return snapshot
 
+    async def fail_snapshot(self, session: AsyncSession, snapshot: Snapshot, error: Exception):
+        """Mark snapshot as FAILED with error details so it leaves IN_PROGRESS state."""
+        now = datetime.utcnow()
+        snapshot.status = SnapshotStatus.FAILED
+        snapshot.completed_at = now
+        if snapshot.started_at:
+            snapshot.duration_secs = int((now - snapshot.started_at).total_seconds())
+        existing = dict(snapshot.extra_data or {})
+        existing["error"] = str(error)[:2000]
+        snapshot.extra_data = existing
+        await session.merge(snapshot)
+        await session.commit()
+
     async def update_job_status(self, session: AsyncSession, job_id: uuid.UUID, status: JobStatus, result: Dict):
         job = await session.get(Job, job_id)
         if job:
             job.status = status
             job.result = result
-            if status == JobStatus.COMPLETED:
+            if status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
                 job.completed_at = datetime.utcnow()
+            if status == JobStatus.COMPLETED:
                 job.progress_pct = 100
             await session.commit()
 
