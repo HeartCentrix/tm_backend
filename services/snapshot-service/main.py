@@ -529,36 +529,99 @@ async def list_snapshot_calendar(
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
 
-    def fmt(i):
+    sem = asyncio.Semaphore(20)
+
+    async def fmt(i):
         raw = _raw(i)
-        organizer = raw.get("organizer", {}).get("emailAddress", {})
+        # Read from blob concurrently if metadata is empty
+        if (not raw or len(raw) <= 2) and i.blob_path:
+            async with sem:
+                raw = await _read_blob(i.blob_path) or {}
+        if not isinstance(raw, dict):
+            raw = {}
+
+        organizer_obj = (raw.get("organizer") or {}).get("emailAddress") or {}
+        start_obj = raw.get("start") or {}
+        end_obj = raw.get("end") or {}
+        subject = raw.get("subject") or raw.get("name") or ""
+        graph_type = raw.get("type") or ""  # singleInstance, occurrence, seriesMaster, exception
+
+        # Build display name from available fields
+        if not subject:
+            start_dt = start_obj.get("dateTime") or start_obj.get("date") or ""
+            if start_dt:
+                try:
+                    from datetime import datetime as _dt
+                    parsed = _dt.fromisoformat(start_dt.replace("Z", "+00:00").split(".")[0])
+                    time_str = parsed.strftime("%-I:%M %p") if not start_obj.get("date") else parsed.strftime("%b %-d")
+                    subject = f"Event · {time_str}"
+                except Exception:
+                    subject = "Calendar Event"
+            else:
+                subject = "Calendar Event"
+
+        # Derive a human-readable eventType label for filter sidebar
+        is_cancelled = raw.get("isCancelled", False) or subject.lower().startswith("canceled") or subject.lower().startswith("cancelled")
+        is_all_day = raw.get("isAllDay", False) or (not start_obj.get("dateTime") and bool(start_obj.get("date")))
+        is_online = raw.get("isOnlineMeeting", False)
+        has_recurrence = bool(raw.get("recurrence")) or graph_type in ("seriesMaster", "occurrence")
+        has_attendees = bool(raw.get("attendees"))
+        if is_cancelled:
+            event_type = "Cancelled"
+        elif graph_type == "seriesMaster":
+            event_type = "Recurring Series"
+        elif graph_type == "occurrence":
+            event_type = "Recurring"
+        elif graph_type == "exception":
+            event_type = "Exception"
+        elif is_all_day:
+            event_type = "All Day"
+        elif is_online:
+            event_type = "Online Meeting"
+        elif has_recurrence:
+            event_type = "Recurring"
+        elif has_attendees:
+            event_type = "Meeting"
+        else:
+            event_type = "Appointment"
+
         return {
             "id": str(i.id),
             "snapshotId": str(i.snapshot_id),
             "externalId": i.external_id,
             "itemType": i.item_type,
-            "subject": raw.get("subject") or i.name,
-            "start": raw.get("start", {}).get("dateTime") or raw.get("start", {}).get("date"),
-            "end": raw.get("end", {}).get("dateTime") or raw.get("end", {}).get("date"),
-            "timeZone": raw.get("start", {}).get("timeZone") or "UTC",
-            "isAllDay": raw.get("isAllDay", False),
-            "location": raw.get("location", {}).get("displayName") or "",
-            "organizer": f"{organizer.get('name','')} <{organizer.get('address','')}>".strip(" <>") or None,
-            "attendees": raw.get("attendees", []),
-            "body": raw.get("body", {}).get("content") or "",
-            "bodyContentType": raw.get("body", {}).get("contentType") or "text",
-            "isOnlineMeeting": raw.get("isOnlineMeeting", False),
+            "subject": subject or i.name or "",
+            "start": start_obj.get("dateTime") or start_obj.get("date"),
+            "end": end_obj.get("dateTime") or end_obj.get("date"),
+            "timeZone": start_obj.get("timeZone") or "UTC",
+            "isAllDay": is_all_day,
+            "isCancelled": is_cancelled,
+            "location": (raw.get("location") or {}).get("displayName") or "",
+            "organizer": organizer_obj.get("name") or organizer_obj.get("address") or None,
+            "organizerEmail": organizer_obj.get("address") or "",
+            "attendees": raw.get("attendees") or [],
+            "body": (raw.get("body") or {}).get("content") or "",
+            "bodyContentType": (raw.get("body") or {}).get("contentType") or "text",
+            "isOnlineMeeting": is_online,
             "recurrence": raw.get("recurrence"),
+            "recurrenceType": (raw.get("recurrence") or {}).get("pattern", {}).get("type") or None,
+            "graphType": graph_type,
             "showAs": raw.get("showAs") or "",
-            "folderPath": i.folder_path,
+            "importance": raw.get("importance") or "normal",
+            "sensitivity": raw.get("sensitivity") or "normal",
+            "categories": raw.get("categories") or [],
+            "eventType": event_type,
+            "folderPath": i.folder_path or "Calendar",
             "contentSize": i.content_size or 0,
             "isDeleted": i.is_deleted or False,
             "createdAt": i.created_at.isoformat() if i.created_at else "",
-            "name": raw.get("subject") or i.name or "",
+            "name": subject or i.name or "",
+            "date": start_obj.get("dateTime") or start_obj.get("date") or "",
             "metadata": {"raw": raw},
         }
 
-    return {"content": [fmt(i) for i in items], "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
+    results = await asyncio.gather(*[fmt(i) for i in items])
+    return {"content": list(results), "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
 
 
 
