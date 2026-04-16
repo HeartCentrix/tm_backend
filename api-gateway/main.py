@@ -217,6 +217,7 @@ async def snapshot_folders(request: Request):
 @app.get("/api/v1/resources/snapshots/{snapshot_id}")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/search")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/preview")
@@ -239,6 +240,7 @@ async def snapshot(request: Request):
 @app.get("/api/v1/jobs/restore/history")
 @app.post("/api/v1/jobs/export")
 @app.get("/api/v1/jobs/export/{job_id}/status")
+@app.get("/api/v1/exports/{job_id}/download")
 @app.get("/api/v1/exports/{job_id}/download")
 @app.get("/api/v1/jobs/export/{job_id}/download")
 async def restore(request: Request):

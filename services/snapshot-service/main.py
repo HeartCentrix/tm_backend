@@ -480,7 +480,7 @@ async def list_snapshot_messages(
         # Read blob concurrently if metadata is empty
         if (not raw or len(raw) <= 2) and i.blob_path:
             async with sem:
-                raw = await _read_blob(i.blob_path) or {}
+                raw = await _read_blob(i.blob_path)
         if not isinstance(raw, dict): raw = {}
         _from = raw.get("from") or {}
         sender_obj = (_from.get("user") or _from.get("application") or {}) if isinstance(_from, dict) else {}
@@ -536,7 +536,7 @@ async def list_snapshot_calendar(
         # Read from blob concurrently if metadata is empty
         if (not raw or len(raw) <= 2) and i.blob_path:
             async with sem:
-                raw = await _read_blob(i.blob_path) or {}
+                raw = await _read_blob(i.blob_path)
         if not isinstance(raw, dict):
             raw = {}
 
