@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -243,12 +243,20 @@ class PowerBIClient:
         )
         return payload.get("value", [])
 
+    @staticmethod
+    def _format_utc_timestamp(value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
+        return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
     async def list_modified_workspace_ids(self, modified_since: datetime) -> List[str]:
         payload = await self._request_json(
             "GET",
             f"{self.POWER_BI_BASE_URL}/admin/workspaces/modified",
             api="powerbi",
-            params={"modifiedSince": modified_since.isoformat()},
+            params={"modifiedSince": self._format_utc_timestamp(modified_since)},
         )
         return [workspace["id"] for workspace in payload.get("value", []) if workspace.get("id")]
 

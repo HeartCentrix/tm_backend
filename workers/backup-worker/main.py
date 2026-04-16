@@ -20,6 +20,7 @@ import asyncio
 import json
 import uuid
 import hashlib
+import logging
 import os
 import tempfile
 from datetime import datetime, timedelta
@@ -54,6 +55,8 @@ from shared.azure_storage import (
     upload_blob_with_retry,
     upload_blob_with_retry_from_file,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ProgressReporter:
@@ -531,10 +534,20 @@ class BackupWorker:
             return {"success": True, "size": 0, "method": "skipped_no_file_facet",
                     "item_id": file_id, "file_name": file_name}
 
+        drive_id = (
+            file_item.get("_drive_id")
+            or (file_item.get("parentReference") or {}).get("driveId")
+            or resource.external_id
+        )
+        blob_item_id = file_id
+        if drive_id and drive_id != resource.external_id:
+            drive_hash = hashlib.sha1(drive_id.encode()).hexdigest()[:12]
+            blob_item_id = f"{drive_hash}_{file_id}"
+
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "files")
         blob_path = azure_storage_manager.build_blob_path(
-            str(tenant.id), str(resource.id), str(snapshot.id), file_id)
+            str(tenant.id), str(resource.id), str(snapshot.id), blob_item_id)
 
         # Handle empty files
         if file_size_hint == 0:
@@ -542,7 +555,9 @@ class BackupWorker:
                 container, blob_path, b"", shard,
                 metadata={"source": "empty", "original-name": file_name})
             if upload_result.get("success"):
-                await self._create_file_snapshot_item(snapshot, tenant, file_id, file_name, 0, blob_path, {}, file_item)
+                await self._create_file_snapshot_item(
+                    snapshot, tenant, file_id, file_name, 0, blob_path, {}, file_item, drive_id
+                )
             return {"success": upload_result.get("success", False), "size": 0, "method": "empty",
                     "item_id": file_id, "file_name": file_name}
 
@@ -558,13 +573,13 @@ class BackupWorker:
 
         metadata = {
             "source_item_id": file_id,
+            "source_drive_id": drive_id or "",
             "source_etag": source_etag,
             "source_modified": file_item.get("lastModifiedDateTime", ""),
             "original-name": file_name,
         }
 
         # Resolve fresh download URL (delta items often lack it)
-        drive_id = resource.external_id
         try:
             download_url, size, qxh = await graph_client.get_download_url(drive_id, file_id)
         except RuntimeError as e:
@@ -596,7 +611,7 @@ class BackupWorker:
                 raise RuntimeError(f"blob upload failed: {upload_result.get('error')}")
             await self._create_file_snapshot_item(
                 snapshot, tenant, file_id, file_name, size, blob_path,
-                {"sha256": sha256, "quickxor": qxh}, file_item)
+                {"sha256": sha256, "quickxor": qxh}, file_item, drive_id)
             return {"success": True, "size": size, "method": "streaming",
                     "blob_path": blob_path, "sha256": sha256,
                     "item_id": file_id, "file_name": file_name}
@@ -614,9 +629,13 @@ class BackupWorker:
                     pass
 
     async def _create_file_snapshot_item(self, snapshot, tenant, file_id, file_name,
-                                         content_size, blob_path, hashes, file_item):
+                                         content_size, blob_path, hashes, file_item,
+                                         drive_id: Optional[str] = None):
         """Create a SnapshotItem DB record for a successfully backed-up file."""
         metadata = MetadataExtractor.extract_sharepoint_item_metadata(file_item)
+        metadata["drive_id"] = drive_id or (file_item.get("parentReference") or {}).get("driveId")
+        if file_item.get("_site_label"):
+            metadata["site_label"] = file_item["_site_label"]
         content_hash = hashes.get("sha256") or hashes.get("quickxor") or ""
         snapshot_item = SnapshotItem(
             snapshot_id=snapshot.id,
@@ -906,7 +925,7 @@ class BackupWorker:
                     
                     # Route to appropriate handler
                     if resource_type.startswith("ENTRA"):
-                        return await self._backup_entra_resource(resource, tenant, snapshot, graph_client, job_id)
+                        return await self._backup_entra_resource(resource, tenant, snapshot, graph_client, job_id, message)
                     elif resource_type.startswith("TEAMS"):
                         return await self._backup_teams_resource(resource, tenant, snapshot, graph_client, job_id)
                     elif resource_type == "POWER_BI":
@@ -924,7 +943,8 @@ class BackupWorker:
         }
 
     async def _backup_entra_resource(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
-                                     graph_client: GraphClient, job_id: uuid.UUID) -> Dict:
+                                     graph_client: GraphClient, job_id: uuid.UUID,
+                                     message: Optional[Dict[str, Any]] = None) -> Dict:
         """Backup Entra ID resource — users (profile/contacts/calendar), groups (members/owners), apps, devices"""
         item_count = 0
         bytes_added = 0
@@ -934,18 +954,27 @@ class BackupWorker:
         obj_id = resource.external_id
         resource_type = resource.type.value
         items_to_backup = []
+        policy = await self.get_sla_policy(resource, message)
+        backup_entra_core = True if policy is None else bool(getattr(policy, "backup_entra_id", True))
+        backup_contacts = True if policy is None else bool(getattr(policy, "contacts", True))
+        backup_calendars = True if policy is None else bool(getattr(policy, "calendars", True))
+        backup_group_mailbox = True if policy is None else bool(getattr(policy, "group_mailbox", True))
 
         if resource_type == "ENTRA_USER":
             print(f"[{self.worker_id}] [ENTRA_USER START] {resource.display_name} ({obj_id})")
 
             # Fetch all user data in PARALLEL for higher performance
             async def fetch_profile():
+                if not backup_entra_core:
+                    return []
                 print(f"[{self.worker_id}]   [PROFILE] Fetching...")
                 profile = await graph_client.get_user_profile(obj_id)
                 print(f"[{self.worker_id}]   [PROFILE] Done — {profile.get('displayName', 'N/A')}")
                 return [("USER_PROFILE", profile)]
 
             async def fetch_contacts():
+                if not backup_contacts:
+                    return []
                 print(f"[{self.worker_id}]   [CONTACTS] Fetching...")
                 try:
                     contacts = await graph_client.get_user_contacts(obj_id)
@@ -959,6 +988,8 @@ class BackupWorker:
                     raise
 
             async def fetch_calendar():
+                if not backup_calendars:
+                    return [], None
                 print(f"[{self.worker_id}]   [CALENDAR] Fetching...")
                 try:
                     calendars = await graph_client.get_calendar_events_delta(obj_id)
@@ -972,6 +1003,8 @@ class BackupWorker:
                     raise
 
             async def fetch_manager():
+                if not backup_entra_core:
+                    return []
                 print(f"[{self.worker_id}]   [MANAGER] Fetching...")
                 try:
                     manager = await graph_client.get_user_manager(obj_id)
@@ -985,6 +1018,8 @@ class BackupWorker:
                     return []
 
             async def fetch_direct_reports():
+                if not backup_entra_core:
+                    return []
                 print(f"[{self.worker_id}]   [DIRECT_REPORTS] Fetching...")
                 try:
                     reports = await graph_client.get_user_direct_reports(obj_id)
@@ -996,6 +1031,8 @@ class BackupWorker:
                     return []
 
             async def fetch_group_memberships():
+                if not backup_entra_core:
+                    return []
                 print(f"[{self.worker_id}]   [GROUP_MEMBERSHIPS] Fetching...")
                 try:
                     groups = await graph_client.get_user_group_memberships(obj_id)
@@ -1041,17 +1078,34 @@ class BackupWorker:
             print(f"[{self.worker_id}]   [ENTRA_USER] Total items to backup: {len(items_to_backup)}")
 
         elif resource_type in ("ENTRA_GROUP", "DYNAMIC_GROUP"):
-            # Group profile + members + owners
-            group = await graph_client.get_group_profile(obj_id)
-            items_to_backup.append(("GROUP_PROFILE", group))
+            group_mailbox_items: List[SnapshotItem] = []
 
-            members = await graph_client.get_group_members(obj_id)
-            for m in members.get("value", []):
-                items_to_backup.append(("GROUP_MEMBER", m))
+            if backup_entra_core:
+                group = await graph_client.get_group_profile(obj_id)
+                items_to_backup.append(("GROUP_PROFILE", group))
 
-            owners = await graph_client.get_group_owners(obj_id)
-            for o in owners.get("value", []):
-                items_to_backup.append(("GROUP_OWNER", o))
+                members = await graph_client.get_group_members(obj_id)
+                for m in members.get("value", []):
+                    items_to_backup.append(("GROUP_MEMBER", m))
+
+                owners = await graph_client.get_group_owners(obj_id)
+                for o in owners.get("value", []):
+                    items_to_backup.append(("GROUP_OWNER", o))
+
+            group_mail_enabled = bool((resource.extra_data or {}).get("mail_enabled"))
+            if backup_group_mailbox and group_mail_enabled:
+                group_mailbox_items, mailbox_bytes = await self.backup_group_mailbox_content(
+                    resource,
+                    tenant,
+                    snapshot,
+                    graph_client,
+                )
+                bytes_added += mailbox_bytes
+                item_count += len(group_mailbox_items)
+                if group_mailbox_items:
+                    async with async_session_factory() as session:
+                        session.add_all(group_mailbox_items)
+                        await session.commit()
 
         elif resource_type == "ENTRA_APP":
             # Application registration — fetch via /applications?$filter=id eq '{id}'
@@ -1110,8 +1164,9 @@ class BackupWorker:
             async with async_session_factory() as session:
                 session.add_all(db_items)
                 await session.commit()
-                
-                # Update resource backup info (storage_bytes, last_backup_*)
+
+        if db_items or item_count or bytes_added:
+            async with async_session_factory() as session:
                 await self.update_resource_backup_info(session, resource, job_id, snapshot.id, {
                     "item_count": item_count,
                     "bytes_added": bytes_added,
@@ -2283,7 +2338,7 @@ class BackupWorker:
     async def backup_entra_single(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                                   tenant: Tenant, message: Dict) -> Dict:
         """Single-resource Entra ID backup (matches handler signature)"""
-        return await self._backup_entra_resource(resource, tenant, snapshot, graph_client, None)
+        return await self._backup_entra_resource(resource, tenant, snapshot, graph_client, None, message)
 
     async def backup_mailbox(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                              tenant: Tenant, message: Dict) -> Dict:
@@ -2428,10 +2483,54 @@ class BackupWorker:
         print(f"[{self.worker_id}] [SHAREPOINT START] {resource.display_name} (site: {resource.external_id})")
 
         delta_token = (resource.extra_data or {}).get("delta_token")
-        print(f"[{self.worker_id}]   [SP_FILES] Fetching site drive items (paginated, delta)...")
-        files = await graph_client.get_sharepoint_site_drives(resource.external_id, delta_token)
-        items = files.get("value", [])
-        print(f"[{self.worker_id}]   [SP_FILES] Found {len(items)} site files")
+        subsite_delta_tokens = ((resource.extra_data or {}).get("subsite_delta_tokens") or {}).copy()
+
+        async def fetch_site_items(site_id: str, site_label: str, site_delta_token: Optional[str]) -> tuple[List[Dict[str, Any]], Optional[str], str]:
+            files = await graph_client.get_sharepoint_site_drives(site_id, site_delta_token)
+            items = files.get("value", [])
+            for item in items:
+                item["_site_label"] = site_label
+            return items, files.get("@odata.deltaLink"), site_id
+
+        site_targets: List[tuple[str, str, Optional[str]]] = [
+            (resource.external_id, resource.display_name, delta_token)
+        ]
+
+        try:
+            subsites = await graph_client.get_sharepoint_subsites(resource.external_id)
+            for subsite in subsites.get("value", []):
+                subsite_id = (subsite.get("id") or "").replace(",", "/")
+                if not subsite_id:
+                    continue
+                site_targets.append((
+                    subsite_id,
+                    subsite.get("displayName") or subsite.get("name") or subsite_id,
+                    subsite_delta_tokens.get(subsite_id),
+                ))
+        except Exception as exc:
+            logger.warning("Failed to enumerate SharePoint subsites for %s: %s", resource.display_name, exc)
+
+        print(f"[{self.worker_id}]   [SP_FILES] Fetching drive items for {len(site_targets)} site targets (root + subsites)...")
+        site_results = await asyncio.gather(
+            *[fetch_site_items(site_id, site_label, token) for site_id, site_label, token in site_targets],
+            return_exceptions=True,
+        )
+
+        items: List[Dict[str, Any]] = []
+        new_delta = None
+        new_subsite_tokens: Dict[str, str] = {}
+        for result in site_results:
+            if isinstance(result, Exception):
+                logger.warning("SharePoint site target fetch failed for %s: %s", resource.display_name, result)
+                continue
+            site_items, site_delta_link, site_id = result
+            items.extend(site_items)
+            if site_id == resource.external_id:
+                new_delta = site_delta_link
+            elif site_delta_link:
+                new_subsite_tokens[site_id] = site_delta_link
+
+        print(f"[{self.worker_id}]   [SP_FILES] Found {len(items)} site files across root and subsites")
 
         file_tasks = [
             self.backup_single_file(resource, tenant, snapshot, f, graph_client, None)
@@ -2453,7 +2552,16 @@ class BackupWorker:
 
         print(f"[{self.worker_id}]   [SP_FILES] Done — {total_items} uploaded, {failed} failed, {total_bytes} bytes")
 
-        new_delta = files.get("@odata.deltaLink")
+        if new_subsite_tokens:
+            async with async_session_factory() as sess:
+                r = await sess.get(Resource, resource.id)
+                if r:
+                    r.extra_data = r.extra_data or {}
+                    existing_subsite_tokens = (r.extra_data.get("subsite_delta_tokens") or {}).copy()
+                    existing_subsite_tokens.update(new_subsite_tokens)
+                    r.extra_data["subsite_delta_tokens"] = existing_subsite_tokens
+                    await sess.commit()
+
         print(f"[{self.worker_id}] [BACKUP COMPLETE] SharePoint: {resource.display_name} — {total_items} files, {total_bytes} bytes")
         return {"item_count": total_items, "bytes_added": total_bytes, "new_delta_token": new_delta}
 
@@ -2542,6 +2650,125 @@ class BackupWorker:
             tenant_id=tenant.external_tenant_id or settings.EFFECTIVE_POWER_BI_TENANT_ID,
             refresh_token=PowerBIClient.get_refresh_token_from_tenant(tenant),
         )
+
+    async def get_sla_policy(self, resource: Resource, message: Optional[Dict[str, Any]] = None) -> Optional[SlaPolicy]:
+        policy_id = None
+        if message:
+            policy_id = (
+                message.get("slaPolicyId")
+                or message.get("sla_policy_id")
+                or (message.get("spec") or {}).get("sla_policy_id")
+            )
+        if not policy_id:
+            policy_id = resource.sla_policy_id
+        if not policy_id:
+            return None
+
+        try:
+            policy_uuid = uuid.UUID(str(policy_id))
+        except (TypeError, ValueError):
+            return None
+
+        async with async_session_factory() as session:
+            return await session.get(SlaPolicy, policy_uuid)
+
+    async def backup_group_mailbox_content(
+        self,
+        resource: Resource,
+        tenant: Tenant,
+        snapshot: Snapshot,
+        graph_client: GraphClient,
+    ) -> tuple[List[SnapshotItem], int]:
+        """Back up Microsoft 365 group mailbox threads and posts."""
+        group_id = resource.external_id
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "group-mailbox")
+        db_items: List[SnapshotItem] = []
+        bytes_added = 0
+
+        threads = await graph_client.get_group_threads(group_id)
+        thread_list = threads.get("value", [])
+        logger.info("[%s] [GROUP_MAILBOX] %s threads found for %s", self.worker_id, len(thread_list), resource.display_name)
+
+        async def backup_thread(thread: Dict[str, Any]) -> tuple[List[SnapshotItem], int]:
+            local_items: List[SnapshotItem] = []
+            local_bytes = 0
+            thread_id = thread.get("id", str(uuid.uuid4()))
+            conversation_id = thread.get("conversationId")
+            thread_bytes = json.dumps(thread).encode()
+            thread_hash = hashlib.sha256(thread_bytes).hexdigest()
+            thread_blob_path = azure_storage_manager.build_blob_path(
+                str(tenant.id),
+                str(resource.id),
+                str(snapshot.id),
+                f"group_thread_{thread_id}",
+            )
+            thread_upload = await upload_blob_with_retry(container, thread_blob_path, thread_bytes, shard)
+            if thread_upload.get("success"):
+                local_items.append(SnapshotItem(
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    external_id=thread_id,
+                    item_type="GROUP_MAILBOX_THREAD",
+                    name=thread.get("topic") or thread.get("id", thread_id),
+                    folder_path="group-mailbox/threads",
+                    content_hash=thread_hash,
+                    content_size=len(thread_bytes),
+                    blob_path=thread_blob_path,
+                    metadata={"raw": thread, "conversationId": conversation_id},
+                    content_checksum=thread_hash,
+                ))
+                local_bytes += len(thread_bytes)
+
+            try:
+                posts = await graph_client.get_group_thread_posts(group_id, thread_id)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    logger.warning("[%s] [GROUP_MAILBOX] Thread %s disappeared while fetching posts", self.worker_id, thread_id)
+                    return local_items, local_bytes
+                raise
+
+            for post in posts.get("value", []):
+                post_id = post.get("id", str(uuid.uuid4()))
+                post_bytes = json.dumps(post).encode()
+                post_hash = hashlib.sha256(post_bytes).hexdigest()
+                post_blob_path = azure_storage_manager.build_blob_path(
+                    str(tenant.id),
+                    str(resource.id),
+                    str(snapshot.id),
+                    f"group_post_{thread_id}_{post_id}",
+                )
+                post_upload = await upload_blob_with_retry(container, post_blob_path, post_bytes, shard)
+                if post_upload.get("success"):
+                    local_items.append(SnapshotItem(
+                        snapshot_id=snapshot.id,
+                        tenant_id=tenant.id,
+                        external_id=post_id,
+                        item_type="GROUP_MAILBOX_POST",
+                        name=post.get("subject") or post.get("id", post_id),
+                        folder_path=f"group-mailbox/threads/{thread.get('topic') or thread_id}",
+                        content_hash=post_hash,
+                        content_size=len(post_bytes),
+                        blob_path=post_blob_path,
+                        metadata={"raw": post, "threadId": thread_id, "conversationId": conversation_id},
+                        content_checksum=post_hash,
+                    ))
+                    local_bytes += len(post_bytes)
+
+            return local_items, local_bytes
+
+        thread_results = await asyncio.gather(
+            *[backup_thread(thread) for thread in thread_list],
+            return_exceptions=True,
+        )
+        for result in thread_results:
+            if isinstance(result, tuple):
+                db_items.extend(result[0])
+                bytes_added += result[1]
+            elif isinstance(result, Exception):
+                logger.warning("[%s] [GROUP_MAILBOX] Thread backup failed for %s: %s", self.worker_id, resource.display_name, result)
+
+        return db_items, bytes_added
 
     async def create_snapshot(
         self,

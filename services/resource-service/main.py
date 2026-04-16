@@ -1,6 +1,6 @@
 """Resource Service - Manages resources and SLA policies"""
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Iterable
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 from datetime import timedelta
@@ -43,6 +43,91 @@ async def notify_scheduler_reschedule():
 
 
 app = FastAPI(title="Resource Service", version="1.0.0", lifespan=lifespan)
+
+
+USER_LINKED_TYPES = {
+    ResourceType.ENTRA_USER,
+    ResourceType.MAILBOX,
+    ResourceType.SHARED_MAILBOX,
+    ResourceType.ROOM_MAILBOX,
+    ResourceType.ONEDRIVE,
+    ResourceType.TODO,
+    ResourceType.ONENOTE,
+}
+
+GROUP_LINKED_TYPES = {
+    ResourceType.ENTRA_GROUP,
+    ResourceType.DYNAMIC_GROUP,
+    ResourceType.PLANNER,
+    ResourceType.TEAMS_CHANNEL,
+}
+
+
+def _resource_user_key(resource: Resource) -> Optional[str]:
+    if resource.type in {
+        ResourceType.ENTRA_USER,
+        ResourceType.MAILBOX,
+        ResourceType.SHARED_MAILBOX,
+        ResourceType.ROOM_MAILBOX,
+        ResourceType.TODO,
+        ResourceType.ONENOTE,
+    }:
+        return resource.external_id
+    if resource.type == ResourceType.ONEDRIVE:
+        return (resource.extra_data or {}).get("user_id")
+    return None
+
+
+def _resource_group_key(resource: Resource) -> Optional[str]:
+    if resource.type in {
+        ResourceType.ENTRA_GROUP,
+        ResourceType.DYNAMIC_GROUP,
+        ResourceType.PLANNER,
+        ResourceType.TEAMS_CHANNEL,
+    }:
+        return resource.external_id
+    return None
+
+
+async def expand_linked_policy_scope(db: AsyncSession, seed_resources: Iterable[Resource]) -> list[Resource]:
+    seed_resources = list(seed_resources)
+    if not seed_resources:
+        return []
+
+    tenant_ids = {resource.tenant_id for resource in seed_resources}
+    candidate_types = list(USER_LINKED_TYPES | GROUP_LINKED_TYPES)
+    result = await db.execute(
+        select(Resource).where(
+            Resource.tenant_id.in_(tenant_ids),
+            Resource.type.in_(candidate_types),
+        )
+    )
+    candidates = result.scalars().all()
+
+    user_keys = {
+        (resource.tenant_id, key)
+        for resource in seed_resources
+        for key in [_resource_user_key(resource)]
+        if key
+    }
+    group_keys = {
+        (resource.tenant_id, key)
+        for resource in seed_resources
+        for key in [_resource_group_key(resource)]
+        if key
+    }
+
+    expanded: dict[UUID, Resource] = {resource.id: resource for resource in seed_resources}
+    for candidate in candidates:
+        candidate_user_key = _resource_user_key(candidate)
+        candidate_group_key = _resource_group_key(candidate)
+        if candidate_user_key and (candidate.tenant_id, candidate_user_key) in user_keys:
+            expanded[candidate.id] = candidate
+            continue
+        if candidate_group_key and (candidate.tenant_id, candidate_group_key) in group_keys:
+            expanded[candidate.id] = candidate
+
+    return list(expanded.values())
 
 
 @app.get("/health")
@@ -123,7 +208,8 @@ async def list_resources(
              "AZURE_SQL_DB": "azure_sql", "AZURE_POSTGRESQL": "azure_postgresql", "AZURE_POSTGRESQL_SINGLE": "azure_postgresql",
              "RESOURCE_GROUP": "resource_group", "DYNAMIC_GROUP": "dynamic_group",
              "POWER_BI": "power_bi", "POWER_APPS": "power_apps", "POWER_AUTOMATE": "power_automate",
-             "POWER_DLP": "power_dlp", "COPILOT": "copilot", "PLANNER": "planner"}
+             "POWER_DLP": "power_dlp", "COPILOT": "copilot", "PLANNER": "planner",
+             "TODO": "todo", "ONENOTE": "onenote"}
         return m.get(t, t.lower() if t else "unknown")
 
     def map_status(s):
@@ -218,7 +304,8 @@ async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] 
              "AZURE_SQL_DB": "azure_sql", "AZURE_POSTGRESQL": "azure_postgresql", "AZURE_POSTGRESQL_SINGLE": "azure_postgresql",
              "RESOURCE_GROUP": "resource_group", "DYNAMIC_GROUP": "dynamic_group",
              "POWER_BI": "power_bi", "POWER_APPS": "power_apps", "POWER_AUTOMATE": "power_automate",
-             "POWER_DLP": "power_dlp", "COPILOT": "copilot", "PLANNER": "planner"}
+             "POWER_DLP": "power_dlp", "COPILOT": "copilot", "PLANNER": "planner",
+             "TODO": "todo", "ONENOTE": "onenote"}
         return m.get(t, t.lower() if t else "unknown")
 
     def map_status(s):
@@ -348,8 +435,10 @@ async def assign_policy(resource_id: str, request: AssignPolicyRequest, db: Asyn
     resource = result.scalar_one_or_none()
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
-    resource.sla_policy_id = UUID(request.policyId)
-    resource.status = ResourceStatus.ACTIVE
+    resources = await expand_linked_policy_scope(db, [resource])
+    for target in resources:
+        target.sla_policy_id = UUID(request.policyId)
+        target.status = ResourceStatus.ACTIVE
     await db.commit()
 
 
@@ -360,7 +449,9 @@ async def unassign_policy(resource_id: str, db: AsyncSession = Depends(get_db)):
     resource = result.scalar_one_or_none()
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
-    resource.sla_policy_id = None
+    resources = await expand_linked_policy_scope(db, [resource])
+    for target in resources:
+        target.sla_policy_id = None
     await db.commit()
 
 
@@ -431,13 +522,15 @@ async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depe
         result = await db.execute(stmt)
         resources = result.scalars().all()
 
-        for resource in resources:
+        expanded_resources = await expand_linked_policy_scope(db, resources)
+
+        for resource in expanded_resources:
             resource.sla_policy_id = None
         await db.commit()
 
         return {
             "assigned": 0,
-            "unassigned": len(resources),
+            "unassigned": len(expanded_resources),
             "not_found": [],
         }
 
@@ -463,8 +556,10 @@ async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depe
     not_found = [rid for rid in request.resourceIds if rid not in found_ids]
     
     # Bulk update
+    expanded_resources = await expand_linked_policy_scope(db, resources)
+
     updated_count = 0
-    for resource in resources:
+    for resource in expanded_resources:
         resource.sla_policy_id = policy_id
         resource.status = ResourceStatus.ACTIVE
         updated_count += 1
@@ -501,13 +596,15 @@ async def bulk_unassign_policy(request: BulkUnassignRequest, db: AsyncSession = 
     found_ids = {str(r.id) for r in resources}
     not_found = [rid for rid in request.resourceIds if rid not in found_ids]
     
-    for resource in resources:
+    expanded_resources = await expand_linked_policy_scope(db, resources)
+
+    for resource in expanded_resources:
         resource.sla_policy_id = None
     
     await db.commit()
     
     return {
-        "unassigned": len(resources),
+        "unassigned": len(expanded_resources),
         "not_found": not_found,
     }
 

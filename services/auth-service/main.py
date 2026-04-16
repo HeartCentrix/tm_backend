@@ -544,6 +544,37 @@ async def azure_datasource_callback(
             print(f"[auth-service] Upgraded tenant {tenant.id} from M365 to BOTH")
             await db.commit()
 
+    # Store an active AZURE consent token so the Settings status card reflects
+    # a successful Azure connect instead of remaining "Not granted".
+    from shared.security import encrypt_secret
+
+    deactivate_stmt = select(AdminConsentToken).where(
+        AdminConsentToken.org_id == tenant.org_id,
+        AdminConsentToken.consent_type == "AZURE",
+        AdminConsentToken.is_active == True,
+    )
+    old_tokens = (await db.execute(deactivate_stmt)).scalars().all()
+    for old_token in old_tokens:
+        old_token.is_active = False
+
+    encrypted_access_token = encrypt_secret(tokens["access_token"]) if tokens.get("access_token") else None
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=tokens.get("expires_in", 3600))
+    consent_token = AdminConsentToken(
+        id=uuid4(),
+        org_id=tenant.org_id,
+        tenant_id=tenant.id,
+        consent_type="AZURE",
+        access_token_encrypted=encrypted_access_token,
+        refresh_token_encrypted=encrypt_secret(tokens["refresh_token"]) if tokens.get("refresh_token") else None,
+        token_type=tokens.get("token_type", "Bearer"),
+        expires_at=expires_at.replace(tzinfo=None),
+        granted_by=current_user.get("email"),
+        scope=tokens.get("scope") or "https://management.azure.com/.default",
+        is_active=True,
+    )
+    db.add(consent_token)
+    await db.commit()
+
     # Publish discovery.azure message so the discovery worker picks up Azure resources
     from shared.message_bus import message_bus as msg_bus
     if not msg_bus.connection:
@@ -737,7 +768,24 @@ async def get_azure_admin_consent_status(
     token = result.scalar_one_or_none()
     
     if token is None:
-        return None
+        tenant_stmt = select(Tenant).where(
+            Tenant.org_id == org_id,
+            Tenant.type.in_([TenantType.AZURE, TenantType.BOTH]),
+        ).order_by(Tenant.updated_at.desc()).limit(1)
+        tenant = (await db.execute(tenant_stmt)).scalar_one_or_none()
+        if tenant is None:
+            return None
+
+        fallback_timestamp = tenant.updated_at or tenant.created_at or datetime.now(timezone.utc).replace(tzinfo=None)
+        return AdminConsentResponse(
+            id=str(tenant.id),
+            consentType="AZURE",
+            grantedBy=current_user.get("email"),
+            consentedAt=fallback_timestamp.isoformat(),
+            lastUsedAt=tenant.last_discovery_at.isoformat() if tenant.last_discovery_at else None,
+            isActive=True,
+            scope="https://management.azure.com/.default",
+        )
 
     return AdminConsentResponse.model_validate(token)
 

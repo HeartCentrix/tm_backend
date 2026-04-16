@@ -100,6 +100,19 @@ def frequency_to_cron_params(frequency: str, backup_days: list[str] | None = Non
 
 def resource_type_enabled(resource_type: str, policy: SlaPolicy) -> bool:
     """Check if a resource type is enabled in the SLA policy's backup flags."""
+    if resource_type == "ENTRA_USER":
+        return bool(
+            getattr(policy, "backup_entra_id", False)
+            or getattr(policy, "contacts", False)
+            or getattr(policy, "calendars", False)
+        )
+
+    if resource_type in {"ENTRA_GROUP", "DYNAMIC_GROUP"}:
+        return bool(
+            getattr(policy, "backup_entra_id", False)
+            or getattr(policy, "group_mailbox", False)
+        )
+
     flag_name = RESOURCE_TYPE_TO_SLA_FLAG.get(resource_type)
     if not flag_name:
         # Unknown resource types default to enabled

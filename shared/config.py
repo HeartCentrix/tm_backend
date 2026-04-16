@@ -1,15 +1,16 @@
 """Shared configuration for all microservices"""
 import os
 from typing import List
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 class Settings:
     def __init__(self):
-        # Railway provides DATABASE_URL directly; parse it if present
-        railway_database_url = os.getenv("DATABASE_URL")
-        if railway_database_url:
-            parsed = urlparse(railway_database_url)
+        # Railway provides DATABASE_URL directly. Be permissive and also
+        # accept a full Postgres URL accidentally pasted into DB_HOST.
+        self._database_url_override = self._resolve_database_url_override()
+        if self._database_url_override:
+            parsed = urlparse(self._database_url_override)
             self.DB_HOST = parsed.hostname or "localhost"
             self.DB_PORT = str(parsed.port or "5432")
             self.DB_NAME = parsed.path.lstrip("/") if parsed.path else "tm_vault_db"
@@ -108,6 +109,9 @@ class Settings:
         self.GRAPH_BATCH_SIZE = int(os.getenv("GRAPH_BATCH_SIZE", "20"))
         # Chunk size for processing resources
         self.RESOURCE_CHUNK_SIZE = int(os.getenv("RESOURCE_CHUNK_SIZE", "50"))
+        # Discovery staging / merge batch sizes for large tenant onboarding
+        self.DISCOVERY_STAGE_CHUNK_SIZE = int(os.getenv("DISCOVERY_STAGE_CHUNK_SIZE", "500"))
+        self.DISCOVERY_PROGRESS_LOG_EVERY = int(os.getenv("DISCOVERY_PROGRESS_LOG_EVERY", "250"))
         
         self.ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
         self.ELASTICSEARCH_ENABLED = False
@@ -150,6 +154,24 @@ class Settings:
         self.DELTA_TOKEN_URL = os.getenv("DELTA_TOKEN_URL", "http://delta-token:8010")
         self.PROGRESS_TRACKER_URL = os.getenv("PROGRESS_TRACKER_URL", "http://progress-tracker:8011")
         self.AUDIT_SERVICE_URL = os.getenv("AUDIT_SERVICE_URL", "http://audit-service:8012")
+
+    def _resolve_database_url_override(self) -> str:
+        raw_database_url = os.getenv("DATABASE_URL", "").strip()
+        if not raw_database_url:
+            raw_db_host = os.getenv("DB_HOST", "").strip()
+            if raw_db_host.startswith(("postgres://", "postgresql://", "postgresql+asyncpg://")):
+                raw_database_url = raw_db_host
+
+        if not raw_database_url:
+            return ""
+
+        if raw_database_url.startswith("postgresql+asyncpg://"):
+            return raw_database_url
+        if raw_database_url.startswith("postgres://"):
+            return "postgresql+asyncpg://" + raw_database_url[len("postgres://"):]
+        if raw_database_url.startswith("postgresql://"):
+            return "postgresql+asyncpg://" + raw_database_url[len("postgresql://"):]
+        return raw_database_url
 
     def _parse_graph_apps(self) -> List[dict]:
         """Parse multiple Graph app registrations from env vars."""
@@ -229,7 +251,12 @@ class Settings:
 
     @property
     def DATABASE_URL(self) -> str:
-        return f"postgresql+asyncpg://{self.DB_USERNAME}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        if self._database_url_override:
+            return self._database_url_override
+
+        username = quote(self.DB_USERNAME or "")
+        password = quote(self.DB_PASSWORD or "")
+        return f"postgresql+asyncpg://{username}:{password}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
 
     @property
     def RABBITMQ_URL(self) -> str:

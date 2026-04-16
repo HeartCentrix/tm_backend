@@ -108,6 +108,7 @@ async def proxy_request(service: str, path: str, request: Request):
 @app.get("/api/v1/auth/microsoft/url")
 @app.get("/api/v1/auth/microsoft/datasource/url")
 @app.get("/api/v1/auth/azure/datasource/url")
+@app.get("/api/v1/auth/power-bi/url")
 async def auth_get(request: Request):
     return await proxy_request("auth", request.url.path, request)
 
@@ -117,6 +118,7 @@ async def auth_get(request: Request):
 @app.post("/api/v1/auth/logout")
 @app.post("/api/v1/auth/microsoft/datasource/callback")
 @app.post("/api/v1/auth/azure/datasource/callback")
+@app.post("/api/v1/auth/power-bi/callback")
 async def auth_post(request: Request):
     return await proxy_request("auth", request.url.path, request)
 
@@ -129,6 +131,7 @@ async def auth_me(request: Request):
 # Admin Consent status routes (existing datasource APIs handle URL/callback)
 @app.get("/api/v1/admin-consent/m365/status")
 @app.get("/api/v1/admin-consent/azure/status")
+@app.get("/api/v1/admin-consent/power-bi/readiness")
 async def admin_consent_status(request: Request):
     return await proxy_request("auth", request.url.path, request)
 

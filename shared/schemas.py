@@ -447,6 +447,7 @@ class AdminConsentResponse(BaseModel):
     lastUsedAt: Optional[str] = Field(default=None, alias='last_used_at')
     isActive: bool = Field(default=True, alias='is_active')
     scope: Optional[str] = None
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True)
 
     @field_validator('id', mode='before')
     @classmethod
