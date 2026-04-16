@@ -574,20 +574,16 @@ async def get_item_content(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    # Try metadata first
-    meta = item.extra_data or {}
-    raw = meta.get("raw") or meta.get("structured")
-    if raw:
-        return {"source": "metadata", "content": raw}
-
-    # Fall back to blob
+    # For items with a blob_path, the actual content lives in blob storage.
+    # extra_data["structured"] only holds file properties (size, mime_type, etc.),
+    # not the file content, so we must read from blob first.
     if item.blob_path and azure_storage_manager.shards:
         try:
             shard = azure_storage_manager.get_shard_for_resource(
                 str(item.snapshot_id), str(item.tenant_id or "")
             )
             parts = item.blob_path.split("/", 1)
-            container, path = (parts[0], parts[1]) if len(parts) == 2 else ("mailbox", item.blob_path)
+            container, path = (parts[0], parts[1]) if len(parts) == 2 else ("files", item.blob_path)
             data = await shard.download_blob(container, path)
             if data:
                 import json as _json
@@ -599,5 +595,11 @@ async def get_item_content(
                     return Response(content=data, media_type="application/octet-stream")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Blob read failed: {e}")
+
+    # Fall back to inline metadata (e.g. email bodies stored directly in extra_data)
+    meta = item.extra_data or {}
+    raw = meta.get("raw") or meta.get("structured")
+    if raw:
+        return {"source": "metadata", "content": raw}
 
     return {"source": "none", "content": {}}

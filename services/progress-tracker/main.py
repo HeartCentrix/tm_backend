@@ -191,7 +191,11 @@ async def update_progress(request: dict):
                 status_val = request.get("status")
                 if status_val:
                     try:
-                        job.status = JobStatus(status_val)
+                        new_status = JobStatus(status_val)
+                        # Never downgrade a terminal status back to a non-terminal one
+                        terminal = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
+                        if job.status not in terminal:
+                            job.status = new_status
                     except ValueError:
                         pass
                 await db.commit()

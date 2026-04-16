@@ -164,10 +164,90 @@ class BackupWorker:
             print(f"[{self.worker_id}] Azure Storage: {len(azure_storage_manager.shards)} shard(s) ready")
         print(f"[{self.worker_id}] Backup worker initialized (concurrency={settings.BACKUP_CONCURRENCY})")
 
+    async def recover_stuck_jobs(self):
+        """
+        On startup, find jobs stuck in QUEUED or RUNNING state and republish them.
+        Uses SELECT FOR UPDATE SKIP LOCKED so multiple workers don't double-publish.
+        Only targets jobs older than 2 minutes to avoid racing with actively processing jobs.
+        """
+        from datetime import timedelta
+        from sqlalchemy import text as sa_text
+        cutoff = datetime.utcnow() - timedelta(minutes=2)
+        recovered = 0
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(Job)
+                .where(
+                    Job.type == "BACKUP",
+                    Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+                    Job.updated_at < cutoff,
+                )
+                .with_for_update(skip_locked=True)
+            )
+            stuck_jobs = result.scalars().all()
+            for job in stuck_jobs:
+                try:
+                    spec = job.spec or {}
+                    resource_type = spec.get("resource_type", "")
+                    tenant_id = str(job.tenant_id)
+
+                    # Determine queue from resource type
+                    azure_types = {
+                        "AZURE_VM": "backup.azure_vm",
+                        "AZURE_SQL_DB": "backup.azure_sql",
+                        "AZURE_POSTGRESQL": "backup.azure_pg",
+                        "AZURE_POSTGRESQL_SINGLE": "backup.azure_pg",
+                    }
+                    queue = azure_types.get(resource_type, "backup.normal")
+
+                    # Rebuild message
+                    if job.batch_resource_ids:
+                        resource_ids = [str(rid) for rid in job.batch_resource_ids]
+                        message = {
+                            "jobId": str(job.id),
+                            "tenantId": tenant_id,
+                            "resourceType": resource_type,
+                            "resourceIds": resource_ids,
+                            "type": spec.get("type", "INCREMENTAL"),
+                            "priority": job.priority or 5,
+                            "slaPolicyId": spec.get("sla_policy_id"),
+                            "triggeredBy": "RECOVERY",
+                            "snapshotLabel": spec.get("snapshot_label", "recovery"),
+                            "forceFullBackup": spec.get("fullBackup", False),
+                            "createdAt": datetime.utcnow().isoformat(),
+                            "batchSize": len(resource_ids),
+                        }
+                    elif job.resource_id:
+                        message = {
+                            "jobId": str(job.id),
+                            "resourceId": str(job.resource_id),
+                            "tenantId": tenant_id,
+                            "type": spec.get("type", "INCREMENTAL"),
+                            "priority": job.priority or 5,
+                            "triggeredBy": "RECOVERY",
+                            "snapshotLabel": spec.get("snapshot_label", "recovery"),
+                        }
+                    else:
+                        continue
+
+                    job.status = JobStatus.QUEUED
+                    job.attempts = 0
+                    await message_bus.publish(queue, message, priority=job.priority or 5)
+                    recovered += 1
+                    print(f"[{self.worker_id}] Recovered stuck job {job.id} (was {job.status.value if hasattr(job.status, 'value') else job.status}) → republished to {queue}")
+                except Exception as e:
+                    print(f"[{self.worker_id}] Failed to recover job {job.id}: {e}")
+            await session.commit()
+        if recovered:
+            print(f"[{self.worker_id}] Recovery complete: {recovered} job(s) requeued")
+        else:
+            print(f"[{self.worker_id}] Recovery check: no stuck jobs found")
+
     async def start(self):
 
         """Start consuming from all backup queues"""
         await self.initialize()
+        await self.recover_stuck_jobs()
         queues = [
             ("backup.urgent", 10),
             ("backup.high", 20),
@@ -305,7 +385,17 @@ class BackupWorker:
                     resource.status = "INACCESSIBLE"
                     await session.commit()
 
-                
+                # Mark snapshot as FAILED so it doesn't stay IN_PROGRESS forever
+                try:
+                    async with async_session_factory() as fail_sess:
+                        snap = await fail_sess.get(Snapshot, snapshot.id)
+                        if snap and snap.status == SnapshotStatus.IN_PROGRESS:
+                            snap.status = SnapshotStatus.FAILED
+                            snap.completed_at = datetime.utcnow()
+                            snap.extra_data = {**(snap.extra_data or {}), "error": str(e)[:500]}
+                            await fail_sess.commit()
+                except Exception:
+                    pass  # Best-effort; don't mask the original error
 
                 print(f"[{self.worker_id}] Handler FAILED for {resource_type}: {resource.display_name} — {e}")
                 import traceback
@@ -476,28 +566,38 @@ class BackupWorker:
                     if failed_items:
                         snapshot.delta_tokens_json["failed_items"] = failed_items[:100]  # cap at 100
                     async with async_session_factory() as sess:
-                        sess.merge(snapshot)
+                        await sess.merge(snapshot)
                         await sess.commit()
                     # Update delta token
                     new_delta = files.get("@odata.deltaLink")
                     if new_delta:
                         resource.extra_data = resource.extra_data or {}
                         resource.extra_data["delta_token"] = new_delta
+                    total_success = server_copy_ok + streaming_ok
                     async with async_session_factory() as sess:
-                        sess.merge(resource)
+                        await sess.merge(resource)
                         await sess.commit()
-
-                        
 
                         # Update resource backup info (storage_bytes, last_backup_*)
                         await self.update_resource_backup_info(sess, resource, job_id, snapshot.id, {
                             "item_count": total_success,
                             "bytes_added": res_bytes,
                         })
-                    total_success = server_copy_ok + streaming_ok
+                    await self.complete_snapshot(None, snapshot, {"item_count": total_success, "bytes_added": res_bytes, "files_failed": failed_count})
                     return {"item_count": total_success, "bytes_added": res_bytes}
                 except Exception as e:
                     print(f"[{self.worker_id}] File backup failed for {resource.id}: {e}")
+                    # Mark snapshot as FAILED so it doesn't stay IN_PROGRESS forever
+                    try:
+                        async with async_session_factory() as fail_sess:
+                            snap = await fail_sess.get(Snapshot, snapshot.id)
+                            if snap and snap.status == SnapshotStatus.IN_PROGRESS:
+                                snap.status = SnapshotStatus.FAILED
+                                snap.completed_at = datetime.utcnow()
+                                snap.extra_data = {**(snap.extra_data or {}), "error": str(e)[:500]}
+                                await fail_sess.commit()
+                    except Exception:
+                        pass
                     return {"item_count": 0, "bytes_added": 0}
         results = await asyncio.gather(*[backup_one_resource(r) for r in resources], return_exceptions=True)
         return {
@@ -809,19 +909,29 @@ class BackupWorker:
                         resource.extra_data = resource.extra_data or {}
                         resource.extra_data["mail_delta_token"] = new_delta
                         async with async_session_factory() as sess:
-                            sess.merge(resource)
+                            await sess.merge(resource)
                             await sess.commit()
-
-                            
 
                             # Update resource backup info (storage_bytes, last_backup_*)
                             await self.update_resource_backup_info(sess, resource, job_id, snapshot.id, {
                                 "item_count": total_items,
                                 "bytes_added": total_bytes,
                             })
+                    await self.complete_snapshot(None, snapshot, {"item_count": total_items, "bytes_added": total_bytes})
                     return {"item_count": total_items, "bytes_added": total_bytes}
                 except Exception as e:
                     print(f"[{self.worker_id}] Mailbox backup failed for {resource.id}: {e}")
+                    # Mark snapshot as FAILED so it doesn't stay IN_PROGRESS forever
+                    try:
+                        async with async_session_factory() as fail_sess:
+                            snap = await fail_sess.get(Snapshot, snapshot.id)
+                            if snap and snap.status == SnapshotStatus.IN_PROGRESS:
+                                snap.status = SnapshotStatus.FAILED
+                                snap.completed_at = datetime.utcnow()
+                                snap.extra_data = {**(snap.extra_data or {}), "error": str(e)[:500]}
+                                await fail_sess.commit()
+                    except Exception:
+                        pass
                     return {"item_count": 0, "bytes_added": 0}
         results = await asyncio.gather(*[backup_one_mailbox(r) for r in resources], return_exceptions=True)
         return {
@@ -895,6 +1005,17 @@ class BackupWorker:
                         return await self._backup_metadata_only(graph_client, resource, snapshot, tenant, message)
                 except Exception as e:
                     print(f"[{self.worker_id}] Generic backup failed for {resource.id}: {e}")
+                    # Mark snapshot as FAILED so it doesn't stay IN_PROGRESS forever
+                    try:
+                        async with async_session_factory() as fail_sess:
+                            snap = await fail_sess.get(Snapshot, snapshot.id)
+                            if snap and snap.status == SnapshotStatus.IN_PROGRESS:
+                                snap.status = SnapshotStatus.FAILED
+                                snap.completed_at = datetime.utcnow()
+                                snap.extra_data = {**(snap.extra_data or {}), "error": str(e)[:500]}
+                                await fail_sess.commit()
+                    except Exception:
+                        pass
                     return {"item_count": 0, "bytes_added": 0}
         results = await asyncio.gather(*[backup_one(r) for r in resources], return_exceptions=True)
         return {
@@ -1805,9 +1926,9 @@ class BackupWorker:
         )
         await session.commit()
 
-    async def complete_snapshot(self, session: AsyncSession, snapshot: Snapshot, result: Dict):
+    async def complete_snapshot(self, session: Optional[AsyncSession], snapshot: Snapshot, result: Dict):
 
-        """Mark snapshot as completed with result data"""
+        """Mark snapshot as completed with result data. Opens own session if none provided."""
         now = datetime.utcnow()
         snapshot.completed_at = now
         snapshot.item_count = result.get("item_count", 0)
@@ -1817,7 +1938,7 @@ class BackupWorker:
         snapshot.delta_token = result.get("new_delta_token")
         # Set status: PARTIAL if there are failed files, COMPLETE otherwise
         file_tracking = snapshot.delta_tokens_json or {}
-        files_failed = file_tracking.get("files_failed", 0)
+        files_failed = file_tracking.get("files_failed", result.get("files_failed", 0))
         if files_failed > 0:
             snapshot.status = SnapshotStatus.PARTIAL
         else:
@@ -1827,8 +1948,13 @@ class BackupWorker:
             duration = (now - snapshot.started_at).total_seconds()
             snapshot.duration_secs = int(duration)
         # merge() handles detached instances (snapshot was created in a separate session)
-        await session.merge(snapshot)
-        await session.commit()
+        if session is None:
+            async with async_session_factory() as session:
+                await session.merge(snapshot)
+                await session.commit()
+        else:
+            await session.merge(snapshot)
+            await session.commit()
         # Persist delta token on resource for incremental backups
         if result.get("new_delta_token"):
             resource_id = snapshot.resource_id
@@ -1854,20 +1980,29 @@ class BackupWorker:
         )
 
     async def create_snapshot(self, resource: Resource, message: Dict, job_id: uuid.UUID) -> Snapshot:
-
-        async with async_session_factory() as session:
-            snapshot = Snapshot(
-                id=uuid.uuid4(),
-                resource_id=resource.id,
-                job_id=job_id,
-                type=SnapshotType.INCREMENTAL,
-                status=SnapshotStatus.IN_PROGRESS,
-                started_at=datetime.utcnow(),
-                snapshot_label=message.get("snapshotLabel", "scheduled"),
-            )
-            session.add(snapshot)
-            await session.commit()
-            return snapshot
+        snapshot_id = uuid.uuid4()
+        for attempt in range(1, 4):
+            try:
+                async with async_session_factory() as session:
+                    snapshot = Snapshot(
+                        id=snapshot_id,
+                        resource_id=resource.id,
+                        job_id=job_id,
+                        type=SnapshotType.INCREMENTAL,
+                        status=SnapshotStatus.IN_PROGRESS,
+                        started_at=datetime.utcnow(),
+                        snapshot_label=message.get("snapshotLabel", "scheduled"),
+                    )
+                    session.add(snapshot)
+                    await session.commit()
+                    return snapshot
+            except Exception as e:
+                if attempt < 3 and ("deadlock" in str(e).lower() or "serialization" in str(e).lower()):
+                    wait = attempt * 0.5
+                    print(f"[{self.worker_id}] create_snapshot deadlock (attempt {attempt}), retrying in {wait}s")
+                    await asyncio.sleep(wait)
+                else:
+                    raise
 
     async def update_job_status(self, session: AsyncSession, job_id: uuid.UUID, status: JobStatus, result: Dict):
 

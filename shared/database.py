@@ -15,8 +15,9 @@ engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
-    pool_size=30,
-    max_overflow=40,
+    pool_size=10,
+    max_overflow=20,
+    pool_timeout=30,
     connect_args={"server_settings": {"search_path": settings.DB_SCHEMA}},
 )
 
@@ -172,7 +173,7 @@ async def init_db():
             await conn.execute(text(f"SET LOCAL statement_timeout = '{DDL_STATEMENT_TIMEOUT}'"))
             await conn.execute(text(f"SET search_path TO {settings.DB_SCHEMA};"))
 
-            # ── CREATE TABLE IF NOT EXISTS (13 tables + indexes) ──
+            # ── CREATE TABLE IF NOT EXISTS ──
             await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS organizations (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -187,404 +188,407 @@ async def init_db():
                 )
             """))
 
-        # 2. Tenants
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS tenants (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                org_id UUID REFERENCES organizations(id),
-                type VARCHAR DEFAULT 'M365',
-                display_name VARCHAR NOT NULL,
-                external_tenant_id VARCHAR UNIQUE,
-                customer_id VARCHAR,
-                subscription_id VARCHAR,
-                client_id VARCHAR,
-                client_secret_ref VARCHAR,
-                graph_client_id VARCHAR,
-                graph_client_secret_encrypted BYTEA,
-                status VARCHAR DEFAULT 'PENDING',
-                storage_region VARCHAR,
-                last_discovery_at TIMESTAMP,
-                graph_delta_tokens JSON DEFAULT '{}',
-                extra_data JSON DEFAULT '{}',
-                dr_region_enabled BOOLEAN DEFAULT FALSE,
-                dr_region VARCHAR,
-                dr_storage_account_name VARCHAR,
-                dr_storage_account_key_encrypted BYTEA,
-                dr_last_replicated_at TIMESTAMP,
-                azure_refresh_token_encrypted BYTEA,
-                azure_refresh_token_updated_at TIMESTAMP,
-                azure_subscriptions_cached JSON DEFAULT '[]',
-                azure_sql_servers_configured JSON DEFAULT '[]',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
+            # 2. Tenants
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS tenants (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    org_id UUID REFERENCES organizations(id),
+                    type VARCHAR DEFAULT 'M365',
+                    display_name VARCHAR NOT NULL,
+                    external_tenant_id VARCHAR UNIQUE,
+                    customer_id VARCHAR,
+                    subscription_id VARCHAR,
+                    client_id VARCHAR,
+                    client_secret_ref VARCHAR,
+                    graph_client_id VARCHAR,
+                    graph_client_secret_encrypted BYTEA,
+                    status VARCHAR DEFAULT 'PENDING',
+                    storage_region VARCHAR,
+                    last_discovery_at TIMESTAMP,
+                    graph_delta_tokens JSON DEFAULT '{}',
+                    extra_data JSON DEFAULT '{}',
+                    dr_region_enabled BOOLEAN DEFAULT FALSE,
+                    dr_region VARCHAR,
+                    dr_storage_account_name VARCHAR,
+                    dr_storage_account_key_encrypted BYTEA,
+                    dr_last_replicated_at TIMESTAMP,
+                    azure_refresh_token_encrypted BYTEA,
+                    azure_refresh_token_updated_at TIMESTAMP,
+                    azure_subscriptions_cached JSON DEFAULT '[]',
+                    azure_sql_servers_configured JSON DEFAULT '[]',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
 
-        # 3. Platform Users
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS platform_users (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                email VARCHAR UNIQUE NOT NULL,
-                name VARCHAR NOT NULL,
-                external_user_id VARCHAR,
-                org_id UUID REFERENCES organizations(id),
-                tenant_id UUID REFERENCES tenants(id),
-                mfa_enabled BOOLEAN DEFAULT FALSE,
-                last_login_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
+            # 3. Platform Users
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS platform_users (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    email VARCHAR UNIQUE NOT NULL,
+                    name VARCHAR NOT NULL,
+                    external_user_id VARCHAR,
+                    org_id UUID REFERENCES organizations(id),
+                    tenant_id UUID REFERENCES tenants(id),
+                    mfa_enabled BOOLEAN DEFAULT FALSE,
+                    last_login_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
 
-        # 4. User Roles
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS user_roles (
-                user_id UUID REFERENCES platform_users(id),
-                role VARCHAR,
-                PRIMARY KEY (user_id, role)
-            )
-        """))
+            # 4. User Roles
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS user_roles (
+                    user_id UUID REFERENCES platform_users(id),
+                    role VARCHAR,
+                    PRIMARY KEY (user_id, role)
+                )
+            """))
 
-        # 5. SLA Policies
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS sla_policies (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                tenant_id UUID REFERENCES tenants(id),
-                name VARCHAR NOT NULL,
-                frequency VARCHAR DEFAULT 'DAILY',
-                backup_days VARCHAR[],
-                backup_window_start VARCHAR,
-                backup_window_end VARCHAR,
-                resource_types VARCHAR[],
-                batch_size INTEGER DEFAULT 1000,
-                max_concurrent_backups INTEGER DEFAULT 5,
-                sla_violation_alert BOOLEAN DEFAULT TRUE,
-                retention_days INTEGER DEFAULT 2555,
-                retention_versions INTEGER DEFAULT 10,
-                backup_exchange BOOLEAN DEFAULT TRUE,
-                backup_exchange_archive BOOLEAN DEFAULT FALSE,
-                backup_exchange_recoverable BOOLEAN DEFAULT FALSE,
-                backup_onedrive BOOLEAN DEFAULT TRUE,
-                backup_sharepoint BOOLEAN DEFAULT TRUE,
-                backup_teams BOOLEAN DEFAULT TRUE,
-                backup_teams_chats BOOLEAN DEFAULT FALSE,
-                backup_entra_id BOOLEAN DEFAULT TRUE,
-                backup_power_platform BOOLEAN DEFAULT FALSE,
-                backup_copilot BOOLEAN DEFAULT FALSE,
-                contacts BOOLEAN DEFAULT TRUE,
-                calendars BOOLEAN DEFAULT TRUE,
-                tasks BOOLEAN DEFAULT FALSE,
-                group_mailbox BOOLEAN DEFAULT TRUE,
-                planner BOOLEAN DEFAULT FALSE,
-                retention_type VARCHAR DEFAULT 'INDEFINITE',
-                retention_hot_days INTEGER DEFAULT 7,
-                retention_cool_days INTEGER DEFAULT 30,
-                retention_archive_days INTEGER,
-                legal_hold_enabled BOOLEAN DEFAULT FALSE,
-                legal_hold_until TIMESTAMP,
-                immutability_mode VARCHAR DEFAULT 'None',
-                enabled BOOLEAN DEFAULT TRUE,
-                is_default BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
+            # 5. SLA Policies
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS sla_policies (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    tenant_id UUID REFERENCES tenants(id),
+                    name VARCHAR NOT NULL,
+                    frequency VARCHAR DEFAULT 'DAILY',
+                    backup_days VARCHAR[],
+                    backup_window_start VARCHAR,
+                    backup_window_end VARCHAR,
+                    resource_types VARCHAR[],
+                    batch_size INTEGER DEFAULT 1000,
+                    max_concurrent_backups INTEGER DEFAULT 5,
+                    sla_violation_alert BOOLEAN DEFAULT TRUE,
+                    retention_days INTEGER DEFAULT 2555,
+                    retention_versions INTEGER DEFAULT 10,
+                    backup_exchange BOOLEAN DEFAULT TRUE,
+                    backup_exchange_archive BOOLEAN DEFAULT FALSE,
+                    backup_exchange_recoverable BOOLEAN DEFAULT FALSE,
+                    backup_onedrive BOOLEAN DEFAULT TRUE,
+                    backup_sharepoint BOOLEAN DEFAULT TRUE,
+                    backup_teams BOOLEAN DEFAULT TRUE,
+                    backup_teams_chats BOOLEAN DEFAULT FALSE,
+                    backup_entra_id BOOLEAN DEFAULT TRUE,
+                    backup_power_platform BOOLEAN DEFAULT FALSE,
+                    backup_copilot BOOLEAN DEFAULT FALSE,
+                    contacts BOOLEAN DEFAULT TRUE,
+                    calendars BOOLEAN DEFAULT TRUE,
+                    tasks BOOLEAN DEFAULT FALSE,
+                    group_mailbox BOOLEAN DEFAULT TRUE,
+                    planner BOOLEAN DEFAULT FALSE,
+                    retention_type VARCHAR DEFAULT 'INDEFINITE',
+                    retention_hot_days INTEGER DEFAULT 7,
+                    retention_cool_days INTEGER DEFAULT 30,
+                    retention_archive_days INTEGER,
+                    legal_hold_enabled BOOLEAN DEFAULT FALSE,
+                    legal_hold_until TIMESTAMP,
+                    immutability_mode VARCHAR DEFAULT 'None',
+                    enabled BOOLEAN DEFAULT TRUE,
+                    is_default BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
 
-        # 6. Resources
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS resources (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                tenant_id UUID REFERENCES tenants(id),
-                type VARCHAR NOT NULL,
-                external_id VARCHAR NOT NULL,
-                display_name VARCHAR NOT NULL,
-                email VARCHAR,
-                metadata JSON DEFAULT '{}',
-                sla_policy_id UUID REFERENCES sla_policies(id),
-                status VARCHAR DEFAULT 'DISCOVERED',
-                last_backup_job_id UUID,
-                last_backup_at TIMESTAMP,
-                last_backup_status VARCHAR,
-                storage_bytes BIGINT DEFAULT 0,
-                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                archived_at TIMESTAMP,
-                deletion_queued_at TIMESTAMP,
-                azure_subscription_id VARCHAR,
-                azure_resource_group VARCHAR,
-                azure_region VARCHAR,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
+            # 6. Resources
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS resources (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    tenant_id UUID REFERENCES tenants(id),
+                    type VARCHAR NOT NULL,
+                    external_id VARCHAR NOT NULL,
+                    display_name VARCHAR NOT NULL,
+                    email VARCHAR,
+                    metadata JSON DEFAULT '{}',
+                    sla_policy_id UUID REFERENCES sla_policies(id),
+                    status VARCHAR DEFAULT 'DISCOVERED',
+                    last_backup_job_id UUID,
+                    last_backup_at TIMESTAMP,
+                    last_backup_status VARCHAR,
+                    storage_bytes BIGINT DEFAULT 0,
+                    discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    archived_at TIMESTAMP,
+                    deletion_queued_at TIMESTAMP,
+                    azure_subscription_id VARCHAR,
+                    azure_resource_group VARCHAR,
+                    azure_region VARCHAR,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
 
-        # 7. Jobs
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS jobs (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                type VARCHAR NOT NULL,
-                tenant_id UUID REFERENCES tenants(id),
-                resource_id UUID REFERENCES resources(id),
-                batch_resource_ids UUID[] DEFAULT '{}',
-                snapshot_id UUID,
-                status VARCHAR DEFAULT 'QUEUED',
-                priority INTEGER DEFAULT 5,
-                attempts INTEGER DEFAULT 0,
-                max_attempts INTEGER DEFAULT 5,
-                error_message TEXT,
-                progress_pct INTEGER DEFAULT 0,
-                items_processed BIGINT DEFAULT 0,
-                bytes_processed BIGINT DEFAULT 0,
-                result JSON DEFAULT '{}',
-                spec JSON DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                completed_at TIMESTAMP
-            )
-        """))
+            # 7. Jobs
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    type VARCHAR NOT NULL,
+                    tenant_id UUID REFERENCES tenants(id),
+                    resource_id UUID REFERENCES resources(id),
+                    batch_resource_ids UUID[] DEFAULT '{}',
+                    snapshot_id UUID,
+                    status VARCHAR DEFAULT 'QUEUED',
+                    priority INTEGER DEFAULT 5,
+                    attempts INTEGER DEFAULT 0,
+                    max_attempts INTEGER DEFAULT 5,
+                    error_message TEXT,
+                    progress_pct INTEGER DEFAULT 0,
+                    items_processed BIGINT DEFAULT 0,
+                    bytes_processed BIGINT DEFAULT 0,
+                    result JSON DEFAULT '{}',
+                    spec JSON DEFAULT '{}',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP
+                )
+            """))
 
-        # 8. Snapshots
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                resource_id UUID REFERENCES resources(id),
-                job_id UUID REFERENCES jobs(id),
-                type VARCHAR DEFAULT 'INCREMENTAL',
-                status VARCHAR DEFAULT 'COMPLETED',
-                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                completed_at TIMESTAMP,
-                duration_secs INTEGER,
-                item_count INTEGER DEFAULT 0,
-                new_item_count INTEGER DEFAULT 0,
-                bytes_added BIGINT DEFAULT 0,
-                bytes_total BIGINT DEFAULT 0,
-                delta_token VARCHAR,
-                delta_tokens_json JSON DEFAULT '{}',
-                extra_data JSON DEFAULT '{}',
-                snapshot_label VARCHAR,
-                content_checksum VARCHAR,
-                blob_path VARCHAR,
-                storage_version INTEGER DEFAULT 1,
-                azure_restore_point_id VARCHAR,
-                azure_operation_id VARCHAR,
-                dr_replication_status VARCHAR DEFAULT 'pending',
-                dr_blob_path VARCHAR,
-                dr_replicated_at TIMESTAMP,
-                dr_error TEXT,
-                dr_replication_attempts INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
+            # 8. Snapshots
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    resource_id UUID REFERENCES resources(id),
+                    job_id UUID REFERENCES jobs(id),
+                    type VARCHAR DEFAULT 'INCREMENTAL',
+                    status VARCHAR DEFAULT 'COMPLETED',
+                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    duration_secs INTEGER,
+                    item_count INTEGER DEFAULT 0,
+                    new_item_count INTEGER DEFAULT 0,
+                    bytes_added BIGINT DEFAULT 0,
+                    bytes_total BIGINT DEFAULT 0,
+                    delta_token VARCHAR,
+                    delta_tokens_json JSON DEFAULT '{}',
+                    extra_data JSON DEFAULT '{}',
+                    snapshot_label VARCHAR,
+                    content_checksum VARCHAR,
+                    blob_path VARCHAR,
+                    storage_version INTEGER DEFAULT 1,
+                    azure_restore_point_id VARCHAR,
+                    azure_operation_id VARCHAR,
+                    dr_replication_status VARCHAR DEFAULT 'pending',
+                    dr_blob_path VARCHAR,
+                    dr_replicated_at TIMESTAMP,
+                    dr_error TEXT,
+                    dr_replication_attempts INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
 
-        # 9. Snapshot Items
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS snapshot_items (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                snapshot_id UUID REFERENCES snapshots(id),
-                tenant_id UUID REFERENCES tenants(id),
-                external_id VARCHAR NOT NULL,
-                item_type VARCHAR NOT NULL,
-                name VARCHAR NOT NULL,
-                folder_path VARCHAR,
-                content_hash VARCHAR,
-                content_checksum VARCHAR,
-                content_size BIGINT DEFAULT 0,
-                blob_path VARCHAR,
-                encryption_key_id VARCHAR,
-                backup_version INTEGER DEFAULT 1,
-                metadata JSON DEFAULT '{}',
-                is_deleted BOOLEAN DEFAULT FALSE,
-                indexed_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
+            # 9. Snapshot Items
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS snapshot_items (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    snapshot_id UUID REFERENCES snapshots(id),
+                    tenant_id UUID REFERENCES tenants(id),
+                    external_id VARCHAR NOT NULL,
+                    item_type VARCHAR NOT NULL,
+                    name VARCHAR NOT NULL,
+                    folder_path VARCHAR,
+                    content_hash VARCHAR,
+                    content_checksum VARCHAR,
+                    content_size BIGINT DEFAULT 0,
+                    blob_path VARCHAR,
+                    encryption_key_id VARCHAR,
+                    backup_version INTEGER DEFAULT 1,
+                    metadata JSON DEFAULT '{}',
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    indexed_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
 
-        # 10. Job Logs
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS job_logs (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                job_id UUID REFERENCES jobs(id),
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                level VARCHAR DEFAULT 'INFO',
-                message TEXT,
-                details TEXT
-            )
-        """))
+            # 10. Job Logs
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS job_logs (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    job_id UUID REFERENCES jobs(id),
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    level VARCHAR DEFAULT 'INFO',
+                    message TEXT,
+                    details TEXT
+                )
+            """))
 
-        # 11. Alerts
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS alerts (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                tenant_id UUID REFERENCES tenants(id),
-                org_id UUID REFERENCES organizations(id),
-                type VARCHAR NOT NULL,
-                severity VARCHAR DEFAULT 'MEDIUM',
-                message TEXT NOT NULL,
-                resource_id UUID,
-                resource_type VARCHAR,
-                resource_name VARCHAR,
-                triggered_by VARCHAR,
-                resolved BOOLEAN DEFAULT FALSE,
-                resolved_at TIMESTAMP,
-                resolved_by UUID,
-                resolution_note TEXT,
-                details JSON DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
+            # 11. Alerts
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    tenant_id UUID REFERENCES tenants(id),
+                    org_id UUID REFERENCES organizations(id),
+                    type VARCHAR NOT NULL,
+                    severity VARCHAR DEFAULT 'MEDIUM',
+                    message TEXT NOT NULL,
+                    resource_id UUID,
+                    resource_type VARCHAR,
+                    resource_name VARCHAR,
+                    triggered_by VARCHAR,
+                    resolved BOOLEAN DEFAULT FALSE,
+                    resolved_at TIMESTAMP,
+                    resolved_by UUID,
+                    resolution_note TEXT,
+                    details JSON DEFAULT '{}',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
 
-        # 12. Audit Events
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS audit_events (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                org_id UUID REFERENCES organizations(id),
-                tenant_id UUID REFERENCES tenants(id),
-                actor_id UUID,
-                actor_email VARCHAR,
-                actor_type VARCHAR DEFAULT 'SYSTEM',
-                action VARCHAR NOT NULL,
-                resource_id UUID,
-                resource_type VARCHAR,
-                resource_name VARCHAR,
-                outcome VARCHAR DEFAULT 'SUCCESS',
-                job_id UUID,
-                snapshot_id UUID,
-                details JSONB DEFAULT '{}',
-                occurred_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_tenant ON audit_events(tenant_id)"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action)"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_occurred ON audit_events(occurred_at DESC)"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_org ON audit_events(org_id)"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_resource ON audit_events(resource_id)"))
+            # 12. Audit Events
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    org_id UUID REFERENCES organizations(id),
+                    tenant_id UUID REFERENCES tenants(id),
+                    actor_id UUID,
+                    actor_email VARCHAR,
+                    actor_type VARCHAR DEFAULT 'SYSTEM',
+                    action VARCHAR NOT NULL,
+                    resource_id UUID,
+                    resource_type VARCHAR,
+                    resource_name VARCHAR,
+                    outcome VARCHAR DEFAULT 'SUCCESS',
+                    job_id UUID,
+                    snapshot_id UUID,
+                    details JSONB DEFAULT '{}',
+                    occurred_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_tenant ON audit_events(tenant_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_occurred ON audit_events(occurred_at DESC)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_org ON audit_events(org_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_resource ON audit_events(resource_id)"))
 
-        # 13. Admin Consent Tokens
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS admin_consent_tokens (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                org_id UUID REFERENCES organizations(id),
-                tenant_id UUID REFERENCES tenants(id),
-                consent_type VARCHAR NOT NULL,
-                access_token_encrypted BYTEA,
-                refresh_token_encrypted BYTEA,
-                token_type VARCHAR DEFAULT 'Bearer',
-                expires_at TIMESTAMP,
-                granted_by VARCHAR,
-                consented_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_used_at TIMESTAMP,
-                is_active BOOLEAN DEFAULT TRUE,
-                scope VARCHAR,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_org ON admin_consent_tokens(org_id)"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_tenant ON admin_consent_tokens(tenant_id)"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_type ON admin_consent_tokens(consent_type)"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_active ON admin_consent_tokens(is_active)"))
+            # 13. Admin Consent Tokens
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS admin_consent_tokens (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    org_id UUID REFERENCES organizations(id),
+                    tenant_id UUID REFERENCES tenants(id),
+                    consent_type VARCHAR NOT NULL,
+                    access_token_encrypted BYTEA,
+                    refresh_token_encrypted BYTEA,
+                    token_type VARCHAR DEFAULT 'Bearer',
+                    expires_at TIMESTAMP,
+                    granted_by VARCHAR,
+                    consented_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TIMESTAMP,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    scope VARCHAR,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_org ON admin_consent_tokens(org_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_tenant ON admin_consent_tokens(tenant_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_type ON admin_consent_tokens(consent_type)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_admin_consent_active ON admin_consent_tokens(is_active)"))
 
-        # 14. Report Configs
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS report_configs (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                org_id UUID REFERENCES organizations(id),
-                enabled BOOLEAN DEFAULT FALSE NOT NULL,
-                schedule_type VARCHAR DEFAULT 'daily' NOT NULL,
-                send_empty_report BOOLEAN DEFAULT TRUE NOT NULL,
-                empty_message VARCHAR DEFAULT 'No updates. No backups occurred.',
-                send_detailed_report BOOLEAN DEFAULT FALSE NOT NULL,
-                email_recipients JSON DEFAULT '[]',
-                slack_webhooks JSON DEFAULT '[]',
-                teams_webhooks JSON DEFAULT '[]',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_report_configs_org ON report_configs(org_id)"))
+            # 14. Report Configs
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS report_configs (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    org_id UUID REFERENCES organizations(id),
+                    enabled BOOLEAN DEFAULT FALSE NOT NULL,
+                    schedule_type VARCHAR DEFAULT 'daily' NOT NULL,
+                    send_empty_report BOOLEAN DEFAULT TRUE NOT NULL,
+                    empty_message VARCHAR DEFAULT 'No updates. No backups occurred.',
+                    send_detailed_report BOOLEAN DEFAULT FALSE NOT NULL,
+                    email_recipients JSON DEFAULT '[]',
+                    slack_webhooks JSON DEFAULT '[]',
+                    teams_webhooks JSON DEFAULT '[]',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_report_configs_org ON report_configs(org_id)"))
 
-        # 15. Report History
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS report_history (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                org_id UUID REFERENCES organizations(id),
-                report_config_id UUID REFERENCES report_configs(id),
-                report_type VARCHAR NOT NULL,
-                period_start TIMESTAMP,
-                period_end TIMESTAMP,
-                generated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                total_backups INTEGER DEFAULT 0,
-                successful_backups INTEGER DEFAULT 0,
-                failed_backups INTEGER DEFAULT 0,
-                success_rate VARCHAR,
-                coverage_rate VARCHAR,
-                report_data JSON DEFAULT '{}',
-                is_empty BOOLEAN DEFAULT FALSE NOT NULL,
-                delivery_status JSON DEFAULT '{}',
-                error_message TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_report_history_org ON report_history(org_id)"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_report_history_generated ON report_history(generated_at DESC)"))
+            # 15. Report History
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS report_history (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    org_id UUID REFERENCES organizations(id),
+                    report_config_id UUID REFERENCES report_configs(id),
+                    report_type VARCHAR NOT NULL,
+                    period_start TIMESTAMP,
+                    period_end TIMESTAMP,
+                    generated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    total_backups INTEGER DEFAULT 0,
+                    successful_backups INTEGER DEFAULT 0,
+                    failed_backups INTEGER DEFAULT 0,
+                    success_rate VARCHAR,
+                    coverage_rate VARCHAR,
+                    report_data JSON DEFAULT '{}',
+                    is_empty BOOLEAN DEFAULT FALSE NOT NULL,
+                    delivery_status JSON DEFAULT '{}',
+                    error_message TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_report_history_org ON report_history(org_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_report_history_generated ON report_history(generated_at DESC)"))
 
-        # ── Add missing columns to existing tables (idempotent) ──
-        # Run all ALTERs inside the same conn transaction to prevent deadlock
-        add_column_statements = [
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS customer_id VARCHAR;",
-            "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_subscription_id VARCHAR;",
-            "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_resource_group VARCHAR;",
-            "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_region VARCHAR;",
-            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS azure_restore_point_id VARCHAR;",
-            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS azure_operation_id VARCHAR;",
-            "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_hot_days INTEGER DEFAULT 7;",
-            "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_cool_days INTEGER DEFAULT 30;",
-            "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_archive_days INTEGER;",
-            "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS legal_hold_enabled BOOLEAN DEFAULT FALSE;",
-            "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMP;",
-            "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS immutability_mode VARCHAR DEFAULT 'None';",
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_region_enabled BOOLEAN DEFAULT FALSE;",
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_region VARCHAR;",
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_storage_account_name VARCHAR;",
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_storage_account_key_encrypted BYTEA;",
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_last_replicated_at TIMESTAMP;",
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS extra_data JSON DEFAULT '{}';",
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_refresh_token_encrypted BYTEA;",
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_refresh_token_updated_at TIMESTAMP;",
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_subscriptions_cached JSON DEFAULT '{}';",
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_sql_servers_configured JSON DEFAULT '{}';",
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_pg_servers_configured JSON DEFAULT '{}';",
-            "ALTER TABLE report_configs ADD COLUMN IF NOT EXISTS send_detailed_report BOOLEAN DEFAULT FALSE NOT NULL;",
-            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replication_status VARCHAR DEFAULT 'pending';",
-            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_blob_path VARCHAR;",
-            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replicated_at TIMESTAMP;",
-            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_error TEXT;",
-            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replication_attempts INTEGER DEFAULT 0;",
-            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS extra_data JSON DEFAULT '{}';",
-        ]
-        for stmt in add_column_statements:
-            try:
-                await conn.execute(text(stmt))
-            except Exception:
-                pass  # Already exists
+            # ── Add missing columns to existing tables (idempotent) ──
+            add_column_statements = [
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS customer_id VARCHAR;",
+                "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_subscription_id VARCHAR;",
+                "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_resource_group VARCHAR;",
+                "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_region VARCHAR;",
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS azure_restore_point_id VARCHAR;",
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS azure_operation_id VARCHAR;",
+                "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_hot_days INTEGER DEFAULT 7;",
+                "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_cool_days INTEGER DEFAULT 30;",
+                "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_archive_days INTEGER;",
+                "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS legal_hold_enabled BOOLEAN DEFAULT FALSE;",
+                "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMP;",
+                "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS immutability_mode VARCHAR DEFAULT 'None';",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_region_enabled BOOLEAN DEFAULT FALSE;",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_region VARCHAR;",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_storage_account_name VARCHAR;",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_storage_account_key_encrypted BYTEA;",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_last_replicated_at TIMESTAMP;",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS extra_data JSON DEFAULT '{}';",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_refresh_token_encrypted BYTEA;",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_refresh_token_updated_at TIMESTAMP;",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_subscriptions_cached JSON DEFAULT '{}';",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_sql_servers_configured JSON DEFAULT '{}';",
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_pg_servers_configured JSON DEFAULT '{}';",
+                "ALTER TABLE report_configs ADD COLUMN IF NOT EXISTS send_detailed_report BOOLEAN DEFAULT FALSE NOT NULL;",
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replication_status VARCHAR DEFAULT 'pending';",
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_blob_path VARCHAR;",
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replicated_at TIMESTAMP;",
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_error TEXT;",
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replication_attempts INTEGER DEFAULT 0;",
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS extra_data JSON DEFAULT '{}';",
+            ]
+            for stmt in add_column_statements:
+                await conn.execute(text("SAVEPOINT col_sp"))
+                try:
+                    await conn.execute(text(stmt))
+                    await conn.execute(text("RELEASE SAVEPOINT col_sp"))
+                except Exception:
+                    await conn.execute(text("ROLLBACK TO SAVEPOINT col_sp"))  # Already exists
 
-        # ── Convert VARCHAR columns to enum types ──
-        alter_statements = [
-            """ALTER TABLE tenants ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE tenanttype USING type::tenanttype, ALTER COLUMN type SET DEFAULT 'M365'::tenanttype;""",
-            """ALTER TABLE tenants ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE tenantstatus USING status::tenantstatus, ALTER COLUMN status SET DEFAULT 'PENDING'::tenantstatus;""",
-            """ALTER TABLE resources ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE resourcetype USING type::resourcetype, ALTER COLUMN type SET DEFAULT 'ENTRA_USER'::resourcetype;""",
-            """ALTER TABLE resources ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE resourcestatus USING status::resourcestatus, ALTER COLUMN status SET DEFAULT 'DISCOVERED'::resourcestatus;""",
-            """ALTER TABLE jobs ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE jobtype USING type::jobtype, ALTER COLUMN type SET DEFAULT 'BACKUP'::jobtype;""",
-            """ALTER TABLE jobs ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE jobstatus USING status::jobstatus, ALTER COLUMN status SET DEFAULT 'QUEUED'::jobstatus;""",
-            """ALTER TABLE snapshots ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE snapshottype USING type::snapshottype, ALTER COLUMN type SET DEFAULT 'FULL'::snapshottype;""",
-            """ALTER TABLE snapshots ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE snapshotstatus USING status::snapshotstatus, ALTER COLUMN status SET DEFAULT 'IN_PROGRESS'::snapshotstatus;""",
-            """ALTER TABLE user_roles ALTER COLUMN role TYPE userrole USING role::userrole;""",
-        ]
-        for stmt in alter_statements:
-            try:
-                await conn.execute(text(stmt))
-            except Exception:
-                pass  # Already converted
+            # ── Convert VARCHAR columns to enum types (use SAVEPOINT so failures don't abort the transaction) ──
+            alter_statements = [
+                """ALTER TABLE tenants ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE tenanttype USING type::tenanttype, ALTER COLUMN type SET DEFAULT 'M365'::tenanttype;""",
+                """ALTER TABLE tenants ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE tenantstatus USING status::tenantstatus, ALTER COLUMN status SET DEFAULT 'PENDING'::tenantstatus;""",
+                """ALTER TABLE resources ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE resourcetype USING type::resourcetype, ALTER COLUMN type SET DEFAULT 'ENTRA_USER'::resourcetype;""",
+                """ALTER TABLE resources ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE resourcestatus USING status::resourcestatus, ALTER COLUMN status SET DEFAULT 'DISCOVERED'::resourcestatus;""",
+                """ALTER TABLE jobs ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE jobtype USING type::jobtype, ALTER COLUMN type SET DEFAULT 'BACKUP'::jobtype;""",
+                """ALTER TABLE jobs ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE jobstatus USING status::jobstatus, ALTER COLUMN status SET DEFAULT 'QUEUED'::jobstatus;""",
+                """ALTER TABLE snapshots ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE snapshottype USING type::snapshottype, ALTER COLUMN type SET DEFAULT 'FULL'::snapshottype;""",
+                """ALTER TABLE snapshots ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE snapshotstatus USING status::snapshotstatus, ALTER COLUMN status SET DEFAULT 'IN_PROGRESS'::snapshotstatus;""",
+                """ALTER TABLE user_roles ALTER COLUMN role TYPE userrole USING role::userrole;""",
+            ]
+            for stmt in alter_statements:
+                await conn.execute(text("SAVEPOINT alter_sp"))
+                try:
+                    await conn.execute(text(stmt))
+                    await conn.execute(text("RELEASE SAVEPOINT alter_sp"))
+                except Exception:
+                    await conn.execute(text("ROLLBACK TO SAVEPOINT alter_sp"))  # Already converted
 
             # Sync ORM models (for any remaining ORM-specific configurations)
             await conn.run_sync(Base.metadata.create_all)
