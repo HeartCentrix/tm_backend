@@ -332,6 +332,7 @@ class SlaPolicyResponse(BaseModel):
     
     id: str
     tenantId: str = Field(alias='tenant_id')
+    serviceType: str = Field(default='m365', alias='service_type')
     name: str
     frequency: str
     backupDays: Optional[List[str]] = Field(default=None, alias='backup_days')
@@ -351,6 +352,9 @@ class SlaPolicyResponse(BaseModel):
     tasks: Optional[bool] = False
     groupMailbox: Optional[bool] = Field(default=True, alias='group_mailbox')
     planner: Optional[bool] = False
+    backupAzureVm: Optional[bool] = Field(default=True, alias='backup_azure_vm')
+    backupAzureSql: Optional[bool] = Field(default=True, alias='backup_azure_sql')
+    backupAzurePostgresql: Optional[bool] = Field(default=True, alias='backup_azure_postgresql')
     retentionType: str = Field(alias='retention_type')
     retentionDays: Optional[int] = Field(default=None, alias='retention_days')
     enabled: Optional[bool] = True
@@ -371,6 +375,7 @@ class SlaPolicyCreateRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     
     tenantId: str = Field(alias='tenant_id')
+    serviceType: str = Field(default='m365', alias='service_type')
     name: str
     frequency: str
     backupDays: Optional[List[str]] = Field(default=None, alias='backup_days')
@@ -390,6 +395,9 @@ class SlaPolicyCreateRequest(BaseModel):
     tasks: Optional[bool] = False
     groupMailbox: Optional[bool] = Field(default=True, alias='group_mailbox')
     planner: Optional[bool] = False
+    backupAzureVm: Optional[bool] = Field(default=True, alias='backup_azure_vm')
+    backupAzureSql: Optional[bool] = Field(default=True, alias='backup_azure_sql')
+    backupAzurePostgresql: Optional[bool] = Field(default=True, alias='backup_azure_postgresql')
     retentionType: str = Field(alias='retention_type')
     retentionDays: Optional[int] = Field(default=None, alias='retention_days')
     enabled: Optional[bool] = True

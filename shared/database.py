@@ -36,6 +36,21 @@ REQUIRED_TABLES = (
     "resource_discovery_staging",
 )
 
+REQUIRED_COLUMNS = {
+    "sla_policies": (
+        "service_type",
+        "backup_azure_vm",
+        "backup_azure_sql",
+        "backup_azure_postgresql",
+    ),
+    "resources": ("resource_hash",),
+    "resource_discovery_staging": (
+        "azure_subscription_id",
+        "azure_resource_group",
+        "azure_region",
+    ),
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,8 +58,11 @@ engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
-    pool_size=30,
-    max_overflow=40,
+    pool_use_lifo=settings.DB_POOL_USE_LIFO,
+    pool_size=settings.DB_POOL_SIZE,
+    max_overflow=settings.DB_MAX_OVERFLOW,
+    pool_timeout=settings.DB_POOL_TIMEOUT,
+    pool_recycle=settings.DB_POOL_RECYCLE,
     connect_args={"server_settings": {"search_path": SEARCH_PATH}},
 )
 
@@ -82,6 +100,32 @@ async def _has_required_tables(conn) -> bool:
     return True
 
 
+async def _has_required_columns(conn) -> bool:
+    for table_name, columns in REQUIRED_COLUMNS.items():
+        for column_name in columns:
+            result = await conn.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = :schema_name
+                          AND table_name = :table_name
+                          AND column_name = :column_name
+                    )
+                    """
+                ),
+                {
+                    "schema_name": settings.DB_SCHEMA,
+                    "table_name": table_name,
+                    "column_name": column_name,
+                },
+            )
+            if not bool(result.scalar()):
+                return False
+    return True
+
+
 async def wait_for_schema_ready(
     timeout_seconds: int = SCHEMA_READY_TIMEOUT_SECONDS,
     poll_interval_seconds: float = SCHEMA_READY_POLL_INTERVAL_SECONDS,
@@ -92,7 +136,7 @@ async def wait_for_schema_ready(
     while monotonic() < deadline:
         try:
             async with engine.connect() as conn:
-                if await _has_required_tables(conn):
+                if await _has_required_tables(conn) and await _has_required_columns(conn):
                     return True
         except Exception as exc:  # pragma: no cover - defensive startup logging
             last_error = exc
@@ -276,6 +320,7 @@ async def init_db() -> None:
         CREATE TABLE IF NOT EXISTS sla_policies (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             tenant_id UUID REFERENCES tenants(id),
+            service_type VARCHAR DEFAULT 'm365',
             name VARCHAR NOT NULL,
             frequency VARCHAR DEFAULT 'DAILY',
             backup_days VARCHAR[],
@@ -302,6 +347,9 @@ async def init_db() -> None:
             tasks BOOLEAN DEFAULT FALSE,
             group_mailbox BOOLEAN DEFAULT TRUE,
             planner BOOLEAN DEFAULT FALSE,
+            backup_azure_vm BOOLEAN DEFAULT TRUE,
+            backup_azure_sql BOOLEAN DEFAULT TRUE,
+            backup_azure_postgresql BOOLEAN DEFAULT TRUE,
             retention_type VARCHAR DEFAULT 'INDEFINITE',
             retention_hot_days INTEGER DEFAULT 7,
             retention_cool_days INTEGER DEFAULT 30,
@@ -534,6 +582,7 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_admin_consent_tenant ON admin_consent_tokens(tenant_id)",
         "CREATE INDEX IF NOT EXISTS idx_admin_consent_type ON admin_consent_tokens(consent_type)",
         "CREATE INDEX IF NOT EXISTS idx_admin_consent_active ON admin_consent_tokens(is_active)",
+        "CREATE INDEX IF NOT EXISTS idx_sla_policies_tenant_service ON sla_policies(tenant_id, service_type)",
         "CREATE INDEX IF NOT EXISTS idx_resources_tenant_type_external ON resources(tenant_id, type, external_id)",
         "CREATE INDEX IF NOT EXISTS idx_resources_tenant_status_type ON resources(tenant_id, status, type)",
         "CREATE INDEX IF NOT EXISTS idx_discovery_runs_tenant_started ON discovery_runs(tenant_id, started_at DESC)",
@@ -556,6 +605,11 @@ async def init_db() -> None:
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS legal_hold_enabled BOOLEAN DEFAULT FALSE;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMP;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS immutability_mode VARCHAR DEFAULT 'None';",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS service_type VARCHAR DEFAULT 'm365';",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS backup_azure_vm BOOLEAN DEFAULT TRUE;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS backup_azure_sql BOOLEAN DEFAULT TRUE;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS backup_azure_postgresql BOOLEAN DEFAULT TRUE;",
+        "UPDATE sla_policies SET service_type = 'm365' WHERE service_type IS NULL OR service_type = '';",
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_region_enabled BOOLEAN DEFAULT FALSE;",
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_region VARCHAR;",
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dr_storage_account_name VARCHAR;",
@@ -610,13 +664,14 @@ async def init_db() -> None:
 
             await _execute_batch(conn, enum_type_statements)
             await _execute_batch(conn, table_statements)
-            await _execute_batch(conn, index_statements)
 
             for stmt in add_column_statements:
                 try:
                     await conn.execute(text(stmt))
                 except Exception:
                     pass
+
+            await _execute_batch(conn, index_statements)
 
             for stmt in alter_statements:
                 try:

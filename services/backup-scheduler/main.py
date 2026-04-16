@@ -47,7 +47,12 @@ RESOURCE_TYPE_TO_SLA_FLAG: Dict[str, str] = {
     "ENTRA_USER": "backup_entra_id",
     "ENTRA_GROUP": "backup_entra_id",
     "ENTRA_APP": "backup_entra_id",
+    "ENTRA_SERVICE_PRINCIPAL": "backup_entra_id",
     "ENTRA_DEVICE": "backup_entra_id",
+    "ENTRA_ROLE": "backup_entra_id",
+    "ENTRA_ADMIN_UNIT": "backup_entra_id",
+    "ENTRA_AUDIT_LOG": "backup_entra_id",
+    "INTUNE_MANAGED_DEVICE": "backup_entra_id",
     "POWER_BI": "backup_power_platform",
     "POWER_APPS": "backup_power_platform",
     "POWER_AUTOMATE": "backup_power_platform",
@@ -56,6 +61,10 @@ RESOURCE_TYPE_TO_SLA_FLAG: Dict[str, str] = {
     "PLANNER": "planner",
     "TODO": "tasks",
     "ONENOTE": "backup_onedrive",
+    "AZURE_VM": "backup_azure_vm",
+    "AZURE_SQL_DB": "backup_azure_sql",
+    "AZURE_POSTGRESQL": "backup_azure_postgresql",
+    "AZURE_POSTGRESQL_SINGLE": "backup_azure_postgresql",
 }
 
 # AZ-4: Azure workload queue routing
@@ -63,6 +72,7 @@ AZURE_WORKLOAD_QUEUES = {
     ResourceType.AZURE_VM: "azure.vm",
     ResourceType.AZURE_SQL_DB: "azure.sql",
     ResourceType.AZURE_POSTGRESQL: "azure.postgres",
+    ResourceType.AZURE_POSTGRESQL_SINGLE: "azure.postgres",
 }
 
 
@@ -115,8 +125,8 @@ def resource_type_enabled(resource_type: str, policy: SlaPolicy) -> bool:
 
     flag_name = RESOURCE_TYPE_TO_SLA_FLAG.get(resource_type)
     if not flag_name:
-        # Unknown resource types default to enabled
-        return True
+        # Unknown or unsupported resource types should not be scheduled automatically.
+        return False
     return getattr(policy, flag_name, True)
 
 

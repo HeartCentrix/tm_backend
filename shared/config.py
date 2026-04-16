@@ -24,6 +24,11 @@ class Settings:
             self.DB_PASSWORD = os.getenv("DB_PASSWORD")
 
         self.DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
+        self.DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "2"))
+        self.DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "2"))
+        self.DB_POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+        self.DB_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
+        self.DB_POOL_USE_LIFO = os.getenv("DB_POOL_USE_LIFO", "true").lower() in ("true", "1", "yes")
         self.JWT_SECRET = os.getenv("JWT_SECRET", "")
         self.JWT_ALGORITHM = "HS256"
         self.JWT_EXPIRATION_HOURS = 8

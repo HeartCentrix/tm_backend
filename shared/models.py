@@ -219,6 +219,7 @@ class SlaPolicy(Base):
     __tablename__ = "sla_policies"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
+    service_type = Column(String, default="m365", nullable=False, index=True)
     name = Column(String, nullable=False)
     frequency = Column(String, default="DAILY")
     backup_days = Column(ARRAY(String), default=["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"])
@@ -239,6 +240,9 @@ class SlaPolicy(Base):
     tasks = Column(Boolean, default=False)
     group_mailbox = Column(Boolean, default=True)
     planner = Column(Boolean, default=False)
+    backup_azure_vm = Column(Boolean, default=True)
+    backup_azure_sql = Column(Boolean, default=True)
+    backup_azure_postgresql = Column(Boolean, default=True)
     resource_types = Column(ARRAY(String), default=[])
     batch_size = Column(Integer, default=20)
     max_concurrent_backups = Column(Integer, default=50)
