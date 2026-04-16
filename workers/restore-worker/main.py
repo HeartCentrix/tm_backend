@@ -409,13 +409,38 @@ class RestoreWorker:
         zip_buffer = io.BytesIO()
         exported_count = 0
 
+        # Power Platform package items are binary ZIPs — pack them as .zip inside the
+        # outer export ZIP so the user can extract and re-import via the Power Platform
+        # UI or a follow-up restore call.
+        PACKAGE_TYPES = {"POWER_APP_PACKAGE", "POWER_FLOW_PACKAGE"}
+
+        def _workload_for_item(item_type: str) -> str:
+            """Map item_type → container workload for blob download."""
+            if item_type.startswith("POWER_BI"): return "power-bi"
+            if item_type.startswith("POWER_APP"): return "power-apps"
+            if item_type.startswith("POWER_FLOW"): return "power-automate"
+            if item_type.startswith("POWER_DLP"): return "power-dlp"
+            return "files"
+
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for item in items:
                 try:
                     metadata = self._get_item_metadata(item)
+
+                    # Binary-backed items (package ZIPs) bypass the JSON-assuming loader
+                    if item.item_type in PACKAGE_TYPES:
+                        pkg_bytes = self._load_snapshot_item_bytes(item, _workload_for_item(item.item_type))
+                        if pkg_bytes:
+                            subdir = "power_apps" if item.item_type == "POWER_APP_PACKAGE" else "power_automate"
+                            zip_file.writestr(
+                                f"{subdir}/{item.name or item.external_id}.zip",
+                                pkg_bytes,
+                            )
+                            exported_count += 1
+                        continue
+
                     raw_data = self._load_snapshot_item_payload(
-                        item,
-                        "power-bi" if item.item_type.startswith("POWER_BI") else "files",
+                        item, _workload_for_item(item.item_type),
                     )
 
                     # Create file based on item type
@@ -442,6 +467,22 @@ class RestoreWorker:
                     elif item.item_type.startswith("POWER_BI"):
                         zip_file.writestr(
                             f"power_bi/{item.item_type}/{item.external_id}.json",
+                            json.dumps(raw_data, indent=2),
+                        )
+                    elif item.item_type.startswith("POWER_APP"):
+                        # Non-package Power App items (e.g. POWER_APP_DEFINITION)
+                        zip_file.writestr(
+                            f"power_apps/{item.item_type}/{item.external_id}.json",
+                            json.dumps(raw_data, indent=2),
+                        )
+                    elif item.item_type.startswith("POWER_FLOW"):
+                        zip_file.writestr(
+                            f"power_automate/{item.item_type}/{item.external_id}.json",
+                            json.dumps(raw_data, indent=2),
+                        )
+                    elif item.item_type.startswith("POWER_DLP"):
+                        zip_file.writestr(
+                            f"power_dlp/{item.external_id}.json",
                             json.dumps(raw_data, indent=2),
                         )
                     else:

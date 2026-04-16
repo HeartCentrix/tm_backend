@@ -547,6 +547,7 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
     spec = {
         "targetUserId": target_user_id,
         "targetResourceId": request.get("targetResourceId"),
+        "targetEnvironmentId": request.get("targetEnvironmentId"),
         "exportFormat": request.get("exportFormat"),
     }
 
