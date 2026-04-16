@@ -79,20 +79,23 @@ async def get_resource_progress(resource_id: str):
 
 @app.get("/api/v1/progress/resources")
 async def get_all_progress(tenant_id: Optional[str] = Query(None)):
-    """Get progress for all resources, optionally filtered by tenant"""
+    """Get active (QUEUED/RUNNING) job progress per resource, optionally filtered by tenant."""
     async with async_session_factory() as db:
-        stmt = select(Resource, Job).outerjoin(
-            Job, Resource.id == Job.resource_id
-        ).order_by(Job.created_at.desc())
+        # Only join resources that have an active job to avoid computing idle resources
+        stmt = (
+            select(Resource, Job)
+            .join(Job, Resource.id == Job.resource_id)
+            .where(Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]))
+            .order_by(Job.created_at.desc())
+        )
 
         if tenant_id:
             stmt = stmt.where(Resource.tenant_id == uuid.UUID(tenant_id))
 
-        # Only get the latest job per resource
         result = await db.execute(stmt)
         rows = result.all()
 
-        # Deduplicate: keep only latest job per resource
+        # Deduplicate: keep only the latest active job per resource
         latest_jobs: Dict[str, tuple] = {}
         for resource, job in rows:
             rid = str(resource.id)
@@ -191,7 +194,11 @@ async def update_progress(request: dict):
                 status_val = request.get("status")
                 if status_val:
                     try:
-                        job.status = JobStatus(status_val)
+                        new_status = JobStatus(status_val)
+                        # Never downgrade a terminal status back to a non-terminal one
+                        terminal = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
+                        if job.status not in terminal:
+                            job.status = new_status
                     except ValueError:
                         pass
                 await db.commit()
@@ -245,17 +252,13 @@ async def _compute_resource_progress(
 
     # Get cached estimate if available
     cached = progress_cache.get(resource_id, {})
-    total_bytes = cached.get("total_bytes", 0)
     total_items = cached.get("total_items", 0)
-
-    # Use resource storage_bytes as fallback estimate
-    if not total_bytes and resource:
-        total_bytes = resource.storage_bytes or 0
 
     status = "IDLE"
     progress_pct = 0
     processed_items = 0
-    processed_bytes = 0
+    data_backed_up = 0
+    total_data = 0
     job_id = None
     started_at = None
 
@@ -263,9 +266,22 @@ async def _compute_resource_progress(
         status = job.status.value if hasattr(job.status, 'value') else str(job.status)
         progress_pct = job.progress_pct or 0
         processed_items = job.items_processed or 0
-        processed_bytes = job.bytes_processed or 0
+        data_backed_up = job.bytes_processed or 0
+        # total_data: prefer job.result["total_bytes"], then cache, then resource.storage_bytes
+        total_data = (job.result.get("total_bytes", 0) if job.result else 0)
         job_id = str(job.id)
         started_at = job.created_at.isoformat() if job.created_at else None
+
+    if not total_data:
+        total_data = cached.get("total_bytes", 0)
+    if not total_data and resource:
+        total_data = resource.storage_bytes or 0
+
+    # Compute progress_pct using data_backed_up/total_data formula
+    if total_data > 0 and data_backed_up > 0:
+        progress_pct = min(100, int((data_backed_up / total_data) * 100))
+    elif total_items > 0 and processed_items > 0:
+        progress_pct = min(100, int((processed_items / total_items) * 100))
 
     # Calculate ETA if running
     eta_seconds = None
@@ -278,20 +294,14 @@ async def _compute_resource_progress(
         except Exception:
             pass
 
-    # Compute progress from bytes if available
-    if total_bytes > 0 and processed_bytes > 0:
-        progress_pct = min(100, int((processed_bytes / total_bytes) * 100))
-    elif total_items > 0 and processed_items > 0:
-        progress_pct = min(100, int((processed_items / total_items) * 100))
-
     return {
         "resource_id": resource_id,
         "resource_name": resource.display_name if resource else None,
         "resource_type": resource.type.value if resource and hasattr(resource.type, 'value') else None,
         "status": status,
         "progress_pct": progress_pct,
-        "total_bytes": total_bytes,
-        "processed_bytes": processed_bytes,
+        "data_backed_up": data_backed_up,
+        "total_data": total_data,
         "total_items": total_items,
         "processed_items": processed_items,
         "last_backup_at": resource.last_backup_at.isoformat() if resource and resource.last_backup_at else None,

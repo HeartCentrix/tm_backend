@@ -570,6 +570,43 @@ async def init_db() -> None:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS report_configs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            org_id UUID REFERENCES organizations(id),
+            enabled BOOLEAN DEFAULT FALSE NOT NULL,
+            schedule_type VARCHAR DEFAULT 'daily' NOT NULL,
+            send_empty_report BOOLEAN DEFAULT TRUE NOT NULL,
+            empty_message VARCHAR DEFAULT 'No updates. No backups occurred.',
+            send_detailed_report BOOLEAN DEFAULT FALSE NOT NULL,
+            email_recipients JSON DEFAULT '[]',
+            slack_webhooks JSON DEFAULT '[]',
+            teams_webhooks JSON DEFAULT '[]',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS report_history (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            org_id UUID REFERENCES organizations(id),
+            report_config_id UUID REFERENCES report_configs(id),
+            report_type VARCHAR NOT NULL,
+            period_start TIMESTAMP,
+            period_end TIMESTAMP,
+            generated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            total_backups INTEGER DEFAULT 0,
+            successful_backups INTEGER DEFAULT 0,
+            failed_backups INTEGER DEFAULT 0,
+            success_rate VARCHAR,
+            coverage_rate VARCHAR,
+            report_data JSON DEFAULT '{}',
+            is_empty BOOLEAN DEFAULT FALSE NOT NULL,
+            delivery_status JSON DEFAULT '{}',
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
     ]
 
     index_statements = [
@@ -589,6 +626,9 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_discovery_runs_status ON discovery_runs(status)",
         "CREATE INDEX IF NOT EXISTS idx_discovery_stage_run ON resource_discovery_staging(run_id)",
         "CREATE INDEX IF NOT EXISTS idx_discovery_stage_lookup ON resource_discovery_staging(run_id, tenant_id, resource_type, external_id)",
+        "CREATE INDEX IF NOT EXISTS idx_report_configs_org ON report_configs(org_id)",
+        "CREATE INDEX IF NOT EXISTS idx_report_history_org ON report_history(org_id)",
+        "CREATE INDEX IF NOT EXISTS idx_report_history_generated ON report_history(generated_at DESC)",
     ]
 
     add_column_statements = [
@@ -621,6 +661,7 @@ async def init_db() -> None:
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_subscriptions_cached JSON DEFAULT '{}';",
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_sql_servers_configured JSON DEFAULT '{}';",
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS azure_pg_servers_configured JSON DEFAULT '{}';",
+        "ALTER TABLE report_configs ADD COLUMN IF NOT EXISTS send_detailed_report BOOLEAN DEFAULT FALSE NOT NULL;",
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replication_status VARCHAR DEFAULT 'pending';",
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_blob_path VARCHAR;",
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replicated_at TIMESTAMP;",
@@ -674,10 +715,12 @@ async def init_db() -> None:
             await _execute_batch(conn, index_statements)
 
             for stmt in alter_statements:
+                await conn.execute(text("SAVEPOINT alter_sp"))
                 try:
                     await conn.execute(text(stmt))
+                    await conn.execute(text("RELEASE SAVEPOINT alter_sp"))
                 except Exception:
-                    pass
+                    await conn.execute(text("ROLLBACK TO SAVEPOINT alter_sp"))  # Already converted
 
             await conn.run_sync(Base.metadata.create_all)
 

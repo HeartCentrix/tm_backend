@@ -1,3 +1,4 @@
+import asyncio
 """Snapshot Service - Manages snapshots and snapshot items"""
 from contextlib import asynccontextmanager
 from typing import Optional, List
@@ -473,3 +474,301 @@ async def get_snapshot_item_detail(snapshot_id: str, item_id: str, db: AsyncSess
     if not item:
         raise HTTPException(status_code=404, detail="Snapshot item not found")
     return _item_to_response(item)
+
+
+# ==================== Content-Type-Specific Endpoints ====================
+
+def _get_blob_client():
+    from shared.config import settings as _s
+    from azure.storage.blob import BlobServiceClient as _BSC
+    if _s.AZURE_STORAGE_ACCOUNT_NAME and _s.AZURE_STORAGE_ACCOUNT_KEY:
+        conn = (f"DefaultEndpointsProtocol=https;AccountName={_s.AZURE_STORAGE_ACCOUNT_NAME};"
+                f"AccountKey={_s.AZURE_STORAGE_ACCOUNT_KEY};EndpointSuffix=core.windows.net")
+        return _BSC.from_connection_string(conn)
+    return None
+
+
+async def _read_blob(blob_path: str) -> dict:
+    import json as _j, asyncio
+    client = _get_blob_client()
+    if not client or not blob_path:
+        return {}
+    try:
+        # blob_path = {tenant_id}/{resource_id}/{snapshot_id}/{date}/{item_id}
+        # Container = backup-{workload}-{tenant_id[:8]}, blob key = full blob_path
+        parts = blob_path.split("/")
+        tenant_short = parts[0][:8] if parts else ""
+        for container in [f"backup-mailbox-{tenant_short}", f"backup-files-{tenant_short}",
+                          f"backup-teams-{tenant_short}", f"backup-entra-{tenant_short}"]:
+            try:
+                blob = client.get_blob_client(container=container, blob=blob_path)
+                data = await asyncio.get_event_loop().run_in_executor(None, lambda b=blob: b.download_blob().readall())
+                return _j.loads(data.decode("utf-8"))
+            except Exception:
+                continue
+        return {}
+    except Exception:
+        return {}
+
+
+def _raw(item) -> dict:
+    meta = item.extra_data or {}
+    r = meta.get("raw") or meta.get("structured") or meta
+    return r if isinstance(r, dict) else {}
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/emails")
+async def list_snapshot_emails(
+    snapshot_id: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(500, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return emails with from/to/cc/subject/body/date extracted from metadata."""
+    filters = [
+        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.item_type == "EMAIL",
+    ]
+    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
+    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
+
+    def fmt(i):
+        raw = _raw(i)
+        from_addr = raw.get("from", {}).get("emailAddress", {})
+        to_list = [r.get("emailAddress", {}) for r in raw.get("toRecipients", [])]
+        cc_list = [r.get("emailAddress", {}) for r in raw.get("ccRecipients", [])]
+        return {
+            "id": str(i.id),
+            "snapshotId": str(i.snapshot_id),
+            "externalId": i.external_id,
+            "itemType": i.item_type,
+            "subject": raw.get("subject") or i.name,
+            "from": f"{from_addr.get('name', '')} <{from_addr.get('address', '')}>".strip(" <>") or None,
+            "to": "; ".join(f"{r.get('name','')} <{r.get('address','')}>".strip(" <>") for r in to_list),
+            "cc": "; ".join(f"{r.get('name','')} <{r.get('address','')}>".strip(" <>") for r in cc_list),
+            "date": raw.get("sentDateTime") or raw.get("receivedDateTime") or (i.created_at.isoformat() if i.created_at else None),
+            "bodyPreview": raw.get("bodyPreview") or "",
+            "body": raw.get("body", {}).get("content") or "",
+            "bodyContentType": raw.get("body", {}).get("contentType") or "text",
+            "hasAttachments": raw.get("hasAttachments", False),
+            "attachments": raw.get("attachments", []),
+            "folderPath": i.folder_path,
+            "contentSize": i.content_size or 0,
+            "isDeleted": i.is_deleted or False,
+            "createdAt": i.created_at.isoformat() if i.created_at else "",
+            "name": raw.get("subject") or i.name or "",
+            "metadata": {"raw": raw},
+        }
+
+    return {"content": [fmt(i) for i in items], "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/messages")
+async def list_snapshot_messages(
+    snapshot_id: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(500, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return Teams messages with sender/body/date extracted from metadata."""
+    CHAT_TYPES = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
+    filters = [
+        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.item_type.in_(CHAT_TYPES),
+    ]
+    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
+    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
+
+    sem = asyncio.Semaphore(20)
+
+    async def fmt(i):
+        raw = _raw(i)
+        # Read blob concurrently if metadata is empty
+        if (not raw or len(raw) <= 2) and i.blob_path:
+            async with sem:
+                raw = await _read_blob(i.blob_path)
+        if not isinstance(raw, dict): raw = {}
+        _from = raw.get("from") or {}
+        sender_obj = (_from.get("user") or _from.get("application") or {}) if isinstance(_from, dict) else {}
+        body_obj = raw.get("body", {})
+        # Fallback: name column stores the body text
+        body_text = body_obj.get("content") or (i.name if i.name and i.name != "<systemEventMessage/>" else "")
+        return {
+            "id": str(i.id),
+            "snapshotId": str(i.snapshot_id),
+            "externalId": i.external_id,
+            "itemType": i.item_type,
+            "sender": sender_obj.get("displayName") or "",
+            "senderEmail": sender_obj.get("userPrincipalName") or sender_obj.get("email") or "",
+            "body": body_text,
+            "bodyContentType": body_obj.get("contentType") or "html",
+            "date": raw.get("createdDateTime") or (i.created_at.isoformat() if i.created_at else None),
+            "chatTopic": (i.extra_data or {}).get("chatTopic") or "",
+            "channelName": (i.extra_data or {}).get("channelName") or "",
+            "folderPath": i.folder_path,
+            "attachments": raw.get("attachments", []),
+            "mentions": raw.get("mentions", []),
+            "isDeleted": bool(raw.get("deletedDateTime")),
+            "isReply": i.item_type == "TEAMS_MESSAGE_REPLY",
+            "contentSize": i.content_size or 0,
+            "createdAt": i.created_at.isoformat() if i.created_at else "",
+            "name": sender_obj.get("displayName") or "",
+            "metadata": {"raw": raw},
+        }
+
+    results = await asyncio.gather(*[fmt(i) for i in items])
+    return {"content": list(results), "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/calendar")
+async def list_snapshot_calendar(
+    snapshot_id: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(500, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return calendar events with start/end/location/attendees extracted from metadata."""
+    filters = [
+        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.item_type == "CALENDAR_EVENT",
+    ]
+    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
+    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
+
+    sem = asyncio.Semaphore(20)
+
+    async def fmt(i):
+        raw = _raw(i)
+        # Read from blob concurrently if metadata is empty
+        if (not raw or len(raw) <= 2) and i.blob_path:
+            async with sem:
+                raw = await _read_blob(i.blob_path)
+        if not isinstance(raw, dict):
+            raw = {}
+
+        organizer_obj = (raw.get("organizer") or {}).get("emailAddress") or {}
+        start_obj = raw.get("start") or {}
+        end_obj = raw.get("end") or {}
+        subject = raw.get("subject") or raw.get("name") or ""
+        graph_type = raw.get("type") or ""  # singleInstance, occurrence, seriesMaster, exception
+
+        # Build display name from available fields
+        if not subject:
+            start_dt = start_obj.get("dateTime") or start_obj.get("date") or ""
+            if start_dt:
+                try:
+                    from datetime import datetime as _dt
+                    parsed = _dt.fromisoformat(start_dt.replace("Z", "+00:00").split(".")[0])
+                    time_str = parsed.strftime("%-I:%M %p") if not start_obj.get("date") else parsed.strftime("%b %-d")
+                    subject = f"Event · {time_str}"
+                except Exception:
+                    subject = "Calendar Event"
+            else:
+                subject = "Calendar Event"
+
+        # Derive a human-readable eventType label for filter sidebar
+        is_cancelled = raw.get("isCancelled", False) or subject.lower().startswith("canceled") or subject.lower().startswith("cancelled")
+        is_all_day = raw.get("isAllDay", False) or (not start_obj.get("dateTime") and bool(start_obj.get("date")))
+        is_online = raw.get("isOnlineMeeting", False)
+        has_recurrence = bool(raw.get("recurrence")) or graph_type in ("seriesMaster", "occurrence")
+        has_attendees = bool(raw.get("attendees"))
+        if is_cancelled:
+            event_type = "Cancelled"
+        elif graph_type == "seriesMaster":
+            event_type = "Recurring Series"
+        elif graph_type == "occurrence":
+            event_type = "Recurring"
+        elif graph_type == "exception":
+            event_type = "Exception"
+        elif is_all_day:
+            event_type = "All Day"
+        elif is_online:
+            event_type = "Online Meeting"
+        elif has_recurrence:
+            event_type = "Recurring"
+        elif has_attendees:
+            event_type = "Meeting"
+        else:
+            event_type = "Appointment"
+
+        return {
+            "id": str(i.id),
+            "snapshotId": str(i.snapshot_id),
+            "externalId": i.external_id,
+            "itemType": i.item_type,
+            "subject": subject or i.name or "",
+            "start": start_obj.get("dateTime") or start_obj.get("date"),
+            "end": end_obj.get("dateTime") or end_obj.get("date"),
+            "timeZone": start_obj.get("timeZone") or "UTC",
+            "isAllDay": is_all_day,
+            "isCancelled": is_cancelled,
+            "location": (raw.get("location") or {}).get("displayName") or "",
+            "organizer": organizer_obj.get("name") or organizer_obj.get("address") or None,
+            "organizerEmail": organizer_obj.get("address") or "",
+            "attendees": raw.get("attendees") or [],
+            "body": (raw.get("body") or {}).get("content") or "",
+            "bodyContentType": (raw.get("body") or {}).get("contentType") or "text",
+            "isOnlineMeeting": is_online,
+            "recurrence": raw.get("recurrence"),
+            "recurrenceType": (raw.get("recurrence") or {}).get("pattern", {}).get("type") or None,
+            "graphType": graph_type,
+            "showAs": raw.get("showAs") or "",
+            "importance": raw.get("importance") or "normal",
+            "sensitivity": raw.get("sensitivity") or "normal",
+            "categories": raw.get("categories") or [],
+            "eventType": event_type,
+            "folderPath": i.folder_path or "Calendar",
+            "contentSize": i.content_size or 0,
+            "isDeleted": i.is_deleted or False,
+            "createdAt": i.created_at.isoformat() if i.created_at else "",
+            "name": subject or i.name or "",
+            "date": start_obj.get("dateTime") or start_obj.get("date") or "",
+            "metadata": {"raw": raw},
+        }
+
+    results = await asyncio.gather(*[fmt(i) for i in items])
+    return {"content": list(results), "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
+
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")
+async def get_item_content(
+    snapshot_id: str,
+    item_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the raw content of a snapshot item, reading from blob if metadata is empty."""
+    from shared.azure_storage import azure_storage_manager
+    item = await db.get(SnapshotItem, UUID(item_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    # For items with a blob_path, the actual content lives in blob storage.
+    # extra_data["structured"] only holds file properties (size, mime_type, etc.),
+    # not the file content, so we must read from blob first.
+    if item.blob_path and azure_storage_manager.shards:
+        try:
+            shard = azure_storage_manager.get_shard_for_resource(
+                str(item.snapshot_id), str(item.tenant_id or "")
+            )
+            parts = item.blob_path.split("/", 1)
+            container, path = (parts[0], parts[1]) if len(parts) == 2 else ("files", item.blob_path)
+            data = await shard.download_blob(container, path)
+            if data:
+                import json as _json
+                try:
+                    content = _json.loads(data.decode("utf-8"))
+                    return {"source": "blob", "content": content}
+                except Exception:
+                    from fastapi.responses import Response
+                    return Response(content=data, media_type="application/octet-stream")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Blob read failed: {e}")
+
+    # Fall back to inline metadata (e.g. email bodies stored directly in extra_data)
+    meta = item.extra_data or {}
+    raw = meta.get("raw") or meta.get("structured")
+    if raw:
+        return {"source": "metadata", "content": raw}
+
+    return {"source": "none", "content": {}}

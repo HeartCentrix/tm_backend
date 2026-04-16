@@ -910,288 +910,37 @@ async def ingest_m365_audit_logs():
 # ==================== Scheduled Reporting ====================
 
 async def send_daily_backup_report():
-    """Send daily backup status report via email/Slack/Teams"""
-    print("[REPORT] Generating daily backup report...")
-
-    async with async_session_factory() as session:
-        now = datetime.utcnow()
-        yesterday = now - timedelta(days=1)
-
-        # Get backup statistics for last 24h
-        total_backups_result = await session.execute(
-            select(func.count(Job.id)).where(
-                and_(
-                    Job.type == JobType.BACKUP,
-                    Job.created_at >= yesterday,
+    """Trigger daily backup report generation via report-service"""
+    print("[REPORT] Triggering daily backup report...")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{settings.REPORT_SERVICE_URL}/api/v1/reports/generate",
+                json={"report_type": "DAILY"}
                 )
-            )
-        )
-        total_backups = total_backups_result.scalar() or 0
-
-        successful_backups_result = await session.execute(
-            select(func.count(Job.id)).where(
-                and_(
-                    Job.type == JobType.BACKUP,
-                    Job.status == JobStatus.COMPLETED,
-                    Job.created_at >= yesterday,
-                )
-            )
-        )
-        successful_backups = successful_backups_result.scalar() or 0
-
-        failed_backups_result = await session.execute(
-            select(func.count(Job.id)).where(
-                and_(
-                    Job.type == JobType.BACKUP,
-                    Job.status == JobStatus.FAILED,
-                    Job.created_at >= yesterday,
-                )
-            )
-        )
-        failed_backups = failed_backups_result.scalar() or 0
-
-        # Get resource coverage
-        total_resources_result = await session.execute(
-            select(func.count(Resource.id)).where(Resource.status == ResourceStatus.ACTIVE)
-        )
-        total_resources = total_resources_result.scalar() or 0
-
-        protected_resources_result = await session.execute(
-            select(func.count(Resource.id)).where(
-                and_(
-                    Resource.status == ResourceStatus.ACTIVE,
-                    Resource.last_backup_at >= yesterday,
-                    Resource.last_backup_status == "COMPLETED"
-                )
-            )
-        )
-        protected_resources = protected_resources_result.scalar() or 0
-
-        # Get tenants with most failures
-        failing_tenants_result = await session.execute(
-            select(Tenant.display_name, func.count(Job.id).label('fail_count'))
-            .join(Job, Tenant.id == Job.tenant_id)
-            .where(
-                and_(
-                    Job.type == JobType.BACKUP,
-                    Job.status == JobStatus.FAILED,
-                    Job.created_at >= yesterday,
-                )
-            )
-            .group_by(Tenant.display_name)
-            .order_by(func.count(Job.id).desc())
-            .limit(5)
-        )
-        failing_tenants = failing_tenants_result.all()
-
-        coverage_pct = (protected_resources / total_resources * 100) if total_resources > 0 else 0
-
-        report = {
-            "report_type": "DAILY_BACKUP_REPORT",
-            "generated_at": now.isoformat(),
-            "period": f"{yesterday.strftime('%Y-%m-%d')} to {now.strftime('%Y-%m-%d')}",
-            "summary": {
-                "total_backups": total_backups,
-                "successful_backups": successful_backups,
-                "failed_backups": failed_backups,
-                "success_rate": f"{(successful_backups / total_backups * 100) if total_backups > 0 else 0:.1f}%",
-                "total_resources": total_resources,
-                "protected_resources": protected_resources,
-                "coverage_rate": f"{coverage_pct:.1f}%",
-            },
-            "failing_tenants": [
-                {"tenant": t[0], "failures": t[1]}
-                for t in failing_tenants
-            ],
-        }
-
-        # Send report via configured channels
-        await send_report_to_channels(report)
-
-        print(f"[REPORT] Daily report: {successful_backups}/{total_backups} successful, "
-              f"{coverage_pct:.1f}% coverage")
+            if response.status_code == 200:
+                print(f"[REPORT] Daily report triggered successfully")
+            else:
+                print(f"[REPORT] Failed to trigger daily report: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"[REPORT] Error triggering daily report: {e}")
 
 
 async def send_weekly_summary_report():
-    """Send weekly summary report with trends and recommendations"""
-    print("[REPORT] Generating weekly summary report...")
-
-    async with async_session_factory() as session:
-        now = datetime.utcnow()
-        week_ago = now - timedelta(days=7)
-
-        # Weekly backup statistics
-        total_backups_result = await session.execute(
-            select(func.count(Job.id)).where(
-                and_(
-                    Job.type == JobType.BACKUP,
-                    Job.created_at >= week_ago,
-                )
-            )
-        )
-        total_backups = total_backups_result.scalar() or 0
-
-        successful_backups_result = await session.execute(
-            select(func.count(Job.id)).where(
-                and_(
-                    Job.type == JobType.BACKUP,
-                    Job.status == JobStatus.COMPLETED,
-                    Job.created_at >= week_ago,
-                )
-            )
-        )
-        successful_backups = successful_backups_result.scalar() or 0
-
-        # Storage usage
-        storage_result = await session.execute(
-            select(func.sum(Resource.storage_bytes)).where(Resource.status == ResourceStatus.ACTIVE)
-        )
-        total_storage_bytes = storage_result.scalar() or 0
-
-        # SLA compliance
-        resources_with_sla_result = await session.execute(
-            select(func.count(Resource.id)).where(
-                and_(
-                    Resource.status == ResourceStatus.ACTIVE,
-                    Resource.sla_policy_id.isnot(None)
-                )
-            )
-        )
-        resources_with_sla = resources_with_sla_result.scalar() or 0
-
-        # Calculate recommendations
-        recommendations = []
-        if total_backups > 0:
-            success_rate = successful_backups / total_backups
-            if success_rate < 0.95:
-                recommendations.append("Review failed backup jobs and resolve underlying issues")
-
-        if total_storage_bytes > 100 * 1024**3:  # >100GB
-            recommendations.append("Consider implementing data deduplication to reduce storage costs")
-
-        report = {
-            "report_type": "WEEKLY_SUMMARY_REPORT",
-            "generated_at": now.isoformat(),
-            "period": f"Week of {week_ago.strftime('%Y-%m-%d')}",
-            "summary": {
-                "total_backups": total_backups,
-                "successful_backups": successful_backups,
-                "success_rate": f"{(successful_backups / total_backups * 100) if total_backups > 0 else 0:.1f}%",
-                "total_storage_gb": round(total_storage_bytes / (1024**3), 2),
-                "resources_with_sla": resources_with_sla,
-            },
-            "recommendations": recommendations,
-        }
-
-        await send_report_to_channels(report)
-
-        print(f"[REPORT] Weekly summary: {total_backups} backups, "
-              f"{total_storage_bytes / (1024**3):.2f}GB storage")
-
-
-async def send_report_to_channels(report: Dict[str, Any]):
-    """Send report to configured notification channels (email/Slack/Teams)"""
-    # Send to Teams webhook
-    await send_teams_report_notification(report)
-
-    # Send to Slack webhook (if configured)
-    await send_slack_report_notification(report)
-
-    # Send via email (if configured)
-    await send_email_report_notification(report)
-
-
-async def send_teams_report_notification(report: Dict[str, Any]):
-    """Send report to Teams webhook"""
-    if not hasattr(settings, 'TEAMS_WEBHOOK_URL') or not getattr(settings, 'TEAMS_WEBHOOK_URL'):
-        return
-
-    summary = report.get("summary", {})
-    title = report.get("report_type", "Backup Report").replace("_", " ")
-
-    message = {
-        "@type": "MessageCard",
-        "@context": "http://schema.org/extensions",
-        "summary": title,
-        "themeColor": "0078D4",
-        "title": f"TM Vault - {title}",
-        "sections": [
-            {
-                "activityTitle": title,
-                "activitySubtitle": report.get("period", ""),
-                "facts": [
-                    {"name": "Total Backups", "value": str(summary.get("total_backups", 0))},
-                    {"name": "Successful", "value": str(summary.get("successful_backups", 0))},
-                    {"name": "Success Rate", "value": summary.get("success_rate", "N/A")},
-                ],
-            }
-        ],
-    }
-
-    # Add coverage rate if available
-    if "coverage_rate" in summary:
-        message["sections"][0]["facts"].append(
-            {"name": "Coverage Rate", "value": summary["coverage_rate"]}
-        )
-
+    """Trigger weekly backup report generation via report-service"""
+    print("[REPORT] Triggering weekly summary report...")
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(settings.TEAMS_WEBHOOK_URL, json=message)
-            print(f"[REPORT] Report sent to Teams: {title}")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{settings.REPORT_SERVICE_URL}/api/v1/reports/generate",
+                json={"report_type": "WEEKLY"}
+            )
+            if response.status_code == 200:
+                print(f"[REPORT] Weekly report triggered successfully")
+            else:
+                print(f"[REPORT] Failed to trigger weekly report: {response.status_code} - {response.text}")
     except Exception as e:
-        print(f"[REPORT] Failed to send Teams notification: {e}")
-
-
-async def send_slack_report_notification(report: Dict[str, Any]):
-    """Send report to Slack webhook"""
-    if not hasattr(settings, 'SLACK_WEBHOOK_URL') or not getattr(settings, 'SLACK_WEBHOOK_URL'):
-        return
-
-    summary = report.get("summary", {})
-
-    blocks = [
-        {
-            "type": "header",
-            "text": {
-                "type": "plain_text",
-                "text": f"TM Vault - {report.get('report_type', 'Report').replace('_', ' ')}",
-            }
-        },
-        {
-            "type": "section",
-            "fields": [
-                {"type": "mrkdwn", "text": f"*Total Backups:*\n{summary.get('total_backups', 0)}"},
-                {"type": "mrkdwn", "text": f"*Successful:*\n{summary.get('successful_backups', 0)}"},
-                {"type": "mrkdwn", "text": f"*Success Rate:*\n{summary.get('success_rate', 'N/A')}"},
-            ]
-        }
-    ]
-
-    # Add recommendations if available
-    if "recommendations" in report and report["recommendations"]:
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "*Recommendations:*\n" + "\n".join([f"• {r}" for r in report["recommendations"]])
-            }
-        })
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(settings.SLACK_WEBHOOK_URL, json={"blocks": blocks})
-            print(f"[REPORT] Report sent to Slack")
-    except Exception as e:
-        print(f"[REPORT] Failed to send Slack notification: {e}")
-
-
-async def send_email_report_notification(report: Dict[str, Any]):
-    """Send report via email (placeholder - requires SMTP configuration)"""
-    if not hasattr(settings, 'SMTP_ENABLED') or not getattr(settings, 'SMTP_ENABLED', False):
-        return
-
-    # Placeholder for email sending logic
-    print(f"[REPORT] Email notification would be sent (SMTP not configured)")
+        print(f"[REPORT] Error triggering weekly report: {e}")
 
 
 async def send_violations_to_alert_service(violations: List[Dict]):

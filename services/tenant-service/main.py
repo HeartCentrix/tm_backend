@@ -6,11 +6,11 @@ from datetime import datetime, timezone, timedelta
 import csv
 import io
 
-from fastapi import FastAPI, Depends, HTTPException, Query, Response
+from fastapi import FastAPI, Depends, HTTPException, Query, Response, BackgroundTasks
 from sqlalchemy import select, func, text
 
 from shared.config import settings
-from shared.database import get_db, close_db, AsyncSession, engine
+from shared.database import get_db, close_db, AsyncSession, engine, async_session_factory
 from shared.models import Tenant, TenantType, TenantStatus, Organization, Resource, ResourceStatus, ResourceType, SlaPolicy
 from shared.schemas import (
     TenantResponse, TenantCreateRequest, DiscoveryStatus, TenantInfoResponse,
@@ -214,22 +214,55 @@ async def delete_tenant(tenant_id: str, db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/v1/tenants/{tenant_id}/discover")
 @app.post("/api/v1/tenants/{tenant_id}/discover-m365")
-async def trigger_discovery(tenant_id: str, db: AsyncSession = Depends(get_db)):
-    """Run M365 discovery via Graph API and store resources"""
+async def trigger_discovery(tenant_id: str, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    """Trigger M365 discovery in background and return immediately"""
     stmt = select(Tenant).where(Tenant.id == UUID(tenant_id))
     result = await db.execute(stmt)
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    try:
-        count = await run_tenant_discovery(db, tenant)
-        await db.commit()
-        return {"discoveryId": str(uuid4()), "resourcesFound": count}
-    except Exception as e:
-        tenant.status = TenantStatus.DISCONNECTED
-        await db.commit()
-        raise HTTPException(status_code=500, detail=f"Discovery failed: {str(e)}")
+    tenant.status = TenantStatus.DISCOVERING
+    await db.commit()
+
+    async def _run():
+        async with async_session_factory() as bg_db:
+            t = await bg_db.get(Tenant, tenant.id)
+            try:
+                count = await run_tenant_discovery(bg_db, t)
+                await bg_db.commit()
+                print(f"[DISCOVERY] M365 complete for {tenant_id}: {count} resources")
+                try:
+                    import httpx
+                    async with httpx.AsyncClient(timeout=5.0) as _c:
+                        await _c.post("http://audit-service:8012/api/v1/audit/log", json={
+                            "action": "DISCOVERY_RUN",
+                            "tenant_id": tenant_id,
+                            "actor_type": "USER",
+                            "outcome": "SUCCESS",
+                            "details": {"resourcesFound": count, "type": "M365"},
+                        })
+                except Exception:
+                    pass
+            except Exception as e:
+                t.status = TenantStatus.DISCONNECTED
+                await bg_db.commit()
+                print(f"[DISCOVERY] M365 failed for {tenant_id}: {e}")
+                try:
+                    import httpx
+                    async with httpx.AsyncClient(timeout=5.0) as _c:
+                        await _c.post("http://audit-service:8012/api/v1/audit/log", json={
+                            "action": "DISCOVERY_RUN",
+                            "tenant_id": tenant_id,
+                            "actor_type": "USER",
+                            "outcome": "FAILURE",
+                            "details": {"error": str(e), "type": "M365"},
+                        })
+                except Exception:
+                    pass
+
+    background_tasks.add_task(_run)
+    return {"discoveryId": str(uuid4()), "status": "started", "message": "Discovery running in background"}
 
 
 @app.post("/api/v1/tenants/{tenant_id}/discover-azure")

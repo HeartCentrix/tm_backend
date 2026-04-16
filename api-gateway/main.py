@@ -18,6 +18,7 @@ SERVICES = {
     "dashboard": settings.DASHBOARD_SERVICE_URL,
     "alert": settings.ALERT_SERVICE_URL,
     "scheduler": settings.BACKUP_SCHEDULER_URL,
+    "report": settings.REPORT_SERVICE_URL,
     "graph-proxy": settings.GRAPH_PROXY_URL,
     "delta-token": settings.DELTA_TOKEN_URL,
     "progress": settings.PROGRESS_TRACKER_URL,
@@ -47,7 +48,7 @@ app.add_middleware(
 )
 
 
-async def proxy_request(service: str, path: str, request: Request):
+async def proxy_request(service: str, path: str, request: Request, timeout: httpx.Timeout = None):
     """Forward request to microservice with retry logic"""
     import asyncio
 
@@ -75,6 +76,7 @@ async def proxy_request(service: str, path: str, request: Request):
                 headers=headers,
                 params=request.query_params,
                 content=await request.body(),
+                timeout=timeout,
             )
 
             return Response(
@@ -206,6 +208,9 @@ async def job(request: Request):
 # Snapshot routes
 @app.get("/api/v1/resources/snapshots/folders")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/content-types")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/emails")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/messages")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/calendar")
 async def snapshot_folders(request: Request):
     return await proxy_request("snapshot", request.url.path, request)
 
@@ -215,6 +220,8 @@ async def snapshot_folders(request: Request):
 @app.get("/api/v1/resources/{resource_id}/snapshots/calendar")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/search")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/preview")
@@ -237,6 +244,8 @@ async def snapshot(request: Request):
 @app.get("/api/v1/jobs/restore/history")
 @app.post("/api/v1/jobs/export")
 @app.get("/api/v1/jobs/export/{job_id}/status")
+@app.get("/api/v1/exports/{job_id}/download")
+@app.get("/api/v1/exports/{job_id}/download")
 @app.get("/api/v1/jobs/export/{job_id}/download")
 async def restore(request: Request):
     return await proxy_request("job", request.url.path, request)
@@ -266,6 +275,18 @@ async def alert(request: Request):
 @app.post("/api/v1/policies/{policy_id}/auto-assign")
 async def policy(request: Request):
     return await proxy_request("resource", request.url.path, request)
+
+
+# Report Configuration routes
+@app.get("/api/v1/reports/config")
+@app.post("/api/v1/reports/config")
+@app.put("/api/v1/reports/config")
+@app.get("/api/v1/reports/history")
+@app.get("/api/v1/reports/history/{report_id}")
+@app.post("/api/v1/reports/generate")
+async def report_proxy(request: Request):
+    return await proxy_request("report", request.url.path, request,
+                               timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0))
 
 
 # Access Control routes

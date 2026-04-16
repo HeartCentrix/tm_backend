@@ -7,6 +7,7 @@ services:
       POSTGRES_DB: ${DB_NAME}
       POSTGRES_USER: ${DB_USERNAME}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
+    command: postgres -c max_connections=300 -c shared_buffers=256MB
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -234,6 +235,23 @@ services:
       rabbitmq:
         condition: service_healthy
       redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  report-service:
+    build:
+      context: .
+      dockerfile: services/report-service/Dockerfile
+    container_name: tm_vault_report_service
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+    ports:
+      - "8014:8014"
+    depends_on:
+      postgres:
         condition: service_healthy
     restart: unless-stopped
     networks:

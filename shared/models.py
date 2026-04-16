@@ -476,3 +476,58 @@ class ResourceDiscoveryStaging(Base):
     azure_region = Column(String, nullable=True)
     discovered_at = Column(DateTime, default=utcnow, nullable=False)
     created_at = Column(DateTime, default=utcnow)
+
+
+class ReportConfig(Base):
+    __tablename__ = "report_configs"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), index=True, nullable=True)
+
+    # Schedule settings
+    enabled = Column(Boolean, default=False, nullable=False)
+    schedule_type = Column(String, default="daily", nullable=False)  # daily, weekly, monthly
+
+    # Empty report handling
+    send_empty_report = Column(Boolean, default=True, nullable=False)
+    empty_message = Column(String, default="No updates. No backups occurred.", nullable=True)
+    send_detailed_report = Column(Boolean, default=False, nullable=False)
+
+    # Notification endpoints (stored as JSON arrays)
+    email_recipients = Column(JSON, default=list, nullable=True)
+    slack_webhooks = Column(JSON, default=list, nullable=True)
+    teams_webhooks = Column(JSON, default=list, nullable=True)
+
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class ReportHistory(Base):
+    __tablename__ = "report_history"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), index=True)
+    report_config_id = Column(UUID(as_uuid=True), ForeignKey("report_configs.id"), nullable=True)
+
+    # Report metadata
+    report_type = Column(String, nullable=False)  # DAILY, WEEKLY, MONTHLY
+    period_start = Column(DateTime, nullable=True)
+    period_end = Column(DateTime, nullable=True)
+    generated_at = Column(DateTime, default=utcnow, nullable=False)
+
+    # Report content summary
+    total_backups = Column(Integer, default=0)
+    successful_backups = Column(Integer, default=0)
+    failed_backups = Column(Integer, default=0)
+    success_rate = Column(String, nullable=True)
+    coverage_rate = Column(String, nullable=True)
+
+    # Full report data (JSON)
+    report_data = Column(JSON, default=dict, nullable=True)
+    is_empty = Column(Boolean, default=False, nullable=False)
+
+    # Delivery status
+    delivery_status = Column(JSON, default=dict, nullable=True)
+
+    # Error tracking
+    error_message = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=utcnow)
