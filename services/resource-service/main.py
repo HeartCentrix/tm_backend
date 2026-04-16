@@ -27,6 +27,15 @@ async def lifespan(app: FastAPI):
     await close_db()
 
 
+# Resource types hidden from UI listing endpoints by default.
+# Rationale: POWER_BI workspaces share identity with the M365 Group that backs them,
+# so they show up in the Power Platform tab looking like duplicates of Teams/SharePoint/
+# Entra rows with the same display name and email. Discovery and backup still process
+# these rows; they just don't appear in list/search/by-type responses unless the caller
+# passes ?includeHidden=true.
+UI_HIDDEN_TYPES = {"POWER_BI"}
+
+
 def format_bytes(bytes_val: int) -> str:
     if bytes_val < 1024**3:
         return f"{bytes_val / 1024**2:.1f} MB"
@@ -207,19 +216,33 @@ async def list_resources(
     size: int = Query(50, ge=1),
     status: Optional[str] = Query(None),
     types: Optional[str] = Query(None),  # comma-separated resource types
+    includeHidden: bool = Query(False),  # opt-in to include UI_HIDDEN_TYPES like POWER_BI
     db: AsyncSession = Depends(get_db),
 ):
     status_clause = "AND status = :rstatus" if status else ""
     type_clause = ""
+    hidden_clause = ""
     if types:
+        # Explicit type filter. Respect it as-is but still drop hidden unless opted in —
+        # e.g. if someone passes types=MAILBOX,POWER_BI the POWER_BI rows get stripped.
         type_list = [t.strip() for t in types.split(",")]
+        if not includeHidden:
+            type_list = [t for t in type_list if t not in UI_HIDDEN_TYPES]
+        if not type_list:
+            # All requested types were hidden — empty result without hitting the DB.
+            return {"items": [], "item_number": 0, "page_number": page, "next_page_token": None}
         placeholders = ", ".join([f":rt{i}" for i in range(len(type_list))])
         type_clause = f"AND type IN ({placeholders})"
+    elif not includeHidden and UI_HIDDEN_TYPES:
+        # No explicit filter — exclude hidden by default.
+        hidden_placeholders = ", ".join([f":hidden{i}" for i in range(len(UI_HIDDEN_TYPES))])
+        hidden_clause = f"AND type NOT IN ({hidden_placeholders})"
+
     query = text(f"""
         SELECT id, tenant_id, type, external_id, display_name, email, metadata, sla_policy_id,
                status, storage_bytes, last_backup_at, last_backup_status, created_at
         FROM resources
-        WHERE tenant_id = :rtenant {status_clause} {type_clause}
+        WHERE tenant_id = :rtenant {status_clause} {type_clause} {hidden_clause}
         ORDER BY created_at DESC
         LIMIT :rlimit OFFSET :roffset
     """)
@@ -227,16 +250,18 @@ async def list_resources(
     if status:
         params["rstatus"] = status
     if types:
-        type_list = [t.strip() for t in types.split(",")]
         for i, t in enumerate(type_list):
             params[f"rt{i}"] = t
+    if hidden_clause:
+        for i, t in enumerate(sorted(UI_HIDDEN_TYPES)):
+            params[f"hidden{i}"] = t
 
     result = await db.execute(query, params)
     rows = result.fetchall()
 
     # Count
     count_query = text(f"""
-        SELECT count(*) FROM resources WHERE tenant_id = :rtenant {status_clause} {type_clause}
+        SELECT count(*) FROM resources WHERE tenant_id = :rtenant {status_clause} {type_clause} {hidden_clause}
     """)
     count_result = await db.execute(count_query, params)
     total = count_result.scalar() or 0
@@ -320,10 +345,19 @@ async def list_resources(
 
 
 @app.get("/api/v1/resources/search")
-async def search_resources(query: str = Query(...), type: Optional[str] = Query(None), db: AsyncSession = Depends(get_db)):
+async def search_resources(
+    query: str = Query(...),
+    type: Optional[str] = Query(None),
+    includeHidden: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+):
     filters = [or_(Resource.display_name.ilike(f"%{query}%"), Resource.email.ilike(f"%{query}%"))]
     if type:
+        if not includeHidden and type in UI_HIDDEN_TYPES:
+            return []
         filters.append(Resource.type == type)
+    elif not includeHidden and UI_HIDDEN_TYPES:
+        filters.append(Resource.type.notin_(list(UI_HIDDEN_TYPES)))
     stmt = select(Resource).where(*filters).limit(50)
     result = await db.execute(stmt)
     return [
@@ -335,7 +369,18 @@ async def search_resources(query: str = Query(...), type: Optional[str] = Query(
 
 
 @app.get("/api/v1/resources/by-type")
-async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] = Query(None), page: int = Query(1, ge=1), size: int = Query(50, ge=1), db: AsyncSession = Depends(get_db)):
+async def get_resources_by_type(
+    type: str = Query(...),
+    tenantId: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1),
+    includeHidden: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+):
+    # Hidden types return an empty page unless the caller explicitly opts in.
+    if not includeHidden and type in UI_HIDDEN_TYPES:
+        return {"items": [], "item_number": 0, "page_number": page, "next_page_token": None}
+
     query = text(f"""
         SELECT id, tenant_id, type, external_id, display_name, email, metadata, sla_policy_id,
                status, storage_bytes, last_backup_at, last_backup_status, created_at
