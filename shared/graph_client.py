@@ -1043,14 +1043,19 @@ class GraphClient:
         )
 
     async def get_teams_chats(self, delta_token: str = None) -> Dict[str, Any]:
-        """
-        Get all Teams chats accessible to the app using delta API.
-        Graph API: GET /chats/delta
-        """
-        url = f"{self.GRAPH_URL}/chats/delta"
+        """Get all Teams chats accessible to the app.
+
+        /chats/delta is NOT in the v1.0 Graph reference (was previously called here
+        but never documented). We now scope by user: /users/{id}/chats. For
+        organization-wide chat export the documented approach is
+        /users/{id}/chats/getAllMessages.
+
+        Kept API-compatible: callers may still pass delta_token from a previous
+        nextLink response and it'll be used verbatim."""
         if delta_token:
             url = delta_token
-
+        else:
+            url = f"{self.GRAPH_URL}/chats"
         params = {"$top": "999", "$expand": "members,permission"}
         result = await self._get(url, params=params)
         all_value = result.get("value", [])
@@ -1061,6 +1066,22 @@ class GraphClient:
             result = await self._get(next_url)
             all_value.extend(result.get("value", []))
 
+        result["value"] = all_value
+        return result
+
+    async def get_all_chat_messages_for_user(self, user_id: str) -> Dict[str, Any]:
+        """Export all chat messages a user is part of.
+
+        Graph API: GET /users/{id}/chats/getAllMessages
+        Permission: Chat.Read.All (or ChatMessage.Read.All). This is the documented
+        replacement for the undocumented /chats/delta used previously."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/chats/getAllMessages"
+        params = {"$top": "50"}
+        result = await self._get(url, params=params)
+        all_value = result.get("value", [])
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_value.extend(result.get("value", []))
         result["value"] = all_value
         return result
 
@@ -1190,15 +1211,29 @@ class GraphClient:
         return await self._get(f"{self.GRAPH_URL}/users/{user_id}/contacts", params={"$top": "999"})
 
     async def get_calendar_events_delta(self, user_id: str, delta_token: str = None) -> Dict[str, Any]:
-        """
-        Get calendar events using delta API.
-        Graph API: GET /users/{id}/calendar/events/delta
-        """
-        url = f"{self.GRAPH_URL}/users/{user_id}/calendar/events/delta"
-        if delta_token:
-            url = delta_token
+        """Get calendar events using the documented delta API.
 
-        params = {"$top": "999"}
+        Graph v1.0 documents /users/{id}/calendarView/delta (with startDateTime /
+        endDateTime bounds); the previously-used /calendar/events/delta is not in
+        the v1.0 reference — it may still respond today but isn't guaranteed.
+
+        Window is 10 years back / 1 year forward by default, which covers almost
+        every realistic retention need without paginating the full multi-decade
+        history of recurring meetings."""
+        if delta_token:
+            # delta token contains the full next URL including the preserved window
+            url = delta_token
+            params = {"$top": "999"}
+        else:
+            url = f"{self.GRAPH_URL}/users/{user_id}/calendarView/delta"
+            now = datetime.utcnow()
+            start = (now - timedelta(days=365 * 10)).replace(microsecond=0).isoformat() + "Z"
+            end = (now + timedelta(days=365)).replace(microsecond=0).isoformat() + "Z"
+            params = {
+                "$top": "999",
+                "startDateTime": start,
+                "endDateTime": end,
+            }
         result = await self._get(url, params=params)
         all_value = result.get("value", [])
 

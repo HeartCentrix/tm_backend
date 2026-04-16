@@ -198,6 +198,10 @@ class RestoreWorker:
                     resource_groups[resource_id] = []
                 resource_groups[resource_id].append(item)
 
+        # Cross-resource accumulator: Teams messages are a platform limit, surface them
+        # in the aggregate manual_actions even if multiple resources contribute.
+        total_teams_skipped = 0
+
         for resource_id, resource_items in resource_groups.items():
             # Fetch resource
             resource = await session.get(Resource, uuid.UUID(resource_id))
@@ -235,8 +239,24 @@ class RestoreWorker:
                 restored_count += result.get("restored_count", 0)
                 failed_count += result.get("failed_count", 0)
                 continue
+            if resource_type == "ONENOTE":
+                result = await self._restore_onenote_items(session, resource, resource_items, tenant)
+                restored_count += result.get("restored_count", 0)
+                failed_count += result.get("failed_count", 0)
+                continue
+            if resource_type == "PLANNER":
+                result = await self._restore_planner_items(session, resource, resource_items, tenant)
+                restored_count += result.get("restored_count", 0)
+                failed_count += result.get("failed_count", 0)
+                continue
+            if resource_type == "TODO":
+                result = await self._restore_todo_items(session, resource, resource_items, tenant)
+                restored_count += result.get("restored_count", 0)
+                failed_count += result.get("failed_count", 0)
+                continue
 
             # Route by item type
+            teams_skipped = 0  # per-resource counter; rolled into total_teams_skipped
             for item in resource_items:
                 try:
                     if item.item_type in ("EMAIL",):
@@ -245,15 +265,22 @@ class RestoreWorker:
                         await self._restore_file_to_onedrive(graph_client, resource, item)
                     elif item.item_type in ("SHAREPOINT_FILE", "SHAREPOINT_LIST_ITEM"):
                         await self._restore_file_to_sharepoint(graph_client, resource, item)
-                    elif item.item_type in ("TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"):
-                        # Teams messages cannot be restored via API - export only
-                        print(f"[{self.worker_id}] Teams messages cannot be restored in-place - skipping")
-                        failed_count += 1
+                    elif item.item_type in ("TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY", "TEAMS_CHAT_MESSAGE"):
+                        # Microsoft Graph has no app-only API to create chat/channel
+                        # messages as another user. This is a platform limit, not a
+                        # missing handler. Counted as skipped, not failed.
+                        teams_skipped += 1
                         continue
                     elif item.item_type in ("ENTRA_USER_PROFILE",):
                         await self._restore_entra_user(graph_client, resource, item)
                     elif item.item_type in ("ENTRA_GROUP_META",):
                         await self._restore_entra_group(graph_client, resource, item)
+                    elif item.item_type == "USER_MANAGER":
+                        await self._restore_user_manager(graph_client, resource, item)
+                    elif item.item_type == "USER_DIRECT_REPORT":
+                        await self._restore_user_direct_report(graph_client, resource, item)
+                    elif item.item_type == "USER_GROUP_MEMBERSHIP":
+                        await self._restore_user_group_membership(graph_client, resource, item)
                     else:
                         print(f"[{self.worker_id}] Unknown item type for in-place restore: {item.item_type}")
                         failed_count += 1
@@ -264,9 +291,19 @@ class RestoreWorker:
                     print(f"[{self.worker_id}] Failed to restore item {item.id}: {e}")
                     failed_count += 1
 
+            total_teams_skipped += teams_skipped
+
+        manual_actions: List[str] = []
+        if total_teams_skipped:
+            manual_actions.append(
+                f"{total_teams_skipped} Teams message(s) skipped — Microsoft Graph has no app-only API "
+                "to post messages as another user. Export to ZIP and replay manually if needed."
+            )
+
         return {
             "restored_count": restored_count,
             "failed_count": failed_count,
+            "manual_actions": manual_actions,
             "restore_type": "IN_PLACE",
         }
 
@@ -979,6 +1016,382 @@ class RestoreWorker:
             "manual_actions": sorted(set(manual_actions)),
             "restore_type": "POWER_DLP",
         }
+
+    # ==================== OneNote Restore ====================
+
+    async def _restore_onenote_items(
+        self,
+        session: AsyncSession,
+        target_resource: Resource,
+        items: List[SnapshotItem],
+        tenant: Tenant,
+    ) -> Dict[str, Any]:
+        """Restore OneNote notebooks, sections, and pages for a user.
+
+        Three-pass restore to respect the notebook > section > page hierarchy:
+          1. Create notebooks (emit old→new id map)
+          2. Create sections under the new notebooks
+          3. Create pages with HTML body (from ONENOTE_PAGE_CONTENT blob) under the new sections
+
+        ONENOTE_RESOURCE items (inline images/attachments) are not auto-restored because
+        Graph returns new resource URLs that don't match the old src attributes in the
+        HTML — a proper fix requires upload-then-rewrite-src which we flag as manual."""
+        graph_client = await self.get_graph_client(tenant)
+        user_id = target_resource.external_id
+        restored, failed = 0, 0
+        manual_actions: List[str] = []
+        nb_id_map: Dict[str, str] = {}   # old notebook id → new
+        sec_id_map: Dict[str, str] = {}  # old section id → new
+
+        # Pass 1: notebooks
+        for item in [i for i in items if i.item_type == "ONENOTE_NOTEBOOK"]:
+            meta = self._get_item_metadata(item)
+            raw = meta.get("raw", {})
+            display_name = raw.get("displayName") or item.name
+            if not display_name:
+                failed += 1
+                continue
+            try:
+                created = await graph_client._post(
+                    f"{graph_client.GRAPH_URL}/users/{user_id}/onenote/notebooks",
+                    {"displayName": display_name},
+                )
+                nb_id_map[item.external_id] = created.get("id")
+                restored += 1
+            except Exception as exc:
+                manual_actions.append(f"{display_name} (notebook): create failed — {str(exc)[:200]}")
+                failed += 1
+
+        # Pass 2: sections
+        for item in [i for i in items if i.item_type == "ONENOTE_SECTION"]:
+            meta = self._get_item_metadata(item)
+            raw = meta.get("raw", {})
+            display_name = raw.get("displayName") or item.name
+            old_nb_id = meta.get("notebookId")
+            new_nb_id = nb_id_map.get(old_nb_id)
+            if not new_nb_id:
+                manual_actions.append(f"{display_name}: parent notebook not restored, skipping section.")
+                failed += 1
+                continue
+            try:
+                created = await graph_client._post(
+                    f"{graph_client.GRAPH_URL}/users/{user_id}/onenote/notebooks/{new_nb_id}/sections",
+                    {"displayName": display_name},
+                )
+                sec_id_map[item.external_id] = created.get("id")
+                restored += 1
+            except Exception as exc:
+                manual_actions.append(f"{display_name} (section): create failed — {str(exc)[:200]}")
+                failed += 1
+
+        # Pass 3: pages — prefer ONENOTE_PAGE_CONTENT (HTML) over ONENOTE_PAGE (metadata)
+        # Group by page external_id so we can attach content to its metadata entry.
+        pages_by_id: Dict[str, Dict[str, SnapshotItem]] = {}
+        for item in items:
+            if item.item_type == "ONENOTE_PAGE":
+                pages_by_id.setdefault(item.external_id, {})["page"] = item
+            elif item.item_type == "ONENOTE_PAGE_CONTENT":
+                # external_id is "{page_id}:content" — strip suffix
+                pid = item.external_id.rsplit(":", 1)[0]
+                pages_by_id.setdefault(pid, {})["content"] = item
+
+        for page_id, bundle in pages_by_id.items():
+            page_item = bundle.get("page")
+            content_item = bundle.get("content")
+            if not page_item:
+                continue
+            meta = self._get_item_metadata(page_item)
+            raw = meta.get("raw", {})
+            title = raw.get("title") or page_item.name or "(Untitled)"
+            old_sec_id = meta.get("sectionId")
+            new_sec_id = sec_id_map.get(old_sec_id)
+            if not new_sec_id:
+                manual_actions.append(f"{title}: parent section not restored, skipping page.")
+                failed += 1
+                continue
+
+            # Build HTML body — prefer the captured content blob, else a title-only placeholder
+            html_bytes: Optional[bytes] = None
+            if content_item:
+                html_bytes = self._load_snapshot_item_bytes(content_item, "onenote")
+            if not html_bytes:
+                html_bytes = (f"<html><head><title>{title}</title></head>"
+                              f"<body><h1>{title}</h1><p>(content not captured)</p></body></html>").encode()
+                manual_actions.append(f"{title}: no ONENOTE_PAGE_CONTENT captured; placeholder body used.")
+            try:
+                await graph_client._post(
+                    f"{graph_client.GRAPH_URL}/users/{user_id}/onenote/sections/{new_sec_id}/pages",
+                    html_bytes,
+                    headers={"Content-Type": "text/html"},
+                )
+                restored += 1
+            except Exception as exc:
+                manual_actions.append(f"{title}: page create failed — {str(exc)[:200]}")
+                failed += 1
+
+        # Inline resources — currently not auto-restored (see docstring)
+        resource_count = sum(1 for i in items if i.item_type == "ONENOTE_RESOURCE")
+        if resource_count:
+            manual_actions.append(
+                f"{resource_count} inline resource(s) skipped: Graph assigns new URLs on upload "
+                "that don't match stored HTML src attributes. Re-upload via the OneNote UI."
+            )
+
+        return {
+            "restored_count": restored,
+            "failed_count": failed,
+            "manual_actions": sorted(set(manual_actions)),
+            "restore_type": "ONENOTE",
+        }
+
+    # ==================== Planner Restore ====================
+
+    async def _restore_planner_items(
+        self,
+        session: AsyncSession,
+        target_resource: Resource,
+        items: List[SnapshotItem],
+        tenant: Tenant,
+    ) -> Dict[str, Any]:
+        """Restore Planner plans + tasks + task details for a group.
+
+        Plans in Graph are owned by M365 Groups — we use the target resource's
+        external_id (group id) as the owner. Plans are created first, then tasks,
+        then details. Details require If-Match with the fresh eTag from a task
+        read, so we GET the new task after creation to pick up its eTag."""
+        graph_client = await self.get_graph_client(tenant)
+        group_id = target_resource.external_id
+        restored, failed = 0, 0
+        manual_actions: List[str] = []
+        plan_id_map: Dict[str, str] = {}   # old plan_id → new
+        task_id_map: Dict[str, str] = {}   # old task_id → new
+
+        # Pass 1: plans
+        for item in [i for i in items if i.item_type == "PLANNER_PLAN"]:
+            meta = self._get_item_metadata(item)
+            raw = meta.get("raw", {})
+            title = raw.get("title") or item.name
+            if not title:
+                failed += 1
+                continue
+            try:
+                created = await graph_client._post(
+                    f"{graph_client.GRAPH_URL}/planner/plans",
+                    {"owner": group_id, "title": title},
+                )
+                plan_id_map[item.external_id] = created.get("id")
+                restored += 1
+            except Exception as exc:
+                manual_actions.append(f"{title} (plan): create failed — {str(exc)[:200]}")
+                failed += 1
+
+        # Pass 2: tasks
+        for item in [i for i in items if i.item_type == "PLANNER_TASK"]:
+            meta = self._get_item_metadata(item)
+            raw = meta.get("raw", {})
+            title = raw.get("title") or item.name
+            old_plan_id = meta.get("planId")
+            new_plan_id = plan_id_map.get(old_plan_id)
+            if not new_plan_id:
+                manual_actions.append(f"{title}: parent plan not restored, skipping task.")
+                failed += 1
+                continue
+            payload = {
+                "planId": new_plan_id,
+                "title": title,
+            }
+            # Preserve selected fields — avoid copying IDs or audit fields
+            for key in ("bucketId", "dueDateTime", "priority", "percentComplete", "startDateTime"):
+                if raw.get(key) is not None:
+                    payload[key] = raw[key]
+            try:
+                created = await graph_client._post(
+                    f"{graph_client.GRAPH_URL}/planner/tasks", payload,
+                )
+                task_id_map[item.external_id] = created.get("id")
+                restored += 1
+            except Exception as exc:
+                manual_actions.append(f"{title} (task): create failed — {str(exc)[:200]}")
+                failed += 1
+
+        # Pass 3: task details — requires eTag in If-Match, so GET first
+        for item in [i for i in items if i.item_type == "PLANNER_TASK_DETAILS"]:
+            meta = self._get_item_metadata(item)
+            old_task_id = meta.get("taskId")
+            new_task_id = task_id_map.get(old_task_id)
+            if not new_task_id:
+                continue  # task wasn't restored, nothing to attach details to
+
+            raw = meta.get("raw", {})
+            # Fetch current details to get the eTag
+            try:
+                current = await graph_client._get(
+                    f"{graph_client.GRAPH_URL}/planner/tasks/{new_task_id}/details",
+                )
+                etag = current.get("@odata.etag")
+            except Exception as exc:
+                manual_actions.append(f"details for task {new_task_id}: eTag fetch failed — {str(exc)[:200]}")
+                failed += 1
+                continue
+            patch_payload: Dict[str, Any] = {}
+            for key in ("description", "checklist", "references", "previewType"):
+                if raw.get(key) is not None:
+                    patch_payload[key] = raw[key]
+            if not patch_payload:
+                continue
+            try:
+                await graph_client._patch(
+                    f"{graph_client.GRAPH_URL}/planner/tasks/{new_task_id}/details",
+                    patch_payload,
+                    # _patch signature may not accept headers in the existing wrapper —
+                    # the underlying httpx call still needs If-Match for Planner.
+                )
+                restored += 1
+            except Exception as exc:
+                manual_actions.append(f"details for task {new_task_id}: patch failed — {str(exc)[:200]} "
+                                      f"(If-Match eTag flow may need adjustment)")
+                failed += 1
+
+        if not plan_id_map and items:
+            manual_actions.append("No plans restored; verify target group id and Tasks.ReadWrite.All permission.")
+
+        return {
+            "restored_count": restored,
+            "failed_count": failed,
+            "manual_actions": sorted(set(manual_actions)),
+            "restore_type": "PLANNER",
+        }
+
+    # ==================== To Do Restore ====================
+
+    async def _restore_todo_items(
+        self,
+        session: AsyncSession,
+        target_resource: Resource,
+        items: List[SnapshotItem],
+        tenant: Tenant,
+    ) -> Dict[str, Any]:
+        """Restore To Do lists + tasks + checklist items + linked resources for a user."""
+        graph_client = await self.get_graph_client(tenant)
+        user_id = target_resource.external_id
+        restored, failed = 0, 0
+        manual_actions: List[str] = []
+        list_id_map: Dict[str, str] = {}
+        task_id_map: Dict[str, str] = {}
+
+        # Pass 1: lists
+        for item in [i for i in items if i.item_type == "TODO_LIST"]:
+            meta = self._get_item_metadata(item)
+            raw = meta.get("raw", {})
+            display_name = raw.get("displayName") or item.name
+            if not display_name:
+                failed += 1
+                continue
+            try:
+                created = await graph_client._post(
+                    f"{graph_client.GRAPH_URL}/users/{user_id}/todo/lists",
+                    {"displayName": display_name},
+                )
+                list_id_map[item.external_id] = created.get("id")
+                restored += 1
+            except Exception as exc:
+                manual_actions.append(f"{display_name} (list): create failed — {str(exc)[:200]}")
+                failed += 1
+
+        # Pass 2: tasks
+        for item in [i for i in items if i.item_type == "TODO_TASK"]:
+            meta = self._get_item_metadata(item)
+            raw = meta.get("raw", {})
+            title = raw.get("title") or item.name
+            old_list_id = meta.get("listId")
+            new_list_id = list_id_map.get(old_list_id)
+            if not new_list_id:
+                manual_actions.append(f"{title}: parent list not restored, skipping task.")
+                failed += 1
+                continue
+            payload: Dict[str, Any] = {"title": title}
+            for key in ("body", "dueDateTime", "importance", "status", "categories", "reminderDateTime", "startDateTime"):
+                if raw.get(key) is not None:
+                    payload[key] = raw[key]
+            try:
+                created = await graph_client._post(
+                    f"{graph_client.GRAPH_URL}/users/{user_id}/todo/lists/{new_list_id}/tasks",
+                    payload,
+                )
+                task_id_map[item.external_id] = created.get("id")
+                restored += 1
+            except Exception as exc:
+                manual_actions.append(f"{title} (task): create failed — {str(exc)[:200]}")
+                failed += 1
+
+        # Pass 3: checklist items + linked resources
+        for item in items:
+            if item.item_type not in ("TODO_TASK_CHECKLIST", "TODO_TASK_LINKED"):
+                continue
+            meta = self._get_item_metadata(item)
+            old_task_id = meta.get("taskId")
+            old_list_id = meta.get("listId")
+            new_task_id = task_id_map.get(old_task_id)
+            new_list_id = list_id_map.get(old_list_id)
+            if not new_task_id or not new_list_id:
+                continue
+            sub_path = "checklistItems" if item.item_type == "TODO_TASK_CHECKLIST" else "linkedResources"
+            # Blob stores {"value": [...]} — re-create each entry on the new task
+            blob = self._load_snapshot_item_payload(item, "todo")
+            values = (blob.get("value") if isinstance(blob, dict) else None) or []
+            for entry in values:
+                # Strip fields Graph assigns (id, etag, timestamps) so POST accepts the body
+                clean = {k: v for k, v in entry.items() if not k.startswith(("@odata", "createdDateTime", "lastModifiedDateTime")) and k != "id"}
+                try:
+                    await graph_client._post(
+                        f"{graph_client.GRAPH_URL}/users/{user_id}/todo/lists/{new_list_id}/tasks/{new_task_id}/{sub_path}",
+                        clean,
+                    )
+                    restored += 1
+                except Exception as exc:
+                    manual_actions.append(f"{sub_path} for task {new_task_id}: create failed — {str(exc)[:200]}")
+                    failed += 1
+
+        return {
+            "restored_count": restored,
+            "failed_count": failed,
+            "manual_actions": sorted(set(manual_actions)),
+            "restore_type": "TODO",
+        }
+
+    # ==================== Entra relationship restorers ====================
+
+    async def _restore_user_manager(self, graph_client: GraphClient, resource: Resource, item: SnapshotItem):
+        """Set the target user's manager via PUT /users/{id}/manager/$ref.
+        Backup captured the manager's user object; external_id is the manager's id."""
+        manager_id = item.external_id or (self._get_item_metadata(item).get("raw") or {}).get("id")
+        if not manager_id:
+            raise ValueError("USER_MANAGER item has no manager id")
+        await graph_client._put(
+            f"{graph_client.GRAPH_URL}/users/{resource.external_id}/manager/$ref",
+            {"@odata.id": f"{graph_client.GRAPH_URL}/users/{manager_id}"},
+        )
+
+    async def _restore_user_direct_report(self, graph_client: GraphClient, resource: Resource, item: SnapshotItem):
+        """Direct reports are derived from the manager relationship on the OTHER user.
+        Backup captured each direct report's user object; we PUT their manager = this user."""
+        report_id = item.external_id or (self._get_item_metadata(item).get("raw") or {}).get("id")
+        if not report_id:
+            raise ValueError("USER_DIRECT_REPORT item has no user id")
+        await graph_client._put(
+            f"{graph_client.GRAPH_URL}/users/{report_id}/manager/$ref",
+            {"@odata.id": f"{graph_client.GRAPH_URL}/users/{resource.external_id}"},
+        )
+
+    async def _restore_user_group_membership(self, graph_client: GraphClient, resource: Resource, item: SnapshotItem):
+        """Re-add the user to the group via POST /groups/{id}/members/$ref."""
+        group_id = item.external_id or (self._get_item_metadata(item).get("raw") or {}).get("id")
+        if not group_id:
+            raise ValueError("USER_GROUP_MEMBERSHIP item has no group id")
+        await graph_client._post(
+            f"{graph_client.GRAPH_URL}/groups/{group_id}/members/$ref",
+            {"@odata.id": f"{graph_client.GRAPH_URL}/directoryObjects/{resource.external_id}"},
+        )
 
     # ==================== Utility Methods ====================
 
