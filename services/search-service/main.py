@@ -48,7 +48,7 @@ async def create_search_index():
             # Create GIN index on metadata JSONB for faster search
             await session.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_snapshot_items_metadata_gin
-                ON snapshot_items USING gin (metadata jsonb_path_ops)
+                ON snapshot_items USING gin ((metadata::jsonb) jsonb_path_ops)
             """))
 
             # Create text search vector column if it doesn't exist
@@ -423,4 +423,3 @@ def build_preview(item: SnapshotItem, raw_data: Dict, query: str) -> str:
         preview_text = preview_text[:297] + "..."
 
     return preview_text
-

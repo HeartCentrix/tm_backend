@@ -19,13 +19,13 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, desc, and_, text
+from sqlalchemy import select, func, desc, and_, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 import httpx
 
 from shared.database import async_session_factory, Base
-from shared.models import AuditEvent, Resource, Tenant, Organization, Job, JobStatus, SlaPolicy
+from shared.models import AuditEvent, Resource, Tenant, Organization, Job, JobStatus, SlaPolicy, ResourceType
 from shared.config import settings
 from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
@@ -103,6 +103,7 @@ ACTIONS = {
     "BACKUP_COMPLETED": "Backup completed successfully",
     "BACKUP_FAILED": "Backup failed permanently",
     "BACKUP_PREEMPTIVE": "Preemptive backup triggered (AI detection)",
+    "BACKUP_SKIPPED_SLA_SCOPE": "Scheduled backup skipped because the assigned SLA does not cover the resource workload",
     "RESTORE_TRIGGERED": "Restore job triggered",
     "RESTORE_COMPLETED": "Restore completed",
     "RESTORE_FAILED": "Restore failed",
@@ -125,6 +126,57 @@ ACTIONS = {
     "RANSOMWARE_SIGNAL": "AI ransomware signal detected",
 }
 
+WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE"}
+
+M365_RESOURCE_TYPES = {
+    ResourceType.MAILBOX,
+    ResourceType.SHARED_MAILBOX,
+    ResourceType.ROOM_MAILBOX,
+    ResourceType.ONEDRIVE,
+    ResourceType.SHAREPOINT_SITE,
+    ResourceType.TEAMS_CHANNEL,
+    ResourceType.TEAMS_CHAT,
+    ResourceType.ENTRA_USER,
+    ResourceType.ENTRA_GROUP,
+    ResourceType.ENTRA_APP,
+    ResourceType.ENTRA_DEVICE,
+    ResourceType.ENTRA_SERVICE_PRINCIPAL,
+    ResourceType.POWER_BI,
+    ResourceType.POWER_APPS,
+    ResourceType.POWER_AUTOMATE,
+    ResourceType.POWER_DLP,
+    ResourceType.COPILOT,
+    ResourceType.PLANNER,
+    ResourceType.TODO,
+    ResourceType.ONENOTE,
+    ResourceType.DYNAMIC_GROUP,
+}
+
+AZURE_RESOURCE_TYPES = {
+    ResourceType.AZURE_VM,
+    ResourceType.AZURE_SQL_DB,
+    ResourceType.AZURE_POSTGRESQL,
+    ResourceType.AZURE_POSTGRESQL_SINGLE,
+    ResourceType.RESOURCE_GROUP,
+}
+
+
+def _parse_service_type(service_type: Optional[str]) -> Optional[str]:
+    if not service_type:
+        return None
+    normalized = service_type.lower()
+    if normalized not in ("m365", "azure"):
+        raise HTTPException(status_code=400, detail="Unsupported serviceType. Expected 'm365' or 'azure'.")
+    return normalized
+
+
+def _resource_types_for_service(service_type: Optional[str]):
+    if service_type == "m365":
+        return M365_RESOURCE_TYPES
+    if service_type == "azure":
+        return AZURE_RESOURCE_TYPES
+    return None
+
 
 @app.get("/health")
 async def health():
@@ -134,6 +186,7 @@ async def health():
 @app.get("/api/v1/activity")
 async def list_activities(
     tenantId: Optional[str] = Query(None),
+    serviceType: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     operation: Optional[str] = Query(None),
@@ -146,6 +199,10 @@ async def list_activities(
     Maps jobs to the frontend's expected ActivityItem format.
     """
     async with async_session_factory() as db:
+        service_key = _parse_service_type(serviceType)
+        service_resource_types = _resource_types_for_service(service_key)
+        service_type_values = {rt.value if hasattr(rt, "value") else str(rt) for rt in service_resource_types} if service_resource_types else None
+
         # Build status filter
         status_map = {
             "Done": JobStatus.COMPLETED,
@@ -153,9 +210,11 @@ async def list_activities(
             "Failed": JobStatus.FAILED,
             "Canceled": JobStatus.CANCELLED,
         }
+        include_job_items = status != "Warning"
+        include_warning_items = (not operation or operation.upper() == "BACKUP") and (not status or status == "Warning")
 
-        stmt = select(Job).order_by(desc(Job.created_at))
-        count_stmt = select(func.count()).select_from(Job)
+        stmt = select(Job).select_from(Job).outerjoin(Resource, Job.resource_id == Resource.id).order_by(desc(Job.created_at))
+        count_stmt = select(func.count()).select_from(Job).outerjoin(Resource, Job.resource_id == Resource.id)
 
         filters = []
         if tenantId:
@@ -169,19 +228,52 @@ async def list_activities(
             filters.append(Job.type == op_upper)
         if status and status in status_map:
             filters.append(Job.status == status_map[status])
+        if service_key and service_resource_types:
+            filters.append(
+                or_(
+                    and_(Job.resource_id.is_not(None), Resource.type.in_(service_resource_types)),
+                    and_(Job.resource_id.is_(None), func.json_extract_path_text(Job.spec, "triggered_by") == f"MANUAL_DATASOURCE_{service_key.upper()}"),
+                )
+            )
 
-        if filters:
-            stmt = stmt.where(and_(*filters))
-            count_stmt = count_stmt.where(and_(*filters))
+        jobs: List[Job] = []
+        job_total = 0
+        if include_job_items:
+            if filters:
+                stmt = stmt.where(and_(*filters))
+                count_stmt = count_stmt.where(and_(*filters))
 
-        # Total count
-        total_result = await db.execute(count_stmt)
-        total = total_result.scalar() or 0
+            # Fetch enough rows so warning items can be merged into the same paginated feed.
+            fetch_limit = max(size, page * size)
+            stmt = stmt.limit(fetch_limit)
+            total_result = await db.execute(count_stmt)
+            job_total = total_result.scalar() or 0
+            result = await db.execute(stmt)
+            jobs = result.scalars().all()
 
-        # Paginated results
-        stmt = stmt.offset((page - 1) * size).limit(size)
-        result = await db.execute(stmt)
-        jobs = result.scalars().all()
+        warning_filters = [AuditEvent.action.in_(WARNING_ACTIVITY_ACTIONS)]
+        if tenantId:
+            warning_filters.append(AuditEvent.tenant_id == uuid.UUID(tenantId))
+        if start_date:
+            warning_filters.append(AuditEvent.occurred_at >= datetime.fromisoformat(start_date))
+        if end_date:
+            warning_filters.append(AuditEvent.occurred_at <= datetime.fromisoformat(end_date))
+        if service_type_values:
+            warning_filters.append(AuditEvent.resource_type.in_(service_type_values))
+
+        warning_events: List[AuditEvent] = []
+        warning_total = 0
+        if include_warning_items:
+            warning_stmt = (
+                select(AuditEvent)
+                .where(and_(*warning_filters))
+                .order_by(desc(AuditEvent.occurred_at))
+                .limit(max(size, page * size))
+            )
+            warning_count_stmt = select(func.count()).select_from(AuditEvent).where(and_(*warning_filters))
+            warning_total = (await db.execute(warning_count_stmt)).scalar() or 0
+            warning_result = await db.execute(warning_stmt)
+            warning_events = warning_result.scalars().all()
 
         # Map jobs to ActivityItem format
         status_reverse_map = {
@@ -205,20 +297,37 @@ async def list_activities(
             cached = _running_job_cache.get(str(job.id), {})
             data_backed_up = cached.get("data_backed_up", job.bytes_processed or 0)
             total_data = cached.get("total_data") or (job.result.get("total_bytes", 0) if job.result else 0)
-            items.append({
-                "id": str(job.id),
-                "start_time": job.created_at.isoformat() if job.created_at else "",
-                "operation": job.type.value if hasattr(job.type, 'value') else str(job.type),
-                "object": resource_name,
-                "status": status_reverse_map.get(job.status, "In Progress"),
-                "finish_time": job.completed_at.isoformat() if job.completed_at else "",
+            items.append({
+                "id": str(job.id),
+                "start_time": job.created_at.isoformat() if job.created_at else "",
+                "operation": job.type.value if hasattr(job.type, 'value') else str(job.type),
+                "object": resource_name,
+                "status": status_reverse_map.get(job.status, "In Progress"),
+                "finish_time": job.completed_at.isoformat() if job.completed_at else "",
                 "details": _compute_details(job),
                 "data_backed_up": data_backed_up,
                 "total_data": total_data,
-            })
+            })
+
+        for event in warning_events:
+            details = event.details or {}
+            items.append({
+                "id": f"audit-{event.id}",
+                "start_time": event.occurred_at.isoformat() if event.occurred_at else "",
+                "operation": "BACKUP",
+                "object": event.resource_name or event.resource_type or "Unknown resource",
+                "status": "Warning",
+                "finish_time": event.occurred_at.isoformat() if event.occurred_at else "",
+                "details": details.get("message") or "Backup skipped because the assigned SLA does not cover this resource type.",
+            })
+
+        items.sort(key=lambda item: item["start_time"] or "", reverse=True)
+        total = job_total + warning_total
+        start_index = (page - 1) * size
+        paginated_items = items[start_index:start_index + size]
 
         return {
-            "items": items,
+            "items": paginated_items,
             "total": total,
             "page": page,
             "size": size,
@@ -228,6 +337,8 @@ async def list_activities(
 
 @app.get("/api/v1/activity/export")
 async def export_activity_csv(
+    tenantId: Optional[str] = Query(None),
+    serviceType: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     operation: Optional[str] = Query(None),
@@ -242,8 +353,13 @@ async def export_activity_csv(
     }
 
     async with async_session_factory() as db:
-        stmt = select(Job).order_by(desc(Job.created_at))
+        service_key = _parse_service_type(serviceType)
+        service_resource_types = _resource_types_for_service(service_key)
+
+        stmt = select(Job).select_from(Job).outerjoin(Resource, Job.resource_id == Resource.id).order_by(desc(Job.created_at))
         filters = []
+        if tenantId:
+            filters.append(Job.tenant_id == uuid.UUID(tenantId))
         if start_date:
             filters.append(Job.created_at >= datetime.fromisoformat(start_date))
         if end_date:
@@ -252,6 +368,13 @@ async def export_activity_csv(
             filters.append(Job.type == operation.upper())
         if status and status in status_map:
             filters.append(Job.status == status_map[status])
+        if service_key and service_resource_types:
+            filters.append(
+                or_(
+                    and_(Job.resource_id.is_not(None), Resource.type.in_(service_resource_types)),
+                    and_(Job.resource_id.is_(None), func.json_extract_path_text(Job.spec, "triggered_by") == f"MANUAL_DATASOURCE_{service_key.upper()}"),
+                )
+            )
 
         if filters:
             stmt = stmt.where(and_(*filters))

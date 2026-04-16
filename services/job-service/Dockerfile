@@ -7,7 +7,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY services/job-service/ .
 ENV PORT=8004
 EXPOSE ${PORT}
-RUN useradd -m appuser && chown -R appuser:appuser /app
-USER appuser
+RUN groupadd --system --gid 10001 appuser \
+    && useradd --system --uid 10001 --gid appuser --create-home --home-dir /home/appuser appuser \
+    && chown -R 10001:10001 /app
+USER 10001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 CMD python -c "import httpx; httpx.get('http://localhost:${PORT:-8004}/health')"
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8004} --workers 2"]

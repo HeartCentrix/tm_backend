@@ -332,6 +332,7 @@ class SlaPolicyResponse(BaseModel):
     
     id: str
     tenantId: str = Field(alias='tenant_id')
+    serviceType: str = Field(default='m365', alias='service_type')
     name: str
     frequency: str
     backupDays: Optional[List[str]] = Field(default=None, alias='backup_days')
@@ -351,6 +352,9 @@ class SlaPolicyResponse(BaseModel):
     tasks: Optional[bool] = False
     groupMailbox: Optional[bool] = Field(default=True, alias='group_mailbox')
     planner: Optional[bool] = False
+    backupAzureVm: Optional[bool] = Field(default=True, alias='backup_azure_vm')
+    backupAzureSql: Optional[bool] = Field(default=True, alias='backup_azure_sql')
+    backupAzurePostgresql: Optional[bool] = Field(default=True, alias='backup_azure_postgresql')
     retentionType: str = Field(alias='retention_type')
     retentionDays: Optional[int] = Field(default=None, alias='retention_days')
     enabled: Optional[bool] = True
@@ -371,6 +375,7 @@ class SlaPolicyCreateRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     
     tenantId: str = Field(alias='tenant_id')
+    serviceType: str = Field(default='m365', alias='service_type')
     name: str
     frequency: str
     backupDays: Optional[List[str]] = Field(default=None, alias='backup_days')
@@ -390,6 +395,9 @@ class SlaPolicyCreateRequest(BaseModel):
     tasks: Optional[bool] = False
     groupMailbox: Optional[bool] = Field(default=True, alias='group_mailbox')
     planner: Optional[bool] = False
+    backupAzureVm: Optional[bool] = Field(default=True, alias='backup_azure_vm')
+    backupAzureSql: Optional[bool] = Field(default=True, alias='backup_azure_sql')
+    backupAzurePostgresql: Optional[bool] = Field(default=True, alias='backup_azure_postgresql')
     retentionType: str = Field(alias='retention_type')
     retentionDays: Optional[int] = Field(default=None, alias='retention_days')
     enabled: Optional[bool] = True
@@ -447,6 +455,7 @@ class AdminConsentResponse(BaseModel):
     lastUsedAt: Optional[str] = Field(default=None, alias='last_used_at')
     isActive: bool = Field(default=True, alias='is_active')
     scope: Optional[str] = None
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True)
 
     @field_validator('id', mode='before')
     @classmethod
@@ -465,3 +474,28 @@ class AdminConsentTokenResponse(BaseModel):
     consentType: str
     message: str
     consentedAt: str
+
+
+class PowerBIOAuthCallbackRequest(BaseModel):
+    tenantId: str
+    code: str
+    state: Optional[str] = None
+
+
+class PowerBIReadinessCheckResponse(BaseModel):
+    key: str
+    label: str
+    status: str
+    detail: str
+
+
+class PowerBIReadinessResponse(BaseModel):
+    tenantId: str
+    status: str
+    summary: str
+    authMode: str
+    usesDedicatedApp: bool
+    accessibleWorkspaceCount: int
+    discoveredWorkspaceCount: int
+    checks: List[PowerBIReadinessCheckResponse]
+    recommendedActions: List[str]

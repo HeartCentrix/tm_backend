@@ -1,7 +1,6 @@
 """Job Service - Manages jobs, backup triggers, restore, and exports"""
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, List
-import uuid
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 import json
@@ -464,14 +463,52 @@ async def trigger_datasource_backup(request: TriggerDatasourceBackupRequest, db:
     if resource_types is None:
         raise HTTPException(status_code=400, detail="Unsupported serviceType. Expected 'm365' or 'azure'.")
 
-    stmt = select(Resource).where(
+    excluded_statuses = [
+        ResourceStatus.INACCESSIBLE,
+        ResourceStatus.SUSPENDED,
+        ResourceStatus.PENDING_DELETION,
+    ]
+    scoped_filters = [
         Resource.tenant_id == UUID(request.tenantId),
         Resource.type.in_(resource_types),
-        Resource.status.notin_([
-            ResourceStatus.INACCESSIBLE,
-            ResourceStatus.SUSPENDED,
-            ResourceStatus.PENDING_DELETION,
-        ]),
+    ]
+    summary_stmt = select(
+        func.count(Resource.id).label("total_discovered"),
+        func.count(Resource.id).filter(
+            Resource.sla_policy_id.is_not(None),
+            Resource.status.notin_(excluded_statuses),
+        ).label("eligible"),
+        func.count(Resource.id).filter(Resource.sla_policy_id.is_(None)).label("skip_no_sla"),
+        func.count(Resource.id).filter(
+            Resource.sla_policy_id.is_not(None),
+            Resource.status == ResourceStatus.INACCESSIBLE,
+        ).label("skip_inaccessible"),
+        func.count(Resource.id).filter(
+            Resource.sla_policy_id.is_not(None),
+            Resource.status == ResourceStatus.SUSPENDED,
+        ).label("skip_suspended"),
+        func.count(Resource.id).filter(
+            Resource.sla_policy_id.is_not(None),
+            Resource.status == ResourceStatus.PENDING_DELETION,
+        ).label("skip_pending_deletion"),
+    ).where(*scoped_filters)
+    summary = (await db.execute(summary_stmt)).one()
+    skipped_by_reason = {
+        "no_sla": int(summary.skip_no_sla or 0),
+        "inaccessible": int(summary.skip_inaccessible or 0),
+        "suspended": int(summary.skip_suspended or 0),
+        "pending_deletion": int(summary.skip_pending_deletion or 0),
+    }
+    print(
+        f"[JOB_SERVICE] DATASOURCE_BACKUP_SUMMARY tenant={request.tenantId} service={service_key} "
+        f"discovered={int(summary.total_discovered or 0)} eligible={int(summary.eligible or 0)} "
+        f"skipped_total={sum(skipped_by_reason.values())} skipped_by_reason={skipped_by_reason}"
+    )
+
+    stmt = select(Resource).where(
+        *scoped_filters,
+        Resource.sla_policy_id.is_not(None),
+        Resource.status.notin_(excluded_statuses),
     )
     result = await db.execute(stmt)
     resources = result.scalars().all()
@@ -479,7 +516,7 @@ async def trigger_datasource_backup(request: TriggerDatasourceBackupRequest, db:
     if not resources:
         raise HTTPException(
             status_code=404,
-            detail=f"No backup-eligible {service_key.upper()} resources found for this datasource. Make sure discovery has run first."
+            detail=f"No backup-eligible {service_key.upper()} resources found for this datasource. Make sure discovery has run and SLA policies are assigned."
         )
 
     resources_map = {str(resource.id): resource for resource in resources}
@@ -592,16 +629,6 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
     job = Job(id=uuid4(), type=JobType.EXPORT, status=JobStatus.QUEUED, priority=5, spec=request)
     db.add(job)
     await db.flush()
-    if settings.RABBITMQ_ENABLED:
-        msg = create_restore_message(
-            job_id=str(job.id),
-            restore_type=request.get("restoreType", "EXPORT_ZIP"),
-            snapshot_ids=request.get("snapshotIds", []),
-            item_ids=request.get("itemIds", []),
-            resource_id=None, tenant_id=None, spec=request,
-        )
-        msg["queue"] = "export.normal"
-        await message_bus.publish("export.normal", msg, priority=5)
     return {"jobId": str(job.id)}
 
 
@@ -619,21 +646,6 @@ async def get_export_status(job_id: str, db: AsyncSession = Depends(get_db)):
 async def get_export_download_url(job_id: str):
     return {"url": f"/api/v1/exports/{job_id}/download"}
 
-
-@app.get("/api/v1/exports/{job_id}/download")
-async def download_export(job_id: str, db: AsyncSession = Depends(get_db)):
-    """Stream export data for a completed export job."""
-    job = await db.get(Job, uuid.UUID(job_id))
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != JobStatus.COMPLETED:
-        raise HTTPException(status_code=202, detail=f"Job not ready: {job.status.value}")
-    import json as _json
-    result = job.result or {}
-    data = result.get("data") or []
-    content = _json.dumps({"jobId": job_id, "exportType": result.get("export_type", "JSON"), "exportedCount": result.get("exported_count", len(data)), "items": data}, indent=2).encode()
-    return StreamingResponse(iter([content]), media_type="application/json",
-        headers={"Content-Disposition": f'attachment; filename="export-{job_id[:8]}.json"'})
 
 @app.get("/api/v1/dlq/stats")
 async def get_dlq_stats():

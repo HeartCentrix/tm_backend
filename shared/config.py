@@ -1,15 +1,16 @@
 """Shared configuration for all microservices"""
 import os
 from typing import List
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 class Settings:
     def __init__(self):
-        # Railway provides DATABASE_URL directly; parse it if present
-        railway_database_url = os.getenv("DATABASE_URL")
-        if railway_database_url:
-            parsed = urlparse(railway_database_url)
+        # Railway provides DATABASE_URL directly. Be permissive and also
+        # accept a full Postgres URL accidentally pasted into DB_HOST.
+        self._database_url_override = self._resolve_database_url_override()
+        if self._database_url_override:
+            parsed = urlparse(self._database_url_override)
             self.DB_HOST = parsed.hostname or "localhost"
             self.DB_PORT = str(parsed.port or "5432")
             self.DB_NAME = parsed.path.lstrip("/") if parsed.path else "tm_vault_db"
@@ -23,6 +24,11 @@ class Settings:
             self.DB_PASSWORD = os.getenv("DB_PASSWORD")
 
         self.DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
+        self.DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "2"))
+        self.DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "2"))
+        self.DB_POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+        self.DB_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
+        self.DB_POOL_USE_LIFO = os.getenv("DB_POOL_USE_LIFO", "true").lower() in ("true", "1", "yes")
         self.JWT_SECRET = os.getenv("JWT_SECRET", "")
         self.JWT_ALGORITHM = "HS256"
         self.JWT_EXPIRATION_HOURS = 8
@@ -108,6 +114,9 @@ class Settings:
         self.GRAPH_BATCH_SIZE = int(os.getenv("GRAPH_BATCH_SIZE", "20"))
         # Chunk size for processing resources
         self.RESOURCE_CHUNK_SIZE = int(os.getenv("RESOURCE_CHUNK_SIZE", "50"))
+        # Discovery staging / merge batch sizes for large tenant onboarding
+        self.DISCOVERY_STAGE_CHUNK_SIZE = int(os.getenv("DISCOVERY_STAGE_CHUNK_SIZE", "500"))
+        self.DISCOVERY_PROGRESS_LOG_EVERY = int(os.getenv("DISCOVERY_PROGRESS_LOG_EVERY", "250"))
         
         self.ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
         self.ELASTICSEARCH_ENABLED = False
@@ -125,6 +134,13 @@ class Settings:
         self._tenant_id = self.GRAPH_APPS[0]["tenant_id"] if self.GRAPH_APPS else "common"
         self.MICROSOFT_AUTH_URL = os.getenv("MICROSOFT_AUTH_URL", f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/authorize")
         self.MICROSOFT_TOKEN_URL = os.getenv("MICROSOFT_TOKEN_URL", f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/token")
+
+        # Dedicated Power BI / Fabric app credentials (optional).
+        # Falls back to the primary Microsoft app when not provided.
+        self.POWER_BI_CLIENT_ID = os.getenv("POWER_BI_CLIENT_ID", "")
+        self.POWER_BI_CLIENT_SECRET = os.getenv("POWER_BI_CLIENT_SECRET", "")
+        self.POWER_BI_TENANT_ID = os.getenv("POWER_BI_TENANT_ID", "")
+        self.POWER_BI_FULL_SNAPSHOT_DAYS = int(os.getenv("POWER_BI_FULL_SNAPSHOT_DAYS", "7"))
 
         # Datasource OAuth URLs (multi-tenant for connecting other orgs)
         self.DATASOURCE_AUTH_URL = os.getenv("DATASOURCE_AUTH_URL", f"https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize")
@@ -144,6 +160,24 @@ class Settings:
         self.PROGRESS_TRACKER_URL = os.getenv("PROGRESS_TRACKER_URL", "http://progress-tracker:8011")
         self.AUDIT_SERVICE_URL = os.getenv("AUDIT_SERVICE_URL", "http://audit-service:8012")
         self.REPORT_SERVICE_URL = os.getenv("REPORT_SERVICE_URL", "http://report-service:8014")
+
+    def _resolve_database_url_override(self) -> str:
+        raw_database_url = os.getenv("DATABASE_URL", "").strip()
+        if not raw_database_url:
+            raw_db_host = os.getenv("DB_HOST", "").strip()
+            if raw_db_host.startswith(("postgres://", "postgresql://", "postgresql+asyncpg://")):
+                raw_database_url = raw_db_host
+
+        if not raw_database_url:
+            return ""
+
+        if raw_database_url.startswith("postgresql+asyncpg://"):
+            return raw_database_url
+        if raw_database_url.startswith("postgres://"):
+            return "postgresql+asyncpg://" + raw_database_url[len("postgres://"):]
+        if raw_database_url.startswith("postgresql://"):
+            return "postgresql+asyncpg://" + raw_database_url[len("postgresql://"):]
+        return raw_database_url
 
     def _parse_graph_apps(self) -> List[dict]:
         """Parse multiple Graph app registrations from env vars."""
@@ -196,6 +230,18 @@ class Settings:
     def MICROSOFT_TENANT_ID(self) -> str:
         return self.GRAPH_APPS[0]["tenant_id"] if self.GRAPH_APPS else "common"
 
+    @property
+    def EFFECTIVE_POWER_BI_CLIENT_ID(self) -> str:
+        return self.POWER_BI_CLIENT_ID or self.MICROSOFT_CLIENT_ID
+
+    @property
+    def EFFECTIVE_POWER_BI_CLIENT_SECRET(self) -> str:
+        return self.POWER_BI_CLIENT_SECRET or self.MICROSOFT_CLIENT_SECRET
+
+    @property
+    def EFFECTIVE_POWER_BI_TENANT_ID(self) -> str:
+        return self.POWER_BI_TENANT_ID or self.MICROSOFT_TENANT_ID
+
     # ARM credentials fallback to Graph app if not explicitly set
     @property
     def EFFECTIVE_ARM_CLIENT_ID(self) -> str:
@@ -211,7 +257,12 @@ class Settings:
 
     @property
     def DATABASE_URL(self) -> str:
-        return f"postgresql+asyncpg://{self.DB_USERNAME}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        if self._database_url_override:
+            return self._database_url_override
+
+        username = quote(self.DB_USERNAME or "")
+        password = quote(self.DB_PASSWORD or "")
+        return f"postgresql+asyncpg://{username}:{password}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
 
     @property
     def RABBITMQ_URL(self) -> str:

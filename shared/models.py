@@ -55,6 +55,10 @@ class ResourceType(str, enum.Enum):
     ENTRA_APP = "ENTRA_APP"
     ENTRA_SERVICE_PRINCIPAL = "ENTRA_SERVICE_PRINCIPAL"
     ENTRA_DEVICE = "ENTRA_DEVICE"
+    ENTRA_ROLE = "ENTRA_ROLE"
+    ENTRA_ADMIN_UNIT = "ENTRA_ADMIN_UNIT"
+    ENTRA_AUDIT_LOG = "ENTRA_AUDIT_LOG"
+    INTUNE_MANAGED_DEVICE = "INTUNE_MANAGED_DEVICE"
     AZURE_VM = "AZURE_VM"
     AZURE_SQL_DB = "AZURE_SQL_DB"
     AZURE_POSTGRESQL = "AZURE_POSTGRESQL"
@@ -192,6 +196,7 @@ class Resource(Base):
     display_name = Column(String, nullable=False)
     email = Column(String)
     extra_data = Column("metadata", MutableDict.as_mutable(JSON), default=dict)
+    resource_hash = Column(String, nullable=True)
     sla_policy_id = Column(UUID(as_uuid=True), ForeignKey("sla_policies.id"))
     status = Column(SAEnum(ResourceStatus), default=ResourceStatus.DISCOVERED)
     last_backup_job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id"))
@@ -214,6 +219,7 @@ class SlaPolicy(Base):
     __tablename__ = "sla_policies"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
+    service_type = Column(String, default="m365", nullable=False, index=True)
     name = Column(String, nullable=False)
     frequency = Column(String, default="DAILY")
     backup_days = Column(ARRAY(String), default=["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"])
@@ -234,6 +240,9 @@ class SlaPolicy(Base):
     tasks = Column(Boolean, default=False)
     group_mailbox = Column(Boolean, default=True)
     planner = Column(Boolean, default=False)
+    backup_azure_vm = Column(Boolean, default=True)
+    backup_azure_sql = Column(Boolean, default=True)
+    backup_azure_postgresql = Column(Boolean, default=True)
     resource_types = Column(ARRAY(String), default=[])
     batch_size = Column(Integer, default=20)
     max_concurrent_backups = Column(Integer, default=50)
@@ -410,48 +419,84 @@ class AdminConsentToken(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), index=True)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
-
+    
     # Consent type: M365 or AZURE
     consent_type = Column(String, nullable=False, index=True)
-
+    
     # Encrypted tokens
     access_token_encrypted = Column(LargeBinary, nullable=True)
     refresh_token_encrypted = Column(LargeBinary, nullable=True)
     token_type = Column(String, default="Bearer")
     expires_at = Column(DateTime, nullable=True)
-
+    
     # Metadata
     granted_by = Column(String, nullable=True)  # Email of user who granted consent
     consented_at = Column(DateTime, default=utcnow)
     last_used_at = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True, index=True)
     scope = Column(String, nullable=True)  # Space-separated list of scopes
-
+    
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class DiscoveryRun(Base):
+    __tablename__ = "discovery_runs"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
+    scope = Column(JSON, default=list, nullable=False)
+    status = Column(String, default="RUNNING", nullable=False, index=True)
+    fetched_count = Column(Integer, default=0, nullable=False)
+    staged_count = Column(Integer, default=0, nullable=False)
+    inserted_count = Column(Integer, default=0, nullable=False)
+    updated_count = Column(Integer, default=0, nullable=False)
+    unchanged_count = Column(Integer, default=0, nullable=False)
+    stale_marked_count = Column(Integer, default=0, nullable=False)
+    error_message = Column(Text, nullable=True)
+    started_at = Column(DateTime, default=utcnow, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class ResourceDiscoveryStaging(Base):
+    __tablename__ = "resource_discovery_staging"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    run_id = Column(UUID(as_uuid=True), ForeignKey("discovery_runs.id"), nullable=False, index=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
+    resource_type = Column(String, nullable=False)
+    external_id = Column(String, nullable=False)
+    display_name = Column(String, nullable=False)
+    email = Column(String, nullable=True)
+    extra_data = Column("metadata", MutableDict.as_mutable(JSON), default=dict)
+    resource_status = Column(String, default="DISCOVERED", nullable=False)
+    resource_hash = Column(String, nullable=True)
+    azure_subscription_id = Column(String, nullable=True)
+    azure_resource_group = Column(String, nullable=True)
+    azure_region = Column(String, nullable=True)
+    discovered_at = Column(DateTime, default=utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
 
 
 class ReportConfig(Base):
     __tablename__ = "report_configs"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), index=True, nullable=True)
-    
+
     # Schedule settings
     enabled = Column(Boolean, default=False, nullable=False)
     schedule_type = Column(String, default="daily", nullable=False)  # daily, weekly, monthly
-    
+
     # Empty report handling
     send_empty_report = Column(Boolean, default=True, nullable=False)
     empty_message = Column(String, default="No updates. No backups occurred.", nullable=True)
-    send_detailed_report = Column(Boolean, default=False, nullable=False)
     send_detailed_report = Column(Boolean, default=False, nullable=False)
 
-    
     # Notification endpoints (stored as JSON arrays)
     email_recipients = Column(JSON, default=list, nullable=True)
     slack_webhooks = Column(JSON, default=list, nullable=True)
     teams_webhooks = Column(JSON, default=list, nullable=True)
-    
+
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -461,29 +506,28 @@ class ReportHistory(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), index=True)
     report_config_id = Column(UUID(as_uuid=True), ForeignKey("report_configs.id"), nullable=True)
-    
+
     # Report metadata
     report_type = Column(String, nullable=False)  # DAILY, WEEKLY, MONTHLY
     period_start = Column(DateTime, nullable=True)
     period_end = Column(DateTime, nullable=True)
     generated_at = Column(DateTime, default=utcnow, nullable=False)
-    
+
     # Report content summary
     total_backups = Column(Integer, default=0)
     successful_backups = Column(Integer, default=0)
     failed_backups = Column(Integer, default=0)
     success_rate = Column(String, nullable=True)
     coverage_rate = Column(String, nullable=True)
-    
+
     # Full report data (JSON)
     report_data = Column(JSON, default=dict, nullable=True)
     is_empty = Column(Boolean, default=False, nullable=False)
-    
+
     # Delivery status
     delivery_status = Column(JSON, default=dict, nullable=True)
-    # Example: {"email": "sent", "slack": "failed", "teams": "sent"}
-    
+
     # Error tracking
     error_message = Column(Text, nullable=True)
-    
+
     created_at = Column(DateTime, default=utcnow)

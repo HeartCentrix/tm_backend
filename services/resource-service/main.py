@@ -1,6 +1,6 @@
 """Resource Service - Manages resources and SLA policies"""
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Iterable
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 from datetime import timedelta
@@ -11,7 +11,7 @@ from sqlalchemy import select, func, or_, text
 
 from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Resource, SlaPolicy, ResourceType, ResourceStatus
+from shared.models import Resource, SlaPolicy, ResourceType, ResourceStatus, Tenant, TenantType
 from shared.schemas import (
     ResourceResponse, ResourceListResponse, UserResourceResponse,
     AssignPolicyRequest, BulkOperationRequest,
@@ -43,6 +43,154 @@ async def notify_scheduler_reschedule():
 
 
 app = FastAPI(title="Resource Service", version="1.0.0", lifespan=lifespan)
+
+
+USER_LINKED_TYPES = {
+    ResourceType.ENTRA_USER,
+    ResourceType.MAILBOX,
+    ResourceType.SHARED_MAILBOX,
+    ResourceType.ROOM_MAILBOX,
+    ResourceType.ONEDRIVE,
+    ResourceType.TODO,
+    ResourceType.ONENOTE,
+}
+
+GROUP_LINKED_TYPES = {
+    ResourceType.ENTRA_GROUP,
+    ResourceType.DYNAMIC_GROUP,
+    ResourceType.PLANNER,
+    ResourceType.TEAMS_CHANNEL,
+}
+
+VALID_POLICY_SERVICE_TYPES = {"m365", "azure"}
+AZURE_POLICY_RESOURCE_TYPES = {
+    ResourceType.AZURE_VM,
+    ResourceType.AZURE_SQL_DB,
+    ResourceType.AZURE_POSTGRESQL,
+    ResourceType.AZURE_POSTGRESQL_SINGLE,
+    ResourceType.RESOURCE_GROUP,
+}
+
+
+def normalize_policy_service_type(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized not in VALID_POLICY_SERVICE_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unsupported serviceType '{value}'")
+    return normalized
+
+
+def tenant_policy_service_type(tenant: Tenant) -> str:
+    tenant_type = tenant.type.value if hasattr(tenant.type, "value") else str(tenant.type or "")
+    return "azure" if tenant_type.upper() == TenantType.AZURE.value else "m365"
+
+
+def resource_policy_service_type(resource: Resource) -> str:
+    return "azure" if resource.type in AZURE_POLICY_RESOURCE_TYPES else "m365"
+
+
+async def validate_policy_scope(
+    db: AsyncSession,
+    *,
+    policy_id: UUID,
+    tenant_id: UUID,
+    resources: Iterable[Resource],
+) -> SlaPolicy:
+    policy = await db.get(SlaPolicy, policy_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    if policy.tenant_id != tenant_id:
+        raise HTTPException(status_code=400, detail="Policy belongs to a different tenant")
+
+    policy_service_type = normalize_policy_service_type(getattr(policy, "service_type", None)) or "m365"
+    tenant = await db.get(Tenant, tenant_id)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    resource_service_types = set()
+    for resource in resources:
+        if resource.tenant_id != tenant_id:
+            raise HTTPException(status_code=400, detail="All resources must belong to the same tenant as the policy")
+        resource_service_types.add(resource_policy_service_type(resource))
+
+    if len(resource_service_types) > 1:
+        raise HTTPException(status_code=400, detail="Resources must belong to a single service type")
+
+    target_service_type = next(iter(resource_service_types), tenant_policy_service_type(tenant))
+    if policy_service_type != target_service_type:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{policy_service_type.upper()} SLA policies can't be assigned to {target_service_type.upper()} resources",
+        )
+
+    return policy
+
+
+def _resource_user_key(resource: Resource) -> Optional[str]:
+    if resource.type in {
+        ResourceType.ENTRA_USER,
+        ResourceType.MAILBOX,
+        ResourceType.SHARED_MAILBOX,
+        ResourceType.ROOM_MAILBOX,
+        ResourceType.TODO,
+        ResourceType.ONENOTE,
+    }:
+        return resource.external_id
+    if resource.type == ResourceType.ONEDRIVE:
+        return (resource.extra_data or {}).get("user_id")
+    return None
+
+
+def _resource_group_key(resource: Resource) -> Optional[str]:
+    if resource.type in {
+        ResourceType.ENTRA_GROUP,
+        ResourceType.DYNAMIC_GROUP,
+        ResourceType.PLANNER,
+        ResourceType.TEAMS_CHANNEL,
+    }:
+        return resource.external_id
+    return None
+
+
+async def expand_linked_policy_scope(db: AsyncSession, seed_resources: Iterable[Resource]) -> list[Resource]:
+    seed_resources = list(seed_resources)
+    if not seed_resources:
+        return []
+
+    tenant_ids = {resource.tenant_id for resource in seed_resources}
+    candidate_types = list(USER_LINKED_TYPES | GROUP_LINKED_TYPES)
+    result = await db.execute(
+        select(Resource).where(
+            Resource.tenant_id.in_(tenant_ids),
+            Resource.type.in_(candidate_types),
+        )
+    )
+    candidates = result.scalars().all()
+
+    user_keys = {
+        (resource.tenant_id, key)
+        for resource in seed_resources
+        for key in [_resource_user_key(resource)]
+        if key
+    }
+    group_keys = {
+        (resource.tenant_id, key)
+        for resource in seed_resources
+        for key in [_resource_group_key(resource)]
+        if key
+    }
+
+    expanded: dict[UUID, Resource] = {resource.id: resource for resource in seed_resources}
+    for candidate in candidates:
+        candidate_user_key = _resource_user_key(candidate)
+        candidate_group_key = _resource_group_key(candidate)
+        if candidate_user_key and (candidate.tenant_id, candidate_user_key) in user_keys:
+            expanded[candidate.id] = candidate
+            continue
+        if candidate_group_key and (candidate.tenant_id, candidate_group_key) in group_keys:
+            expanded[candidate.id] = candidate
+
+    return list(expanded.values())
 
 
 @app.get("/health")
@@ -123,7 +271,8 @@ async def list_resources(
              "AZURE_SQL_DB": "azure_sql", "AZURE_POSTGRESQL": "azure_postgresql", "AZURE_POSTGRESQL_SINGLE": "azure_postgresql",
              "RESOURCE_GROUP": "resource_group", "DYNAMIC_GROUP": "dynamic_group",
              "POWER_BI": "power_bi", "POWER_APPS": "power_apps", "POWER_AUTOMATE": "power_automate",
-             "POWER_DLP": "power_dlp", "COPILOT": "copilot", "PLANNER": "planner"}
+             "POWER_DLP": "power_dlp", "COPILOT": "copilot", "PLANNER": "planner",
+             "TODO": "todo", "ONENOTE": "onenote"}
         return m.get(t, t.lower() if t else "unknown")
 
     def map_status(s):
@@ -218,7 +367,8 @@ async def get_resources_by_type(type: str = Query(...), tenantId: Optional[str] 
              "AZURE_SQL_DB": "azure_sql", "AZURE_POSTGRESQL": "azure_postgresql", "AZURE_POSTGRESQL_SINGLE": "azure_postgresql",
              "RESOURCE_GROUP": "resource_group", "DYNAMIC_GROUP": "dynamic_group",
              "POWER_BI": "power_bi", "POWER_APPS": "power_apps", "POWER_AUTOMATE": "power_automate",
-             "POWER_DLP": "power_dlp", "COPILOT": "copilot", "PLANNER": "planner"}
+             "POWER_DLP": "power_dlp", "COPILOT": "copilot", "PLANNER": "planner",
+             "TODO": "todo", "ONENOTE": "onenote"}
         return m.get(t, t.lower() if t else "unknown")
 
     def map_status(s):
@@ -348,8 +498,16 @@ async def assign_policy(resource_id: str, request: AssignPolicyRequest, db: Asyn
     resource = result.scalar_one_or_none()
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
-    resource.sla_policy_id = UUID(request.policyId)
-    resource.status = ResourceStatus.ACTIVE
+    await validate_policy_scope(
+        db,
+        policy_id=UUID(request.policyId),
+        tenant_id=resource.tenant_id,
+        resources=[resource],
+    )
+    resources = await expand_linked_policy_scope(db, [resource])
+    for target in resources:
+        target.sla_policy_id = UUID(request.policyId)
+        target.status = ResourceStatus.ACTIVE
     await db.commit()
 
 
@@ -360,7 +518,9 @@ async def unassign_policy(resource_id: str, db: AsyncSession = Depends(get_db)):
     resource = result.scalar_one_or_none()
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
-    resource.sla_policy_id = None
+    resources = await expand_linked_policy_scope(db, [resource])
+    for target in resources:
+        target.sla_policy_id = None
     await db.commit()
 
 
@@ -431,13 +591,15 @@ async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depe
         result = await db.execute(stmt)
         resources = result.scalars().all()
 
-        for resource in resources:
+        expanded_resources = await expand_linked_policy_scope(db, resources)
+
+        for resource in expanded_resources:
             resource.sla_policy_id = None
         await db.commit()
 
         return {
             "assigned": 0,
-            "unassigned": len(resources),
+            "unassigned": len(expanded_resources),
             "not_found": [],
         }
 
@@ -461,10 +623,22 @@ async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depe
     resources = result.scalars().all()
     found_ids = {str(r.id) for r in resources}
     not_found = [rid for rid in request.resourceIds if rid not in found_ids]
+    if resources:
+        tenant_ids = {resource.tenant_id for resource in resources}
+        if len(tenant_ids) != 1:
+            raise HTTPException(status_code=400, detail="Resources must belong to a single tenant")
+        await validate_policy_scope(
+            db,
+            policy_id=policy_id,
+            tenant_id=next(iter(tenant_ids)),
+            resources=resources,
+        )
     
     # Bulk update
+    expanded_resources = await expand_linked_policy_scope(db, resources)
+
     updated_count = 0
-    for resource in resources:
+    for resource in expanded_resources:
         resource.sla_policy_id = policy_id
         resource.status = ResourceStatus.ACTIVE
         updated_count += 1
@@ -501,13 +675,15 @@ async def bulk_unassign_policy(request: BulkUnassignRequest, db: AsyncSession = 
     found_ids = {str(r.id) for r in resources}
     not_found = [rid for rid in request.resourceIds if rid not in found_ids]
     
-    for resource in resources:
+    expanded_resources = await expand_linked_policy_scope(db, resources)
+
+    for resource in expanded_resources:
         resource.sla_policy_id = None
     
     await db.commit()
     
     return {
-        "unassigned": len(resources),
+        "unassigned": len(expanded_resources),
         "not_found": not_found,
     }
 
@@ -543,15 +719,23 @@ def build_schedule(policy):
 def policy_to_dict(p):
     """Convert policy to API response format"""
     result = SlaPolicyResponse.model_validate(p).model_dump()
+    result["serviceType"] = (result.get("serviceType") or "m365").lower()
     print(f"[POLICY] Converted policy: id={result.get('id')}, name={result.get('name')}")
     return result
 
 
 @app.get("/api/v1/policies")
-async def list_policies(tenantId: Optional[str] = Query(None), db: AsyncSession = Depends(get_db)):
+async def list_policies(
+    tenantId: Optional[str] = Query(None),
+    serviceType: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
     stmt = select(SlaPolicy).order_by(SlaPolicy.created_at.desc())
     if tenantId:
         stmt = stmt.where(SlaPolicy.tenant_id == UUID(tenantId))
+    normalized_service_type = normalize_policy_service_type(serviceType)
+    if normalized_service_type:
+        stmt = stmt.where(SlaPolicy.service_type == normalized_service_type)
     result = await db.execute(stmt)
     policies = result.scalars().all()
     return [policy_to_dict(p) for p in policies]
@@ -573,28 +757,38 @@ async def create_policy(request: dict, db: AsyncSession = Depends(get_db)):
     def get_val(camel: str, snake: str, default=None):
         return request.get(camel, request.get(snake, default))
 
+    tenant_id = UUID(get_val("tenantId", "tenant_id"))
+    tenant = await db.get(Tenant, tenant_id)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    service_type = normalize_policy_service_type(get_val("serviceType", "service_type")) or tenant_policy_service_type(tenant)
+
     policy = SlaPolicy(
         id=uuid4(),
-        tenant_id=UUID(get_val("tenantId", "tenant_id")),
+        tenant_id=tenant_id,
+        service_type=service_type,
         name=get_val("name", "name", "New Policy"),
         frequency=get_val("frequency", "frequency", "DAILY"),
         backup_days=get_val("backupDays", "backup_days", ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]),
         backup_window_start=get_val("backupWindowStart", "backup_window_start", "21:00"),
-        backup_exchange=get_val("backupExchange", "backup_exchange", True),
+        backup_exchange=get_val("backupExchange", "backup_exchange", service_type == "m365"),
         backup_exchange_archive=get_val("backupExchangeArchive", "backup_exchange_archive", False),
         backup_exchange_recoverable=get_val("backupExchangeRecoverable", "backup_exchange_recoverable", False),
-        backup_onedrive=get_val("backupOneDrive", "backup_onedrive", True),
-        backup_sharepoint=get_val("backupSharepoint", "backup_sharepoint", True),
-        backup_teams=get_val("backupTeams", "backup_teams", True),
+        backup_onedrive=get_val("backupOneDrive", "backup_onedrive", service_type == "m365"),
+        backup_sharepoint=get_val("backupSharepoint", "backup_sharepoint", service_type == "m365"),
+        backup_teams=get_val("backupTeams", "backup_teams", service_type == "m365"),
         backup_teams_chats=get_val("backupTeamsChats", "backup_teams_chats", False),
-        backup_entra_id=get_val("backupEntraId", "backup_entra_id", True),
+        backup_entra_id=get_val("backupEntraId", "backup_entra_id", service_type == "m365"),
         backup_power_platform=get_val("backupPowerPlatform", "backup_power_platform", False),
         backup_copilot=get_val("backupCopilot", "backup_copilot", False),
-        contacts=get_val("contacts", "contacts", True),
-        calendars=get_val("calendars", "calendars", True),
+        contacts=get_val("contacts", "contacts", service_type == "m365"),
+        calendars=get_val("calendars", "calendars", service_type == "m365"),
         tasks=get_val("tasks", "tasks", False),
-        group_mailbox=get_val("groupMailbox", "group_mailbox", True),
+        group_mailbox=get_val("groupMailbox", "group_mailbox", service_type == "m365"),
         planner=get_val("planner", "planner", False),
+        backup_azure_vm=get_val("backupAzureVm", "backup_azure_vm", service_type == "azure"),
+        backup_azure_sql=get_val("backupAzureSql", "backup_azure_sql", service_type == "azure"),
+        backup_azure_postgresql=get_val("backupAzurePostgresql", "backup_azure_postgresql", service_type == "azure"),
         retention_type=get_val("retentionType", "retention_type", "INDEFINITE"),
         retention_days=get_val("retentionDays", "retention_days"),
         enabled=get_val("enabled", "enabled", True),
@@ -620,6 +814,15 @@ async def update_policy(policy_id: str, request: dict, db: AsyncSession = Depend
     # Helper to get value by camelCase or snake_case
     def get_val(camel: str, snake: str, default=None):
         return request.get(camel, request.get(snake, default))
+
+    tenant = await db.get(Tenant, policy.tenant_id)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    requested_service_type = normalize_policy_service_type(get_val("serviceType", "service_type"))
+    if requested_service_type is not None:
+        policy.service_type = requested_service_type
+    elif not getattr(policy, "service_type", None):
+        policy.service_type = tenant_policy_service_type(tenant)
     
     # Map camelCase field names to snake_case DB columns
     field_map = {
@@ -633,6 +836,8 @@ async def update_policy(policy_id: str, request: dict, db: AsyncSession = Depend
         'backupCopilot': 'backup_copilot',
         'contacts': 'contacts', 'calendars': 'calendars', 'tasks': 'tasks',
         'groupMailbox': 'group_mailbox', 'planner': 'planner',
+        'backupAzureVm': 'backup_azure_vm', 'backupAzureSql': 'backup_azure_sql',
+        'backupAzurePostgresql': 'backup_azure_postgresql',
         'retentionType': 'retention_type', 'retentionDays': 'retention_days',
         'enabled': 'enabled', 'isDefault': 'is_default',
     }

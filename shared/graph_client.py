@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import hashlib
 import time
 
+from shared.power_bi_client import PowerBIClient
+
 logger = logging.getLogger(__name__)
 
 # Timeout constants — tuned for Graph API and token endpoint behavior
@@ -24,10 +26,11 @@ class GraphClient:
         "https://graph.microsoft.com/.default"
     ]
 
-    def __init__(self, client_id: str, client_secret: str, tenant_id: str):
+    def __init__(self, client_id: str, client_secret: str, tenant_id: str, power_bi_refresh_token: Optional[str] = None):
         self.client_id = client_id
         self.client_secret = client_secret
         self.tenant_id = tenant_id
+        self.power_bi_refresh_token = power_bi_refresh_token
         self._access_token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
 
@@ -670,33 +673,145 @@ class GraphClient:
         except Exception as e:
             print(f"Error discovering Power Platform environments: {e}")
 
-        # 4. Discover Power BI workspaces via Graph API
+        # 4. Discover Power BI workspaces via Power BI REST API
         try:
-            result = await self._get(
-                f"{self.GRAPH_URL}/groups",
-                params={
-                    "$filter": "resourceProvisioningOptions/Any(x:x eq 'PowerBI')",
-                    "$top": "999",
-                    "$count": "true"
-                }
+            power_bi_client = PowerBIClient(
+                tenant_id=self.tenant_id,
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                refresh_token=self.power_bi_refresh_token,
             )
-            for g in result.get("value", []):
+            workspaces = await power_bi_client.list_workspaces()
+            self.power_bi_refresh_token = power_bi_client.refresh_token
+            for workspace in workspaces:
+                workspace_id = workspace.get("id")
+                if not workspace_id:
+                    continue
                 resources.append({
-                    "external_id": f"pbi_ws_{g.get('id')}",
-                    "display_name": g.get("displayName", "Unknown Power BI Workspace"),
-                    "email": g.get("mail"),
+                    "external_id": f"pbi_ws_{workspace_id}",
+                    "display_name": workspace.get("name", "Unknown Power BI Workspace"),
+                    "email": None,
                     "type": "POWER_BI",
                     "metadata": {
-                        "workspace_id": g.get("id"),
-                        "mail_enabled": g.get("mailEnabled"),
-                        "security_enabled": g.get("securityEnabled"),
-                        "visibility": g.get("visibility"),
-                        "description": g.get("description"),
+                        "workspace_id": workspace_id,
+                        "workspace_type": workspace.get("type"),
+                        "is_on_dedicated_capacity": workspace.get("isOnDedicatedCapacity"),
+                        "capacity_id": workspace.get("capacityId"),
+                        "description": workspace.get("description"),
+                        "state": workspace.get("state"),
+                        "default_dataset_storage_format": workspace.get("defaultDatasetStorageFormat"),
                     },
                 })
         except Exception as e:
             print(f"Error discovering Power BI workspaces: {e}")
 
+        return resources
+
+    async def discover_planner(self) -> List[Dict[str, Any]]:
+        """Discover Planner-capable group containers that actually have plans."""
+        resources = []
+        groups = await self.discover_groups()
+        semaphore = asyncio.Semaphore(8)
+
+        async def _probe_group(group: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            group_id = group.get("external_id")
+            if not group_id:
+                return None
+
+            metadata = group.get("metadata") or {}
+            if not (
+                metadata.get("mail_enabled")
+                or "Unified" in (metadata.get("group_types") or [])
+            ):
+                return None
+
+            async with semaphore:
+                try:
+                    plans = await self.get_planner_plans_for_group(group_id)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code in (403, 404):
+                        return None
+                    raise
+                except Exception:
+                    return None
+
+            plan_list = plans.get("value", [])
+            if not plan_list:
+                return None
+
+            return {
+                "external_id": group_id,
+                "display_name": f"{group.get('display_name', 'Unknown')} Planner",
+                "email": group.get("email"),
+                "type": "PLANNER",
+                "metadata": {
+                    "group_id": group_id,
+                    "group_display_name": group.get("display_name"),
+                    "group_email": group.get("email"),
+                    "plan_count": len(plan_list),
+                    "plan_ids": [plan.get("id") for plan in plan_list if plan.get("id")],
+                },
+            }
+
+        results = await asyncio.gather(
+            *[_probe_group(group) for group in groups],
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, dict):
+                resources.append(result)
+        return resources
+
+    async def discover_todo(self) -> List[Dict[str, Any]]:
+        """Discover users whose To Do workload is accessible."""
+        resources = []
+        users = await self.discover_users()
+        semaphore = asyncio.Semaphore(10)
+
+        async def _probe_user(user: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            user_id = user.get("external_id")
+            if not user_id:
+                return None
+
+            async with semaphore:
+                try:
+                    lists = await self.get_user_todo_lists(user_id)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code in (403, 404):
+                        return None
+                    raise
+                except Exception:
+                    return None
+
+            list_items = lists.get("value", [])
+            if not list_items:
+                return None
+
+            return {
+                "external_id": user_id,
+                "display_name": f"{user.get('display_name', 'Unknown')} To Do",
+                "email": user.get("email"),
+                "type": "TODO",
+                "metadata": {
+                    "user_id": user_id,
+                    "user_email": user.get("email"),
+                    "list_count": len(list_items),
+                    "wellknown_lists": [
+                        item.get("wellknownListName")
+                        for item in list_items
+                        if item.get("wellknownListName")
+                    ],
+                },
+                "_account_enabled": user.get("_account_enabled", True),
+            }
+
+        results = await asyncio.gather(
+            *[_probe_user(user) for user in users],
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, dict):
+                resources.append(result)
         return resources
     
     async def discover_all(self) -> List[Dict[str, Any]]:
@@ -721,6 +836,8 @@ class GraphClient:
             _safe_discover("onedrive", self.discover_onedrive()),
             _safe_discover("sharepoint", self.discover_sharepoint()),
             _safe_discover("teams", self.discover_teams()),
+            _safe_discover("planner", self.discover_planner()),
+            _safe_discover("todo", self.discover_todo()),
             _safe_discover("power_platform", self.discover_power_platform()),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -792,6 +909,20 @@ class GraphClient:
             result = await self._get(next_url)
             all_value.extend(result.get("value", []))
 
+        result["value"] = all_value
+        return result
+
+    async def get_sharepoint_subsites(self, site_id: str) -> Dict[str, Any]:
+        """
+        Get subsites for a SharePoint site.
+        Graph API: GET /sites/{site-id}/sites
+        """
+        graph_site_id = site_id.replace("/", ",")
+        result = await self._get(f"{self.GRAPH_URL}/sites/{graph_site_id}/sites", params={"$top": "999"})
+        all_value = result.get("value", [])
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_value.extend(result.get("value", []))
         result["value"] = all_value
         return result
 
@@ -1177,6 +1308,35 @@ class GraphClient:
         result["value"] = all_value
         return result
 
+    async def get_group_threads(self, group_id: str) -> Dict[str, Any]:
+        """
+        Get group conversation threads.
+        Graph API: GET /groups/{id}/threads
+        """
+        result = await self._get(f"{self.GRAPH_URL}/groups/{group_id}/threads", params={"$top": "999"})
+        all_value = result.get("value", [])
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_value.extend(result.get("value", []))
+        result["value"] = all_value
+        return result
+
+    async def get_group_thread_posts(self, group_id: str, thread_id: str) -> Dict[str, Any]:
+        """
+        Get posts for a specific group thread.
+        Graph API: GET /groups/{id}/threads/{thread-id}/posts
+        """
+        result = await self._get(
+            f"{self.GRAPH_URL}/groups/{group_id}/threads/{thread_id}/posts",
+            params={"$top": "999"},
+        )
+        all_value = result.get("value", [])
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_value.extend(result.get("value", []))
+        result["value"] = all_value
+        return result
+
     async def get_planner_tasks(self, user_id: str = None, plan_id: str = None) -> Dict[str, Any]:
         """
         Get Planner tasks.
@@ -1203,13 +1363,17 @@ class GraphClient:
 
     async def get_power_bi_workspaces(self) -> Dict[str, Any]:
         """
-        Get Power BI workspaces.
-        Graph API: GET /groups (filtered for Power BI)
+        Get Power BI workspaces via Power BI REST API.
         """
-        return await self._get(f"{self.GRAPH_URL}/groups", params={
-            "$filter": "resourceProvisioningOptions/Any(x:x eq 'PowerBI')",
-            "$top": "999"
-        })
+        power_bi_client = PowerBIClient(
+            tenant_id=self.tenant_id,
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+            refresh_token=self.power_bi_refresh_token,
+        )
+        workspaces = await power_bi_client.list_workspaces()
+        self.power_bi_refresh_token = power_bi_client.refresh_token
+        return {"value": workspaces}
 
     async def get_onenote_notebooks(self, user_id: str) -> Dict[str, Any]:
         """

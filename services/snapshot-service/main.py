@@ -1,7 +1,7 @@
 import asyncio
 """Snapshot Service - Manages snapshots and snapshot items"""
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 
@@ -10,6 +10,7 @@ from sqlalchemy import select, func, distinct, and_, or_
 
 from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus
+from shared.power_bi_snapshot import assemble_power_bi_items
 from shared.schemas import (
     SnapshotListResponse, SnapshotResponse, SnapshotItemListResponse, SnapshotItemResponse, SnapshotDiff
 )
@@ -23,6 +24,52 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Snapshot Service", version="1.0.0", lifespan=lifespan)
+
+
+def _item_to_response(item: SnapshotItem) -> SnapshotItemResponse:
+    return SnapshotItemResponse(
+        id=str(item.id),
+        snapshotId=str(item.snapshot_id),
+        externalId=item.external_id,
+        itemType=item.item_type,
+        name=item.name,
+        folderPath=item.folder_path,
+        contentSize=item.content_size or 0,
+        metadata=item.extra_data or {},
+        isDeleted=item.is_deleted or False,
+        createdAt=item.created_at.isoformat() if item.created_at else "",
+    )
+
+
+async def _get_power_bi_assembled_items(db: AsyncSession, snapshot_id: str) -> Optional[List[SnapshotItem]]:
+    snapshot = await db.get(Snapshot, UUID(snapshot_id))
+    if not snapshot:
+        return None
+
+    resource = await db.get(Resource, snapshot.resource_id)
+    if not resource:
+        return None
+
+    resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+    if resource_type != "POWER_BI":
+        return None
+
+    snapshots_result = await db.execute(
+        select(Snapshot).where(
+            Snapshot.resource_id == snapshot.resource_id,
+            Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
+            Snapshot.created_at <= snapshot.created_at,
+        ).order_by(Snapshot.created_at.asc())
+    )
+    snapshots = snapshots_result.scalars().all()
+    if not snapshots:
+        return []
+
+    snapshot_ids = [s.id for s in snapshots]
+    items_result = await db.execute(
+        select(SnapshotItem).where(SnapshotItem.snapshot_id.in_(snapshot_ids)).order_by(SnapshotItem.created_at.asc())
+    )
+    return assemble_power_bi_items(snapshots, items_result.scalars().all(), up_to_snapshot_id=snapshot_id)
 
 
 @app.get("/health")
@@ -68,6 +115,15 @@ async def get_snapshot_folders(
     db: AsyncSession = Depends(get_db),
 ):
     """Get distinct folder paths for items in a snapshot, optionally filtered by item type."""
+    assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
+    if assembled_items is not None:
+        filtered = [item for item in assembled_items if not item_type or item.item_type == item_type]
+        counts: dict[str, int] = {}
+        for item in filtered:
+            path = item.folder_path or ""
+            counts[path] = counts.get(path, 0) + 1
+        return [{"path": path, "count": count} for path, count in sorted(counts.items())]
+
     filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
     if item_type:
         filters.append(SnapshotItem.item_type == item_type)
@@ -93,6 +149,10 @@ async def get_snapshot_content_types(
     db: AsyncSession = Depends(get_db),
 ):
     """Get distinct content types available in a snapshot."""
+    assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
+    if assembled_items is not None:
+        return {"contentTypes": sorted({item.item_type for item in assembled_items if item.item_type})}
+
     stmt = (
         select(distinct(SnapshotItem.item_type))
         .where(SnapshotItem.snapshot_id == UUID(snapshot_id))
@@ -130,6 +190,19 @@ async def list_snapshot_items(
     itemType: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
+    assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
+    if assembled_items is not None:
+        filtered = [item for item in assembled_items if not itemType or item.item_type == itemType]
+        total = len(filtered)
+        page_items = filtered[(page - 1) * size : page * size]
+        return SnapshotItemListResponse(
+            content=[_item_to_response(item) for item in page_items],
+            totalPages=max(1, (total + size - 1) // size),
+            totalElements=total,
+            size=size,
+            number=page,
+        )
+
     filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
     if itemType:
         filters.append(SnapshotItem.item_type == itemType)
@@ -140,16 +213,7 @@ async def list_snapshot_items(
     items = result.scalars().all()
     
     return SnapshotItemListResponse(
-        content=[
-            SnapshotItemResponse(
-                id=str(i.id), snapshotId=str(i.snapshot_id), externalId=i.external_id,
-                itemType=i.item_type, name=i.name, folderPath=i.folder_path,
-                contentSize=i.content_size or 0, metadata=i.extra_data or {},
-                isDeleted=i.is_deleted or False,
-                createdAt=i.created_at.isoformat() if i.created_at else "",
-            )
-            for i in items
-        ],
+        content=[_item_to_response(item) for item in items],
         totalPages=max(1, (total + size - 1) // size),
         totalElements=total,
         size=size, number=page,
@@ -170,6 +234,19 @@ async def browse_snapshot_items(
     itemType: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
+    assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
+    if assembled_items is not None:
+        filtered = [item for item in assembled_items if not itemType or item.item_type == itemType]
+        total = len(filtered)
+        page_items = filtered[(page - 1) * size : page * size]
+        return SnapshotItemListResponse(
+            content=[_item_to_response(item) for item in page_items],
+            totalPages=max(1, (total + size - 1) // size),
+            totalElements=total,
+            size=size,
+            number=page,
+        )
+
     filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
     if itemType:
         filters.append(SnapshotItem.item_type == itemType)
@@ -180,16 +257,7 @@ async def browse_snapshot_items(
     items = result.scalars().all()
 
     return SnapshotItemListResponse(
-        content=[
-            SnapshotItemResponse(
-                id=str(i.id), snapshotId=str(i.snapshot_id), externalId=i.external_id,
-                itemType=i.item_type, name=i.name, folderPath=i.folder_path,
-                contentSize=i.content_size or 0, metadata=i.extra_data or {},
-                isDeleted=i.is_deleted or False,
-                createdAt=i.created_at.isoformat() if i.created_at else "",
-            )
-            for i in items
-        ],
+        content=[_item_to_response(item) for item in items],
         totalPages=max(1, (total + size - 1) // size),
         totalElements=total,
         size=size, number=page,
@@ -250,7 +318,7 @@ async def list_resources_with_backups(
              "ONEDRIVE": "onedrive", "SHAREPOINT_SITE": "sharepoint_site", "TEAMS_CHANNEL": "teams_channel",
              "TEAMS_CHAT": "teams_chat", "ENTRA_USER": "entra_user", "ENTRA_GROUP": "entra_group",
              "ENTRA_APP": "entra_app", "ENTRA_DEVICE": "entra_device", "AZURE_VM": "azure_vm",
-             "AZURE_SQL_DB": "azure_sql", "AZURE_POSTGRESQL": "azure_postgresql"}
+             "AZURE_SQL_DB": "azure_sql", "AZURE_POSTGRESQL": "azure_postgresql", "POWER_BI": "power_bi"}
         return m.get(t, t.lower() if t else "unknown")
 
     resources_map = {str(r.id): r for r in all_resources}
@@ -301,6 +369,47 @@ async def search_snapshot_items(
     db: AsyncSession = Depends(get_db),
 ):
     """Search snapshot items for a resource with optional filters."""
+    resource = await db.get(Resource, UUID(resource_id))
+    resource_type = resource.type.value if resource and hasattr(resource.type, "value") else (str(resource.type) if resource else "")
+    if resource and resource_type == "POWER_BI":
+        target_snapshot_id = snapshot_id
+        if not target_snapshot_id:
+            latest_snapshot_result = await db.execute(
+                select(Snapshot).where(
+                    Snapshot.resource_id == UUID(resource_id),
+                    Snapshot.status.in_([SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]),
+                ).order_by(Snapshot.created_at.desc()).limit(1)
+            )
+            latest_snapshot = latest_snapshot_result.scalar_one_or_none()
+            target_snapshot_id = str(latest_snapshot.id) if latest_snapshot else None
+
+        if not target_snapshot_id:
+            return SnapshotItemListResponse(
+                content=[], totalPages=0, totalElements=0, size=size, number=page,
+            )
+
+        assembled_items = await _get_power_bi_assembled_items(db, target_snapshot_id)
+        filtered = assembled_items or []
+        if item_type:
+            filtered = [item for item in filtered if item.item_type == item_type]
+        if folder_path:
+            filtered = [item for item in filtered if item.folder_path == folder_path]
+        if query:
+            lowered = query.lower()
+            filtered = [
+                item for item in filtered
+                if lowered in (item.name or "").lower() or lowered in (item.external_id or "").lower()
+            ]
+        total = len(filtered)
+        page_items = filtered[(page - 1) * size : page * size]
+        return SnapshotItemListResponse(
+            content=[_item_to_response(item) for item in page_items],
+            totalPages=max(1, (total + size - 1) // size),
+            totalElements=total,
+            size=size,
+            number=page,
+        )
+
     snapshot_ids_stmt = select(Snapshot.id).where(
         Snapshot.resource_id == UUID(resource_id),
         Snapshot.status == SnapshotStatus.COMPLETED,
@@ -340,20 +449,31 @@ async def search_snapshot_items(
     items = result.scalars().all()
 
     return SnapshotItemListResponse(
-        content=[
-            SnapshotItemResponse(
-                id=str(i.id), snapshotId=str(i.snapshot_id), externalId=i.external_id,
-                itemType=i.item_type, name=i.name, folderPath=i.folder_path,
-                contentSize=i.content_size or 0, metadata=i.extra_data or {},
-                isDeleted=i.is_deleted or False,
-                createdAt=i.created_at.isoformat() if i.created_at else "",
-            )
-            for i in items
-        ],
+        content=[_item_to_response(item) for item in items],
         totalPages=max(1, (total + size - 1) // size),
         totalElements=total,
         size=size, number=page,
     )
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}", response_model=SnapshotItemResponse)
+async def get_snapshot_item_detail(snapshot_id: str, item_id: str, db: AsyncSession = Depends(get_db)):
+    assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
+    if assembled_items is not None:
+        item = next((row for row in assembled_items if str(row.id) == item_id), None)
+        if not item:
+            raise HTTPException(status_code=404, detail="Snapshot item not found")
+        return _item_to_response(item)
+
+    stmt = select(SnapshotItem).where(
+        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.id == UUID(item_id),
+    )
+    result = await db.execute(stmt)
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Snapshot item not found")
+    return _item_to_response(item)
 
 
 # ==================== Content-Type-Specific Endpoints ====================
@@ -396,20 +516,6 @@ def _raw(item) -> dict:
     r = meta.get("raw") or meta.get("structured") or meta
     return r if isinstance(r, dict) else {}
 
-
-@app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")
-async def get_item_content(snapshot_id: str, item_id: str, db: AsyncSession = Depends(get_db)):
-    item = await db.get(SnapshotItem, UUID(item_id))
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-    raw = _raw(item)
-    if raw and len(raw) > 2:
-        return {"source": "metadata", "content": raw}
-    if item.blob_path:
-        blob_content = await _read_blob(item.blob_path)
-        if blob_content:
-            return {"source": "blob", "content": blob_content}
-    return {"source": "none", "content": {}}
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/emails")
 async def list_snapshot_emails(
