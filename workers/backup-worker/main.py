@@ -24,7 +24,8 @@ import logging
 import os
 import tempfile
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional
+import time
+from typing import Dict, List, Any, Optional, Tuple
 import aio_pika
 from aio_pika import IncomingMessage
 import httpx
@@ -102,6 +103,14 @@ class BackupWorker:
         self.worker_id = f"worker-{uuid.uuid4().hex[:8]}"
         self.graph_clients: Dict[str, GraphClient] = {}
         self.audit_logger = AuditLogger()
+        # Teams chat export cache: user_id -> (fetched_at_unix, messages[])
+        # /users/{id}/chats/getAllMessages returns the full chat history for
+        # a user; if we're backing up 100 chats for the same user we don't want
+        # to hit that endpoint 100 times. Cache TTL is 5 min — well within a
+        # batch-backup window, and new messages arriving during a run are
+        # handled on the next run.
+        self._chat_export_cache: Dict[str, Tuple[float, List[Dict]]] = {}
+        self._chat_export_cache_ttl = 300.0  # seconds
         # Concurrency controls
         self.backup_semaphore = asyncio.Semaphore(8)  # 8 concurrent file streams per worker NIC
         self.copy_semaphore = asyncio.Semaphore(20)  # Azure Storage account ingress limit
@@ -1319,19 +1328,82 @@ class BackupWorker:
         
         return {"item_count": item_count, "bytes_added": bytes_added}
 
+    async def _get_chat_participant_user_id(self, resource: Resource, graph_client: GraphClient) -> Optional[str]:
+        """Return a user id that participates in this chat.
+
+        1:1 and group chat message export via /users/{id}/chats/getAllMessages
+        requires a user scope. We pick any one participant — all participants
+        see the same messages, so which one we pick is irrelevant for
+        completeness, only for token permissions. Prefer a participant stored
+        on the resource (from discovery) and fall back to a fresh members call.
+        Returns None if no user-type participant can be resolved (e.g. chat
+        with only bots/guests, though Graph requires at least one real user)."""
+        extra = resource.extra_data or {}
+        # Discovery may have stored members on extra_data
+        for m in (extra.get("members") or []):
+            uid = m.get("userId") or m.get("user_id") or (m.get("user") or {}).get("id")
+            if uid:
+                return uid
+        # Fallback: live fetch via /chats/{id}/members (Chat.ReadBasic.All scope)
+        try:
+            members = await graph_client._get(
+                f"{graph_client.GRAPH_URL}/chats/{resource.external_id}/members"
+            )
+        except Exception as exc:
+            print(f"[{self.worker_id}]   [CHAT_MEMBERS] Failed to list members for {resource.external_id}: {exc}")
+            return None
+        for m in members.get("value", []) or []:
+            uid = m.get("userId") or (m.get("additionalData") or {}).get("userId")
+            if uid:
+                return uid
+        return None
+
+    async def _get_cached_user_chat_messages(self, graph_client: GraphClient, user_id: str) -> List[Dict]:
+        """Return /users/{user_id}/chats/getAllMessages, cached per worker.
+
+        Several TEAMS_CHAT backup jobs in a batch commonly share participants,
+        so without caching we'd re-fetch the entire user's chat history for
+        every chat. TTL is 5 min (see __init__); beyond that we refresh so
+        long-running workers don't serve stale exports across backup cycles."""
+        now = time.monotonic()
+        cached = self._chat_export_cache.get(user_id)
+        if cached and (now - cached[0]) < self._chat_export_cache_ttl:
+            return cached[1]
+        payload = await graph_client.get_all_chat_messages_for_user(user_id)
+        msgs = payload.get("value", []) if isinstance(payload, dict) else []
+        self._chat_export_cache[user_id] = (now, msgs)
+        return msgs
+
     async def _backup_single_chat(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
                                   graph_client: GraphClient) -> tuple:
-        """Backup a single Teams chat — parallel uploads, single bulk DB insert."""
+        """Backup a single Teams chat via the user-scoped export endpoint.
+
+        Why not /chats/{id}/messages? Microsoft's Teams service gates that
+        endpoint behind an additional ACL check (InsufficientPrivileges /
+        AclCheckFailed) even when Chat.Read.All is granted app-only. The
+        documented replacement for programmatic export is
+        /users/{userId}/chats/getAllMessages — we pick a participant of this
+        chat, fetch all messages that user sees, filter by chatId, and store
+        the same shape we always did.
+
+        Messages are cached per participant user so multi-chat batches don't
+        re-fetch the full export each time."""
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
         chat_id = resource.external_id
-        delta_token = (resource.extra_data or {}).get("chat_delta_token")
         chat_topic = resource.display_name or chat_id
 
-        print(f"[{self.worker_id}]   [CHAT_MSG] {chat_topic} — fetching messages (delta)...")
-        chat_msgs = await graph_client.get_chat_messages(chat_id, delta_token)
-        msg_list = chat_msgs.get("value", [])
-        print(f"[{self.worker_id}]   [CHAT_MSG] {chat_topic} — {len(msg_list)} messages")
+        # Resolve a participant user to export on behalf of
+        user_id = await self._get_chat_participant_user_id(resource, graph_client)
+        if not user_id:
+            print(f"[{self.worker_id}]   [CHAT_MSG] {chat_topic} — no resolvable participant user; skipping")
+            return 0, 0
+
+        print(f"[{self.worker_id}]   [CHAT_MSG] {chat_topic} — exporting via user {user_id}")
+        all_user_msgs = await self._get_cached_user_chat_messages(graph_client, user_id)
+        # Filter to this chat only — getAllMessages mixes every chat the user is part of
+        msg_list = [m for m in all_user_msgs if m.get("chatId") == chat_id]
+        print(f"[{self.worker_id}]   [CHAT_MSG] {chat_topic} — {len(msg_list)} messages (of {len(all_user_msgs)} across all chats)")
 
         upload_tasks = []
         item_metas = []
@@ -1358,7 +1430,7 @@ class BackupWorker:
                     folder_path=f"chats/{chat_topic}",
                     content_hash=content_hash, content_size=len(content_bytes),
                     blob_path=blob_path,
-                    metadata={"raw": msg, "chatId": chat_id, "chatTopic": chat_topic},
+                    metadata={"raw": msg, "chatId": chat_id, "chatTopic": chat_topic, "exportedVia": user_id},
                     content_checksum=content_hash,
                 ))
                 bytes_added += len(content_bytes)
@@ -1370,15 +1442,11 @@ class BackupWorker:
                 session.add_all(db_items)
                 await session.commit()
 
-        # Save delta token for next incremental backup
-        new_delta = chat_msgs.get("@odata.deltaLink")
-        if new_delta:
-            async with async_session_factory() as sess:
-                r = await sess.get(Resource, resource.id)
-                if r:
-                    r.extra_data = r.extra_data or {}
-                    r.extra_data["chat_delta_token"] = new_delta
-                    await sess.commit()
+        # Note: /chats/getAllMessages doesn't return a delta link — each run is a
+        # full export. Incremental support would require per-user delta tokens
+        # (a separate endpoint) which we can wire in later; for now, the storage
+        # layer dedupes by content_hash so re-backing up the same message costs
+        # DB rows but not bytes.
 
         return len(db_items), bytes_added
 
