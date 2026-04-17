@@ -53,6 +53,7 @@ class ResourceType(str, enum.Enum):
     TEAMS_CHAT = "TEAMS_CHAT"
     ENTRA_USER = "ENTRA_USER"
     ENTRA_GROUP = "ENTRA_GROUP"
+    M365_GROUP = "M365_GROUP"  # Unified (modern) group — links group mailbox + SP site + (optional) Team
     ENTRA_APP = "ENTRA_APP"
     ENTRA_SERVICE_PRINCIPAL = "ENTRA_SERVICE_PRINCIPAL"
     ENTRA_DEVICE = "ENTRA_DEVICE"

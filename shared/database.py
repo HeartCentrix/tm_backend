@@ -173,6 +173,7 @@ async def _ensure_enum_values() -> None:
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_ADMIN_UNIT';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_AUDIT_LOG';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'INTUNE_MANAGED_DEVICE';",
+        "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'M365_GROUP';",
         "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'PENDING_DISCOVERY';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'QUEUED';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'RUNNING';",

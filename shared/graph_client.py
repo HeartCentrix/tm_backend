@@ -189,55 +189,154 @@ class GraphClient:
             resp = await client.delete(url, headers=headers)
             resp.raise_for_status()
     
+    # System mailbox display-name prefixes Microsoft creates and never wants backed up.
+    # Matches afi.ai's exclusion list — these are tenant infrastructure, not user data.
+    _SYSTEM_MAILBOX_PREFIXES = (
+        "DiscoverySearchMailbox",
+        "FederatedEmail.",
+        "SystemMailbox{",
+        "Microsoft Office 365 portal",
+        "MicrosoftSupport",
+        "MicrosoftCustomerSupport",
+        "Spam Quarantine",
+    )
+
+    @classmethod
+    def _is_system_mailbox(cls, display_name: Optional[str], upn: Optional[str]) -> bool:
+        for needle in (display_name or "", upn or ""):
+            for prefix in cls._SYSTEM_MAILBOX_PREFIXES:
+                if needle.startswith(prefix):
+                    return True
+        return False
+
     async def discover_users(self) -> List[Dict[str, Any]]:
-        """Fetch all users from Entra ID"""
-        result = await self._get(f"{self.GRAPH_URL}/users", params={"$top": "999", "$count": "true"})
+        """Fetch all users from Entra ID. Skips Guest users and system mailboxes —
+        afi.ai treats these as out-of-scope for backup."""
+        result = await self._get(
+            f"{self.GRAPH_URL}/users",
+            params={
+                "$top": "999",
+                "$count": "true",
+                "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,accountEnabled,createdDateTime,userType",
+            },
+        )
         all_value = result.get("value", [])
         while "@odata.nextLink" in result:
             result = await self._get(result["@odata.nextLink"])
             all_value.extend(result.get("value", []))
 
         users = []
+        skipped_guest = 0
+        skipped_system = 0
         for u in all_value:
+            user_type = (u.get("userType") or "").lower()
+            display_name = u.get("displayName") or u.get("mail") or u.get("userPrincipalName") or "Unknown"
+            upn = u.get("userPrincipalName")
+            if user_type == "guest":
+                skipped_guest += 1
+                continue
+            if self._is_system_mailbox(display_name, upn):
+                skipped_system += 1
+                continue
             is_enabled = u.get("accountEnabled", True)
             users.append({
                 "external_id": u.get("id"),
-                "display_name": u.get("displayName", u.get("mail", u.get("userPrincipalName", "Unknown"))),
-                "email": u.get("mail") or u.get("userPrincipalName"),
+                "display_name": display_name,
+                "email": u.get("mail") or upn,
                 "type": "ENTRA_USER",
                 "metadata": {
-                    "user_principal_name": u.get("userPrincipalName"),
+                    "user_principal_name": upn,
                     "job_title": u.get("jobTitle"),
                     "department": u.get("department"),
                     "account_enabled": is_enabled,
+                    "user_type": u.get("userType"),
                     "created_at": u.get("createdDateTime"),
                 },
                 "_account_enabled": is_enabled,  # For discovery worker to filter
             })
+        if skipped_guest or skipped_system:
+            print(f"[GraphClient] discover_users: skipped {skipped_guest} guest(s), {skipped_system} system account(s)")
         return users
     
+    @staticmethod
+    def _classify_group(g: Dict[str, Any]) -> str:
+        """Map Entra group flags to a canonical classification.
+
+        Microsoft splits groups across three flags (groupTypes, mailEnabled,
+        securityEnabled) which don't form an obvious taxonomy. afi.ai surfaces
+        a single 'kind' to the user — we mirror that:
+          M365_GROUP            — groupTypes contains 'Unified' (a.k.a. modern group)
+          DISTRIBUTION_LIST     — mail-enabled, NOT security, no Unified flag
+          MAIL_ENABLED_SECURITY — both mail- and security-enabled
+          SECURITY_GROUP        — security-only (not mail-enabled)
+        Anything else falls back to UNKNOWN — typically dynamic groups or
+        provisioning artifacts. The caller decides whether to back it up."""
+        group_types = [t.lower() for t in (g.get("groupTypes") or [])]
+        mail_enabled = bool(g.get("mailEnabled"))
+        security_enabled = bool(g.get("securityEnabled"))
+        if "unified" in group_types:
+            return "M365_GROUP"
+        if mail_enabled and security_enabled:
+            return "MAIL_ENABLED_SECURITY"
+        if mail_enabled and not security_enabled:
+            return "DISTRIBUTION_LIST"
+        if security_enabled and not mail_enabled:
+            return "SECURITY_GROUP"
+        return "UNKNOWN"
+
     async def discover_groups(self) -> List[Dict[str, Any]]:
-        """Fetch all groups from Entra ID"""
-        result = await self._get(f"{self.GRAPH_URL}/groups", params={"$top": "999", "$count": "true"})
+        """Fetch all groups from Entra ID and classify each one.
+
+        Unified (M365) groups are emitted as type=M365_GROUP so a single resource
+        row represents the group's mailbox + SharePoint site + (optional) Team —
+        matching afi.ai's UX. Distribution Lists and security groups stay as
+        ENTRA_GROUP rows but carry a `group_classification` so the UI can label
+        them and backup handlers can decide what to fetch.
+        """
+        result = await self._get(
+            f"{self.GRAPH_URL}/groups",
+            params={
+                "$top": "999",
+                "$count": "true",
+                # Pull resourceProvisioningOptions so we know if a Unified group
+                # has a Team attached (caller can skip Team-scan if absent).
+                "$select": "id,displayName,mail,mailEnabled,securityEnabled,groupTypes,description,resourceProvisioningOptions,visibility,createdDateTime",
+            },
+        )
         all_value = result.get("value", [])
         while "@odata.nextLink" in result:
             result = await self._get(result["@odata.nextLink"])
             all_value.extend(result.get("value", []))
 
         groups = []
+        counts: Dict[str, int] = {}
         for g in all_value:
+            classification = self._classify_group(g)
+            counts[classification] = counts.get(classification, 0) + 1
+            provisioning = [p.lower() for p in (g.get("resourceProvisioningOptions") or [])]
+            metadata = {
+                "mail_enabled": g.get("mailEnabled"),
+                "security_enabled": g.get("securityEnabled"),
+                "group_types": g.get("groupTypes", []),
+                "description": g.get("description"),
+                "visibility": g.get("visibility"),
+                "created_at": g.get("createdDateTime"),
+                "group_classification": classification,
+                "has_team": "team" in provisioning,
+                "resource_provisioning_options": g.get("resourceProvisioningOptions") or [],
+            }
             groups.append({
                 "external_id": g.get("id"),
                 "display_name": g.get("displayName", "Unknown"),
                 "email": g.get("mail"),
-                "type": "ENTRA_GROUP",
-                "metadata": {
-                    "mail_enabled": g.get("mailEnabled"),
-                    "security_enabled": g.get("securityEnabled"),
-                    "group_types": g.get("groupTypes", []),
-                    "description": g.get("description"),
-                },
+                # Unified → first-class M365_GROUP row; everything else stays as
+                # ENTRA_GROUP and the classification metadata distinguishes them.
+                "type": "M365_GROUP" if classification == "M365_GROUP" else "ENTRA_GROUP",
+                "metadata": metadata,
             })
+        if counts:
+            summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+            print(f"[GraphClient] discover_groups: {summary}")
         return groups
     
     # ------------------------------------------------------------------
@@ -258,16 +357,33 @@ class GraphClient:
           "equipment" → ROOM_MAILBOX
           None/other  → skipped (no mailbox)
         """
-        # Step 1: Fetch all users (no $filter — get everyone)
+        # Step 1: Fetch all users (no $filter — get everyone). Add userType so we
+        # can drop guests; afi.ai never backs up guest mailboxes (they live in their
+        # home tenant).
         users_result = await self._get(
             f"{self.GRAPH_URL}/users",
             params={"$top": "999", "$count": "true",
-                    "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,accountEnabled,createdDateTime"},
+                    "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,accountEnabled,createdDateTime,userType"},
         )
-        all_users = users_result.get("value", [])
+        all_users_raw = users_result.get("value", [])
         while "@odata.nextLink" in users_result:
             users_result = await self._get(users_result["@odata.nextLink"])
-            all_users.extend(users_result.get("value", []))
+            all_users_raw.extend(users_result.get("value", []))
+        # Drop guests + system mailboxes BEFORE the per-user mailboxSettings round-trip
+        # to avoid wasted API calls on tenant infrastructure accounts.
+        all_users = []
+        skipped_guest = 0
+        skipped_system = 0
+        for u in all_users_raw:
+            if (u.get("userType") or "").lower() == "guest":
+                skipped_guest += 1
+                continue
+            if self._is_system_mailbox(u.get("displayName"), u.get("userPrincipalName")):
+                skipped_system += 1
+                continue
+            all_users.append(u)
+        if skipped_guest or skipped_system:
+            print(f"[GraphClient] discover_mailboxes: skipped {skipped_guest} guest(s), {skipped_system} system account(s) before enrichment")
         mailboxes = []
 
         # Step 2: Enrich each user with userPurpose
