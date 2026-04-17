@@ -47,6 +47,8 @@ TYPE_MAP: Dict[str, ResourceType] = {
     "ENTRA_USER": ResourceType.ENTRA_USER,
     "ENTRA_GROUP": ResourceType.ENTRA_GROUP,
     "M365_GROUP": ResourceType.M365_GROUP,
+    "ENTRA_CONDITIONAL_ACCESS": ResourceType.ENTRA_CONDITIONAL_ACCESS,
+    "ENTRA_BITLOCKER_KEY": ResourceType.ENTRA_BITLOCKER_KEY,
     "ENTRA_APP": ResourceType.ENTRA_APP,
     "ENTRA_DEVICE": ResourceType.ENTRA_DEVICE,
     "AZURE_VM": ResourceType.AZURE_VM,
@@ -78,6 +80,17 @@ DISCOVERY_SCOPE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "power_platform": {
         "method": "discover_power_platform",
         "resource_types": {ResourceType.POWER_BI, ResourceType.POWER_APPS, ResourceType.POWER_AUTOMATE},
+    },
+    # Phase 2 P2 — security-critical Entra extras. CA policies and BitLocker
+    # keys are tenant-singleton resources; afi captures both so a takeover or
+    # misconfiguration can be reverted from the last clean snapshot.
+    "conditional_access": {
+        "method": "discover_conditional_access",
+        "resource_types": {ResourceType.ENTRA_CONDITIONAL_ACCESS},
+    },
+    "bitlocker": {
+        "method": "discover_bitlocker_keys",
+        "resource_types": {ResourceType.ENTRA_BITLOCKER_KEY},
     },
 }
 

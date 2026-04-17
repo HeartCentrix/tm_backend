@@ -997,6 +997,9 @@ class GraphClient:
             _safe_discover("planner", self.discover_planner()),
             _safe_discover("todo", self.discover_todo()),
             _safe_discover("power_platform", self.discover_power_platform()),
+            # Phase 2 P2 — security-critical Entra extras
+            _safe_discover("conditional_access", self.discover_conditional_access()),
+            _safe_discover("bitlocker", self.discover_bitlocker_keys()),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1016,6 +1019,108 @@ class GraphClient:
                 unique.append(r)
 
         return unique
+
+    # ── Conditional Access policies ─────────────────────────────────────────
+    # Tenant-singleton resources — small in number, high in security value.
+    # afi backs these up so a misconfiguration or tenant-takeover incident can
+    # be reverted by re-applying the captured definitions.
+
+    async def discover_conditional_access(self) -> List[Dict[str, Any]]:
+        """List all CA policies as discovery rows. Each row's external_id is the
+        policy ID; full definition lives in metadata so the backup handler can
+        re-dump it without a second round-trip."""
+        url = f"{self.GRAPH_URL}/identity/conditionalAccess/policies"
+        try:
+            result = await self._get(url, params={"$top": "200"})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (401, 403):
+                # Tenant lacks Policy.Read.All or doesn't have Entra ID P1+
+                print(f"[GraphClient] CA policies inaccessible (HTTP {e.response.status_code}) — skipping")
+                return []
+            raise
+        all_value = result.get("value", []) or []
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_value.extend(result.get("value", []))
+        rows = []
+        for p in all_value:
+            rows.append({
+                "external_id": p.get("id"),
+                "display_name": p.get("displayName") or "(unnamed CA policy)",
+                "email": None,
+                "type": "ENTRA_CONDITIONAL_ACCESS",
+                "metadata": {
+                    "state": p.get("state"),
+                    "created_at": p.get("createdDateTime"),
+                    "modified_at": p.get("modifiedDateTime"),
+                    "raw": p,  # full definition cached for backup handler
+                },
+            })
+        return rows
+
+    async def get_conditional_access_policy(self, policy_id: str) -> Optional[Dict[str, Any]]:
+        """Re-fetch a single CA policy by ID — used by the backup handler when
+        the cached metadata is stale or missing."""
+        url = f"{self.GRAPH_URL}/identity/conditionalAccess/policies/{policy_id}"
+        try:
+            return await self._get(url)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+
+    # ── BitLocker recovery keys ─────────────────────────────────────────────
+    # The list endpoint returns key metadata (id, deviceId, createdDateTime)
+    # WITHOUT the key value. Reading the key value requires a separate GET to
+    # /informationProtection/bitlocker/recoveryKeys/{id}?$select=key — and the
+    # caller must have BitlockerKey.Read.All. We capture metadata at discovery
+    # and pull the key bytes during backup so a least-privileged discovery
+    # token still works.
+
+    async def discover_bitlocker_keys(self) -> List[Dict[str, Any]]:
+        """List BitLocker recovery key metadata across the tenant."""
+        url = f"{self.GRAPH_URL}/informationProtection/bitlocker/recoveryKeys"
+        try:
+            result = await self._get(url, params={"$top": "200"})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (401, 403, 404):
+                print(f"[GraphClient] BitLocker keys inaccessible (HTTP {e.response.status_code}) — skipping")
+                return []
+            raise
+        all_value = result.get("value", []) or []
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            all_value.extend(result.get("value", []))
+        rows = []
+        for k in all_value:
+            kid = k.get("id")
+            device_id = k.get("deviceId")
+            volume_type = k.get("volumeType")
+            rows.append({
+                "external_id": kid,
+                "display_name": f"BitLocker key — device {device_id} ({volume_type})" if device_id else (kid or "BitLocker key"),
+                "email": None,
+                "type": "ENTRA_BITLOCKER_KEY",
+                "metadata": {
+                    "device_id": device_id,
+                    "volume_type": volume_type,
+                    "created_at": k.get("createdDateTime"),
+                },
+            })
+        return rows
+
+    async def get_bitlocker_key_value(self, key_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch the actual recovery key bytes for a single BitLocker entry.
+        Requires BitlockerKey.Read.All — separate from the metadata-only
+        BitlockerKey.ReadBasic.All used by the list endpoint."""
+        url = f"{self.GRAPH_URL}/informationProtection/bitlocker/recoveryKeys/{key_id}"
+        try:
+            # $select=key promotes the actual recovery key into the response
+            return await self._get(url, params={"$select": "id,createdDateTime,deviceId,volumeType,key"})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (403, 404):
+                return None
+            raise
 
     async def get_directory_audit_logs(self, filter_expr: str = None, top: int = 100) -> List[Dict[str, Any]]:
         """
@@ -1393,6 +1498,211 @@ class GraphClient:
 
         result["value"] = all_value
         return result
+
+    # ── Attachment endpoints ────────────────────────────────────────────────
+    # Mailbox messages and calendar events both expose /attachments collections.
+    # Three attachment types exist:
+    #   #microsoft.graph.fileAttachment       — binary file, content via /$value
+    #   #microsoft.graph.itemAttachment       — embedded item (msg/event/contact);
+    #                                           expand inline at list time
+    #   #microsoft.graph.referenceAttachment  — link only (OneDrive URL etc.) —
+    #                                           no content, just metadata
+    # afi.ai captures fileAttachments inline as separate blobs; we mirror that.
+
+    async def list_message_attachments(self, user_id: str, message_id: str) -> List[Dict[str, Any]]:
+        """List attachments on a single mailbox message. Returns the raw list
+        (no $value blobs) — caller fetches binary content separately for
+        fileAttachments. Empty list on 404 (message gone) or 403 (no access)."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}/attachments"
+        try:
+            result = await self._get(url, params={"$top": "100"})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (403, 404):
+                return []
+            raise
+        items = result.get("value", []) or []
+        # Some tenants paginate even for /attachments — follow nextLink defensively.
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            items.extend(result.get("value", []))
+        return items
+
+    async def get_message_attachment_content(
+        self, user_id: str, message_id: str, attachment_id: str
+    ) -> bytes:
+        """Download a fileAttachment's binary content via /$value."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}/attachments/{attachment_id}/$value"
+        token = await self._get_token()
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+            resp.raise_for_status()
+            return resp.content
+
+    async def list_event_attachments(self, user_id: str, event_id: str) -> List[Dict[str, Any]]:
+        """List attachments on a calendar event."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/events/{event_id}/attachments"
+        try:
+            result = await self._get(url, params={"$top": "100"})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (403, 404):
+                return []
+            raise
+        items = result.get("value", []) or []
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            items.extend(result.get("value", []))
+        return items
+
+    async def get_event_attachment_content(
+        self, user_id: str, event_id: str, attachment_id: str
+    ) -> bytes:
+        """Download a calendar event fileAttachment's binary content via /$value."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/events/{event_id}/attachments/{attachment_id}/$value"
+        token = await self._get_token()
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+            resp.raise_for_status()
+            return resp.content
+
+    # ── File version endpoints ──────────────────────────────────────────────
+    # OneDrive/SharePoint files retain a version history when versioning is
+    # enabled (default for SP, opt-in for OD personal). Graph exposes:
+    #   GET /drives/{did}/items/{iid}/versions          — list metadata
+    #   GET /drives/{did}/items/{iid}/versions/{vid}/content  — binary
+
+    async def list_file_versions(self, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
+        """List historical versions of a drive item. Returns newest-first.
+        The first entry is the current version (same content as the live file)."""
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/versions"
+        try:
+            result = await self._get(url, params={"$top": "200"})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (403, 404):
+                return []
+            raise
+        items = result.get("value", []) or []
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            items.extend(result.get("value", []))
+        return items
+
+    async def get_file_version_content(
+        self, drive_id: str, item_id: str, version_id: str
+    ) -> bytes:
+        """Download the binary content of a specific historical version."""
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/versions/{version_id}/content"
+        token = await self._get_token()
+        async with httpx.AsyncClient(timeout=600.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+            resp.raise_for_status()
+            return resp.content
+
+    # ── File / item permissions ─────────────────────────────────────────────
+    # Graph's `permissions` collection on a drive item lists every grant —
+    # direct sharing, SP groups, link-based access, inheritance markers. afi
+    # captures these so restored files re-establish the exact same ACL set.
+
+    async def list_file_permissions(self, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
+        """List ACL grants on a OneDrive/SharePoint item. Empty list on 404
+        (item gone) or 403 (no permissions to read permissions — uncommon)."""
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/permissions"
+        try:
+            result = await self._get(url, params={"$top": "200"})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (403, 404):
+                return []
+            raise
+        items = result.get("value", []) or []
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            items.extend(result.get("value", []))
+        return items
+
+    # ── Mailbox folder tree ─────────────────────────────────────────────────
+    # Each message's `parentFolderId` is opaque; to reconstruct "/Inbox/Project X"
+    # we must walk the folder tree once per user. afi rebuilds the hierarchy on
+    # restore — without the full path we can only restore items to a flat root.
+
+    async def get_mail_folder_tree(
+        self, user_id: str, well_known_root: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Return a flat map: folder_id → full path like "/Inbox/Subfolder".
+
+        If well_known_root is provided (e.g., 'archive', 'recoverableitemsroot'),
+        starts the walk at that special folder instead of the primary mailbox.
+        Returns empty dict if the root folder doesn't exist (no archive license,
+        no Exchange mailbox, etc.)."""
+        if well_known_root:
+            root_url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{well_known_root}"
+            try:
+                root = await self._get(root_url, params={"$select": "id,displayName"})
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (403, 404):
+                    return {}
+                raise
+            roots = [root]
+        else:
+            try:
+                top = await self._get(
+                    f"{self.GRAPH_URL}/users/{user_id}/mailFolders",
+                    params={"$top": "200", "$select": "id,displayName"},
+                )
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (403, 404):
+                    return {}
+                raise
+            roots = top.get("value", []) or []
+
+        tree: Dict[str, str] = {}
+
+        async def walk(folder: Dict[str, Any], parent_path: str) -> None:
+            fid = folder.get("id")
+            name = folder.get("displayName") or "(unnamed)"
+            path = f"{parent_path}/{name}"
+            if fid:
+                tree[fid] = path
+            # Each folder has a childFolderCount field; only descend if > 0 to
+            # avoid wasted requests on leaves.
+            if folder.get("childFolderCount", 0) <= 0:
+                # If we don't know the count (selective $select), still walk once.
+                if "childFolderCount" in folder:
+                    return
+            try:
+                child_resp = await self._get(
+                    f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{fid}/childFolders",
+                    params={"$top": "200", "$select": "id,displayName,childFolderCount"},
+                )
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (403, 404):
+                    return
+                raise
+            children = child_resp.get("value", []) or []
+            for c in children:
+                await walk(c, path)
+
+        # Start each root walk in parallel, then walk children serially within
+        # each subtree (folder trees are usually shallow and bounded).
+        await asyncio.gather(*[walk(r, "") for r in roots], return_exceptions=False)
+        return tree
+
+    async def list_messages_in_folder(
+        self, user_id: str, folder_id: str, top: int = 999,
+    ) -> List[Dict[str, Any]]:
+        """Fetch all messages directly inside a single mail folder. Used for
+        pulling Online Archive / Recoverable Items content where the top-level
+        /messages endpoint doesn't reach."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{folder_id}/messages"
+        try:
+            result = await self._get(url, params={"$top": str(top)})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (403, 404):
+                return []
+            raise
+        items = result.get("value", []) or []
+        while "@odata.nextLink" in result:
+            result = await self._get(result["@odata.nextLink"])
+            items.extend(result.get("value", []))
+        return items
 
     async def get_drive_items_delta(self, drive_id: str, delta_token: str = None) -> Dict[str, Any]:
         """

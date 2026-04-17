@@ -126,7 +126,7 @@ ACTIONS = {
     "RANSOMWARE_SIGNAL": "AI ransomware signal detected",
 }
 
-WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE"}
+WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE", "RANSOMWARE_SIGNAL"}
 
 M365_RESOURCE_TYPES = {
     ResourceType.MAILBOX,
@@ -294,9 +294,9 @@ async def list_activities(
                 if resource:
                     resource_name = resource.display_name
 
-            cached = _running_job_cache.get(str(job.id), {})
-            data_backed_up = cached.get("data_backed_up", job.bytes_processed or 0)
-            total_data = cached.get("total_data") or (job.result.get("total_bytes", 0) if job.result else 0)
+            cached = _running_job_cache.get(str(job.id), {})
+            data_backed_up = cached.get("data_backed_up", job.bytes_processed or 0)
+            total_data = cached.get("total_data") or (job.result.get("total_bytes", 0) if job.result else 0)
             items.append({
                 "id": str(job.id),
                 "start_time": job.created_at.isoformat() if job.created_at else "",
@@ -304,9 +304,9 @@ async def list_activities(
                 "object": resource_name,
                 "status": status_reverse_map.get(job.status, "In Progress"),
                 "finish_time": job.completed_at.isoformat() if job.completed_at else "",
-                "details": _compute_details(job),
-                "data_backed_up": data_backed_up,
-                "total_data": total_data,
+                "details": _compute_details(job),
+                "data_backed_up": data_backed_up,
+                "total_data": total_data,
             })
 
         for event in warning_events:

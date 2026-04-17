@@ -54,6 +54,8 @@ class ResourceType(str, enum.Enum):
     ENTRA_USER = "ENTRA_USER"
     ENTRA_GROUP = "ENTRA_GROUP"
     M365_GROUP = "M365_GROUP"  # Unified (modern) group — links group mailbox + SP site + (optional) Team
+    ENTRA_CONDITIONAL_ACCESS = "ENTRA_CONDITIONAL_ACCESS"  # CA policy (full JSON definition incl. conditions + grants)
+    ENTRA_BITLOCKER_KEY = "ENTRA_BITLOCKER_KEY"  # Per-device recovery key (no key bytes — just the metadata Graph exposes)
     ENTRA_APP = "ENTRA_APP"
     ENTRA_SERVICE_PRINCIPAL = "ENTRA_SERVICE_PRINCIPAL"
     ENTRA_DEVICE = "ENTRA_DEVICE"
