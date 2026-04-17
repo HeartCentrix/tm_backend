@@ -204,6 +204,9 @@ class PowerBIClient:
         return response.json()
 
     async def _poll_lro(self, location: str, api: str) -> Dict[str, Any]:
+        # Fabric LRO: polling {location} returns only the status envelope
+        # ({status, percentComplete, ...}). The actual result lives at
+        # {location}/result and must be fetched once status == "Succeeded".
         deadline = datetime.utcnow() + timedelta(minutes=3)
         while datetime.utcnow() < deadline:
             response = await self._request("GET", location, api=api)
@@ -216,8 +219,25 @@ class PowerBIClient:
             if status in {"running", "inprogress", "notstarted"}:
                 await asyncio.sleep(int(response.headers.get("Retry-After", "3")))
                 continue
-            if "result" in payload and isinstance(payload["result"], dict):
-                return payload["result"]
+
+            if status == "succeeded":
+                # Some older endpoints inline the result on the status object.
+                if isinstance(payload.get("result"), dict):
+                    return payload["result"]
+                result_response = await self._request(
+                    "GET", location.rstrip("/") + "/result", api=api
+                )
+                if result_response.status_code == 200 and result_response.content:
+                    return result_response.json()
+                return {}
+
+            if status in {"failed", "cancelled", "canceled"}:
+                raise RuntimeError(
+                    f"Power BI/Fabric LRO {status} for {location}: "
+                    f"{payload.get('error') or payload}"
+                )
+
+            # Unknown terminal status — return what we have so the caller can inspect.
             return payload
         raise TimeoutError(f"Timed out waiting for Power BI/Fabric LRO: {location}")
 

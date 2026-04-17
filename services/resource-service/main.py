@@ -34,12 +34,8 @@ async def lifespan(app: FastAPI):
 
 
 # Resource types hidden from UI listing endpoints by default.
-# Rationale: POWER_BI workspaces share identity with the M365 Group that backs them,
-# so they show up in the Power Platform tab looking like duplicates of Teams/SharePoint/
-# Entra rows with the same display name and email. Discovery and backup still process
-# these rows; they just don't appear in list/search/by-type responses unless the caller
-# passes ?includeHidden=true.
-UI_HIDDEN_TYPES = {"POWER_BI"}
+# Caller can still opt in via ?includeHidden=true.
+UI_HIDDEN_TYPES: set[str] = set()
 
 
 def format_bytes(bytes_val: int) -> str:
