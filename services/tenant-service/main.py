@@ -372,23 +372,35 @@ async def get_tenant_info(tenant_id: str, db: AsyncSession = Depends(get_db)):
         tenant.customer_id = str(uuid4())
         await db.flush()
     
-    # Map region code to human-readable name
-    region_map = {
-        "AU": "Australia",
-        "US": "United States",
-        "EU": "Europe",
-        "UK": "United Kingdom",
-        "CA": "Canada",
-        "DE": "Germany",
-        "FR": "France",
-        "JP": "Japan",
-        "IN": "India",
-        "BR": "Brazil",
-    }
-    
-    region_code = tenant.storage_region or "US"
-    region_name = region_map.get(region_code, region_code)
-    
+    # Resolve the *actual* region from the Azure Storage Account holding this
+    # tenant's backups. Try in order:
+    #  1. Dynamic ARM lookup of the account's location (authoritative, but
+    #     requires the service principal to have Reader on the account).
+    #  2. AZURE_BACKUP_REGION env setting — the region the admin configured.
+    #  3. Legacy tenant.storage_region coarse code (DB column).
+    from shared.azure_region import format_azure_region, get_storage_account_region
+
+    region_name: Optional[str] = None
+    try:
+        account_name = settings.AZURE_STORAGE_ACCOUNT_NAME
+        if account_name:
+            region_code = await get_storage_account_region(account_name)
+            region_name = format_azure_region(region_code)
+    except Exception:
+        region_name = None
+
+    if not region_name:
+        region_name = format_azure_region(settings.AZURE_BACKUP_REGION)
+
+    if not region_name:
+        legacy_region_map = {
+            "AU": "Australia", "US": "United States", "EU": "Europe",
+            "UK": "United Kingdom", "CA": "Canada", "DE": "Germany",
+            "FR": "France", "JP": "Japan", "IN": "India", "BR": "Brazil",
+        }
+        fallback_code = tenant.storage_region or "US"
+        region_name = legacy_region_map.get(fallback_code, fallback_code)
+
     return TenantInfoResponse(
         customerId=tenant.customer_id,
         tenantId=tenant.external_tenant_id or tenant_id,
