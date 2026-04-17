@@ -6,10 +6,12 @@ Handles different restore types:
 - Export (download as PST, ZIP, etc.)
 """
 import asyncio
+import gzip
 import json
 import uuid
 import zipfile
 import io
+from collections import OrderedDict
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from pathlib import Path
@@ -54,6 +56,11 @@ class RestoreWorker:
         self.graph_clients: Dict[str, GraphClient] = {}
         self.blob_service_client: Optional[BlobServiceClient] = None
         self.semaphore = asyncio.Semaphore(30)  # Max 30 concurrent restores
+        # Packed-blob cache: a single Teams chat pack backs thousands of
+        # messages. Without caching, a bulk restore re-downloads + re-decompresses
+        # the same blob once per item. Bounded LRU keeps memory in check.
+        self._packed_blob_cache: "OrderedDict[str, bytes]" = OrderedDict()
+        self._packed_blob_cache_cap = 32
 
     async def initialize(self):
         """Initialize connections and clients"""
@@ -513,6 +520,8 @@ class RestoreWorker:
             if item_type.startswith("POWER_APP"): return "power-apps"
             if item_type.startswith("POWER_FLOW"): return "power-automate"
             if item_type.startswith("POWER_DLP"): return "power-dlp"
+            if item_type in ("TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY", "TEAMS_CHAT_MESSAGE"):
+                return "teams"
             return "files"
 
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
@@ -1806,6 +1815,34 @@ class RestoreWorker:
             return {}
 
         container_name = azure_storage_manager.get_container_name(str(item.tenant_id), resource_type)
+
+        # Packed-blob path: SnapshotItem points into a larger NDJSON blob at a
+        # specific (byte_offset, byte_length) slice. We cache the decompressed
+        # blob so a bulk restore that walks one chat pays a single download per
+        # pack, not one per message.
+        byte_offset = getattr(item, "byte_offset", None)
+        byte_length = getattr(item, "byte_length", None)
+        if byte_offset is not None and byte_length is not None:
+            decompressed = self._packed_blob_cache.get(item.blob_path)
+            if decompressed is None:
+                blob_client = self.blob_service_client.get_blob_client(
+                    container=container_name, blob=item.blob_path,
+                )
+                raw_bytes = blob_client.download_blob().readall()
+                decompressed = (
+                    gzip.decompress(raw_bytes)
+                    if item.blob_path.endswith(".gz")
+                    else raw_bytes
+                )
+                self._packed_blob_cache[item.blob_path] = decompressed
+                self._packed_blob_cache.move_to_end(item.blob_path)
+                while len(self._packed_blob_cache) > self._packed_blob_cache_cap:
+                    self._packed_blob_cache.popitem(last=False)
+            else:
+                self._packed_blob_cache.move_to_end(item.blob_path)
+            slice_bytes = decompressed[byte_offset:byte_offset + byte_length]
+            return json.loads(slice_bytes.decode("utf-8"))
+
         blob_client = self.blob_service_client.get_blob_client(container=container_name, blob=item.blob_path)
         payload_bytes = blob_client.download_blob().readall()
         return json.loads(payload_bytes.decode("utf-8"))
