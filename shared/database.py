@@ -190,7 +190,8 @@ async def _ensure_enum_values() -> None:
         "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'DISCOVERING';",
         "ALTER TYPE tenanttype ADD VALUE IF NOT EXISTS 'M365';",
         "ALTER TYPE tenanttype ADD VALUE IF NOT EXISTS 'AZURE';",
-        "ALTER TYPE tenanttype ADD VALUE IF NOT EXISTS 'BOTH';",
+        # 'BOTH' removed; legacy deployments may still have it as an orphaned enum
+        # value (harmless — no rows reference it after the migration).
         "ALTER TYPE jobtype ADD VALUE IF NOT EXISTS 'BACKUP';",
         "ALTER TYPE jobtype ADD VALUE IF NOT EXISTS 'RESTORE';",
         "ALTER TYPE jobtype ADD VALUE IF NOT EXISTS 'EXPORT';",
@@ -225,7 +226,7 @@ async def init_db() -> None:
             CREATE TYPE userrole AS ENUM ('SUPER_ADMIN', 'ORG_ADMIN', 'TENANT_ADMIN', 'BACKUP_OPERATOR', 'RESTORE_OPERATOR', 'CONTENT_VIEWER', 'USER');
         EXCEPTION WHEN duplicate_object THEN null; END $$;""",
         """DO $$ BEGIN
-            CREATE TYPE tenanttype AS ENUM ('M365', 'AZURE', 'BOTH');
+            CREATE TYPE tenanttype AS ENUM ('M365', 'AZURE');
         EXCEPTION WHEN duplicate_object THEN null; END $$;""",
         """DO $$ BEGIN
             CREATE TYPE tenantstatus AS ENUM ('PENDING', 'ACTIVE', 'DISCONNECTED', 'SUSPENDED', 'PENDING_DELETION', 'DISCOVERING', 'PENDING_DISCOVERY');

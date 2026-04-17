@@ -576,135 +576,130 @@ class GraphClient:
         return resources
 
     async def discover_power_platform(self) -> List[Dict[str, Any]]:
-        """Discover Power Platform resources using Power Platform Admin APIs and Power BI APIs"""
+        """Discover Power Platform resources via PowerPlatformClient (correct audience).
+
+        Previously this code hand-rolled HTTP against api.bap.microsoft.com using
+        a Graph-scoped token, which Microsoft rejects with 401
+        InvalidAuthenticationAudience (the BAP admin endpoints require a
+        service.powerapps.com-scoped token). PowerPlatformClient gets the right
+        token audience, so environments / apps / flows / DLP policies actually
+        come back here.
+
+        Power BI is orthogonal and still uses PowerBIClient (different REST
+        surface, different scope)."""
+        from shared.power_platform_client import PowerPlatformClient
         resources = []
-        token = await self._get_token()
 
-        # 1. Discover Power Platform Environments using Power Platform Admin API
+        pp = PowerPlatformClient(
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+            tenant_id=self.tenant_id,
+        )
+
+        # 1. Environments
         try:
-            env_url = "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments"
-            headers = {"Authorization": f"Bearer {token}"}
-            async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
-                resp = await client.get(env_url, headers=headers)
-                if resp.status_code == 200:
-                    env_data = resp.json()
-                    environments = env_data.get("value", [])
-                else:
-                    print(f"Error fetching Power Platform environments: {resp.status_code} {resp.text}")
-                    environments = []
+            envs_data = await pp.list_environments()
+            environments = envs_data.get("value", []) if isinstance(envs_data, dict) else []
+        except Exception as e:
+            print(f"[discover_power_platform] list_environments failed: {e}")
+            environments = []
 
-            for env in environments:
-                env_id = env.get("name")
-                env_props = env.get("properties", {})
-                env_name = env_props.get("displayName", env_id)
-                env_type = env_props.get("environmentType", "Unknown")
-                env_region = env_props.get("location", {}).get("name", "Unknown")
-                has_dataverse = env_props.get("linkedEnvironmentMetadata", {}).get("CommonDataService") is not None
+        for env in environments:
+            env_id = env.get("name")
+            env_props = env.get("properties", {})
+            env_name = env_props.get("displayName", env_id)
+            env_type = env_props.get("environmentType", "Unknown")
+            env_region = (env_props.get("location", {}) or {}).get("name", "Unknown") \
+                if isinstance(env_props.get("location"), dict) else env_props.get("location", "Unknown")
+            has_dataverse = (env_props.get("linkedEnvironmentMetadata", {}) or {}).get("CommonDataService") is not None
 
-                # Add environment as a resource
+            # Environment itself as a POWER_APPS row (external_id prefixed "env_"
+            # so the Recovery RestoreModal can distinguish environments from apps)
+            resources.append({
+                "external_id": f"env_{env_id}",
+                "display_name": f"{env_name} (Environment)",
+                "email": None,
+                "type": "POWER_APPS",
+                "metadata": {
+                    "environment_id": env_id,
+                    "environment_type": env_type,
+                    "region": env_region,
+                    "has_dataverse": has_dataverse,
+                    "created_time": env_props.get("createdTime"),
+                },
+            })
+
+            # 2. Power Apps in this environment
+            try:
+                apps_data = await pp.list_apps(env_id)
+                for app in (apps_data.get("value", []) if isinstance(apps_data, dict) else []):
+                    app_props = app.get("properties", {})
+                    resources.append({
+                        "external_id": f"app_{app.get('id', app.get('name'))}",
+                        "display_name": app_props.get("displayName", app.get("name", "Unknown App")),
+                        "email": None,
+                        "type": "POWER_APPS",
+                        "metadata": {
+                            "app_id": app.get("name"),
+                            "environment_id": env_id,
+                            "environment_name": env_name,
+                            "app_type": app_props.get("appType"),
+                            "created_by": (app_props.get("createdBy", {}) or {}).get("displayName"),
+                            "created_time": app_props.get("createdTime"),
+                            "modified_time": app_props.get("lastModifiedTime"),
+                        },
+                    })
+            except Exception as e:
+                print(f"[discover_power_platform] list_apps failed for env {env_id}: {e}")
+
+            # 3. Power Automate flows in this environment
+            try:
+                flows_data = await pp.list_flows(env_id)
+                for flow in (flows_data.get("value", []) if isinstance(flows_data, dict) else []):
+                    flow_props = flow.get("properties", {})
+                    resources.append({
+                        "external_id": f"flow_{flow.get('id', flow.get('name'))}",
+                        "display_name": flow_props.get("displayName", flow.get("name", "Unknown Flow")),
+                        "email": None,
+                        "type": "POWER_AUTOMATE",
+                        "metadata": {
+                            "flow_id": flow.get("name"),
+                            "environment_id": env_id,
+                            "environment_name": env_name,
+                            "state": flow_props.get("state"),
+                            "created_by": (flow_props.get("createdBy", {}) or {}).get("displayName"),
+                            "created_time": flow_props.get("createdTime"),
+                            "modified_time": flow_props.get("lastModifiedTime"),
+                        },
+                    })
+            except Exception as e:
+                print(f"[discover_power_platform] list_flows failed for env {env_id}: {e}")
+
+        # 4. Tenant-level DLP policies
+        try:
+            dlp_data = await pp.list_dlp_policies()
+            for policy in (dlp_data.get("value", []) if isinstance(dlp_data, dict) else []):
+                policy_id = policy.get("name") or policy.get("id")
+                policy_props = policy.get("properties", {})
+                if not policy_id:
+                    continue
                 resources.append({
-                    "external_id": f"env_{env_id}",
-                    "display_name": f"{env_name} (Environment)",
+                    "external_id": f"dlp_{policy_id}",
+                    "display_name": policy_props.get("displayName", policy_id),
                     "email": None,
-                    "type": "POWER_APPS",
+                    "type": "POWER_DLP",
                     "metadata": {
-                        "environment_id": env_id,
-                        "environment_type": env_type,
-                        "region": env_region,
-                        "has_dataverse": has_dataverse,
-                        "created_time": env_props.get("createdTime"),
+                        "policy_id": policy_id,
+                        "policy_type": policy_props.get("policyType"),
+                        "environment_type": policy_props.get("environmentType"),
+                        "created_time": policy_props.get("createdTime"),
+                        "modified_time": policy_props.get("lastModifiedTime"),
                     },
                 })
-
-                # 2. Discover Power Apps in each environment
-                try:
-                    apps_url = f"https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments/{env_id}/resources/Microsoft.PowerApps"
-                    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
-                        apps_resp = await client.get(apps_url, headers=headers)
-                        if apps_resp.status_code == 200:
-                            apps_data = apps_resp.json()
-                            for app in apps_data.get("value", []):
-                                app_props = app.get("properties", {})
-                                resources.append({
-                                    "external_id": f"app_{app.get('id', app.get('name'))}",
-                                    "display_name": app_props.get("displayName", app.get("name", "Unknown App")),
-                                    "email": None,
-                                    "type": "POWER_APPS",
-                                    "metadata": {
-                                        "app_id": app.get("name"),
-                                        "environment_id": env_id,
-                                        "environment_name": env_name,
-                                        "app_type": app_props.get("appType"),
-                                        "created_by": app_props.get("createdBy", {}).get("displayName"),
-                                        "created_time": app_props.get("createdTime"),
-                                        "modified_time": app_props.get("lastModifiedTime"),
-                                    },
-                                })
-                except Exception as e:
-                    print(f"Error discovering Power Apps for env {env_id}: {e}")
-
-                # 3. Discover Power Automate flows in each environment
-                try:
-                    flows_url = f"https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments/{env_id}/resources/Microsoft.Flow"
-                    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
-                        flows_resp = await client.get(flows_url, headers=headers)
-                        if flows_resp.status_code == 200:
-                            flows_data = flows_resp.json()
-                            for flow in flows_data.get("value", []):
-                                flow_props = flow.get("properties", {})
-                                resources.append({
-                                    "external_id": f"flow_{flow.get('id', flow.get('name'))}",
-                                    "display_name": flow_props.get("displayName", flow.get("name", "Unknown Flow")),
-                                    "email": None,
-                                    "type": "POWER_AUTOMATE",
-                                    "metadata": {
-                                        "flow_id": flow.get("name"),
-                                        "environment_id": env_id,
-                                        "environment_name": env_name,
-                                        "state": flow_props.get("state"),
-                                        "created_by": flow_props.get("createdBy", {}).get("displayName"),
-                                        "created_time": flow_props.get("createdTime"),
-                                        "modified_time": flow_props.get("lastModifiedTime"),
-                                    },
-                                })
-                except Exception as e:
-                    print(f"Error discovering Power Automate flows for env {env_id}: {e}")
-
         except Exception as e:
-            print(f"Error discovering Power Platform environments: {e}")
+            print(f"[discover_power_platform] list_dlp_policies failed: {e}")
 
-        # 3b. Discover tenant-level DLP policies (Power Platform governance)
-        try:
-            dlp_url = "https://api.bap.microsoft.com/providers/PowerPlatform.Governance/v2/policies"
-            headers = {"Authorization": f"Bearer {token}"}
-            async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
-                dlp_resp = await client.get(dlp_url, headers=headers, params={"api-version": "2020-10-01"})
-                if dlp_resp.status_code == 200:
-                    dlp_data = dlp_resp.json()
-                    for policy in dlp_data.get("value", []):
-                        policy_id = policy.get("name") or policy.get("id")
-                        policy_props = policy.get("properties", {})
-                        if not policy_id:
-                            continue
-                        resources.append({
-                            "external_id": f"dlp_{policy_id}",
-                            "display_name": policy_props.get("displayName", policy_id),
-                            "email": None,
-                            "type": "POWER_DLP",
-                            "metadata": {
-                                "policy_id": policy_id,
-                                "policy_type": policy_props.get("policyType"),
-                                "environment_type": policy_props.get("environmentType"),
-                                "created_time": policy_props.get("createdTime"),
-                                "modified_time": policy_props.get("lastModifiedTime"),
-                            },
-                        })
-                else:
-                    print(f"Error fetching DLP policies: {dlp_resp.status_code} {dlp_resp.text[:200]}")
-        except Exception as e:
-            print(f"Error discovering DLP policies: {e}")
-
-        # 4. Discover Power BI workspaces via Power BI REST API
+        # 5. Discover Power BI workspaces via Power BI REST API
         try:
             power_bi_client = PowerBIClient(
                 tenant_id=self.tenant_id,

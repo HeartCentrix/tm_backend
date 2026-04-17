@@ -349,10 +349,9 @@ async def datasource_callback(
         tenant.graph_client_id = settings.MICROSOFT_CLIENT_ID
         tenant.graph_client_secret_encrypted = encrypted_secret
         tenant.status = TenantStatus.ACTIVE
-        # If existing tenant is AZURE type, upgrade to BOTH (M365 + Azure connected)
-        if tenant.type == TenantType.AZURE:
-            tenant.type = TenantType.BOTH
-            print(f"[auth-service] Upgraded tenant {tenant.id} from AZURE to BOTH")
+        # If an existing AZURE tenant is being re-onboarded through the M365 flow,
+        # it remains an AZURE tenant — we no longer flip to a combined type.
+        # To back up M365 on the same Microsoft tenant, create a second tenant row.
 
     await db.flush()
     tenant_id = tenant.id
@@ -538,11 +537,8 @@ async def azure_datasource_callback(
         print(f"[auth-service] Created Azure tenant: {tenant.id} ({display_name}), external_tenant_id={external_tenant_id}")
     else:
         print(f"[auth-service] Azure tenant already exists: {tenant.id} ({tenant.display_name}), type={tenant.type}")
-        # If existing tenant is M365 type, upgrade to BOTH (M365 + Azure connected)
-        if tenant.type == TenantType.M365:
-            tenant.type = TenantType.BOTH
-            print(f"[auth-service] Upgraded tenant {tenant.id} from M365 to BOTH")
-            await db.commit()
+        # Existing tenant keeps its original type. To onboard Azure on an M365
+        # tenant (or vice versa), create a separate tenant row for the other side.
 
     # Store an active AZURE consent token so the Settings status card reflects
     # a successful Azure connect instead of remaining "Not granted".
@@ -770,7 +766,7 @@ async def get_azure_admin_consent_status(
     if token is None:
         tenant_stmt = select(Tenant).where(
             Tenant.org_id == org_id,
-            Tenant.type.in_([TenantType.AZURE, TenantType.BOTH]),
+            Tenant.type == TenantType.AZURE,
         ).order_by(Tenant.updated_at.desc()).limit(1)
         tenant = (await db.execute(tenant_stmt)).scalar_one_or_none()
         if tenant is None:

@@ -29,7 +29,8 @@ class UserRole(str, enum.Enum):
 class TenantType(str, enum.Enum):
     M365 = "M365"
     AZURE = "AZURE"
-    BOTH = "BOTH"
+    # Legacy 'BOTH' removed. A tenant is now exactly one workload type; to back up
+    # M365 + Azure for the same Microsoft tenant, create two tenant rows.
 
 
 class TenantStatus(str, enum.Enum):

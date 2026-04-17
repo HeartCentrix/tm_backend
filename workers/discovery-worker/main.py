@@ -924,7 +924,7 @@ async def run_all_discoveries():
     async with async_session_factory() as db:
         try:
             stmt = select(Tenant).where(
-                text("type IN ('M365', 'AZURE', 'BOTH')"),
+                text("type IN ('M365', 'AZURE')"),
                 text("status IN ('ACTIVE', 'PENDING', 'DISCOVERING')"),
             )
             result = await db.execute(stmt)

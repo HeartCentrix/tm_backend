@@ -873,7 +873,7 @@ async def ingest_m365_audit_logs():
             select(Tenant).where(
                 and_(
                     Tenant.status == TenantStatus.ACTIVE,
-                    Tenant.type.in_([TenantType.M365, TenantType.BOTH]),
+                    Tenant.type == TenantType.M365,
                     Tenant.client_id.isnot(None),
                     Tenant.external_tenant_id.isnot(None),
                 )
