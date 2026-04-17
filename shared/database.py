@@ -176,6 +176,17 @@ async def _ensure_enum_values() -> None:
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'M365_GROUP';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_CONDITIONAL_ACCESS';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_BITLOCKER_KEY';",
+        # Per-user Teams chat export shard — emitted by the legacy full-discovery
+        # path; we keep it valid in the enum so cold boots that ran a stale
+        # image (or older queued discovery messages) don't crash the staging
+        # insert.
+        "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'TEAMS_CHAT_EXPORT';",
+        # Tier 2 per-user content categories — children of an ENTRA_USER row.
+        "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'USER_MAIL';",
+        "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'USER_ONEDRIVE';",
+        "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'USER_CONTACTS';",
+        "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'USER_CALENDAR';",
+        "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'USER_CHATS';",
         "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'PENDING_DISCOVERY';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'QUEUED';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'RUNNING';",
@@ -699,6 +710,8 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_resource_groups_priority ON resource_groups(tenant_id, priority, enabled)",
         "CREATE INDEX IF NOT EXISTS idx_group_policy_assignments_group ON group_policy_assignments(group_id)",
         "CREATE INDEX IF NOT EXISTS idx_group_policy_assignments_policy ON group_policy_assignments(policy_id)",
+        # Two-tier discovery — fast lookup of all child rows under a parent user.
+        "CREATE INDEX IF NOT EXISTS ix_resources_parent_id ON resources(parent_resource_id)",
     ]
 
     add_column_statements = [
@@ -707,6 +720,8 @@ async def init_db() -> None:
         "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_resource_group VARCHAR;",
         "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_region VARCHAR;",
         "ALTER TABLE resources ADD COLUMN IF NOT EXISTS resource_hash VARCHAR;",
+        # Two-tier discovery: child rows point at their parent user resource.
+        "ALTER TABLE resources ADD COLUMN IF NOT EXISTS parent_resource_id UUID REFERENCES resources(id) ON DELETE CASCADE;",
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS azure_restore_point_id VARCHAR;",
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS azure_operation_id VARCHAR;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_hot_days INTEGER DEFAULT 7;",

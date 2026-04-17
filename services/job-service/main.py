@@ -12,7 +12,7 @@ from sqlalchemy import select, func, text
 
 from shared.config import settings
 from shared.database import get_db, close_db, AsyncSession, engine
-from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot, SnapshotItem, SlaPolicy, ResourceType, ResourceStatus
+from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot, SnapshotItem, SnapshotStatus, SlaPolicy, ResourceType, ResourceStatus
 from shared.schemas import (
     JobResponse, JobListResponse, TriggerBackupRequest, TriggerBulkBackupRequest, TriggerDatasourceBackupRequest
 )
@@ -301,14 +301,54 @@ async def get_job_progress(job_id: str, token: Optional[str] = Query(None)):
 
 @app.post("/api/v1/jobs/{job_id}/cancel", status_code=204)
 async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
-    stmt = select(Job).where(Job.id == UUID(job_id))
-    result = await db.execute(stmt)
-    job = result.scalar_one_or_none()
+    """Cancel a job and cascade the cancellation to its dependents.
+
+    Cascade:
+      1. Job.status → CANCELLED.
+      2. Every related Resource (single resource_id OR each id in
+         batch_resource_ids) gets last_backup_status='CANCELLED' so the
+         Protection page reflects the cancellation immediately, matching
+         what the Activity page shows for the same job.
+      3. Any IN_PROGRESS snapshot tied to this job is flipped to FAILED —
+         SnapshotStatus has no CANCELLED value, and FAILED is closer to the
+         truth than leaving it permanently 'in progress'.
+
+    The worker's batch loop doesn't poll mid-flight, so an already-running
+    backup may still complete its current resource — but downstream state is
+    consistent the moment the cancel returns."""
+    job = (await db.execute(select(Job).where(Job.id == UUID(job_id)))).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.status in [JobStatus.QUEUED, JobStatus.RUNNING]:
-        job.status = JobStatus.CANCELLED
-        await db.flush()
+    if job.status not in (JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.RETRYING):
+        # Already terminal — nothing to cascade.
+        return
+
+    job.status = JobStatus.CANCELLED
+    job.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # Collect every resource this job touched.
+    resource_ids: List[UUID] = []
+    if job.resource_id:
+        resource_ids.append(job.resource_id)
+    for rid in (job.batch_resource_ids or []):
+        try:
+            resource_ids.append(UUID(rid) if isinstance(rid, str) else rid)
+        except (ValueError, TypeError):
+            continue
+
+    if resource_ids:
+        await db.execute(
+            text("UPDATE resources SET last_backup_status = 'CANCELLED', last_backup_job_id = :jid WHERE id = ANY(:ids)"),
+            {"jid": job.id, "ids": resource_ids},
+        )
+        # Mark any in-flight snapshots for this job as FAILED so the
+        # Recovery page doesn't show a permanently-spinning row.
+        await db.execute(
+            text("UPDATE snapshots SET status = 'FAILED' WHERE job_id = :jid AND status = 'IN_PROGRESS'"),
+            {"jid": job.id},
+        )
+
+    await db.flush()
 
 
 @app.post("/api/v1/jobs/{job_id}/retry", response_model=JobResponse)

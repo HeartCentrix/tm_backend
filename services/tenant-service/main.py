@@ -29,12 +29,20 @@ TYPE_MAP = {
     "TEAMS_CHAT": ResourceType.TEAMS_CHAT,
     "ENTRA_USER": ResourceType.ENTRA_USER,
     "ENTRA_GROUP": ResourceType.ENTRA_GROUP,
+    "M365_GROUP": ResourceType.M365_GROUP,
+    "DYNAMIC_GROUP": ResourceType.DYNAMIC_GROUP,
     "ENTRA_APP": ResourceType.ENTRA_APP,
     "ENTRA_DEVICE": ResourceType.ENTRA_DEVICE,
     "POWER_BI": ResourceType.POWER_BI,
     "POWER_APPS": ResourceType.POWER_APPS,
     "POWER_AUTOMATE": ResourceType.POWER_AUTOMATE,
     "POWER_DLP": ResourceType.POWER_DLP,
+    # Tier 2 child types — created by the per-user content discovery endpoint.
+    "USER_MAIL": ResourceType.USER_MAIL,
+    "USER_ONEDRIVE": ResourceType.USER_ONEDRIVE,
+    "USER_CONTACTS": ResourceType.USER_CONTACTS,
+    "USER_CALENDAR": ResourceType.USER_CALENDAR,
+    "USER_CHATS": ResourceType.USER_CHATS,
 }
 
 
@@ -308,6 +316,82 @@ async def trigger_azure_discovery(tenant_id: str, db: AsyncSession = Depends(get
     }, priority=5)
 
     return {"discoveryId": discovery_id, "tenantId": str(tenant.id), "resourcesFound": -1}
+
+
+@app.post("/api/v1/tenants/{tenant_id}/users/{user_resource_id}/discover-content")
+async def discover_user_content(
+    tenant_id: str,
+    user_resource_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Tier 2 discovery: fetch the five fixed content categories
+    (Mail / OneDrive / Contacts / Calendar / Chats) for one user and persist
+    them as child rows under the user resource.
+
+    Triggered when the user opens the backup flow for a specific user — gives
+    the UI per-content counts and gives the backup worker the IDs it needs
+    (drive id, chat ids, etc.) without re-walking Graph at backup time."""
+    tenant = (await db.execute(select(Tenant).where(Tenant.id == UUID(tenant_id)))).scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    user = (await db.execute(
+        select(Resource).where(Resource.id == UUID(user_resource_id), Resource.tenant_id == tenant.id)
+    )).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User resource not found")
+    if user.type != ResourceType.ENTRA_USER:
+        raise HTTPException(status_code=400, detail=f"Resource type {user.type.value} is not a user (must be ENTRA_USER)")
+
+    client_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
+    client_secret = settings.MICROSOFT_CLIENT_SECRET or settings.AZURE_AD_CLIENT_SECRET
+    ext_tenant_id = tenant.external_tenant_id or settings.MICROSOFT_TENANT_ID or settings.AZURE_AD_TENANT_ID or "common"
+    graph = GraphClient(client_id, client_secret, ext_tenant_id)
+
+    upn = (user.extra_data or {}).get("user_principal_name") or user.email
+    children = await graph.discover_user_content(
+        user_external_id=user.external_id,
+        user_principal_name=upn,
+        user_display_name=user.display_name,
+    )
+
+    upserted = 0
+    for c in children:
+        rtype = TYPE_MAP.get(c["type"])
+        if rtype is None:
+            continue
+        existing = (await db.execute(
+            select(Resource).where(
+                Resource.tenant_id == tenant.id,
+                Resource.type == rtype,
+                Resource.parent_resource_id == user.id,
+            )
+        )).scalar_one_or_none()
+        if existing:
+            existing.display_name = c["display_name"]
+            existing.email = c.get("email")
+            existing.extra_data = c.get("metadata", {})
+            existing.external_id = c["external_id"]
+        else:
+            db.add(Resource(
+                id=uuid4(),
+                tenant_id=tenant.id,
+                type=rtype,
+                external_id=c["external_id"],
+                display_name=c["display_name"],
+                email=c.get("email"),
+                extra_data=c.get("metadata", {}),
+                parent_resource_id=user.id,
+                status=ResourceStatus.DISCOVERED,
+            ))
+        upserted += 1
+    await db.commit()
+    return {
+        "tenantId": tenant_id,
+        "userResourceId": user_resource_id,
+        "contentDiscovered": upserted,
+        "categories": [c["type"] for c in children],
+    }
 
 
 @app.get("/api/v1/tenants/{tenant_id}/discovery-status", response_model=DiscoveryStatus)

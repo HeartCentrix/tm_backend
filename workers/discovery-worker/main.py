@@ -103,11 +103,20 @@ DISCOVERY_SCOPE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "groups": {"method": "discover_groups", "resource_types": {ResourceType.ENTRA_GROUP, ResourceType.M365_GROUP}},
     "mailboxes": {
         "method": "discover_mailboxes",
+        # Tier 1 only emits SHARED + ROOM mailboxes (user MAILBOX rows are
+        # Tier 2 children of an ENTRA_USER); leave MAILBOX in the stale-mark
+        # set so legacy rows still get cleaned up by the next pass.
         "resource_types": {ResourceType.MAILBOX, ResourceType.SHARED_MAILBOX, ResourceType.ROOM_MAILBOX},
     },
     "onedrive": {"method": "discover_onedrive", "resource_types": {ResourceType.ONEDRIVE}},
     "sharepoint": {"method": "discover_sharepoint", "resource_types": {ResourceType.SHAREPOINT_SITE}},
-    "teams": {"method": "discover_teams", "resource_types": {ResourceType.TEAMS_CHANNEL, ResourceType.TEAMS_CHAT, ResourceType.TEAMS_CHAT_EXPORT}},
+    # Tier 1: channels only. Per-user TEAMS_CHAT + TEAMS_CHAT_EXPORT shards
+    # are now produced by the Tier 2 per-user discovery, not the tenant scan.
+    "teams": {
+        "method": "discover_teams",
+        "method_kwargs": {"include_chats": False},
+        "resource_types": {ResourceType.TEAMS_CHANNEL},
+    },
     "planner": {"method": "discover_planner", "resource_types": {ResourceType.PLANNER}},
     "todo": {"method": "discover_todo", "resource_types": {ResourceType.TODO}},
     "power_platform": {
@@ -131,9 +140,23 @@ DISCOVERY_SCOPE_ALIASES: Dict[str, str] = {
     "shared_mailboxes": "mailboxes",
 }
 
-FULL_DISCOVERY_RESOURCE_TYPES: Set[ResourceType] = set().union(
-    *(spec["resource_types"] for spec in DISCOVERY_SCOPE_DEFINITIONS.values())
-)
+FULL_DISCOVERY_RESOURCE_TYPES: Set[ResourceType] = {
+    # Tier 1 only — what `graph.discover_all()` actually scans. If you add a
+    # category to discover_all, mirror it here so stale-marking covers it; if
+    # you don't, leave it out so a tenant-wide scan doesn't accidentally
+    # mark, say, every PLANNER row stale just because we no longer scan
+    # planner by default.
+    ResourceType.ENTRA_USER,
+    ResourceType.ENTRA_GROUP,
+    ResourceType.M365_GROUP,
+    ResourceType.SHARED_MAILBOX,
+    ResourceType.ROOM_MAILBOX,
+    ResourceType.SHAREPOINT_SITE,
+    ResourceType.TEAMS_CHANNEL,
+    ResourceType.POWER_BI,
+    ResourceType.POWER_APPS,
+    ResourceType.POWER_AUTOMATE,
+}
 
 STAGE_INSERT_STMT = text(
     """
@@ -705,8 +728,9 @@ async def _discover_resources_for_scope(
     async def _safe_discover(scope_name: str) -> Tuple[str, List[Dict[str, Any]], bool]:
         spec = DISCOVERY_SCOPE_DEFINITIONS[scope_name]
         method = getattr(graph, spec["method"])
+        kwargs = spec.get("method_kwargs") or {}
         try:
-            result = await method()
+            result = await method(**kwargs)
             logger.info("Scoped discovery '%s' returned %d resource(s)", scope_name, len(result))
             return scope_name, result, False
         except Exception as exc:

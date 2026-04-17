@@ -314,6 +314,8 @@ class GraphClient:
             classification = self._classify_group(g)
             counts[classification] = counts.get(classification, 0) + 1
             provisioning = [p.lower() for p in (g.get("resourceProvisioningOptions") or [])]
+            group_types_lc = [t.lower() for t in (g.get("groupTypes") or [])]
+            is_dynamic = "dynamicmembership" in group_types_lc
             metadata = {
                 "mail_enabled": g.get("mailEnabled"),
                 "security_enabled": g.get("securityEnabled"),
@@ -324,6 +326,11 @@ class GraphClient:
                 "group_classification": classification,
                 "has_team": "team" in provisioning,
                 "resource_provisioning_options": g.get("resourceProvisioningOptions") or [],
+                # Auto-protection bucket flags — surfaced for the Protection
+                # page so the user can target dynamic / Entra-only groups
+                # without needing the UI to re-derive these from groupTypes.
+                "is_dynamic_group": is_dynamic,
+                "auto_protect_eligible": classification in ("M365_GROUP", "SECURITY_GROUP") or is_dynamic,
             }
             groups.append({
                 "external_id": g.get("id"),
@@ -346,7 +353,7 @@ class GraphClient:
     #   3. Build resource records based on userPurpose value
     # ------------------------------------------------------------------
 
-    async def discover_mailboxes(self) -> List[Dict[str, Any]]:
+    async def discover_mailboxes(self, kinds: Optional[set] = None) -> List[Dict[str, Any]]:
         """
         Discover all mailboxes by enriching users with userPurpose.
 
@@ -356,6 +363,11 @@ class GraphClient:
           "room"      → ROOM_MAILBOX
           "equipment" → ROOM_MAILBOX
           None/other  → skipped (no mailbox)
+
+        `kinds`, if supplied, restricts the result to those resource type
+        strings — e.g. {"SHARED_MAILBOX","ROOM_MAILBOX"} for Tier 1, which
+        excludes per-user MAILBOX rows (those are emitted as USER_MAIL Tier 2
+        children later, on demand).
         """
         # Step 1: Fetch all users (no $filter — get everyone). Add userType so we
         # can drop guests; afi.ai never backs up guest mailboxes (they live in their
@@ -463,6 +475,8 @@ class GraphClient:
 
         for r in results:
             if r:
+                if kinds and r["type"] not in kinds:
+                    continue
                 mailboxes.append(r)
 
         print(f"[GraphClient] discover_mailboxes: found {len(mailboxes)} mailboxes "
@@ -545,8 +559,14 @@ class GraphClient:
             })
         return sites
     
-    async def discover_teams(self) -> List[Dict[str, Any]]:
-        """Discover Teams groups (for channels) and all chats (1-on-1 and group)"""
+    async def discover_teams(self, include_chats: bool = True) -> List[Dict[str, Any]]:
+        """Discover Teams groups (for channels) and, when ``include_chats`` is
+        True, every 1:1 / group chat across the tenant.
+
+        Tier 1 callers pass ``include_chats=False`` because per-user chat
+        enumeration is deferred to Tier 2 (`discover_user_content`). The chat
+        scan is the slowest part of this method (one /users/{id}/chats round-
+        trip per user) so skipping it is a meaningful speedup."""
         resources = []
 
         # 1. Discover Teams groups (for channel backups)
@@ -575,6 +595,8 @@ class GraphClient:
         # 2. Discover all chats (1-on-1 and group chats)
         # Note: GET /chats (global) does NOT support app-only auth.
         # We use GET /users/{id}/chats per-user, which DOES support app-only with Chat.Read.All.
+        if not include_chats:
+            return resources
         try:
             import time
 
@@ -1031,33 +1053,37 @@ class GraphClient:
         return resources
     
     async def discover_all(self) -> List[Dict[str, Any]]:
-        """Run full discovery in PARALLEL and return all resources"""
+        """Tier 1 discovery — runs on datasource add and on the protection
+        page's "refresh" button. Discovers only top-level container resources
+        (Users, Shared Mailboxes, Rooms, SharePoint sites, Groups & Teams,
+        Power Platform). Per-user content (Mail/OneDrive/Contacts/Calendar/
+        Chats) is deferred to Tier 2 and runs on demand via
+        `discover_user_content()` when a user is selected for backup.
+
+        Excluded from Tier 1 (still callable individually as scoped scans):
+          discover_onedrive (per-user → Tier 2)
+          discover_planner / discover_todo (low-frequency, opt-in)
+          discover_conditional_access / discover_bitlocker_keys (Entra security
+            singletons — opt-in)
+          chats inside discover_teams (per-user → Tier 2; channels stay)
+          user mailboxes inside discover_mailboxes (per-user → Tier 2; shared
+            + room mailboxes stay since they're tenant-level)"""
         all_resources = []
 
         async def _safe_discover(name, coro):
-            """Run a discovery coroutine safely, catching errors."""
             try:
-                result = await coro
-                return result
+                return await coro
             except Exception as e:
                 print(f"Error discovering {name}: {e}")
                 return []
 
-        # Run ALL discovery endpoints in parallel (Graph API, users, groups, mailboxes,
-        # OneDrive, SharePoint, Teams chats/channels, Power Platform)
         tasks = [
             _safe_discover("users", self.discover_users()),
             _safe_discover("groups", self.discover_groups()),
-            _safe_discover("mailboxes", self.discover_mailboxes()),
-            _safe_discover("onedrive", self.discover_onedrive()),
+            _safe_discover("mailboxes (shared+rooms)", self.discover_mailboxes(kinds={"SHARED_MAILBOX", "ROOM_MAILBOX"})),
             _safe_discover("sharepoint", self.discover_sharepoint()),
-            _safe_discover("teams", self.discover_teams()),
-            _safe_discover("planner", self.discover_planner()),
-            _safe_discover("todo", self.discover_todo()),
+            _safe_discover("teams (channels)", self.discover_teams(include_chats=False)),
             _safe_discover("power_platform", self.discover_power_platform()),
-            # Phase 2 P2 — security-critical Entra extras
-            _safe_discover("conditional_access", self.discover_conditional_access()),
-            _safe_discover("bitlocker", self.discover_bitlocker_keys()),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1077,6 +1103,155 @@ class GraphClient:
                 unique.append(r)
 
         return unique
+
+    # ── Tier 2 per-user content discovery ───────────────────────────────────
+    # Runs on demand when the user clicks "back up" on a specific Entra user.
+    # Returns five fixed buckets (Mail, OneDrive, Contacts, Calendar, Chats),
+    # each a self-describing dict with type=USER_*, parent_external_id set to
+    # the Entra user ID, and a metadata blob carrying counts/IDs the backup
+    # worker can use to plan its run. We deliberately do NOT enumerate every
+    # message/file here — that's the backup worker's job. The summary counts
+    # exist so the Protection / Recovery UI can show the user "you have X
+    # mailbox folders, Y OneDrive items, …" without a second discovery pass.
+
+    async def discover_user_content(
+        self,
+        user_external_id: str,
+        user_principal_name: Optional[str] = None,
+        user_display_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Discover the five fixed content categories for one Entra user.
+
+        Returns up to 5 dicts (type ∈ USER_MAIL, USER_ONEDRIVE, USER_CONTACTS,
+        USER_CALENDAR, USER_CHATS). A category is omitted if Graph returns
+        404/403 (e.g. user has no mailbox / OneDrive not provisioned)."""
+        display = user_display_name or user_principal_name or user_external_id
+        email = user_principal_name
+
+        async def _safe(name: str, coro):
+            try:
+                return await coro
+            except Exception as e:
+                msg = str(e)
+                if "404" in msg or "403" in msg or "423" in msg:
+                    return None
+                print(f"[GraphClient] discover_user_content {name} failed for {display}: {e}")
+                return None
+
+        # Mail — folder count + storage estimate.
+        async def _mail():
+            folders = await self._get(
+                f"{self.GRAPH_URL}/users/{user_external_id}/mailFolders",
+                params={"$top": "999", "$select": "id,displayName,totalItemCount,unreadItemCount"},
+            )
+            folder_list = folders.get("value", []) or []
+            total_items = sum(int(f.get("totalItemCount") or 0) for f in folder_list)
+            return {
+                "external_id": f"{user_external_id}:mail",
+                "display_name": f"Mail — {display}",
+                "email": email,
+                "type": "USER_MAIL",
+                "parent_external_id": user_external_id,
+                "metadata": {
+                    "user_id": user_external_id,
+                    "user_principal_name": user_principal_name,
+                    "folder_count": len(folder_list),
+                    "item_count": total_items,
+                },
+            }
+
+        # OneDrive — drive id + quota.
+        async def _onedrive():
+            drive = await self._get(f"{self.GRAPH_URL}/users/{user_external_id}/drive")
+            if not drive or not drive.get("id"):
+                return None
+            return {
+                "external_id": f"{user_external_id}:onedrive",
+                "display_name": f"OneDrive — {display}",
+                "email": email,
+                "type": "USER_ONEDRIVE",
+                "parent_external_id": user_external_id,
+                "metadata": {
+                    "user_id": user_external_id,
+                    "drive_id": drive.get("id"),
+                    "web_url": drive.get("webUrl"),
+                    "quota": drive.get("quota", {}),
+                },
+            }
+
+        # Contacts — folder + count.
+        async def _contacts():
+            folders = await self._get(
+                f"{self.GRAPH_URL}/users/{user_external_id}/contactFolders",
+                params={"$top": "100", "$select": "id,displayName"},
+            )
+            folder_list = folders.get("value", []) or []
+            # Count items in default contacts folder (cheap probe; full count
+            # would need per-folder GETs).
+            count_probe = await self._get(
+                f"{self.GRAPH_URL}/users/{user_external_id}/contacts/$count",
+            ) if not folder_list else None
+            return {
+                "external_id": f"{user_external_id}:contacts",
+                "display_name": f"Contacts — {display}",
+                "email": email,
+                "type": "USER_CONTACTS",
+                "parent_external_id": user_external_id,
+                "metadata": {
+                    "user_id": user_external_id,
+                    "folder_count": len(folder_list),
+                    "default_folder_count": count_probe if isinstance(count_probe, int) else None,
+                },
+            }
+
+        # Calendar — list of calendars.
+        async def _calendar():
+            cals = await self._get(
+                f"{self.GRAPH_URL}/users/{user_external_id}/calendars",
+                params={"$top": "100", "$select": "id,name,canEdit,owner"},
+            )
+            cal_list = cals.get("value", []) or []
+            return {
+                "external_id": f"{user_external_id}:calendar",
+                "display_name": f"Calendar — {display}",
+                "email": email,
+                "type": "USER_CALENDAR",
+                "parent_external_id": user_external_id,
+                "metadata": {
+                    "user_id": user_external_id,
+                    "calendar_count": len(cal_list),
+                    "calendar_names": [c.get("name") for c in cal_list[:10]],
+                },
+            }
+
+        # Chats — chat IDs for this user (1:1 + group).
+        async def _chats():
+            chats = await self._get(
+                f"{self.GRAPH_URL}/users/{user_external_id}/chats",
+                params={"$top": "999", "$select": "id,chatType,topic,lastUpdatedDateTime"},
+            )
+            chat_list = chats.get("value", []) or []
+            return {
+                "external_id": f"{user_external_id}:chats",
+                "display_name": f"Chats — {display}",
+                "email": email,
+                "type": "USER_CHATS",
+                "parent_external_id": user_external_id,
+                "metadata": {
+                    "user_id": user_external_id,
+                    "chat_count": len(chat_list),
+                    "chat_ids": [c.get("id") for c in chat_list],
+                },
+            }
+
+        results = await asyncio.gather(
+            _safe("mail", _mail()),
+            _safe("onedrive", _onedrive()),
+            _safe("contacts", _contacts()),
+            _safe("calendar", _calendar()),
+            _safe("chats", _chats()),
+        )
+        return [r for r in results if r]
 
     # ── Conditional Access policies ─────────────────────────────────────────
     # Tenant-singleton resources — small in number, high in security value.

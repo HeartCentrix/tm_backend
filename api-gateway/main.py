@@ -155,6 +155,7 @@ async def dashboard(request: Request):
 @app.post("/api/v1/tenants/{tenant_id}/discover")
 @app.post("/api/v1/tenants/{tenant_id}/discover-m365")
 @app.post("/api/v1/tenants/{tenant_id}/discover-azure")
+@app.post("/api/v1/tenants/{tenant_id}/users/{user_resource_id}/discover-content")
 @app.get("/api/v1/tenants/{tenant_id}/discovery-status")
 @app.get("/api/v1/tenants/{tenant_id}/storage-summary")
 @app.post("/api/v1/tenants/{tenant_id}/test-connection")
@@ -207,7 +208,13 @@ async def job(request: Request):
 
 # Snapshot routes
 @app.get("/api/v1/resources/snapshots/folders")
-@app.get("/api/v1/resources/snapshots/{snapshot_id}/content-types")
+# Per-content-type browsers — five fixed types replace the old
+# /content-types lookup. /mail and /chats are aliases for /emails and
+# /messages so legacy callers keep working during the cutover.
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/mail")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/onedrive")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/contacts")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/chats")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/emails")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/messages")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/calendar")

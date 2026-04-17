@@ -147,27 +147,6 @@ async def get_snapshot_folders(
     ]
 
 
-@app.get("/api/v1/resources/snapshots/{snapshot_id}/content-types")
-async def get_snapshot_content_types(
-    snapshot_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    """Get distinct content types available in a snapshot."""
-    assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
-    if assembled_items is not None:
-        return {"contentTypes": sorted({item.item_type for item in assembled_items if item.item_type})}
-
-    stmt = (
-        select(distinct(SnapshotItem.item_type))
-        .where(SnapshotItem.snapshot_id == UUID(snapshot_id))
-        .order_by(SnapshotItem.item_type)
-    )
-    result = await db.execute(stmt)
-    types = [row[0] for row in result.fetchall() if row[0]]
-
-    return {"contentTypes": types}
-
-
 @app.get("/api/v1/resources/snapshots/{snapshot_id}", response_model=SnapshotResponse)
 async def get_snapshot(snapshot_id: str, db: AsyncSession = Depends(get_db)):
     stmt = select(Snapshot).where(Snapshot.id == UUID(snapshot_id))
@@ -544,6 +523,7 @@ def _raw(item) -> dict:
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/emails")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/mail")
 async def list_snapshot_emails(
     snapshot_id: str,
     page: int = Query(1, ge=1),
@@ -590,6 +570,7 @@ async def list_snapshot_emails(
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/messages")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/chats")
 async def list_snapshot_messages(
     snapshot_id: str,
     page: int = Query(1, ge=1),
@@ -764,6 +745,87 @@ async def list_snapshot_calendar(
     results = await asyncio.gather(*[fmt(i) for i in items])
     return {"content": list(results), "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
 
+
+# ── Per-content-type endpoints — Tier 2 backup browsers ─────────────────────
+# These five fixed endpoints (mail/onedrive/contacts/calendar/chats) replace
+# the previous dynamic /content-types lookup. The Recovery UI now hardcodes
+# its tabs and queries these directly — no more "what's in this snapshot?"
+# round-trip before render.
+
+ONEDRIVE_ITEM_TYPES = ("FILE", "ONEDRIVE_FILE", "FILE_VERSION")
+CONTACT_ITEM_TYPES = ("USER_CONTACT", "CONTACT")
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/onedrive")
+async def list_snapshot_onedrive(
+    snapshot_id: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(500, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return OneDrive files in a snapshot."""
+    filters = [
+        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.item_type.in_(ONEDRIVE_ITEM_TYPES),
+    ]
+    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
+    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
+    return {
+        "content": [_item_to_response(i) for i in items],
+        "totalElements": total,
+        "totalPages": max(1, (total+size-1)//size),
+        "size": size,
+        "number": page,
+    }
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/contacts")
+async def list_snapshot_contacts(
+    snapshot_id: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(500, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return contacts in a snapshot."""
+    filters = [
+        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.item_type.in_(CONTACT_ITEM_TYPES),
+    ]
+    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
+    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
+
+    def fmt(i):
+        raw = _raw(i)
+        emails = raw.get("emailAddresses") or []
+        phones = raw.get("businessPhones") or []
+        return {
+            "id": str(i.id),
+            "snapshotId": str(i.snapshot_id),
+            "externalId": i.external_id,
+            "itemType": i.item_type,
+            "displayName": raw.get("displayName") or i.name,
+            "givenName": raw.get("givenName") or "",
+            "surname": raw.get("surname") or "",
+            "companyName": raw.get("companyName") or "",
+            "jobTitle": raw.get("jobTitle") or "",
+            "emails": [e.get("address") for e in emails if isinstance(e, dict)],
+            "primaryEmail": (emails[0].get("address") if emails and isinstance(emails[0], dict) else None),
+            "phones": phones,
+            "folderPath": i.folder_path or "Contacts",
+            "contentSize": i.content_size or 0,
+            "isDeleted": i.is_deleted or False,
+            "createdAt": i.created_at.isoformat() if i.created_at else "",
+            "name": raw.get("displayName") or i.name or "",
+            "metadata": {"raw": raw},
+        }
+
+    return {
+        "content": [fmt(i) for i in items],
+        "totalElements": total,
+        "totalPages": max(1, (total+size-1)//size),
+        "size": size,
+        "number": page,
+    }
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")

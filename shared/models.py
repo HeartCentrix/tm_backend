@@ -78,6 +78,15 @@ class ResourceType(str, enum.Enum):
     PLANNER = "PLANNER"
     TODO = "TODO"
     ONENOTE = "ONENOTE"
+    # Tier 2 per-user content categories — children of an ENTRA_USER row,
+    # linked via parent_resource_id. Distinct from the Tier 1 MAILBOX /
+    # ONEDRIVE / TEAMS_CHAT types so stale-marking on a Tier 1 run doesn't
+    # touch Tier 2 children.
+    USER_MAIL = "USER_MAIL"
+    USER_ONEDRIVE = "USER_ONEDRIVE"
+    USER_CONTACTS = "USER_CONTACTS"
+    USER_CALENDAR = "USER_CALENDAR"
+    USER_CHATS = "USER_CHATS"
 
 
 class ResourceStatus(str, enum.Enum):
@@ -218,6 +227,13 @@ class Resource(Base):
     azure_subscription_id = Column(String, nullable=True)
     azure_resource_group = Column(String, nullable=True)
     azure_region = Column(String, nullable=True)
+
+    # Two-tier discovery: Tier 1 creates parent rows (ENTRA_USER, etc.) with
+    # parent_resource_id NULL; Tier 2 creates child rows (MAILBOX, ONEDRIVE,
+    # USER_CONTACTS, USER_CALENDAR, TEAMS_CHAT) pointing at the parent user
+    # via parent_resource_id. Lets the UI group all of a user's backup-ables
+    # under one card.
+    parent_resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id", ondelete="CASCADE"), nullable=True, index=True)
 
 
 class SlaPolicy(Base):

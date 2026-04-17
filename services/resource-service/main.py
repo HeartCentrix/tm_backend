@@ -224,7 +224,7 @@ async def list_resources(
     includeHidden: bool = Query(False),  # opt-in to include UI_HIDDEN_TYPES like POWER_BI
     db: AsyncSession = Depends(get_db),
 ):
-    status_clause = "AND status = :rstatus" if status else ""
+    status_clause = "AND r.status = :rstatus" if status else ""
     type_clause = ""
     hidden_clause = ""
     if types:
@@ -237,18 +237,32 @@ async def list_resources(
             # All requested types were hidden — empty result without hitting the DB.
             return {"items": [], "item_number": 0, "page_number": page, "next_page_token": None}
         placeholders = ", ".join([f":rt{i}" for i in range(len(type_list))])
-        type_clause = f"AND type IN ({placeholders})"
+        type_clause = f"AND r.type IN ({placeholders})"
     elif not includeHidden and UI_HIDDEN_TYPES:
         # No explicit filter — exclude hidden by default.
         hidden_placeholders = ", ".join([f":hidden{i}" for i in range(len(UI_HIDDEN_TYPES))])
-        hidden_clause = f"AND type NOT IN ({hidden_placeholders})"
+        hidden_clause = f"AND r.type NOT IN ({hidden_placeholders})"
 
+    # `last_backup_status` is derived from the latest Job rather than the
+    # denormalized resources.last_backup_status column so it stays in lockstep
+    # with the Activity page (which reads Job.status). The lateral join picks
+    # up the most recent BACKUP job touching this resource — either as the
+    # single resource_id or as a member of a batch.
     query = text(f"""
-        SELECT id, tenant_id, type, external_id, display_name, email, metadata, sla_policy_id,
-               status, storage_bytes, last_backup_at, last_backup_status, created_at
-        FROM resources
-        WHERE tenant_id = :rtenant {status_clause} {type_clause} {hidden_clause}
-        ORDER BY created_at DESC
+        SELECT r.id, r.tenant_id, r.type, r.external_id, r.display_name, r.email, r.metadata, r.sla_policy_id,
+               r.status, r.storage_bytes, r.last_backup_at,
+               COALESCE(latest_job.status::text, r.last_backup_status) AS last_backup_status,
+               r.created_at
+        FROM resources r
+        LEFT JOIN LATERAL (
+            SELECT j.status FROM jobs j
+            WHERE j.type = 'BACKUP'
+              AND (j.resource_id = r.id OR r.id = ANY(j.batch_resource_ids))
+            ORDER BY j.created_at DESC
+            LIMIT 1
+        ) latest_job ON TRUE
+        WHERE r.tenant_id = :rtenant {status_clause} {type_clause} {hidden_clause}
+        ORDER BY r.created_at DESC
         LIMIT :rlimit OFFSET :roffset
     """)
     params = {"rtenant": tenantId, "rlimit": size, "roffset": (page - 1) * size}
@@ -266,7 +280,7 @@ async def list_resources(
 
     # Count
     count_query = text(f"""
-        SELECT count(*) FROM resources WHERE tenant_id = :rtenant {status_clause} {type_clause} {hidden_clause}
+        SELECT count(*) FROM resources r WHERE r.tenant_id = :rtenant {status_clause} {type_clause} {hidden_clause}
     """)
     count_result = await db.execute(count_query, params)
     total = count_result.scalar() or 0
@@ -386,13 +400,25 @@ async def get_resources_by_type(
     if not includeHidden and type in UI_HIDDEN_TYPES:
         return {"items": [], "item_number": 0, "page_number": page, "next_page_token": None}
 
+    # Same lateral join as the main list — derive last_backup_status from
+    # the latest BACKUP job touching this resource so Protection mirrors
+    # Activity.
     query = text(f"""
-        SELECT id, tenant_id, type, external_id, display_name, email, metadata, sla_policy_id,
-               status, storage_bytes, last_backup_at, last_backup_status, created_at
-        FROM resources
-        WHERE type = :rtype
-        {'AND tenant_id = :rtenant' if tenantId else ''}
-        ORDER BY created_at DESC
+        SELECT r.id, r.tenant_id, r.type, r.external_id, r.display_name, r.email, r.metadata, r.sla_policy_id,
+               r.status, r.storage_bytes, r.last_backup_at,
+               COALESCE(latest_job.status::text, r.last_backup_status) AS last_backup_status,
+               r.created_at
+        FROM resources r
+        LEFT JOIN LATERAL (
+            SELECT j.status FROM jobs j
+            WHERE j.type = 'BACKUP'
+              AND (j.resource_id = r.id OR r.id = ANY(j.batch_resource_ids))
+            ORDER BY j.created_at DESC
+            LIMIT 1
+        ) latest_job ON TRUE
+        WHERE r.type = :rtype
+        {'AND r.tenant_id = :rtenant' if tenantId else ''}
+        ORDER BY r.created_at DESC
         LIMIT :rlimit OFFSET :roffset
     """)
     params = {"rtype": type, "rlimit": size, "roffset": (page - 1) * size}
@@ -403,8 +429,8 @@ async def get_resources_by_type(
     rows = result.fetchall()
 
     count_query = text(f"""
-        SELECT count(*) FROM resources WHERE type = :rtype
-        {'AND tenant_id = :rtenant' if tenantId else ''}
+        SELECT count(*) FROM resources r WHERE r.type = :rtype
+        {'AND r.tenant_id = :rtenant' if tenantId else ''}
     """)
     count_result = await db.execute(count_query, params)
     total = count_result.scalar() or 0
