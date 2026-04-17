@@ -215,6 +215,7 @@ async def job(request: Request):
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/onedrive")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/contacts")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/chats")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/chats/groups")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/emails")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/messages")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/calendar")
@@ -223,6 +224,7 @@ async def snapshot_folders(request: Request):
 
 
 @app.get("/api/v1/resources/{resource_id}/snapshots")
+@app.get("/api/v1/resources/{resource_id}/content-snapshots")
 @app.get("/api/v1/resources/{resource_id}/snapshots/by-date")
 @app.get("/api/v1/resources/{resource_id}/snapshots/calendar")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}")

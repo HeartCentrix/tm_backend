@@ -355,6 +355,7 @@ async def discover_user_content(
         user_display_name=user.display_name,
     )
 
+    child_ids: List[str] = []
     upserted = 0
     for c in children:
         rtype = TYPE_MAP.get(c["type"])
@@ -372,9 +373,13 @@ async def discover_user_content(
             existing.email = c.get("email")
             existing.extra_data = c.get("metadata", {})
             existing.external_id = c["external_id"]
+            # Re-inherit parent SLA each time (covers parent SLA changes since last discovery).
+            existing.sla_policy_id = user.sla_policy_id
+            child_ids.append(str(existing.id))
         else:
+            new_id = uuid4()
             db.add(Resource(
-                id=uuid4(),
+                id=new_id,
                 tenant_id=tenant.id,
                 type=rtype,
                 external_id=c["external_id"],
@@ -382,8 +387,13 @@ async def discover_user_content(
                 email=c.get("email"),
                 extra_data=c.get("metadata", {}),
                 parent_resource_id=user.id,
+                # Children inherit the parent user's SLA so trigger-bulk's
+                # "every resource must have a policy" gate doesn't trip when
+                # we fan a backup out across them.
+                sla_policy_id=user.sla_policy_id,
                 status=ResourceStatus.DISCOVERED,
             ))
+            child_ids.append(str(new_id))
         upserted += 1
     await db.commit()
     return {
@@ -391,6 +401,10 @@ async def discover_user_content(
         "userResourceId": user_resource_id,
         "contentDiscovered": upserted,
         "categories": [c["type"] for c in children],
+        # Frontend uses these to fan a bulk backup out across all 5 children
+        # immediately after discovery so the user's Mail/OneDrive/Contacts/
+        # Calendar/Chats actually get persisted as snapshots.
+        "childResourceIds": child_ids,
     }
 
 

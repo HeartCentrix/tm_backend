@@ -1,7 +1,7 @@
 import asyncio
 """Snapshot Service - Manages snapshots and snapshot items"""
 from contextlib import asynccontextmanager
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 
@@ -20,73 +20,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-async def _backfill_folder_paths():
-    """One-shot backfill: derive `folder_path` from `extra_data.raw` for any
-    snapshot item still missing it. Lets pre-fix snapshots show real folder
-    grouping in the Recovery left panel without re-running their backups.
-
-    OneDrive / SharePoint: takes raw.parentReference.path (Microsoft Graph
-    driveItem schema — see https://learn.microsoft.com/graph/api/resources/itemreference)
-    and strips the "/drive/root:" prefix. Mail / contacts: falls back to
-    "folder:<8-char id prefix>" because folder NAMES require a separate
-    Graph round-trip we can't make at startup. Re-running the backup with
-    the new handler populates names properly going forward."""
-    from sqlalchemy import text as _text
-    statements = [
-        # OneDrive / SharePoint files — name is in parentReference.path.
-        # Coerce empty path (root items) to "/" so the tree has a sensible
-        # bucket instead of a nameless one.
-        """
-        UPDATE snapshot_items
-        SET folder_path = COALESCE(
-            NULLIF(
-              CASE
-                WHEN metadata->'raw'->'parentReference'->>'path' LIKE '%:%'
-                THEN split_part(metadata->'raw'->'parentReference'->>'path', ':', 2)
-                ELSE metadata->'raw'->'parentReference'->>'path'
-              END,
-              ''
-            ),
-            '/'
-        )
-        WHERE (folder_path IS NULL OR folder_path = '')
-          AND item_type IN ('FILE', 'ONEDRIVE_FILE', 'SHAREPOINT_FILE')
-          AND metadata->'raw'->'parentReference'->>'path' IS NOT NULL
-        """,
-        # Mail — opaque folder ID groups together at least.
-        """
-        UPDATE snapshot_items
-        SET folder_path = 'folder:' || substr(metadata->'raw'->>'parentFolderId', 1, 12)
-        WHERE (folder_path IS NULL OR folder_path = '')
-          AND item_type = 'EMAIL'
-          AND metadata->'raw'->>'parentFolderId' IS NOT NULL
-        """,
-        # Contacts — same fallback.
-        """
-        UPDATE snapshot_items
-        SET folder_path = 'folder:' || substr(metadata->'raw'->>'parentFolderId', 1, 12)
-        WHERE (folder_path IS NULL OR folder_path = '')
-          AND item_type IN ('USER_CONTACT', 'CONTACT')
-          AND metadata->'raw'->>'parentFolderId' IS NOT NULL
-        """,
-    ]
-    from shared.database import async_session_factory as _factory
-    async with _factory() as session:
-        for stmt in statements:
-            try:
-                await session.execute(_text(stmt))
-            except Exception as e:
-                print(f"[SNAPSHOT] folder_path backfill skipped: {e}")
-        await session.commit()
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    try:
-        await _backfill_folder_paths()
-    except Exception as e:
-        print(f"[SNAPSHOT] folder backfill failed (non-fatal): {e}")
     yield
     await close_db()
 
@@ -182,19 +118,7 @@ async def get_snapshot_folders(
     item_type: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get distinct folder paths for items in a snapshot, optionally filtered by item type.
-
-    Resolution order per item:
-      1. `folder_path` column if populated (newer Tier 2 backups + legacy mailbox/onedrive handlers).
-      2. `extra_data.raw.parentReference.path` for OneDrive / SharePoint files (cleaned of the "/drive/root:" prefix).
-         Reference: Microsoft Graph driveItem `parentReference.path` —
-         https://learn.microsoft.com/graph/api/resources/itemreference
-      3. `extra_data.raw.parentFolderId` for mail items — opaque ID until we
-         can resolve folder names; better than one giant bucket.
-
-    Falling back inline like this avoids a one-time backfill migration and
-    keeps the endpoint useful for snapshots taken before the folder_path
-    plumbing landed."""
+    """Get distinct folder paths for items in a snapshot, optionally filtered by item type."""
     assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
     if assembled_items is not None:
         filtered = [item for item in assembled_items if not item_type or item.item_type == item_type]
@@ -208,31 +132,40 @@ async def get_snapshot_folders(
     if item_type:
         filters.append(SnapshotItem.item_type == item_type)
 
-    items = (await db.execute(select(SnapshotItem).where(*filters))).scalars().all()
+    stmt = (
+        select(SnapshotItem.folder_path, func.count(SnapshotItem.id).label("count"))
+        .where(*filters)
+        .group_by(SnapshotItem.folder_path)
+        .order_by(SnapshotItem.folder_path)
+    )
+    result = await db.execute(stmt)
+    rows = result.fetchall()
 
-    def _derive(item) -> str:
-        if item.folder_path:
-            return item.folder_path
-        meta = item.extra_data or {}
-        raw = meta.get("raw") if isinstance(meta, dict) else None
-        if not isinstance(raw, dict):
-            raw = meta if isinstance(meta, dict) else {}
-        # OneDrive / SharePoint files
-        parent_ref = raw.get("parentReference") or {}
-        if isinstance(parent_ref, dict) and parent_ref.get("path"):
-            p = parent_ref["path"]
-            return p.split(":", 1)[1] if ":" in p else p
-        # Mail
-        if raw.get("parentFolderId"):
-            return f"folder:{raw['parentFolderId'][:8]}"
-        return ""
+    return [
+        {"path": row[0] or "", "count": row[1]}
+        for row in rows
+    ]
 
-    counts: Dict[str, int] = {}
-    for it in items:
-        key = _derive(it) or ""
-        counts[key] = counts.get(key, 0) + 1
 
-    return [{"path": p, "count": c} for p, c in sorted(counts.items())]
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/content-types")
+async def get_snapshot_content_types(
+    snapshot_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get distinct content types available in a snapshot."""
+    assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
+    if assembled_items is not None:
+        return {"contentTypes": sorted({item.item_type for item in assembled_items if item.item_type})}
+
+    stmt = (
+        select(distinct(SnapshotItem.item_type))
+        .where(SnapshotItem.snapshot_id == UUID(snapshot_id))
+        .order_by(SnapshotItem.item_type)
+    )
+    result = await db.execute(stmt)
+    types = [row[0] for row in result.fetchall() if row[0]]
+
+    return {"contentTypes": types}
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}", response_model=SnapshotResponse)
@@ -344,12 +277,8 @@ async def list_resources_with_backups(
     size: int = Query(50, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all resources for a tenant that have at least one completed snapshot.
-
-    Tier 2 children (parent_resource_id IS NOT NULL) are hidden from the
-    Recovery list — their snapshot counts and item totals roll up under the
-    parent resource so the user sees one row per backed-up identity rather
-    than one row per content category."""
+    """List all resources for a tenant that have at least one completed snapshot."""
+    # Get all resources for this tenant
     resources_stmt = (
         select(Resource)
         .where(Resource.tenant_id == UUID(tenantId))
@@ -368,6 +297,7 @@ async def list_resources_with_backups(
 
     resource_ids = [r.id for r in all_resources]
 
+    # Get snapshot stats for these resources
     stats_stmt = (
         select(
             Snapshot.resource_id,
@@ -379,36 +309,11 @@ async def list_resources_with_backups(
         .group_by(Snapshot.resource_id)
     )
     stats_result = await db.execute(stats_stmt)
-    raw_stats: Dict[str, Dict[str, int]] = {}
+    stats = {}
     for s in stats_result.fetchall():
-        raw_stats[str(s[0])] = {"snapshot_count": int(s[1] or 0), "total_items": int(s[2] or 0)}
+        stats[str(s[0])] = {"snapshot_count": s[1], "total_items": s[2] or 0}
 
-    # Roll children up under their parent. Stats keyed by the parent's ID.
-    stats: Dict[str, Dict[str, int]] = {}
-    for r in all_resources:
-        # Tier 2 children never get their own row — they accumulate onto the
-        # parent's stats below.
-        if r.parent_resource_id is not None:
-            continue
-        own = raw_stats.get(str(r.id), {"snapshot_count": 0, "total_items": 0})
-        stats[str(r.id)] = dict(own)
-
-    for r in all_resources:
-        if r.parent_resource_id is None:
-            continue
-        parent_key = str(r.parent_resource_id)
-        if parent_key not in stats:
-            # Parent missing (shouldn't happen) — promote child standalone.
-            stats[parent_key] = {"snapshot_count": 0, "total_items": 0}
-        child_stats = raw_stats.get(str(r.id))
-        if not child_stats:
-            continue
-        stats[parent_key]["snapshot_count"] += child_stats["snapshot_count"]
-        stats[parent_key]["total_items"] += child_stats["total_items"]
-
-    # Drop parents with no rolled-up snapshots (no own + no child snapshots).
-    stats = {k: v for k, v in stats.items() if v["snapshot_count"] > 0}
-
+    # Count and paginate
     total = len(stats)
     paginated_ids = list(stats.keys())[(page - 1) * size : page * size]
 
@@ -451,83 +356,6 @@ async def list_resources_with_backups(
         "page_number": page,
         "next_page_token": str(page + 1) if has_next else None,
         "items": items,
-    }
-
-
-# Maps each Recovery content tab to the Tier 2 child resource type that
-# holds its snapshots. The parent ENTRA_USER's own snapshots stay separate
-# (they hold identity items: profile, manager, group memberships) and are
-# not surfaced via these tabs.
-CONTENT_TAB_TO_TYPE: Dict[str, str] = {
-    "mail": "USER_MAIL",
-    "onedrive": "USER_ONEDRIVE",
-    "contacts": "USER_CONTACTS",
-    "calendar": "USER_CALENDAR",
-    "chats": "USER_CHATS",
-}
-
-
-@app.get("/api/v1/resources/{resource_id}/content-snapshots")
-async def get_content_snapshots(
-    resource_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    """Return the latest completed snapshot per content tab for a resource.
-
-    Resolution: each tab maps to the child resource type that backs it
-    (mail → USER_MAIL, onedrive → USER_ONEDRIVE, …). For each child the
-    most recent COMPLETED snapshot wins. Tabs with no snapshot yet return
-    null so the UI can render an empty state without a second round-trip.
-
-    Recovery uses this on resource select so it can hide the snapshot
-    dropdown — clicking a tab now jumps straight to the right snapshot."""
-    parent = await db.get(Resource, UUID(resource_id))
-    if not parent:
-        raise HTTPException(status_code=404, detail="Resource not found")
-
-    # Pull every Tier 2 child of this resource in one shot.
-    children = (await db.execute(
-        select(Resource).where(Resource.parent_resource_id == parent.id)
-    )).scalars().all()
-    children_by_type: Dict[str, Resource] = {c.type.value: c for c in children}
-
-    # Resource IDs we'll roll into snapshot count (parent + every child).
-    counted_ids = [parent.id] + [c.id for c in children]
-
-    snapshot_count = (await db.execute(
-        select(func.count(Snapshot.id))
-        .where(Snapshot.resource_id.in_(counted_ids))
-        .where(Snapshot.status == SnapshotStatus.COMPLETED)
-    )).scalar() or 0
-
-    by_content: Dict[str, Optional[Dict[str, Any]]] = {}
-    for tab, child_type in CONTENT_TAB_TO_TYPE.items():
-        child = children_by_type.get(child_type)
-        if not child:
-            by_content[tab] = None
-            continue
-        snap = (await db.execute(
-            select(Snapshot)
-            .where(Snapshot.resource_id == child.id)
-            .where(Snapshot.status == SnapshotStatus.COMPLETED)
-            .order_by(Snapshot.created_at.desc())
-            .limit(1)
-        )).scalar_one_or_none()
-        if not snap:
-            by_content[tab] = None
-            continue
-        by_content[tab] = {
-            "snapshotId": str(snap.id),
-            "childResourceId": str(child.id),
-            "itemCount": int(snap.item_count or 0),
-            "bytesTotal": int(snap.bytes_total or 0),
-            "createdAt": snap.created_at.isoformat() if snap.created_at else None,
-        }
-
-    return {
-        "resourceId": str(parent.id),
-        "snapshotCount": int(snapshot_count),
-        "byContent": by_content,
     }
 
 
@@ -716,12 +544,10 @@ def _raw(item) -> dict:
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/emails")
-@app.get("/api/v1/resources/snapshots/{snapshot_id}/mail")
 async def list_snapshot_emails(
     snapshot_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(500, ge=1),
-    folder: Optional[str] = Query(None, description="Filter to a specific mail folder path"),
     db: AsyncSession = Depends(get_db),
 ):
     """Return emails with from/to/cc/subject/body/date extracted from metadata."""
@@ -729,8 +555,6 @@ async def list_snapshot_emails(
         SnapshotItem.snapshot_id == UUID(snapshot_id),
         SnapshotItem.item_type == "EMAIL",
     ]
-    if folder is not None:
-        filters.append(SnapshotItem.folder_path == folder)
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
 
@@ -766,40 +590,25 @@ async def list_snapshot_emails(
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/messages")
-@app.get("/api/v1/resources/snapshots/{snapshot_id}/chats")
 async def list_snapshot_messages(
     snapshot_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(500, ge=1),
     chatId: Optional[str] = Query(None),
-    folder: Optional[str] = Query(None, description="Filter to one chat by folder_path (e.g. 'chats/Vinay Chauhan')"),
     db: AsyncSession = Depends(get_db),
 ):
     """Return Teams messages with sender/body/date extracted from metadata.
 
-    Two filters:
-      - `folder`: matches SnapshotItem.folder_path — used by the new flat
-        chat-folder left panel (paths look like "chats/Vinay Chauhan" or
-        "chats/Group: Hemant, Vinay +5 more").
-      - `chatId`: legacy filter — matches the chatId field in extra_data.
-        Kept so old links and the legacy TEAMS_CHAT_EXPORT data still work."""
+    Pass chatId to narrow a per-user TEAMS_CHAT_EXPORT snapshot down to one
+    chat (the post-refactor path — snapshots are now user-scoped, so restore
+    or the viewer need to filter by chat themselves)."""
     CHAT_TYPES = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
     filters = [
         SnapshotItem.snapshot_id == UUID(snapshot_id),
         SnapshotItem.item_type.in_(CHAT_TYPES),
     ]
-    if folder is not None:
-        filters.append(SnapshotItem.folder_path == folder)
     if chatId:
-        # `extra_data` is a plain JSON column (not JSONB) so the `[].astext`
-        # accessor is unavailable. Use json_extract_path_text and check
-        # both possible nestings: top-level (legacy chat-export shards) and
-        # nested under raw (Tier 2 USER_CHATS handler).
-        from sqlalchemy import or_
-        filters.append(or_(
-            func.json_extract_path_text(SnapshotItem.extra_data, "chatId") == chatId,
-            func.json_extract_path_text(SnapshotItem.extra_data, "raw", "chatId") == chatId,
-        ))
+        filters.append(SnapshotItem.extra_data["chatId"].astext == chatId)
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
 
@@ -843,48 +652,6 @@ async def list_snapshot_messages(
 
     results = await asyncio.gather(*[fmt(i) for i in items])
     return {"content": list(results), "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
-
-
-@app.get("/api/v1/resources/snapshots/{snapshot_id}/chats/groups")
-async def list_snapshot_chat_groups(
-    snapshot_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    """Distinct chats inside a USER_CHATS snapshot, with display name + count.
-
-    The display name is derived from the first message's `chatTopic` if
-    present, otherwise falls back to the sender's display name to give the
-    user a meaningful label for 1:1 chats. Powers the chats tab's left
-    panel — clicking a row sets ?chatId=<id> on the messages query."""
-    items = (await db.execute(
-        select(SnapshotItem)
-        .where(SnapshotItem.snapshot_id == UUID(snapshot_id))
-        .where(SnapshotItem.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
-    )).scalars().all()
-
-    groups: Dict[str, Dict[str, Any]] = {}
-    for it in items:
-        meta = it.extra_data or {}
-        raw = meta.get("raw") or {}
-        chat_id = raw.get("chatId") or meta.get("chatId")
-        if not chat_id:
-            continue
-        g = groups.setdefault(chat_id, {"chatId": chat_id, "displayName": "", "count": 0, "lastMessageAt": None})
-        g["count"] += 1
-        # Pick a display name once (first row that has one).
-        if not g["displayName"]:
-            topic = raw.get("chatTopic") or meta.get("chatTopic")
-            if topic:
-                g["displayName"] = topic
-            else:
-                _from = raw.get("from") or {}
-                sender = (_from.get("user") or _from.get("application") or {}) if isinstance(_from, dict) else {}
-                g["displayName"] = sender.get("displayName") or f"Chat {chat_id[:8]}"
-        ts = raw.get("createdDateTime")
-        if ts and (g["lastMessageAt"] is None or ts > g["lastMessageAt"]):
-            g["lastMessageAt"] = ts
-
-    return sorted(groups.values(), key=lambda g: (g.get("lastMessageAt") or ""), reverse=True)
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/calendar")
@@ -997,93 +764,6 @@ async def list_snapshot_calendar(
     results = await asyncio.gather(*[fmt(i) for i in items])
     return {"content": list(results), "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
 
-
-# ── Per-content-type endpoints — Tier 2 backup browsers ─────────────────────
-# These five fixed endpoints (mail/onedrive/contacts/calendar/chats) replace
-# the previous dynamic /content-types lookup. The Recovery UI now hardcodes
-# its tabs and queries these directly — no more "what's in this snapshot?"
-# round-trip before render.
-
-ONEDRIVE_ITEM_TYPES = ("FILE", "ONEDRIVE_FILE", "FILE_VERSION")
-CONTACT_ITEM_TYPES = ("USER_CONTACT", "CONTACT")
-
-
-@app.get("/api/v1/resources/snapshots/{snapshot_id}/onedrive")
-async def list_snapshot_onedrive(
-    snapshot_id: str,
-    page: int = Query(1, ge=1),
-    size: int = Query(500, ge=1),
-    folder: Optional[str] = Query(None),
-    db: AsyncSession = Depends(get_db),
-):
-    """Return OneDrive files in a snapshot."""
-    filters = [
-        SnapshotItem.snapshot_id == UUID(snapshot_id),
-        SnapshotItem.item_type.in_(ONEDRIVE_ITEM_TYPES),
-    ]
-    if folder is not None:
-        filters.append(SnapshotItem.folder_path == folder)
-    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
-    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
-    return {
-        "content": [_item_to_response(i) for i in items],
-        "totalElements": total,
-        "totalPages": max(1, (total+size-1)//size),
-        "size": size,
-        "number": page,
-    }
-
-
-@app.get("/api/v1/resources/snapshots/{snapshot_id}/contacts")
-async def list_snapshot_contacts(
-    snapshot_id: str,
-    page: int = Query(1, ge=1),
-    size: int = Query(500, ge=1),
-    folder: Optional[str] = Query(None),
-    db: AsyncSession = Depends(get_db),
-):
-    """Return contacts in a snapshot."""
-    filters = [
-        SnapshotItem.snapshot_id == UUID(snapshot_id),
-        SnapshotItem.item_type.in_(CONTACT_ITEM_TYPES),
-    ]
-    if folder is not None:
-        filters.append(SnapshotItem.folder_path == folder)
-    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
-    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
-
-    def fmt(i):
-        raw = _raw(i)
-        emails = raw.get("emailAddresses") or []
-        phones = raw.get("businessPhones") or []
-        return {
-            "id": str(i.id),
-            "snapshotId": str(i.snapshot_id),
-            "externalId": i.external_id,
-            "itemType": i.item_type,
-            "displayName": raw.get("displayName") or i.name,
-            "givenName": raw.get("givenName") or "",
-            "surname": raw.get("surname") or "",
-            "companyName": raw.get("companyName") or "",
-            "jobTitle": raw.get("jobTitle") or "",
-            "emails": [e.get("address") for e in emails if isinstance(e, dict)],
-            "primaryEmail": (emails[0].get("address") if emails and isinstance(emails[0], dict) else None),
-            "phones": phones,
-            "folderPath": i.folder_path or "Contacts",
-            "contentSize": i.content_size or 0,
-            "isDeleted": i.is_deleted or False,
-            "createdAt": i.created_at.isoformat() if i.created_at else "",
-            "name": raw.get("displayName") or i.name or "",
-            "metadata": {"raw": raw},
-        }
-
-    return {
-        "content": [fmt(i) for i in items],
-        "totalElements": total,
-        "totalPages": max(1, (total+size-1)//size),
-        "size": size,
-        "number": page,
-    }
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")
