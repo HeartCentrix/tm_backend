@@ -728,6 +728,38 @@ class GraphClient:
             total_elapsed = time.time() - start_time
             logger.info("Teams chat discovery complete: %d chats in %.1fs", len(all_chats), total_elapsed)
 
+            # Phase 4: emit per-user TEAMS_CHAT_EXPORT shards.
+            # One resource per Graph user who has any chats — the backup worker
+            # issues a single /users/{id}/chats/getAllMessages/delta call per
+            # shard instead of one call per chat (Graph caps $top=50, so a heavy
+            # user was previously stuck paying that full-export cost once per
+            # chat job). Delta token lives on this row's extra_data.
+            for user, user_chats in zip(all_users, user_chat_results):
+                if isinstance(user_chats, Exception):
+                    continue
+                chat_ids = [c.get("id") for c in user_chats if c.get("id")]
+                if not chat_ids:
+                    continue
+                user_id = user.get("id")
+                if not user_id:
+                    continue
+                display = user.get("displayName") or user.get("userPrincipalName") or user_id
+                resources.append({
+                    "external_id": user_id,
+                    "display_name": f"Chat export — {display}",
+                    "email": user.get("userPrincipalName"),
+                    "type": "TEAMS_CHAT_EXPORT",
+                    "metadata": {
+                        "userPrincipalName": user.get("userPrincipalName"),
+                        "userDisplayName": user.get("displayName"),
+                        "chatIds": chat_ids,
+                        "chatCount": len(chat_ids),
+                    },
+                })
+            logger.info("Teams chat-export shards emitted: %d users", sum(
+                1 for r in resources if r.get("type") == "TEAMS_CHAT_EXPORT"
+            ))
+
         except Exception as e:
             logger.warning(f"Failed to discover Teams chats: {e}")
 
@@ -1342,6 +1374,32 @@ class GraphClient:
             all_value.extend(result.get("value", []))
         result["value"] = all_value
         return result
+
+    async def get_all_chat_messages_for_user_delta(
+        self, user_id: str, delta_token: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Incremental chat export via delta query.
+
+        Graph API: GET /users/{id}/chats/getAllMessages/delta
+        Permission: Chat.Read.All (same as the non-delta endpoint).
+
+        First call (no delta_token): full sync, returns every message and an
+        @odata.deltaLink. Subsequent calls (delta_token = previous deltaLink):
+        only messages added/changed since the last sync.
+
+        Hard limit: delta only covers the last 8 months. If the token is
+        expired or too old, Graph returns 410/400 and callers should fall
+        back to get_all_chat_messages_for_user() for a full reseed.
+        """
+        if delta_token:
+            # A deltaLink IS the full URL — use it verbatim, no extra params.
+            url = delta_token
+            params = None
+        else:
+            url = f"{self.GRAPH_URL}/users/{user_id}/chats/getAllMessages/delta"
+            params = {"$top": "50"}
+        # _get already paginates via @odata.nextLink and preserves @odata.deltaLink.
+        return await self._get(url, params=params)
 
     async def get_chat_messages(self, chat_id: str, delta_token: str = None) -> Dict[str, Any]:
         """

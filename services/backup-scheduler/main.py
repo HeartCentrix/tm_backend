@@ -49,7 +49,12 @@ RESOURCE_TYPE_TO_SLA_FLAG: Dict[str, str] = {
     "ONEDRIVE": "backup_onedrive",
     "SHAREPOINT_SITE": "backup_sharepoint",
     "TEAMS_CHANNEL": "backup_teams",
+    # TEAMS_CHAT rows stay in the catalog as the user-facing entity (UI,
+    # restore-by-chat), but are excluded from job dispatch — see
+    # SCHEDULER_IGNORED_TYPES below. Actual chat backup runs against the
+    # per-user TEAMS_CHAT_EXPORT shard emitted by discovery.
     "TEAMS_CHAT": "backup_teams_chats",
+    "TEAMS_CHAT_EXPORT": "backup_teams_chats",
     "ENTRA_USER": "backup_entra_id",
     "ENTRA_GROUP": "backup_entra_id",
     "ENTRA_APP": "backup_entra_id",
@@ -81,6 +86,7 @@ RESOURCE_TYPE_DISPLAY_NAMES: Dict[str, str] = {
     "SHAREPOINT_SITE": "SharePoint",
     "TEAMS_CHANNEL": "Teams channel data",
     "TEAMS_CHAT": "Teams chats",
+    "TEAMS_CHAT_EXPORT": "Teams chat exports",
     "ENTRA_USER": "Entra user data",
     "ENTRA_GROUP": "Entra group data",
     "ENTRA_APP": "Entra app data",
@@ -214,8 +220,18 @@ def frequency_to_cron_params(
     return {"trigger": "cron", "hour": (base_hour + hour_carry) % 24, "minute": final_minute, **dow_clause}
 
 
+# Resource types intentionally excluded from dispatch even when an SLA policy
+# would otherwise cover them. TEAMS_CHAT is here because actual chat-message
+# backup runs through TEAMS_CHAT_EXPORT (one delta pull per user, not per chat);
+# the TEAMS_CHAT rows remain as the user-facing catalog entity for restore.
+SCHEDULER_IGNORED_TYPES: set[str] = {"TEAMS_CHAT"}
+
+
 def resource_type_enabled(resource_type: str, policy: SlaPolicy) -> bool:
     """Check if a resource type is enabled in the SLA policy's backup flags."""
+    if resource_type in SCHEDULER_IGNORED_TYPES:
+        return False
+
     if resource_type == "ENTRA_USER":
         return bool(
             getattr(policy, "backup_entra_id", False)

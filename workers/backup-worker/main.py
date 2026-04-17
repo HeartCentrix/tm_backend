@@ -103,13 +103,15 @@ class BackupWorker:
         self.worker_id = f"worker-{uuid.uuid4().hex[:8]}"
         self.graph_clients: Dict[str, GraphClient] = {}
         self.audit_logger = AuditLogger()
-        # Teams chat export cache: user_id -> (fetched_at_unix, messages[])
-        # /users/{id}/chats/getAllMessages returns the full chat history for
-        # a user; if we're backing up 100 chats for the same user we don't want
-        # to hit that endpoint 100 times. Cache TTL is 5 min — well within a
-        # batch-backup window, and new messages arriving during a run are
-        # handled on the next run.
-        self._chat_export_cache: Dict[str, Tuple[float, List[Dict]]] = {}
+        # Teams chat export cache: user_id -> (fetched_at_unix, messages[], delta_link)
+        # /users/{id}/chats/getAllMessages/delta returns either the full chat
+        # history (first run) or only changes since the saved deltaLink.
+        # If we're backing up 100 chats for the same user we don't want to hit
+        # that endpoint 100 times. Cache TTL is 5 min — well within a batch-backup
+        # window, and new messages arriving during a run are handled on the next run.
+        # delta_link is captured so callers can persist it per-resource for the
+        # next backup run to use as an incremental anchor.
+        self._chat_export_cache: Dict[str, Tuple[float, List[Dict], Optional[str]]] = {}
         self._chat_export_cache_ttl = 300.0  # seconds
         # Concurrency controls
         self.backup_semaphore = asyncio.Semaphore(8)  # 8 concurrent file streams per worker NIC
@@ -204,7 +206,13 @@ class BackupWorker:
         "MAILBOX": "backup_mailbox", "SHARED_MAILBOX": "backup_mailbox", "ROOM_MAILBOX": "backup_mailbox",
         "ONEDRIVE": "backup_onedrive",
         "SHAREPOINT_SITE": "backup_sharepoint",
-        "TEAMS_CHANNEL": "backup_teams_single", "TEAMS_CHAT": "backup_teams_single",
+        "TEAMS_CHANNEL": "backup_teams_single",
+        # TEAMS_CHAT: scheduler denylists this type (SCHEDULER_IGNORED_TYPES);
+        # handler is kept only to drain any in-flight queue messages from
+        # before the cutover. Real chat-message backup runs through
+        # TEAMS_CHAT_EXPORT below.
+        "TEAMS_CHAT": "backup_teams_chat_single",
+        "TEAMS_CHAT_EXPORT": "backup_teams_chat_export",
         "ENTRA_USER": "backup_entra_single", "ENTRA_GROUP": "backup_entra_single",
         "M365_GROUP": "backup_entra_single", "ENTRA_APP": "backup_entra_single",
         "ENTRA_DEVICE": "backup_entra_single", "ENTRA_SERVICE_PRINCIPAL": "backup_entra_single",
@@ -1632,21 +1640,50 @@ class BackupWorker:
                 return uid
         return None
 
-    async def _get_cached_user_chat_messages(self, graph_client: GraphClient, user_id: str) -> List[Dict]:
-        """Return /users/{user_id}/chats/getAllMessages, cached per worker.
+    async def _get_cached_user_chat_messages(
+        self,
+        graph_client: GraphClient,
+        user_id: str,
+        delta_token: Optional[str] = None,
+    ) -> Tuple[List[Dict], Optional[str]]:
+        """Return (messages, new_delta_link) for a user's chat export, cached per worker.
 
         Several TEAMS_CHAT backup jobs in a batch commonly share participants,
         so without caching we'd re-fetch the entire user's chat history for
         every chat. TTL is 5 min (see __init__); beyond that we refresh so
-        long-running workers don't serve stale exports across backup cycles."""
+        long-running workers don't serve stale exports across backup cycles.
+
+        delta_token (if provided) is used to fetch only messages added/changed
+        since the last sync. If Graph rejects the token (expired, older than
+        the 8-month delta window, or malformed) we fall back to a full export.
+        """
         now = time.monotonic()
         cached = self._chat_export_cache.get(user_id)
         if cached and (now - cached[0]) < self._chat_export_cache_ttl:
-            return cached[1]
-        payload = await graph_client.get_all_chat_messages_for_user(user_id)
+            return cached[1], cached[2]
+
+        try:
+            payload = await graph_client.get_all_chat_messages_for_user_delta(
+                user_id, delta_token=delta_token
+            )
+        except Exception as e:
+            # Delta tokens expire after 8 months or can be invalidated by
+            # Graph; a full reseed is the documented recovery path.
+            if delta_token:
+                print(
+                    f"[{self.worker_id}]   [CHAT_MSG] delta token rejected for user "
+                    f"{user_id} ({e}); falling back to full export"
+                )
+                payload = await graph_client.get_all_chat_messages_for_user_delta(user_id)
+            else:
+                raise
+
         msgs = payload.get("value", []) if isinstance(payload, dict) else []
-        self._chat_export_cache[user_id] = (now, msgs)
-        return msgs
+        new_delta_link = (
+            payload.get("@odata.deltaLink") if isinstance(payload, dict) else None
+        )
+        self._chat_export_cache[user_id] = (now, msgs, new_delta_link)
+        return msgs, new_delta_link
 
     async def _backup_single_chat(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
                                   graph_client: GraphClient) -> tuple:
@@ -1673,8 +1710,22 @@ class BackupWorker:
             print(f"[{self.worker_id}]   [CHAT_MSG] {chat_topic} — no resolvable participant user; skipping")
             return 0, 0
 
-        print(f"[{self.worker_id}]   [CHAT_MSG] {chat_topic} — exporting via user {user_id}")
-        all_user_msgs = await self._get_cached_user_chat_messages(graph_client, user_id)
+        # Per-user delta anchor stored on the resource. First run is a full
+        # sync; every run after that fetches only new/changed messages.
+        # Keyed by user_id because the delta is scoped to a Graph user, not a
+        # chat — different chats that share a participant can legitimately
+        # persist different anchors (each reflects that chat's last sync).
+        existing_tokens = ((resource.extra_data or {}).get("chat_delta_tokens") or {})
+        delta_token = existing_tokens.get(user_id)
+
+        sync_mode = "delta" if delta_token else "full"
+        print(
+            f"[{self.worker_id}]   [CHAT_MSG] {chat_topic} — exporting via user "
+            f"{user_id} ({sync_mode} sync)"
+        )
+        all_user_msgs, new_delta_link = await self._get_cached_user_chat_messages(
+            graph_client, user_id, delta_token=delta_token
+        )
         # Filter to this chat only — getAllMessages mixes every chat the user is part of
         msg_list = [m for m in all_user_msgs if m.get("chatId") == chat_id]
         print(f"[{self.worker_id}]   [CHAT_MSG] {chat_topic} — {len(msg_list)} messages (of {len(all_user_msgs)} across all chats)")
@@ -1716,13 +1767,211 @@ class BackupWorker:
                 session.add_all(db_items)
                 await session.commit()
 
-        # Note: /chats/getAllMessages doesn't return a delta link — each run is a
-        # full export. Incremental support would require per-user delta tokens
-        # (a separate endpoint) which we can wire in later; for now, the storage
-        # layer dedupes by content_hash so re-backing up the same message costs
-        # DB rows but not bytes.
+        # Persist the per-user deltaLink so the next run can do an incremental
+        # fetch. Only write when Graph returned one — a missing deltaLink means
+        # the sync is incomplete and we must retry a full export next time.
+        if new_delta_link:
+            resource.extra_data = resource.extra_data or {}
+            tokens = dict(resource.extra_data.get("chat_delta_tokens") or {})
+            tokens[user_id] = new_delta_link
+            resource.extra_data["chat_delta_tokens"] = tokens
+            async with async_session_factory() as session:
+                await session.merge(resource)
+                await session.commit()
 
         return len(db_items), bytes_added
+
+    async def backup_teams_chat_export(
+        self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
+        tenant: Tenant, message: Dict,
+    ) -> Dict:
+        """Backup every Teams chat a single Graph user participates in, in one pass.
+
+        Resource shape: TEAMS_CHAT_EXPORT, external_id = Graph user id.
+        Calls /users/{id}/chats/getAllMessages[/delta] once, groups the result
+        by chatId, writes one SnapshotItem per message. This replaces the
+        per-chat fanout that re-paid the full-export cost for every chat a
+        user was in.
+
+        Delta token is stored flat on resource.extra_data["delta_token"]
+        because the resource IS the user — no per-user keying needed.
+        Upload + commit are chunked by chat to bound memory for heavy users
+        (a single participant with 500 chats × 500 msgs = 250k items).
+        """
+        user_id = resource.external_id
+        user_label = resource.display_name or user_id
+
+        delta_token = (resource.extra_data or {}).get("delta_token")
+        sync_mode = "delta" if delta_token else "full"
+        print(
+            f"[{self.worker_id}] [CHAT_EXPORT START] {user_label} "
+            f"(user={user_id}, {sync_mode} sync)"
+        )
+
+        # Build chat_id -> display_name map from the tenant's TEAMS_CHAT rows so
+        # each message row can carry a human-readable chatTopic / folder_path.
+        # Messages for chats discovery hasn't indexed yet fall back to the raw id.
+        chat_topics: Dict[str, str] = {}
+        async with async_session_factory() as sess:
+            chat_rows = (await sess.execute(
+                select(Resource.external_id, Resource.display_name).where(
+                    Resource.tenant_id == tenant.id,
+                    Resource.type == ResourceType.TEAMS_CHAT,
+                )
+            )).all()
+            for ext_id, dn in chat_rows:
+                if ext_id:
+                    chat_topics[ext_id] = dn or ext_id
+
+        try:
+            payload = await graph_client.get_all_chat_messages_for_user_delta(
+                user_id, delta_token=delta_token
+            )
+        except Exception as e:
+            if delta_token:
+                print(
+                    f"[{self.worker_id}] [CHAT_EXPORT] delta token rejected for "
+                    f"{user_label} ({e}); falling back to full export"
+                )
+                payload = await graph_client.get_all_chat_messages_for_user_delta(user_id)
+            else:
+                raise
+
+        msgs: List[Dict] = payload.get("value", []) if isinstance(payload, dict) else []
+        new_delta_link = (
+            payload.get("@odata.deltaLink") if isinstance(payload, dict) else None
+        )
+
+        # Group by chatId so we can commit per-chat batches and keep the
+        # in-memory upload pipeline bounded regardless of how many chats the
+        # user is in.
+        by_chat: Dict[str, List[Dict]] = {}
+        for m in msgs:
+            cid = m.get("chatId")
+            if not cid:
+                continue
+            by_chat.setdefault(cid, []).append(m)
+
+        print(
+            f"[{self.worker_id}] [CHAT_EXPORT] {user_label} — "
+            f"{len(msgs)} messages across {len(by_chat)} chats"
+        )
+
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
+
+        total_items = 0
+        total_bytes = 0
+        UPLOAD_BATCH = 500  # bound concurrent upload tasks + memory per gather()
+
+        # Content-addressed dedup: two users in the same chat fetch the same
+        # message bytes. Upload once per unique content_hash per tenant; later
+        # snapshots reference the existing blob_path. Uses SnapshotItem history
+        # as the dedup index so the first successful upload wins even across
+        # separate EXPORT runs.
+        dedup_reused = 0
+        for chat_id, chat_msgs in by_chat.items():
+            chat_topic = chat_topics.get(chat_id, chat_id)
+            folder_path = f"chats/{chat_topic}"
+
+            for i in range(0, len(chat_msgs), UPLOAD_BATCH):
+                batch = chat_msgs[i:i + UPLOAD_BATCH]
+
+                prepared = []
+                for msg in batch:
+                    msg_id = msg.get("id", str(uuid.uuid4()))
+                    content_bytes = json.dumps(msg).encode()
+                    content_hash = hashlib.sha256(content_bytes).hexdigest()
+                    shared_blob_path = (
+                        f"{tenant.id}/teams/messages/"
+                        f"{content_hash[:2]}/{content_hash[2:4]}/{content_hash}.json"
+                    )
+                    prepared.append((msg_id, msg, content_bytes, content_hash, shared_blob_path))
+
+                hashes = [p[3] for p in prepared]
+                async with async_session_factory() as session:
+                    existing_rows = (await session.execute(
+                        select(SnapshotItem.content_checksum, SnapshotItem.blob_path)
+                        .where(SnapshotItem.tenant_id == tenant.id,
+                               SnapshotItem.content_checksum.in_(hashes))
+                    )).all()
+                existing_blobs: Dict[str, str] = {row[0]: row[1] for row in existing_rows}
+
+                upload_tasks = []
+                upload_meta = []
+                for msg_id, msg, content_bytes, content_hash, shared_blob_path in prepared:
+                    if content_hash in existing_blobs:
+                        continue
+                    upload_tasks.append(
+                        upload_blob_with_retry(container, shared_blob_path, content_bytes, shard)
+                    )
+                    upload_meta.append((content_hash, shared_blob_path, len(content_bytes)))
+
+                upload_results: Dict[str, Tuple[str, int]] = {}
+                if upload_tasks:
+                    results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+                    for (content_hash, shared_blob_path, size), result in zip(upload_meta, results):
+                        if isinstance(result, dict) and result.get("success"):
+                            upload_results[content_hash] = (shared_blob_path, size)
+
+                db_items = []
+                for msg_id, msg, content_bytes, content_hash, shared_blob_path in prepared:
+                    if content_hash in existing_blobs:
+                        final_blob_path = existing_blobs[content_hash]
+                        dedup_reused += 1
+                    elif content_hash in upload_results:
+                        final_blob_path, size = upload_results[content_hash]
+                        total_bytes += size
+                    else:
+                        continue  # upload failed, skip SnapshotItem
+                    db_items.append(SnapshotItem(
+                        snapshot_id=snapshot.id, tenant_id=tenant.id,
+                        external_id=msg_id, item_type="TEAMS_CHAT_MESSAGE",
+                        name=msg.get("body", {}).get("content", "")[:100] or msg_id,
+                        folder_path=folder_path,
+                        content_hash=content_hash, content_size=len(content_bytes),
+                        blob_path=final_blob_path,
+                        extra_data={
+                            "raw": msg, "chatId": chat_id,
+                            "chatTopic": chat_topic, "exportedVia": user_id,
+                            "dedup": content_hash in existing_blobs,
+                        },
+                        content_checksum=content_hash,
+                    ))
+
+                if db_items:
+                    async with async_session_factory() as session:
+                        session.add_all(db_items)
+                        await session.commit()
+                    total_items += len(db_items)
+
+        if dedup_reused:
+            print(
+                f"[{self.worker_id}] [CHAT_EXPORT] {user_label} — "
+                f"dedup: {dedup_reused} messages reused existing blobs"
+            )
+
+        if new_delta_link:
+            async with async_session_factory() as session:
+                r = await session.get(Resource, resource.id)
+                if r is not None:
+                    r.extra_data = r.extra_data or {}
+                    r.extra_data["delta_token"] = new_delta_link
+                    await session.commit()
+
+        print(
+            f"[{self.worker_id}] [CHAT_EXPORT COMPLETE] {user_label} — "
+            f"{total_items} messages, {total_bytes} bytes, "
+            f"delta={'saved' if new_delta_link else 'missing'}"
+        )
+
+        async with async_session_factory() as sess:
+            await self.update_resource_backup_info(sess, resource, None, snapshot.id, {
+                "item_count": total_items,
+                "bytes_added": total_bytes,
+            })
+
+        return {"item_count": total_items, "bytes_added": total_bytes}
 
     async def backup_power_bi_workspace(
         self,
