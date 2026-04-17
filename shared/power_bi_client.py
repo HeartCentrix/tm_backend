@@ -179,7 +179,13 @@ class PowerBIClient:
                 json=json,
                 headers=request_headers,
             )
-            response.raise_for_status()
+            if response.is_error:
+                body = (response.text or "")[:1000]
+                raise httpx.HTTPStatusError(
+                    f"{response.status_code} from {url}: {body}",
+                    request=response.request,
+                    response=response,
+                )
             return response
 
     async def _request_json(
@@ -198,6 +204,9 @@ class PowerBIClient:
         return response.json()
 
     async def _poll_lro(self, location: str, api: str) -> Dict[str, Any]:
+        # Fabric LRO: polling {location} returns only the status envelope
+        # ({status, percentComplete, ...}). The actual result lives at
+        # {location}/result and must be fetched once status == "Succeeded".
         deadline = datetime.utcnow() + timedelta(minutes=3)
         while datetime.utcnow() < deadline:
             response = await self._request("GET", location, api=api)
@@ -210,8 +219,25 @@ class PowerBIClient:
             if status in {"running", "inprogress", "notstarted"}:
                 await asyncio.sleep(int(response.headers.get("Retry-After", "3")))
                 continue
-            if "result" in payload and isinstance(payload["result"], dict):
-                return payload["result"]
+
+            if status == "succeeded":
+                # Some older endpoints inline the result on the status object.
+                if isinstance(payload.get("result"), dict):
+                    return payload["result"]
+                result_response = await self._request(
+                    "GET", location.rstrip("/") + "/result", api=api
+                )
+                if result_response.status_code == 200 and result_response.content:
+                    return result_response.json()
+                return {}
+
+            if status in {"failed", "cancelled", "canceled"}:
+                raise RuntimeError(
+                    f"Power BI/Fabric LRO {status} for {location}: "
+                    f"{payload.get('error') or payload}"
+                )
+
+            # Unknown terminal status — return what we have so the caller can inspect.
             return payload
         raise TimeoutError(f"Timed out waiting for Power BI/Fabric LRO: {location}")
 
@@ -245,20 +271,36 @@ class PowerBIClient:
 
     @staticmethod
     def _format_utc_timestamp(value: datetime) -> str:
+        # Power BI /admin/workspaces/modified requires the .NET roundtrip timestamp
+        # with 7 fractional digits (100ns ticks). 0, 3, and 6 digits are all rejected
+        # with "Date value should be in ISO-8601 format".
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
         else:
             value = value.astimezone(timezone.utc)
-        return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        return value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond:06d}0Z"
 
     async def list_modified_workspace_ids(self, modified_since: datetime) -> List[str]:
+        # Power BI rule: modifiedSince must be >= 30 min and <= 30 days old.
+        now = datetime.now(timezone.utc)
+        if modified_since.tzinfo is None:
+            modified_since = modified_since.replace(tzinfo=timezone.utc)
+        lower_bound = now - timedelta(days=30) + timedelta(minutes=1)
+        upper_bound = now - timedelta(minutes=31)
+        if modified_since < lower_bound:
+            modified_since = lower_bound
+        if modified_since > upper_bound:
+            modified_since = upper_bound
+
         payload = await self._request_json(
             "GET",
             f"{self.POWER_BI_BASE_URL}/admin/workspaces/modified",
             api="powerbi",
             params={"modifiedSince": self._format_utc_timestamp(modified_since)},
         )
-        return [workspace["id"] for workspace in payload.get("value", []) if workspace.get("id")]
+        # Endpoint returns a bare JSON array, not {"value": [...]}.
+        workspaces = payload if isinstance(payload, list) else payload.get("value", [])
+        return [workspace["id"] for workspace in workspaces if workspace.get("id")]
 
     async def scan_workspaces(
         self,

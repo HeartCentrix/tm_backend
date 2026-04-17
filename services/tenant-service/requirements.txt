@@ -8,3 +8,7 @@ pydantic==2.5.3
 pydantic-settings==2.1.0
 python-dotenv==1.0.0
 aio-pika>=9.4.0
+azure-identity>=1.15.0
+azure-mgmt-storage>=21.1.0
+azure-mgmt-subscription>=3.1.1
+aiohttp>=3.9.0

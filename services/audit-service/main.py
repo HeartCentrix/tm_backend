@@ -128,6 +128,10 @@ ACTIONS = {
 
 WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE", "RANSOMWARE_SIGNAL"}
 
+# Discovery events (run start + completion, per-tenant) are surfaced in the
+# activity feed so users can see auto- and manual-triggered discoveries.
+DISCOVERY_ACTIVITY_ACTIONS = {"DISCOVERY_STARTED", "DISCOVERY_RUN"}
+
 M365_RESOURCE_TYPES = {
     ResourceType.MAILBOX,
     ResourceType.SHARED_MAILBOX,
@@ -275,6 +279,38 @@ async def list_activities(
             warning_result = await db.execute(warning_stmt)
             warning_events = warning_result.scalars().all()
 
+        # Discovery events: fetch when no operation filter is set, or when the
+        # user specifically asks for DISCOVERY. Status filter "Failed"/"Done"/
+        # "In Progress" maps to outcomes below.
+        include_discovery_items = (
+            (not operation or operation.upper() == "DISCOVERY")
+            and (not status or status in {"Done", "In Progress", "Failed"})
+        )
+        discovery_events: List[AuditEvent] = []
+        discovery_total = 0
+        if include_discovery_items:
+            discovery_filters = [AuditEvent.action.in_(DISCOVERY_ACTIVITY_ACTIONS)]
+            if tenantId:
+                discovery_filters.append(AuditEvent.tenant_id == uuid.UUID(tenantId))
+            if start_date:
+                discovery_filters.append(AuditEvent.occurred_at >= datetime.fromisoformat(start_date))
+            if end_date:
+                discovery_filters.append(AuditEvent.occurred_at <= datetime.fromisoformat(end_date))
+            # serviceType (m365/azure) maps to the resource_type we store on
+            # discovery events ("M365" or "AZURE").
+            if service_key:
+                discovery_filters.append(AuditEvent.resource_type == service_key.upper())
+            discovery_stmt = (
+                select(AuditEvent)
+                .where(and_(*discovery_filters))
+                .order_by(desc(AuditEvent.occurred_at))
+                .limit(max(size, page * size))
+            )
+            discovery_count_stmt = select(func.count()).select_from(AuditEvent).where(and_(*discovery_filters))
+            discovery_total = (await db.execute(discovery_count_stmt)).scalar() or 0
+            discovery_result = await db.execute(discovery_stmt)
+            discovery_events = discovery_result.scalars().all()
+
         # Map jobs to ActivityItem format
         status_reverse_map = {
             JobStatus.COMPLETED: "Done",
@@ -321,8 +357,49 @@ async def list_activities(
                 "details": details.get("message") or "Backup skipped because the assigned SLA does not cover this resource type.",
             })
 
+        # Discovery events rendered as DISCOVERY activity rows.
+        for event in discovery_events:
+            details = event.details or {}
+            is_start = event.action == "DISCOVERY_STARTED"
+            outcome = (event.outcome or "").upper() if event.outcome else ""
+            if is_start:
+                disco_status = "In Progress"
+            elif outcome == "SUCCESS":
+                disco_status = "Done"
+            elif outcome == "FAILURE":
+                disco_status = "Failed"
+            else:
+                disco_status = "In Progress"
+
+            if status and status not in {disco_status}:
+                continue
+
+            disco_type = details.get("type") or event.resource_type or "Discovery"
+            if is_start:
+                detail_text = f"{disco_type} discovery started"
+            elif outcome == "SUCCESS":
+                found = details.get("resourcesFound")
+                detail_text = f"{disco_type} discovery completed"
+                if found is not None:
+                    detail_text += f" — {found} resources"
+            elif outcome == "FAILURE":
+                err = details.get("error") or "unknown error"
+                detail_text = f"{disco_type} discovery failed: {err}"
+            else:
+                detail_text = f"{disco_type} discovery"
+
+            items.append({
+                "id": f"discovery-{event.id}",
+                "start_time": event.occurred_at.isoformat() if event.occurred_at else "",
+                "operation": "DISCOVERY",
+                "object": event.resource_name or disco_type,
+                "status": disco_status,
+                "finish_time": "" if is_start else (event.occurred_at.isoformat() if event.occurred_at else ""),
+                "details": detail_text,
+            })
+
         items.sort(key=lambda item: item["start_time"] or "", reverse=True)
-        total = job_total + warning_total
+        total = job_total + warning_total + discovery_total
         start_index = (page - 1) * size
         paginated_items = items[start_index:start_index + size]
 

@@ -70,6 +70,7 @@ class Settings:
         self.AZURE_ARM_CLIENT_ID = os.getenv("AZURE_ARM_CLIENT_ID", "")
         self.AZURE_ARM_CLIENT_SECRET = os.getenv("AZURE_ARM_CLIENT_SECRET", "")
         self.AZURE_ARM_TENANT_ID = os.getenv("AZURE_ARM_TENANT_ID", "")
+        self.AZURE_SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID", "")
 
         # Azure Backup resource group (for VM restore point collections)
         self.AZURE_BACKUP_RESOURCE_GROUP = os.getenv("AZURE_BACKUP_RESOURCE_GROUP", "rg-tmvault-backup")

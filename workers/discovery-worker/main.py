@@ -14,6 +14,7 @@ from uuid import UUID
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 import aio_pika
+import httpx
 from aio_pika import IncomingMessage
 from sqlalchemy import bindparam, select, text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -35,6 +36,37 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger("discovery-worker")
+
+
+async def _emit_discovery_audit(
+    action: str,
+    tenant_id: UUID,
+    tenant_name: str,
+    discovery_type: str,
+    outcome: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Post a discovery event to the audit service so it shows up in the
+    activity feed. Non-fatal: network/audit-service errors are swallowed so
+    they never break the discovery flow itself."""
+    payload: Dict[str, Any] = {
+        "action": action,
+        "tenant_id": str(tenant_id),
+        "actor_type": "WORKER",
+        "resource_type": discovery_type,
+        "resource_name": tenant_name,
+        "details": {"type": discovery_type, **(details or {})},
+    }
+    if outcome:
+        payload["outcome"] = outcome
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload,
+            )
+    except Exception as exc:
+        logger.warning("[audit] failed to emit %s for tenant %s: %s", action, tenant_id, exc)
+
 
 TYPE_MAP: Dict[str, ResourceType] = {
     "MAILBOX": ResourceType.MAILBOX,
@@ -738,6 +770,10 @@ async def discover_tenant(tenant_id: UUID, discovery_scope: Optional[List[str]] 
             "delegated service-user" if power_bi_refresh_token else "app-only",
             discovery_scope or "FULL",
         )
+        await _emit_discovery_audit(
+            "DISCOVERY_STARTED", tenant_id, tenant_display_name, "M365",
+            details={"scope": discovery_scope or "FULL"},
+        )
 
         graph = GraphClient(
             client_id,
@@ -793,6 +829,17 @@ async def discover_tenant(tenant_id: UUID, discovery_scope: Optional[List[str]] 
             unchanged_count,
             stale_marked_count,
         )
+        await _emit_discovery_audit(
+            "DISCOVERY_RUN", tenant_id, tenant_display_name, "M365",
+            outcome="SUCCESS",
+            details={
+                "resourcesFound": staged_count,
+                "inserted": inserted_count,
+                "updated": updated_count,
+                "unchanged": unchanged_count,
+                "staleMarked": stale_marked_count,
+            },
+        )
         return staged_count
 
     except Exception as e:
@@ -801,6 +848,10 @@ async def discover_tenant(tenant_id: UUID, discovery_scope: Optional[List[str]] 
             await _mark_discovery_failed(tenant_id, run_id, previous_status, str(e))
         except Exception as recovery_error:
             logger.warning("Failed to persist discovery failure state for tenant %s: %s", tenant_id, recovery_error)
+        await _emit_discovery_audit(
+            "DISCOVERY_RUN", tenant_id, tenant_display_name, "M365",
+            outcome="FAILURE", details={"error": str(e)},
+        )
         return 0
 
 
@@ -905,6 +956,9 @@ async def discover_azure_tenant(tenant_id: UUID) -> int:
             await db.commit()
 
         logger.info("Starting Azure resource discovery for tenant %s (%s)...", tenant_display_name, tenant_id)
+        await _emit_discovery_audit(
+            "DISCOVERY_STARTED", tenant_id, tenant_display_name, "AZURE",
+        )
 
         async with async_session_factory() as db:
             tenant = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalar_one_or_none()
@@ -952,6 +1006,17 @@ async def discover_azure_tenant(tenant_id: UUID) -> int:
             unchanged_count,
             stale_marked_count,
         )
+        await _emit_discovery_audit(
+            "DISCOVERY_RUN", tenant_id, tenant_display_name, "AZURE",
+            outcome="SUCCESS",
+            details={
+                "resourcesFound": staged_count,
+                "inserted": inserted_count,
+                "updated": updated_count,
+                "unchanged": unchanged_count,
+                "staleMarked": stale_marked_count,
+            },
+        )
         return staged_count
 
     except Exception as e:
@@ -960,6 +1025,10 @@ async def discover_azure_tenant(tenant_id: UUID) -> int:
             await _mark_discovery_failed(tenant_id, run_id, previous_status, str(e))
         except Exception as recovery_error:
             logger.warning("Failed to persist Azure discovery failure state for tenant %s: %s", tenant_id, recovery_error)
+        await _emit_discovery_audit(
+            "DISCOVERY_RUN", tenant_id, tenant_display_name, "AZURE",
+            outcome="FAILURE", details={"error": str(e)},
+        )
         return 0
 
 
