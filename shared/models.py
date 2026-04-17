@@ -423,6 +423,8 @@ class SnapshotItem(Base):
     blob_path = Column(String)  # NEW: Azure Blob path for this item
     encryption_key_id = Column(String)  # NEW: DEK version used
     backup_version = Column(Integer, default=1)  # NEW: backup schema version
+    byte_offset = Column(BigInteger, nullable=True)
+    byte_length = Column(BigInteger, nullable=True)
     extra_data = Column("metadata", JSON, default=dict)
     is_deleted = Column(Boolean, default=False)
     indexed_at = Column(DateTime)

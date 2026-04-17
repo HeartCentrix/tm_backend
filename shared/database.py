@@ -521,6 +521,8 @@ async def init_db() -> None:
             blob_path VARCHAR,
             encryption_key_id VARCHAR,
             backup_version INTEGER DEFAULT 1,
+            byte_offset BIGINT,
+            byte_length BIGINT,
             metadata JSON DEFAULT '{}',
             is_deleted BOOLEAN DEFAULT FALSE,
             indexed_at TIMESTAMP,
@@ -699,6 +701,8 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_resource_groups_priority ON resource_groups(tenant_id, priority, enabled)",
         "CREATE INDEX IF NOT EXISTS idx_group_policy_assignments_group ON group_policy_assignments(group_id)",
         "CREATE INDEX IF NOT EXISTS idx_group_policy_assignments_policy ON group_policy_assignments(policy_id)",
+        # Teams chat packed-blob dedup lookup
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_items_tenant_checksum ON snapshot_items(tenant_id, content_checksum)",
     ]
 
     add_column_statements = [
@@ -758,6 +762,9 @@ async def init_db() -> None:
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS key_name VARCHAR;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS key_version VARCHAR;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS auto_apply_to_matching BOOLEAN DEFAULT FALSE NOT NULL;",
+        # Teams chat packed-blob byte-range granular restore
+        "ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS byte_offset BIGINT;",
+        "ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS byte_length BIGINT;",
     ]
 
     alter_statements = [
