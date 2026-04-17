@@ -61,6 +61,12 @@ from shared.azure_storage import (
 logger = logging.getLogger(__name__)
 
 
+def _teams_packed_blobs_enabled() -> bool:
+    return os.getenv("TEAMS_CHAT_PACKED_BLOBS", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 class AuditLogger:
     """Logs backup events via HTTP POST and RabbitMQ"""
 
@@ -1857,6 +1863,14 @@ class BackupWorker:
             f"{len(msgs)} messages across {len(by_chat)} chats"
         )
 
+        if _teams_packed_blobs_enabled():
+            return await self._backup_teams_chat_export_packed(
+                resource=resource, snapshot=snapshot, tenant=tenant,
+                msgs=msgs, chat_topics=chat_topics,
+                new_delta_link=new_delta_link,
+                user_id=user_id, user_label=user_label,
+            )
+
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
 
@@ -1961,6 +1975,186 @@ class BackupWorker:
 
         print(
             f"[{self.worker_id}] [CHAT_EXPORT COMPLETE] {user_label} — "
+            f"{total_items} messages, {total_bytes} bytes, "
+            f"delta={'saved' if new_delta_link else 'missing'}"
+        )
+
+        async with async_session_factory() as sess:
+            await self.update_resource_backup_info(sess, resource, None, snapshot.id, {
+                "item_count": total_items,
+                "bytes_added": total_bytes,
+            })
+
+        return {"item_count": total_items, "bytes_added": total_bytes}
+
+    async def _backup_teams_chat_export_packed(
+        self, resource: Resource, snapshot: Snapshot, tenant: Tenant,
+        msgs: List[Dict], chat_topics: Dict[str, str],
+        new_delta_link: Optional[str], user_id: str, user_label: str,
+    ) -> Dict:
+        """Packed NDJSON variant of backup_teams_chat_export.
+
+        Groups messages by (chat_id, creation-date) and packs many messages into
+        one NDJSON blob per shard. Each message still gets its own SnapshotItem,
+        but records (blob_path, byte_offset, byte_length) so individual-message
+        restore reads a byte range from the packed blob instead of one blob per
+        message. Flushes a pack when it hits FLUSH_BYTES, FLUSH_MSGS, or EOF.
+
+        Gated by TEAMS_CHAT_PACKED_BLOBS env var — default off.
+        """
+        FLUSH_BYTES = 8 * 1024 * 1024
+        FLUSH_MSGS = 5000
+
+        shard_info = azure_storage_manager.get_shard_for_resource(
+            str(resource.id), str(tenant.id)
+        )
+        container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
+
+        buckets: Dict[Tuple[str, str], List[Dict]] = {}
+        for m in msgs:
+            cid = m.get("chatId")
+            if not cid:
+                continue
+            raw_dt = m.get("createdDateTime") or m.get("lastModifiedDateTime") or ""
+            date_key = raw_dt[:10] if len(raw_dt) >= 10 else datetime.utcnow().strftime("%Y-%m-%d")
+            buckets.setdefault((cid, date_key), []).append(m)
+
+        print(
+            f"[{self.worker_id}] [CHAT_EXPORT_PACKED] {user_label} — "
+            f"{len(msgs)} messages across {len(buckets)} chat-date buckets"
+        )
+
+        total_items = 0
+        total_bytes = 0
+        dedup_reused = 0
+
+        for (chat_id, date_key), bucket_msgs in buckets.items():
+            chat_topic = chat_topics.get(chat_id, chat_id)
+            folder_path = f"chats/{chat_topic}"
+
+            prepared: List[Tuple[str, Dict, bytes, str]] = []
+            for msg in bucket_msgs:
+                msg_id = msg.get("id", str(uuid.uuid4()))
+                content_bytes = json.dumps(msg, separators=(",", ":")).encode()
+                content_hash = hashlib.sha256(content_bytes).hexdigest()
+                prepared.append((msg_id, msg, content_bytes, content_hash))
+
+            hashes = [p[3] for p in prepared]
+            async with async_session_factory() as session:
+                existing_rows = (await session.execute(
+                    select(
+                        SnapshotItem.content_checksum,
+                        SnapshotItem.blob_path,
+                        SnapshotItem.byte_offset,
+                        SnapshotItem.byte_length,
+                        SnapshotItem.content_size,
+                    ).where(
+                        SnapshotItem.tenant_id == tenant.id,
+                        SnapshotItem.content_checksum.in_(hashes),
+                    )
+                )).all()
+            existing: Dict[str, Tuple[Optional[str], Optional[int], Optional[int], int]] = {
+                row[0]: (row[1], row[2], row[3], row[4] or 0) for row in existing_rows
+            }
+
+            shard_idx = 0
+            buf = bytearray()
+            pack_entries: List[Tuple[int, int, str, str, Dict]] = []
+            bucket_items: List[SnapshotItem] = []
+
+            async def flush_pack():
+                nonlocal shard_idx, buf, pack_entries, total_bytes, total_items
+                if not pack_entries:
+                    return
+                blob_path = (
+                    f"{tenant.id}/teams/messages/{chat_id}/{date_key}/"
+                    f"{shard_idx:04d}.ndjson"
+                )
+                payload = bytes(buf)
+                result = await upload_blob_with_retry(
+                    container, blob_path, payload, shard_info
+                )
+                if result.get("success"):
+                    total_bytes += len(payload)
+                    for offset, length, content_hash, msg_id, msg in pack_entries:
+                        bucket_items.append(SnapshotItem(
+                            snapshot_id=snapshot.id, tenant_id=tenant.id,
+                            external_id=msg_id, item_type="TEAMS_CHAT_MESSAGE",
+                            name=msg.get("body", {}).get("content", "")[:100] or msg_id,
+                            folder_path=folder_path,
+                            content_hash=content_hash, content_size=length,
+                            blob_path=blob_path,
+                            byte_offset=offset, byte_length=length,
+                            extra_data={
+                                "raw": msg, "chatId": chat_id,
+                                "chatTopic": chat_topic, "exportedVia": user_id,
+                                "packed": True,
+                            },
+                            content_checksum=content_hash,
+                        ))
+                    total_items += len(pack_entries)
+                else:
+                    print(
+                        f"[{self.worker_id}] [CHAT_EXPORT_PACKED] upload failed "
+                        f"{blob_path}: {result.get('error')}"
+                    )
+                buf = bytearray()
+                pack_entries = []
+                shard_idx += 1
+
+            for msg_id, msg, content_bytes, content_hash in prepared:
+                if content_hash in existing:
+                    ex_path, ex_off, ex_len, ex_size = existing[content_hash]
+                    bucket_items.append(SnapshotItem(
+                        snapshot_id=snapshot.id, tenant_id=tenant.id,
+                        external_id=msg_id, item_type="TEAMS_CHAT_MESSAGE",
+                        name=msg.get("body", {}).get("content", "")[:100] or msg_id,
+                        folder_path=folder_path,
+                        content_hash=content_hash, content_size=ex_size,
+                        blob_path=ex_path,
+                        byte_offset=ex_off, byte_length=ex_len,
+                        extra_data={
+                            "raw": msg, "chatId": chat_id,
+                            "chatTopic": chat_topic, "exportedVia": user_id,
+                            "packed": ex_off is not None, "dedup": True,
+                        },
+                        content_checksum=content_hash,
+                    ))
+                    dedup_reused += 1
+                    total_items += 1
+                    continue
+
+                offset = len(buf)
+                buf.extend(content_bytes)
+                buf.extend(b"\n")
+                pack_entries.append((offset, len(content_bytes), content_hash, msg_id, msg))
+
+                if len(buf) >= FLUSH_BYTES or len(pack_entries) >= FLUSH_MSGS:
+                    await flush_pack()
+
+            await flush_pack()
+
+            if bucket_items:
+                async with async_session_factory() as session:
+                    session.add_all(bucket_items)
+                    await session.commit()
+
+        if dedup_reused:
+            print(
+                f"[{self.worker_id}] [CHAT_EXPORT_PACKED] {user_label} — "
+                f"dedup: {dedup_reused} messages reused existing blobs"
+            )
+
+        if new_delta_link:
+            async with async_session_factory() as session:
+                r = await session.get(Resource, resource.id)
+                if r is not None:
+                    r.extra_data = r.extra_data or {}
+                    r.extra_data["delta_token"] = new_delta_link
+                    await session.commit()
+
+        print(
+            f"[{self.worker_id}] [CHAT_EXPORT_PACKED COMPLETE] {user_label} — "
             f"{total_items} messages, {total_bytes} bytes, "
             f"delta={'saved' if new_delta_link else 'missing'}"
         )
