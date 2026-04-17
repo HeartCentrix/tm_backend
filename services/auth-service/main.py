@@ -345,6 +345,13 @@ async def datasource_callback(
             status=TenantStatus.ACTIVE,
         )
         db.add(tenant)
+        await db.flush()
+        try:
+            from shared.sla_presets import seed_preset_policies
+            n = await seed_preset_policies(db, tenant.id, "M365")
+            print(f"[auth-service] Seeded {n} preset SLA policies for new M365 tenant {tenant.id}")
+        except Exception as exc:
+            print(f"[auth-service] WARN preset SLA seeding failed: {exc}")
     else:
         tenant.graph_client_id = settings.MICROSOFT_CLIENT_ID
         tenant.graph_client_secret_encrypted = encrypted_secret
@@ -533,6 +540,13 @@ async def azure_datasource_callback(
             status=TenantStatus.ACTIVE,
         )
         db.add(tenant)
+        await db.flush()
+        try:
+            from shared.sla_presets import seed_preset_policies
+            n = await seed_preset_policies(db, tenant.id, "AZURE")
+            print(f"[auth-service] Seeded {n} preset SLA policies for new Azure tenant {tenant.id}")
+        except Exception as exc:
+            print(f"[auth-service] WARN preset SLA seeding failed: {exc}")
         await db.commit()
         print(f"[auth-service] Created Azure tenant: {tenant.id} ({display_name}), external_tenant_id={external_tenant_id}")
     else:

@@ -1,6 +1,6 @@
 """Resource Service - Manages resources and SLA policies"""
 from contextlib import asynccontextmanager
-from typing import Optional, Iterable
+from typing import Optional, Iterable, List, Dict, Any
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 from datetime import timedelta
@@ -11,12 +11,18 @@ from sqlalchemy import select, func, or_, text
 
 from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Resource, SlaPolicy, ResourceType, ResourceStatus, Tenant, TenantType
+from shared.models import (
+    Resource, SlaPolicy, ResourceType, ResourceStatus, Tenant, TenantType,
+    SlaExclusion, ResourceGroup, GroupPolicyAssignment,
+)
 from shared.schemas import (
     ResourceResponse, ResourceListResponse, UserResourceResponse,
     AssignPolicyRequest, BulkOperationRequest,
     BulkAssignRequest, BulkUnassignRequest,
-    SlaPolicyResponse, SlaPolicyCreateRequest
+    SlaPolicyResponse, SlaPolicyCreateRequest,
+    SlaExclusionRequest, SlaExclusionResponse,
+    ResourceGroupRequest, ResourceGroupResponse,
+    GroupPolicyAssignmentRequest,
 )
 
 
@@ -836,6 +842,28 @@ async def create_policy(request: dict, db: AsyncSession = Depends(get_db)):
         backup_azure_postgresql=get_val("backupAzurePostgresql", "backup_azure_postgresql", service_type == "azure"),
         retention_type=get_val("retentionType", "retention_type", "INDEFINITE"),
         retention_days=get_val("retentionDays", "retention_days"),
+        # Phase 1 SLA expansion fields — all optional; sensible defaults applied
+        retention_mode=get_val("retentionMode", "retention_mode", "FLAT"),
+        retention_hot_days=get_val("retentionHotDays", "retention_hot_days", 7),
+        retention_cool_days=get_val("retentionCoolDays", "retention_cool_days", 30),
+        retention_archive_days=get_val("retentionArchiveDays", "retention_archive_days"),
+        gfs_daily_count=get_val("gfsDailyCount", "gfs_daily_count"),
+        gfs_weekly_count=get_val("gfsWeeklyCount", "gfs_weekly_count"),
+        gfs_monthly_count=get_val("gfsMonthlyCount", "gfs_monthly_count"),
+        gfs_yearly_count=get_val("gfsYearlyCount", "gfs_yearly_count"),
+        item_retention_days=get_val("itemRetentionDays", "item_retention_days"),
+        item_retention_basis=get_val("itemRetentionBasis", "item_retention_basis", "SNAPSHOT"),
+        archived_retention_mode=get_val("archivedRetentionMode", "archived_retention_mode", "SAME"),
+        archived_retention_days=get_val("archivedRetentionDays", "archived_retention_days"),
+        legal_hold_enabled=get_val("legalHoldEnabled", "legal_hold_enabled", False),
+        legal_hold_until=get_val("legalHoldUntil", "legal_hold_until"),
+        immutability_mode=get_val("immutabilityMode", "immutability_mode", "None"),
+        storage_region=get_val("storageRegion", "storage_region"),
+        encryption_mode=get_val("encryptionMode", "encryption_mode", "VAULT_MANAGED"),
+        key_vault_uri=get_val("keyVaultUri", "key_vault_uri"),
+        key_name=get_val("keyName", "key_name"),
+        key_version=get_val("keyVersion", "key_version"),
+        auto_apply_to_matching=get_val("autoApplyToMatching", "auto_apply_to_matching", False),
         enabled=get_val("enabled", "enabled", True),
         is_default=get_val("isDefault", "is_default", False),
     )
@@ -884,6 +912,28 @@ async def update_policy(policy_id: str, request: dict, db: AsyncSession = Depend
         'backupAzureVm': 'backup_azure_vm', 'backupAzureSql': 'backup_azure_sql',
         'backupAzurePostgresql': 'backup_azure_postgresql',
         'retentionType': 'retention_type', 'retentionDays': 'retention_days',
+        # Phase 1 fields — editable after create
+        'retentionMode': 'retention_mode',
+        'retentionHotDays': 'retention_hot_days',
+        'retentionCoolDays': 'retention_cool_days',
+        'retentionArchiveDays': 'retention_archive_days',
+        'gfsDailyCount': 'gfs_daily_count',
+        'gfsWeeklyCount': 'gfs_weekly_count',
+        'gfsMonthlyCount': 'gfs_monthly_count',
+        'gfsYearlyCount': 'gfs_yearly_count',
+        'itemRetentionDays': 'item_retention_days',
+        'itemRetentionBasis': 'item_retention_basis',
+        'archivedRetentionMode': 'archived_retention_mode',
+        'archivedRetentionDays': 'archived_retention_days',
+        'legalHoldEnabled': 'legal_hold_enabled',
+        'legalHoldUntil': 'legal_hold_until',
+        'immutabilityMode': 'immutability_mode',
+        'storageRegion': 'storage_region',
+        'encryptionMode': 'encryption_mode',
+        'keyVaultUri': 'key_vault_uri',
+        'keyName': 'key_name',
+        'keyVersion': 'key_version',
+        'autoApplyToMatching': 'auto_apply_to_matching',
         'enabled': 'enabled', 'isDefault': 'is_default',
     }
     
@@ -926,3 +976,192 @@ async def get_policy_resources(policy_id: str, db: AsyncSession = Depends(get_db
 @app.post("/api/v1/policies/{policy_id}/auto-assign", status_code=204)
 async def auto_assign_policy(policy_id: str, request: dict):
     pass
+
+
+# ==================== SLA Exclusions ====================
+# Per-policy exclusion rules (folder paths, file extensions, subject regex, etc.)
+# Backup-worker consults these before staging each item. apply_to_historical flags
+# items for offline purge from existing snapshots.
+
+@app.get("/api/v1/policies/{policy_id}/exclusions", response_model=List[SlaExclusionResponse])
+async def list_policy_exclusions(policy_id: str, db: AsyncSession = Depends(get_db)):
+    stmt = select(SlaExclusion).where(SlaExclusion.policy_id == UUID(policy_id)).order_by(SlaExclusion.created_at.desc())
+    result = await db.execute(stmt)
+    return [SlaExclusionResponse.model_validate(x) for x in result.scalars().all()]
+
+
+@app.post("/api/v1/policies/{policy_id}/exclusions", response_model=SlaExclusionResponse, status_code=201)
+async def create_policy_exclusion(policy_id: str, body: SlaExclusionRequest, db: AsyncSession = Depends(get_db)):
+    policy = await db.get(SlaPolicy, UUID(policy_id))
+    if not policy:
+        raise HTTPException(status_code=404, detail="Policy not found")
+
+    allowed_types = {"FOLDER_PATH", "FILE_EXTENSION", "SUBJECT_REGEX", "MIME_TYPE", "EMAIL_ADDRESS", "FILENAME_GLOB"}
+    if body.exclusionType not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"exclusion_type must be one of {sorted(allowed_types)}")
+
+    exclusion = SlaExclusion(
+        id=uuid4(),
+        policy_id=policy.id,
+        exclusion_type=body.exclusionType,
+        pattern=body.pattern,
+        workload=body.workload,
+        apply_to_historical=body.applyToHistorical or False,
+        enabled=body.enabled if body.enabled is not None else True,
+    )
+    db.add(exclusion)
+    await db.commit()
+    await db.refresh(exclusion)
+    return SlaExclusionResponse.model_validate(exclusion)
+
+
+@app.delete("/api/v1/policies/{policy_id}/exclusions/{exclusion_id}", status_code=204)
+async def delete_policy_exclusion(policy_id: str, exclusion_id: str, db: AsyncSession = Depends(get_db)):
+    stmt = select(SlaExclusion).where(
+        SlaExclusion.id == UUID(exclusion_id),
+        SlaExclusion.policy_id == UUID(policy_id),
+    )
+    exclusion = (await db.execute(stmt)).scalar_one_or_none()
+    if not exclusion:
+        raise HTTPException(status_code=404, detail="Exclusion not found")
+    await db.delete(exclusion)
+    await db.commit()
+
+
+# ==================== Resource Groups ====================
+# Dynamic (rule-based) or static groups for mass-policy-assignment.
+# Discovery-worker evaluates rules on newly-discovered resources when
+# auto_protect_new=true on any group that has a policy attached.
+
+async def _serialize_group(db: AsyncSession, g: ResourceGroup) -> Dict[str, Any]:
+    """Fetch attached policy ids for a group and return the full API response dict."""
+    assignments = (await db.execute(
+        select(GroupPolicyAssignment.policy_id).where(GroupPolicyAssignment.group_id == g.id)
+    )).scalars().all()
+    payload = ResourceGroupResponse.model_validate(g).model_dump(by_alias=False)
+    payload["attachedPolicyIds"] = [str(pid) for pid in assignments]
+    return payload
+
+
+@app.get("/api/v1/resource-groups")
+async def list_resource_groups(
+    tenantId: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = (select(ResourceGroup)
+            .where(ResourceGroup.tenant_id == UUID(tenantId))
+            .order_by(ResourceGroup.priority.asc(), ResourceGroup.created_at.desc()))
+    groups = (await db.execute(stmt)).scalars().all()
+    return [await _serialize_group(db, g) for g in groups]
+
+
+@app.get("/api/v1/resource-groups/{group_id}")
+async def get_resource_group(group_id: str, db: AsyncSession = Depends(get_db)):
+    g = await db.get(ResourceGroup, UUID(group_id))
+    if not g:
+        raise HTTPException(status_code=404, detail="Resource group not found")
+    return await _serialize_group(db, g)
+
+
+@app.post("/api/v1/resource-groups", status_code=201)
+async def create_resource_group(body: dict, db: AsyncSession = Depends(get_db)):
+    tenant_id = body.get("tenantId") or body.get("tenant_id")
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenantId is required")
+    if not body.get("name"):
+        raise HTTPException(status_code=400, detail="name is required")
+    group = ResourceGroup(
+        id=uuid4(),
+        tenant_id=UUID(tenant_id),
+        name=body.get("name"),
+        description=body.get("description"),
+        group_type=body.get("groupType") or body.get("group_type") or "DYNAMIC",
+        rules=body.get("rules") or [],
+        combinator=body.get("combinator") or "AND",
+        priority=body.get("priority", 100),
+        auto_protect_new=body.get("autoProtectNew", body.get("auto_protect_new", False)),
+        enabled=body.get("enabled", True),
+    )
+    db.add(group)
+    await db.commit()
+    await db.refresh(group)
+    return await _serialize_group(db, group)
+
+
+@app.put("/api/v1/resource-groups/{group_id}")
+async def update_resource_group(group_id: str, body: dict, db: AsyncSession = Depends(get_db)):
+    g = await db.get(ResourceGroup, UUID(group_id))
+    if not g:
+        raise HTTPException(status_code=404, detail="Resource group not found")
+    # camelCase or snake_case accepted
+    field_map = {
+        "name": "name", "description": "description",
+        "groupType": "group_type", "group_type": "group_type",
+        "rules": "rules", "combinator": "combinator", "priority": "priority",
+        "autoProtectNew": "auto_protect_new", "auto_protect_new": "auto_protect_new",
+        "enabled": "enabled",
+    }
+    for key, column in field_map.items():
+        if key in body:
+            setattr(g, column, body[key])
+    g.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    await db.commit()
+    await db.refresh(g)
+    return await _serialize_group(db, g)
+
+
+@app.delete("/api/v1/resource-groups/{group_id}", status_code=204)
+async def delete_resource_group(group_id: str, db: AsyncSession = Depends(get_db)):
+    g = await db.get(ResourceGroup, UUID(group_id))
+    if not g:
+        raise HTTPException(status_code=404, detail="Resource group not found")
+    await db.delete(g)  # assignments cascade
+    await db.commit()
+
+
+# ---------- Group ↔ policy attach / detach ----------
+
+@app.post("/api/v1/resource-groups/{group_id}/policies", status_code=201)
+async def attach_policy_to_group(
+    group_id: str,
+    body: GroupPolicyAssignmentRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    g = await db.get(ResourceGroup, UUID(group_id))
+    if not g:
+        raise HTTPException(status_code=404, detail="Resource group not found")
+    policy = await db.get(SlaPolicy, UUID(body.policyId))
+    if not policy:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    if policy.tenant_id != g.tenant_id:
+        raise HTTPException(status_code=400, detail="Policy and group must belong to the same tenant")
+
+    # Idempotent — if already attached, return existing
+    existing_stmt = select(GroupPolicyAssignment).where(
+        GroupPolicyAssignment.group_id == g.id,
+        GroupPolicyAssignment.policy_id == policy.id,
+    )
+    existing = (await db.execute(existing_stmt)).scalar_one_or_none()
+    if existing:
+        return {"id": str(existing.id), "groupId": str(g.id), "policyId": str(policy.id), "alreadyAttached": True}
+
+    link = GroupPolicyAssignment(id=uuid4(), group_id=g.id, policy_id=policy.id)
+    db.add(link)
+    await db.commit()
+    return {"id": str(link.id), "groupId": str(g.id), "policyId": str(policy.id)}
+
+
+@app.delete("/api/v1/resource-groups/{group_id}/policies/{policy_id}", status_code=204)
+async def detach_policy_from_group(
+    group_id: str, policy_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(GroupPolicyAssignment).where(
+        GroupPolicyAssignment.group_id == UUID(group_id),
+        GroupPolicyAssignment.policy_id == UUID(policy_id),
+    )
+    link = (await db.execute(stmt)).scalar_one_or_none()
+    if not link:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    await db.delete(link)
+    await db.commit()

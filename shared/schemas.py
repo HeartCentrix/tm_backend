@@ -1,6 +1,6 @@
 """Shared Pydantic schemas for all microservices"""
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from uuid import UUID
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
@@ -357,15 +357,38 @@ class SlaPolicyResponse(BaseModel):
     backupAzurePostgresql: Optional[bool] = Field(default=True, alias='backup_azure_postgresql')
     retentionType: str = Field(alias='retention_type')
     retentionDays: Optional[int] = Field(default=None, alias='retention_days')
+    # Phase 1 schema expansion (GFS, item-level, archived-rules, BYOK, auto-apply)
+    retentionMode: str = Field(default='FLAT', alias='retention_mode')
+    retentionHotDays: Optional[int] = Field(default=None, alias='retention_hot_days')
+    retentionCoolDays: Optional[int] = Field(default=None, alias='retention_cool_days')
+    retentionArchiveDays: Optional[int] = Field(default=None, alias='retention_archive_days')
+    gfsDailyCount: Optional[int] = Field(default=None, alias='gfs_daily_count')
+    gfsWeeklyCount: Optional[int] = Field(default=None, alias='gfs_weekly_count')
+    gfsMonthlyCount: Optional[int] = Field(default=None, alias='gfs_monthly_count')
+    gfsYearlyCount: Optional[int] = Field(default=None, alias='gfs_yearly_count')
+    itemRetentionDays: Optional[int] = Field(default=None, alias='item_retention_days')
+    itemRetentionBasis: str = Field(default='SNAPSHOT', alias='item_retention_basis')
+    archivedRetentionMode: str = Field(default='SAME', alias='archived_retention_mode')
+    archivedRetentionDays: Optional[int] = Field(default=None, alias='archived_retention_days')
+    legalHoldEnabled: Optional[bool] = Field(default=False, alias='legal_hold_enabled')
+    legalHoldUntil: Optional[str] = Field(default=None, alias='legal_hold_until')
+    immutabilityMode: str = Field(default='None', alias='immutability_mode')
+    storageRegion: Optional[str] = Field(default=None, alias='storage_region')
+    encryptionMode: str = Field(default='VAULT_MANAGED', alias='encryption_mode')
+    keyVaultUri: Optional[str] = Field(default=None, alias='key_vault_uri')
+    keyName: Optional[str] = Field(default=None, alias='key_name')
+    keyVersion: Optional[str] = Field(default=None, alias='key_version')
+    autoApplyToMatching: Optional[bool] = Field(default=False, alias='auto_apply_to_matching')
+    isDefault: Optional[bool] = Field(default=False, alias='is_default')
     enabled: Optional[bool] = True
     createdAt: str = Field(alias='created_at')
-    
+
     @field_validator('id', 'tenantId', mode='before')
     @classmethod
     def uuid_to_str(cls, v):
         return str(v) if v else v
-    
-    @field_validator('createdAt', mode='before')
+
+    @field_validator('createdAt', 'legalHoldUntil', mode='before')
     @classmethod
     def datetime_to_str(cls, v):
         return v.isoformat() if v else v
@@ -400,7 +423,128 @@ class SlaPolicyCreateRequest(BaseModel):
     backupAzurePostgresql: Optional[bool] = Field(default=True, alias='backup_azure_postgresql')
     retentionType: str = Field(alias='retention_type')
     retentionDays: Optional[int] = Field(default=None, alias='retention_days')
+    # Phase 1 fields
+    retentionMode: Optional[str] = Field(default='FLAT', alias='retention_mode')
+    retentionHotDays: Optional[int] = Field(default=None, alias='retention_hot_days')
+    retentionCoolDays: Optional[int] = Field(default=None, alias='retention_cool_days')
+    retentionArchiveDays: Optional[int] = Field(default=None, alias='retention_archive_days')
+    gfsDailyCount: Optional[int] = Field(default=None, alias='gfs_daily_count')
+    gfsWeeklyCount: Optional[int] = Field(default=None, alias='gfs_weekly_count')
+    gfsMonthlyCount: Optional[int] = Field(default=None, alias='gfs_monthly_count')
+    gfsYearlyCount: Optional[int] = Field(default=None, alias='gfs_yearly_count')
+    itemRetentionDays: Optional[int] = Field(default=None, alias='item_retention_days')
+    itemRetentionBasis: Optional[str] = Field(default='SNAPSHOT', alias='item_retention_basis')
+    archivedRetentionMode: Optional[str] = Field(default='SAME', alias='archived_retention_mode')
+    archivedRetentionDays: Optional[int] = Field(default=None, alias='archived_retention_days')
+    legalHoldEnabled: Optional[bool] = Field(default=False, alias='legal_hold_enabled')
+    legalHoldUntil: Optional[str] = Field(default=None, alias='legal_hold_until')
+    immutabilityMode: Optional[str] = Field(default='None', alias='immutability_mode')
+    storageRegion: Optional[str] = Field(default=None, alias='storage_region')
+    encryptionMode: Optional[str] = Field(default='VAULT_MANAGED', alias='encryption_mode')
+    keyVaultUri: Optional[str] = Field(default=None, alias='key_vault_uri')
+    keyName: Optional[str] = Field(default=None, alias='key_name')
+    keyVersion: Optional[str] = Field(default=None, alias='key_version')
+    autoApplyToMatching: Optional[bool] = Field(default=False, alias='auto_apply_to_matching')
+    isDefault: Optional[bool] = Field(default=False, alias='is_default')
     enabled: Optional[bool] = True
+
+
+# ============ SLA Exclusions + Resource Groups (Phase 1) ============
+
+class SlaExclusionRequest(BaseModel):
+    """Create or update an exclusion rule on an SLA policy."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    # FOLDER_PATH | FILE_EXTENSION | SUBJECT_REGEX | MIME_TYPE | EMAIL_ADDRESS | FILENAME_GLOB
+    exclusionType: str = Field(alias='exclusion_type')
+    pattern: str
+    # Optional workload scope (EMAIL / FILE / CALENDAR / ...). NULL = apply wherever relevant.
+    workload: Optional[str] = None
+    applyToHistorical: Optional[bool] = Field(default=False, alias='apply_to_historical')
+    enabled: Optional[bool] = True
+
+
+class SlaExclusionResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True)
+
+    id: str
+    policyId: str = Field(alias='policy_id')
+    exclusionType: str = Field(alias='exclusion_type')
+    pattern: str
+    workload: Optional[str] = None
+    applyToHistorical: bool = Field(alias='apply_to_historical')
+    enabled: bool
+    createdAt: str = Field(alias='created_at')
+
+    @field_validator('id', 'policyId', mode='before')
+    @classmethod
+    def uuid_to_str(cls, v):
+        return str(v) if v else v
+
+    @field_validator('createdAt', mode='before')
+    @classmethod
+    def datetime_to_str(cls, v):
+        return v.isoformat() if v else v
+
+
+class ResourceGroupRule(BaseModel):
+    """Single rule within a dynamic resource group.
+
+    field     : one of NAME / EMAIL / DEPARTMENT / CITY / COUNTRY / JOB_TITLE /
+                RESOURCE_TYPE / EXTERNAL_ID / TAG_VALUE (tenant-kind specific)
+    operator  : EQUALS / NOT_EQUALS / CONTAINS / NOT_CONTAINS / STARTS_WITH /
+                ENDS_WITH / IN (value is comma-separated)
+    value     : right-hand side; string or comma-list for IN"""
+    field: str
+    operator: str
+    value: str
+
+
+class ResourceGroupRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str
+    description: Optional[str] = None
+    groupType: Optional[str] = Field(default='DYNAMIC', alias='group_type')
+    rules: Optional[List[ResourceGroupRule]] = Field(default_factory=list)
+    combinator: Optional[str] = 'AND'  # AND | OR
+    priority: Optional[int] = 100
+    autoProtectNew: Optional[bool] = Field(default=False, alias='auto_protect_new')
+    enabled: Optional[bool] = True
+
+
+class ResourceGroupResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True)
+
+    id: str
+    tenantId: str = Field(alias='tenant_id')
+    name: str
+    description: Optional[str] = None
+    groupType: str = Field(alias='group_type')
+    rules: List[Dict[str, Any]] = Field(default_factory=list)
+    combinator: str
+    priority: int
+    autoProtectNew: bool = Field(alias='auto_protect_new')
+    enabled: bool
+    # Populated when fetched with assignments joined
+    attachedPolicyIds: Optional[List[str]] = None
+    createdAt: str = Field(alias='created_at')
+
+    @field_validator('id', 'tenantId', mode='before')
+    @classmethod
+    def uuid_to_str(cls, v):
+        return str(v) if v else v
+
+    @field_validator('createdAt', mode='before')
+    @classmethod
+    def datetime_to_str(cls, v):
+        return v.isoformat() if v else v
+
+
+class GroupPolicyAssignmentRequest(BaseModel):
+    """Attach a policy to a resource group (or detach by passing the same id to DELETE)."""
+    model_config = ConfigDict(populate_by_name=True)
+    policyId: str = Field(alias='policy_id')
 
 
 # ============ Alert ============
