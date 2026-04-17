@@ -257,6 +257,9 @@ async def startup():
     # AZ-4: Schedule DR setup reconciler (every 6 hours)
     scheduler.add_job(reconcile_dr_setup, "interval", hours=6)
 
+    # Phase 2: Retention cleanup — FLAT/GFS snapshot pruning per SLA policy (daily)
+    scheduler.add_job(run_retention_cleanup, "interval", hours=24)
+
     # Schedule daily backup report (email/Slack/Teams)
     scheduler.add_job(send_daily_backup_report, "cron", hour=8, minute=0, timezone="UTC")
 
@@ -1018,6 +1021,28 @@ async def start_reconciler_loop():
                 print(f"[RECONCILER] Reconciler loop error: {e}")
 
     asyncio.create_task(_reconciler())
+
+
+# ── Phase 2: Retention Cleanup ──
+
+async def run_retention_cleanup():
+    """Daily: apply FLAT/GFS retention rules, delete snapshots outside the window.
+    Azure lifecycle policies still handle blob tier transitions + TTL; this function
+    reclaims DB rows + guarantees GFS behavior that storage lifecycle alone can't express."""
+    import traceback as _tb
+    print("[RETENTION] === START: Snapshot retention cleanup ===")
+    try:
+        from shared.retention_cleanup import enforce_retention_all_tenants
+        results = await enforce_retention_all_tenants(async_session_factory)
+        total_deleted = sum(r.get("deleted_snapshots", 0) for r in results.values() if isinstance(r, dict))
+        total_kept = sum(r.get("kept_snapshots", 0) for r in results.values() if isinstance(r, dict))
+        total_held = sum(r.get("held", 0) for r in results.values() if isinstance(r, dict))
+        errors = [tid for tid, r in results.items() if isinstance(r, dict) and "error" in r]
+        print(f"[RETENTION] === COMPLETE: deleted={total_deleted}, kept={total_kept}, on_hold={total_held}, errors={len(errors)} ===")
+        for tid in errors:
+            print(f"[RETENTION]   tenant {tid}: {results[tid].get('error')}")
+    except Exception as e:
+        print(f"[RETENTION] FATAL ERROR: {e}\n{_tb.format_exc()}")
 
 
 # ── AZ-0: Lifecycle Policy Reconciler ──

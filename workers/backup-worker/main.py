@@ -2850,6 +2850,16 @@ class BackupWorker:
         items = messages.get("value", [])
         print(f"[{self.worker_id}]   [EMAIL] Found {len(items)} messages to backup")
 
+        # SLA exclusions — filter before upload so excluded items never touch storage
+        policy = await self.get_sla_policy(resource, message)
+        exclusions = await self.get_policy_exclusions(policy.id) if policy else []
+        if exclusions:
+            before = len(items)
+            items = [m for m in items if not self._item_is_excluded("EMAIL", m, exclusions)]
+            excluded = before - len(items)
+            if excluded:
+                print(f"[{self.worker_id}]   [EMAIL] Excluded {excluded}/{before} by SLA policy rules")
+
         item_count = 0
         bytes_added = 0
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
@@ -2923,6 +2933,16 @@ class BackupWorker:
 
         items = files.get("value", [])
         print(f"[{self.worker_id}]   [FILES] Found {len(items)} drive items")
+
+        # SLA exclusions — filter before upload
+        policy = await self.get_sla_policy(resource, message)
+        exclusions = await self.get_policy_exclusions(policy.id) if policy else []
+        if exclusions:
+            before = len(items)
+            items = [f for f in items if not self._item_is_excluded("FILE", f, exclusions)]
+            excluded = before - len(items)
+            if excluded:
+                print(f"[{self.worker_id}]   [FILES] Excluded {excluded}/{before} by SLA policy rules")
 
         # Process files in parallel (up to BACKUP_CONCURRENCY at once)
         file_tasks = [
@@ -3023,6 +3043,16 @@ class BackupWorker:
                 new_subsite_tokens[site_id] = site_delta_link
 
         print(f"[{self.worker_id}]   [SP_FILES] Found {len(items)} site files across root and subsites")
+
+        # SLA exclusions — filter before upload
+        policy = await self.get_sla_policy(resource, message)
+        exclusions = await self.get_policy_exclusions(policy.id) if policy else []
+        if exclusions:
+            before = len(items)
+            items = [f for f in items if not self._item_is_excluded("FILE", f, exclusions)]
+            excluded = before - len(items)
+            if excluded:
+                print(f"[{self.worker_id}]   [SP_FILES] Excluded {excluded}/{before} by SLA policy rules")
 
         file_tasks = [
             self.backup_single_file(resource, tenant, snapshot, f, graph_client, None)
@@ -3150,6 +3180,102 @@ class BackupWorker:
         client_secret = settings.MICROSOFT_CLIENT_SECRET
         tenant_id = tenant.external_tenant_id or settings.MICROSOFT_TENANT_ID
         return PowerPlatformClient(client_id=client_id, client_secret=client_secret, tenant_id=tenant_id)
+
+    async def get_policy_exclusions(self, policy_id) -> List[Dict[str, Any]]:
+        """Load enabled exclusions for a policy as plain dicts.
+        Returned once per backup job; callers pass the list into _item_is_excluded
+        for each item so we don't re-query on every message."""
+        from shared.models import SlaExclusion
+        if not policy_id:
+            return []
+        async with async_session_factory() as session:
+            stmt = select(SlaExclusion).where(
+                SlaExclusion.policy_id == (policy_id if isinstance(policy_id, uuid.UUID) else uuid.UUID(str(policy_id))),
+                SlaExclusion.enabled.is_(True),
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            return [
+                {
+                    "type": r.exclusion_type,
+                    "pattern": r.pattern,
+                    "workload": r.workload,
+                    "apply_to_historical": r.apply_to_historical,
+                }
+                for r in rows
+            ]
+
+    @staticmethod
+    def _item_is_excluded(item_workload: str, item: Dict[str, Any], exclusions: List[Dict[str, Any]]) -> bool:
+        """Evaluate whether a single item should be filtered from backup.
+
+        item_workload: EMAIL / FILE / CALENDAR / CONTACT / TEAMS_MESSAGE / CHAT_MESSAGE
+        item: the raw Graph object being considered (email dict, drive item dict, etc.)
+        exclusions: list from get_policy_exclusions()
+
+        Rule semantics:
+          FOLDER_PATH     - matches if item's folder/parent path contains the pattern
+          FILE_EXTENSION  - matches if item's name ends with .{pattern} (case-insensitive)
+          SUBJECT_REGEX   - (email) pattern.search(item.subject)
+          MIME_TYPE       - (file) item.file.mimeType equals pattern
+          EMAIL_ADDRESS   - (email) pattern matches sender/recipient email
+          FILENAME_GLOB   - (file) fnmatch against item.name
+        """
+        import fnmatch, re as _re
+        if not exclusions:
+            return False
+        for rule in exclusions:
+            wl = rule.get("workload")
+            if wl and wl != item_workload and wl != "ALL":
+                continue
+            rtype = rule.get("type")
+            pat = (rule.get("pattern") or "").strip()
+            if not pat:
+                continue
+
+            if rtype == "FOLDER_PATH":
+                folder = (item.get("parentReference", {}) or {}).get("path", "") or item.get("folderPath", "")
+                if pat.lower() in str(folder).lower():
+                    return True
+
+            elif rtype == "FILE_EXTENSION":
+                name = item.get("name", "") or ""
+                ext = "." + pat.lstrip(".").lower()
+                if name.lower().endswith(ext):
+                    return True
+
+            elif rtype == "FILENAME_GLOB":
+                name = item.get("name", "") or ""
+                if fnmatch.fnmatch(name.lower(), pat.lower()):
+                    return True
+
+            elif rtype == "MIME_TYPE":
+                mime = (item.get("file", {}) or {}).get("mimeType") or item.get("mimeType")
+                if mime and mime.lower() == pat.lower():
+                    return True
+
+            elif rtype == "SUBJECT_REGEX":
+                subject = item.get("subject", "") or ""
+                try:
+                    if _re.search(pat, subject, _re.IGNORECASE):
+                        return True
+                except _re.error:
+                    # malformed regex — skip rather than fail the whole backup
+                    pass
+
+            elif rtype == "EMAIL_ADDRESS":
+                addrs = []
+                _from = (item.get("from", {}) or {}).get("emailAddress", {})
+                if _from.get("address"):
+                    addrs.append(_from["address"])
+                for r in (item.get("toRecipients") or []):
+                    a = (r.get("emailAddress") or {}).get("address")
+                    if a:
+                        addrs.append(a)
+                pat_l = pat.lower()
+                if any(pat_l == a.lower() or pat_l in a.lower() for a in addrs):
+                    return True
+
+        return False
 
     async def get_sla_policy(self, resource: Resource, message: Optional[Dict[str, Any]] = None) -> Optional[SlaPolicy]:
         policy_id = None

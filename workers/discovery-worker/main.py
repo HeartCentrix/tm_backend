@@ -549,7 +549,83 @@ async def _persist_discovery_rows(
         {"run_id": run.id},
     )
 
+    # Phase 2 — auto-protect: apply resource-group policies to newly-inserted / unassigned resources.
+    # Evaluated AFTER the MERGE so newly-inserted rows exist. Only touches resources
+    # with NULL sla_policy_id, so we never override an explicit admin assignment.
+    try:
+        await _apply_auto_protect_groups(db, tenant_id)
+    except Exception as exc:
+        # Non-fatal: group matching should never block a discovery run from finishing.
+        logger.warning("Auto-protect group evaluation failed for tenant %s: %s", tenant_id, exc)
+
     return staged_count, inserted_count, updated_count, stale_marked_count
+
+
+async def _apply_auto_protect_groups(db, tenant_id: UUID) -> int:
+    """Evaluate auto-protect resource groups for this tenant and assign policies.
+
+    Flow:
+      1. Load enabled groups with auto_protect_new=true and at least one policy attached
+      2. Load resources in this tenant without an sla_policy_id (or optionally
+         include those missing — current design: only assigns to nulls)
+      3. For each resource, find matching groups (sorted by priority ASC — lower
+         number = higher precedence, matches afi convention)
+      4. Take the first matching group's first attached policy — assign it to the resource
+      5. Commit
+
+    Returns the count of resources auto-assigned."""
+    from shared.models import ResourceGroup, GroupPolicyAssignment, Resource as _Res
+    from shared.resource_group_matcher import find_matching_groups
+
+    # 1. candidate groups (auto-protect + enabled + attached to ≥1 policy)
+    groups_stmt = select(ResourceGroup).where(
+        ResourceGroup.tenant_id == tenant_id,
+        ResourceGroup.enabled.is_(True),
+        ResourceGroup.auto_protect_new.is_(True),
+    ).order_by(ResourceGroup.priority.asc())
+    groups = (await db.execute(groups_stmt)).scalars().all()
+    if not groups:
+        return 0
+
+    # Preload policy assignments per group (single query)
+    group_ids = [g.id for g in groups]
+    assign_stmt = select(GroupPolicyAssignment).where(GroupPolicyAssignment.group_id.in_(group_ids))
+    assignments = (await db.execute(assign_stmt)).scalars().all()
+    group_to_policies: Dict[UUID, List[UUID]] = {}
+    for a in assignments:
+        group_to_policies.setdefault(a.group_id, []).append(a.policy_id)
+    # Drop groups with no attached policy — nothing to assign
+    eligible_groups = [g for g in groups if group_to_policies.get(g.id)]
+    if not eligible_groups:
+        return 0
+
+    # 2. resources in this tenant without a policy
+    resources_stmt = select(_Res).where(
+        _Res.tenant_id == tenant_id,
+        _Res.sla_policy_id.is_(None),
+    )
+    resources = (await db.execute(resources_stmt)).scalars().all()
+    if not resources:
+        return 0
+
+    assigned = 0
+    for resource in resources:
+        matched = find_matching_groups(resource, eligible_groups)
+        if not matched:
+            continue
+        # Use the highest-priority matching group's first attached policy.
+        top_group = matched[0]
+        policies_for_group = group_to_policies.get(top_group.id) or []
+        if not policies_for_group:
+            continue
+        resource.sla_policy_id = policies_for_group[0]
+        assigned += 1
+
+    if assigned:
+        await db.commit()
+        logger.info("[auto-protect] Assigned policies to %d newly-discovered resource(s) for tenant %s",
+                    assigned, tenant_id)
+    return assigned
 
 
 async def _discover_resources_for_scope(

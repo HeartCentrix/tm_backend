@@ -258,10 +258,95 @@ class SlaPolicy(Base):
     legal_hold_enabled = Column(Boolean, default=False, nullable=False)
     legal_hold_until = Column(DateTime, nullable=True)
     immutability_mode = Column(String, default="None", nullable=False)  # "None", "Unlocked", "Locked"
+
+    # Retention scheme (afi.ai parity): how the worker decides which snapshots/items to prune.
+    # FLAT       = simple days-since cutoff (uses retention_days / retention_hot/cool/archive_days)
+    # GFS        = Grandfather-Father-Son: keep N daily, N weekly, N monthly, N yearly
+    # ITEM_LEVEL = per-item cutoff based on the item's own date (email receivedDate, file mTime)
+    # HYBRID     = FLAT for snapshots + ITEM_LEVEL for items within retained snapshots
+    retention_mode = Column(String, default="FLAT", nullable=False)
+    gfs_daily_count = Column(Integer, nullable=True)
+    gfs_weekly_count = Column(Integer, nullable=True)
+    gfs_monthly_count = Column(Integer, nullable=True)
+    gfs_yearly_count = Column(Integer, nullable=True)
+    item_retention_days = Column(Integer, nullable=True)
+    item_retention_basis = Column(String, default="SNAPSHOT", nullable=False)  # "SNAPSHOT" | "ITEM_DATE"
+
+    # Separate retention for resources marked ARCHIVED (afi dropdown):
+    # SAME       = reuse the live retention rules (default)
+    # KEEP_ALL   = never prune
+    # KEEP_LAST  = keep only the most recent snapshot
+    # CUSTOM     = use archived_retention_days for a flat cutoff
+    archived_retention_mode = Column(String, default="SAME", nullable=False)
+    archived_retention_days = Column(Integer, nullable=True)
+
+    # Per-policy overrides (fall back to tenant/org defaults when NULL)
+    storage_region = Column(String, nullable=True)
+    encryption_mode = Column(String, default="VAULT_MANAGED", nullable=False)  # VAULT_MANAGED | CUSTOMER_KEY
+    key_vault_uri = Column(String, nullable=True)  # for BYOK
+    key_name = Column(String, nullable=True)
+    key_version = Column(String, nullable=True)
+
+    # Auto-apply hook — when true, the discovery-worker will assign this policy to
+    # any newly-discovered resource that matches one of its resource-group rules.
+    auto_apply_to_matching = Column(Boolean, default=False, nullable=False)
+
     enabled = Column(Boolean, default=True)
     is_default = Column(Boolean, default=False)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class SlaExclusion(Base):
+    """Exclusion rule attached to an SLA policy.
+
+    Backup handlers consult the parent policy's exclusions before staging each
+    item. apply_to_historical means an offline job should also purge matching
+    items from prior snapshots (retroactive compliance / space reclaim)."""
+    __tablename__ = "sla_exclusions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    policy_id = Column(UUID(as_uuid=True), ForeignKey("sla_policies.id", ondelete="CASCADE"), nullable=False, index=True)
+    # FOLDER_PATH | FILE_EXTENSION | SUBJECT_REGEX | MIME_TYPE | EMAIL_ADDRESS | FILENAME_GLOB
+    exclusion_type = Column(String, nullable=False)
+    pattern = Column(String, nullable=False)
+    # Optional scope to a single workload family. NULL = applies everywhere relevant.
+    # Values: EMAIL | FILE | CALENDAR | CONTACT | TEAMS_MESSAGE | CHAT_MESSAGE | ALL
+    workload = Column(String, nullable=True)
+    apply_to_historical = Column(Boolean, default=False, nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class ResourceGroup(Base):
+    """Named group of resources. Two kinds:
+    - DYNAMIC: rules[] evaluated against resource attributes (name, email, dept, etc.)
+    - STATIC:  explicit list of resource IDs stored via resource.metadata or join table
+    rules is a list of {field, operator, value} dicts; combinator picks AND vs OR.
+    Priority affects tie-breaking when a resource matches multiple groups
+    (lower = higher priority — matches afi's Dynamic > Provider > Default ordering)."""
+    __tablename__ = "resource_groups"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    group_type = Column(String, default="DYNAMIC", nullable=False)  # STATIC | DYNAMIC | PROVIDER_NATIVE
+    rules = Column(JSON, default=list, nullable=False)
+    combinator = Column(String, default="AND", nullable=False)  # AND | OR
+    priority = Column(Integer, default=100, nullable=False)
+    auto_protect_new = Column(Boolean, default=False, nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class GroupPolicyAssignment(Base):
+    """Link table: which SLA policies are attached to which resource groups."""
+    __tablename__ = "group_policy_assignments"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    group_id = Column(UUID(as_uuid=True), ForeignKey("resource_groups.id", ondelete="CASCADE"), nullable=False, index=True)
+    policy_id = Column(UUID(as_uuid=True), ForeignKey("sla_policies.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime, default=utcnow)
 
 
 class Job(Base):

@@ -34,6 +34,11 @@ REQUIRED_TABLES = (
     "admin_consent_tokens",
     "discovery_runs",
     "resource_discovery_staging",
+    # Phase 1 SLA expansion tables — listing them here makes wait_for_schema_ready
+    # return False until they exist, so cold-boot services actually run migrations.
+    "sla_exclusions",
+    "resource_groups",
+    "group_policy_assignments",
 )
 
 REQUIRED_COLUMNS = {
@@ -42,6 +47,8 @@ REQUIRED_COLUMNS = {
         "backup_azure_vm",
         "backup_azure_sql",
         "backup_azure_postgresql",
+        # Phase 1 marker — ensures init_db won't short-circuit on older schemas.
+        "retention_mode",
     ),
     "resources": ("resource_hash",),
     "resource_discovery_staging": (
@@ -358,10 +365,63 @@ async def init_db() -> None:
             legal_hold_enabled BOOLEAN DEFAULT FALSE,
             legal_hold_until TIMESTAMP,
             immutability_mode VARCHAR DEFAULT 'None',
+            retention_mode VARCHAR DEFAULT 'FLAT' NOT NULL,
+            gfs_daily_count INTEGER,
+            gfs_weekly_count INTEGER,
+            gfs_monthly_count INTEGER,
+            gfs_yearly_count INTEGER,
+            item_retention_days INTEGER,
+            item_retention_basis VARCHAR DEFAULT 'SNAPSHOT' NOT NULL,
+            archived_retention_mode VARCHAR DEFAULT 'SAME' NOT NULL,
+            archived_retention_days INTEGER,
+            storage_region VARCHAR,
+            encryption_mode VARCHAR DEFAULT 'VAULT_MANAGED' NOT NULL,
+            key_vault_uri VARCHAR,
+            key_name VARCHAR,
+            key_version VARCHAR,
+            auto_apply_to_matching BOOLEAN DEFAULT FALSE NOT NULL,
             enabled BOOLEAN DEFAULT TRUE,
             is_default BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS sla_exclusions (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            policy_id UUID NOT NULL REFERENCES sla_policies(id) ON DELETE CASCADE,
+            exclusion_type VARCHAR NOT NULL,
+            pattern VARCHAR NOT NULL,
+            workload VARCHAR,
+            apply_to_historical BOOLEAN DEFAULT FALSE NOT NULL,
+            enabled BOOLEAN DEFAULT TRUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS resource_groups (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            name VARCHAR NOT NULL,
+            description TEXT,
+            group_type VARCHAR DEFAULT 'DYNAMIC' NOT NULL,
+            rules JSON DEFAULT '[]' NOT NULL,
+            combinator VARCHAR DEFAULT 'AND' NOT NULL,
+            priority INTEGER DEFAULT 100 NOT NULL,
+            auto_protect_new BOOLEAN DEFAULT FALSE NOT NULL,
+            enabled BOOLEAN DEFAULT TRUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS group_policy_assignments (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            group_id UUID NOT NULL REFERENCES resource_groups(id) ON DELETE CASCADE,
+            policy_id UUID NOT NULL REFERENCES sla_policies(id) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (group_id, policy_id)
         )
         """,
         """
@@ -630,6 +690,12 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_report_configs_org ON report_configs(org_id)",
         "CREATE INDEX IF NOT EXISTS idx_report_history_org ON report_history(org_id)",
         "CREATE INDEX IF NOT EXISTS idx_report_history_generated ON report_history(generated_at DESC)",
+        # Phase 1 — SLA expansion
+        "CREATE INDEX IF NOT EXISTS idx_sla_exclusions_policy ON sla_exclusions(policy_id, enabled)",
+        "CREATE INDEX IF NOT EXISTS idx_resource_groups_tenant ON resource_groups(tenant_id, enabled)",
+        "CREATE INDEX IF NOT EXISTS idx_resource_groups_priority ON resource_groups(tenant_id, priority, enabled)",
+        "CREATE INDEX IF NOT EXISTS idx_group_policy_assignments_group ON group_policy_assignments(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_group_policy_assignments_policy ON group_policy_assignments(policy_id)",
     ]
 
     add_column_statements = [
@@ -672,6 +738,23 @@ async def init_db() -> None:
         "ALTER TABLE resource_discovery_staging ADD COLUMN IF NOT EXISTS azure_subscription_id VARCHAR;",
         "ALTER TABLE resource_discovery_staging ADD COLUMN IF NOT EXISTS azure_resource_group VARCHAR;",
         "ALTER TABLE resource_discovery_staging ADD COLUMN IF NOT EXISTS azure_region VARCHAR;",
+        # Phase 1 schema additions — SLA policy expansion (GFS, item-level, archived rules,
+        # storage region, BYOK, auto-apply). All idempotent — safe to re-run on every boot.
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_mode VARCHAR DEFAULT 'FLAT' NOT NULL;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS gfs_daily_count INTEGER;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS gfs_weekly_count INTEGER;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS gfs_monthly_count INTEGER;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS gfs_yearly_count INTEGER;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS item_retention_days INTEGER;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS item_retention_basis VARCHAR DEFAULT 'SNAPSHOT' NOT NULL;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS archived_retention_mode VARCHAR DEFAULT 'SAME' NOT NULL;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS archived_retention_days INTEGER;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS storage_region VARCHAR;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS encryption_mode VARCHAR DEFAULT 'VAULT_MANAGED' NOT NULL;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS key_vault_uri VARCHAR;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS key_name VARCHAR;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS key_version VARCHAR;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS auto_apply_to_matching BOOLEAN DEFAULT FALSE NOT NULL;",
     ]
 
     alter_statements = [
@@ -726,11 +809,46 @@ async def init_db() -> None:
             await conn.run_sync(Base.metadata.create_all)
 
         await _ensure_enum_values()
+        await _seed_preset_policies_for_existing_tenants()
     except Exception as exc:
         logger.warning("[DB INIT] Schema sync phase failed: %s", exc)
         if await wait_for_schema_ready(timeout_seconds=30):
             return
         raise
+
+
+async def _seed_preset_policies_for_existing_tenants() -> None:
+    """Backfill afi-style preset SLA policies (Gold/Silver/Bronze/Manual) for any
+    tenant that doesn't already have them. Idempotent — re-running is a no-op.
+    Auth-service seeds on tenant creation; this catches tenants that pre-date that
+    hook. Safe to call from every service's init_db (advisory lock above serializes)."""
+    try:
+        from shared.models import Tenant
+        from shared.sla_presets import seed_preset_policies
+    except Exception as exc:
+        logger.warning("[DB INIT] preset seeder unavailable: %s", exc)
+        return
+
+    from sqlalchemy import select
+    total = 0
+    try:
+        async with async_session_factory() as session:
+            tenants = (await session.execute(select(Tenant))).scalars().all()
+        for t in tenants:
+            ttype = getattr(t.type, "value", t.type)
+            try:
+                async with async_session_factory() as session:
+                    n = await seed_preset_policies(session, t.id, str(ttype))
+                    if n:
+                        await session.commit()
+                        total += n
+                        logger.info("[DB INIT] Seeded %d preset policies for tenant %s (%s)", n, t.id, t.display_name)
+            except Exception as exc:
+                logger.warning("[DB INIT] preset seeding failed for tenant %s: %s", t.id, exc)
+        if total:
+            logger.info("[DB INIT] Preset SLA backfill complete — %d policies inserted across %d tenant(s)", total, len(tenants))
+    except Exception as exc:
+        logger.warning("[DB INIT] preset backfill skipped: %s", exc)
 
 
 async def close_db():

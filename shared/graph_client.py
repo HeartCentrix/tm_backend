@@ -328,38 +328,54 @@ class GraphClient:
         return mailboxes
 
     async def discover_onedrive(self) -> List[Dict[str, Any]]:
-        """Discover OneDrive sites for all users"""
-        # Get all users with mailbox licenses, then fetch each user's drive
+        """Discover OneDrive sites for all users in parallel (bounded by Semaphore(10)).
+
+        Previously serial — one GET /users/{id}/drive per user awaited in a loop —
+        which turned into ~N × round-trip-latency wall time for tenants with many
+        users. Matches the pattern used by discover_mailboxes and discover_teams."""
         users = await self.discover_users()
-        drives = []
-        for u in users:
+        semaphore = asyncio.Semaphore(10)
+
+        async def _fetch_drive(u: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             if not u.get("email"):
-                continue
-            try:
-                user_id = u["external_id"]
-                drive_result = await self._get(f"{self.GRAPH_URL}/users/{user_id}/drive")
-                if drive_result and drive_result.get("id"):
-                    drives.append({
-                        "external_id": drive_result["id"],
-                        "display_name": drive_result.get("name", f"OneDrive - {u['display_name']}"),
-                        "email": u["email"],
-                        "type": "ONEDRIVE",
-                        "metadata": {
-                            "user_id": user_id,
-                            "user_email": u["email"],
-                            "drive_id": drive_result["id"],
-                            "web_url": drive_result.get("webUrl"),
-                            "quota": drive_result.get("quota", {}),
-                        },
-                        "_account_enabled": u.get("_account_enabled", True),  # For discovery worker
-                    })
-                # If drive not found (404), skip — discovery worker will mark stale resources
-            except Exception as e:
-                if "404" in str(e) or "423" in str(e):
-                    # Resource not found or locked — discovery worker will handle it
-                    pass
-                else:
+                return None
+            user_id = u["external_id"]
+            async with semaphore:
+                try:
+                    drive_result = await self._get(f"{self.GRAPH_URL}/users/{user_id}/drive")
+                except Exception as e:
+                    msg = str(e)
+                    if "404" in msg or "423" in msg:
+                        # Not found / locked — discovery worker will stale-mark later
+                        return None
                     print(f"Error discovering OneDrive for user {u.get('email')}: {e}")
+                    return None
+
+            if not drive_result or not drive_result.get("id"):
+                return None
+            return {
+                "external_id": drive_result["id"],
+                "display_name": drive_result.get("name", f"OneDrive - {u['display_name']}"),
+                "email": u["email"],
+                "type": "ONEDRIVE",
+                "metadata": {
+                    "user_id": user_id,
+                    "user_email": u["email"],
+                    "drive_id": drive_result["id"],
+                    "web_url": drive_result.get("webUrl"),
+                    "quota": drive_result.get("quota", {}),
+                },
+                "_account_enabled": u.get("_account_enabled", True),
+            }
+
+        results = await asyncio.gather(
+            *[_fetch_drive(u) for u in users],
+            return_exceptions=True,
+        )
+        drives: List[Dict[str, Any]] = []
+        for r in results:
+            if isinstance(r, dict):
+                drives.append(r)
         return drives
     
     async def discover_sharepoint(self) -> List[Dict[str, Any]]:
