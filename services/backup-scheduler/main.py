@@ -882,7 +882,7 @@ async def ingest_m365_audit_logs():
         tenants = tenants_result.scalars().all()
 
     ingested_total = 0
-    audit_service_url = "http://audit-service:8012"
+    audit_service_url = settings.AUDIT_SERVICE_URL
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         for tenant in tenants:
@@ -948,7 +948,7 @@ async def send_violations_to_alert_service(violations: List[Dict]):
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             for violation in violations:
-                await client.post("http://alert-service:8007/api/v1/alerts", json={
+                await client.post(f"{settings.ALERT_SERVICE_URL}/api/v1/alerts", json={
                     "type": "SLA_VIOLATION",
                     "severity": violation.get("severity", "WARNING"),
                     "message": f"SLA violation: {violation.get('resource_type')} resource overdue by "

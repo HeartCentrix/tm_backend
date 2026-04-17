@@ -298,53 +298,21 @@ services:
     networks:
       - tm-network
     deploy:
-      replicas: ${BACKUP_WORKER_REPLICAS:-3}
+      # Default to a single replica. The worker's internal asyncio.Semaphore
+      # (BACKUP_CONCURRENCY, default 100) already fans out dozens of items
+      # concurrently per process, and multi-app Graph rotation spreads load
+      # across the configured apps regardless of replica count. Multiple
+      # replicas multiply DB connections, token caches, and RabbitMQ channels
+      # without proportional throughput gain. Override via BACKUP_WORKER_REPLICAS
+      # env var if a specific workload genuinely needs more parallelism.
+      replicas: ${BACKUP_WORKER_REPLICAS:-1}
 
-  graph-proxy:
-    build:
-      context: .
-      dockerfile: services/graph-proxy/Dockerfile
-    container_name: tm_vault_graph_proxy
-    env_file: .env
-    environment:
-      AZURE_AD_CLIENT_ID: ${AZURE_AD_CLIENT_ID}
-      AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
-      AZURE_AD_TENANT_ID: ${AZURE_AD_TENANT_ID}
-      REDIS_ENABLED: "true"
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-    ports:
-      - "8009:8009"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - tm-network
-
-  delta-token:
-    build:
-      context: .
-      dockerfile: services/delta-token/Dockerfile
-    container_name: tm_vault_delta_token
-    env_file: .env
-    environment:
-      DB_HOST: postgres
-      REDIS_ENABLED: "true"
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-    ports:
-      - "8010:8010"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - tm-network
+  # graph-proxy, delta-token, search-service: retired as of the services audit.
+  # - graph-proxy: zero callers; GraphClient talks to Microsoft Graph directly
+  # - delta-token: zero callers; delta tokens live on snapshots.delta_token column
+  # - search-service: gateway routes /resources/search to resource-service (not this)
+  # Source trees remain under services/ for reference. Re-add to compose only if
+  # a caller appears. This saves ~240 MB RAM and several seconds on compose boot.
 
   progress-tracker:
     build:
@@ -422,22 +390,8 @@ services:
     deploy:
       replicas: ${RESTORE_WORKER_REPLICAS:-2}
 
-  search-service:
-    build:
-      context: .
-      dockerfile: services/search-service/Dockerfile
-    container_name: tm_vault_search
-    env_file: .env
-    environment:
-      DB_HOST: postgres
-    ports:
-      - "8013:8013"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - tm-network
+  # search-service removed — see note above graph-proxy/delta-token. Gateway
+  # routes /resources/search to resource-service; this service had no callers.
 
   # ===== Azure Workload Worker (AZ-1/2/3) =====
 

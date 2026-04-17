@@ -77,8 +77,11 @@ class Settings:
         self.AZURE_BACKUP_REGION = os.getenv("AZURE_BACKUP_REGION", "eastus")
         
         # High-Performance Backup Configuration
-        # Parallelism: Max concurrent Graph API calls per worker
-        self.BACKUP_CONCURRENCY = int(os.getenv("BACKUP_CONCURRENCY", "50"))
+        # Parallelism: Max concurrent Graph API calls per worker.
+        # Raised 50 -> 100 when we moved to a single backup-worker replica; the
+        # per-replica asyncio.Semaphore covers what three replicas × 50 used to.
+        # Tune higher only if Graph throttling (multi_app_manager) isn't saturating.
+        self.BACKUP_CONCURRENCY = int(os.getenv("BACKUP_CONCURRENCY", "100"))
         # Parallelism: Max concurrent Server-Side Copy operations
         self.COPY_CONCURRENCY = int(os.getenv("COPY_CONCURRENCY", "100"))
         # File size threshold (bytes) - above this, use Server-Side Copy
@@ -102,8 +105,7 @@ class Settings:
         self.AZURE_BLOCK_SIZE_MB = int(os.getenv("AZURE_BLOCK_SIZE_MB", "100"))
         # Parallel block uploads per file (5-8 is optimal)
         self.AZURE_UPLOAD_CONCURRENCY = int(os.getenv("AZURE_UPLOAD_CONCURRENCY", "5"))
-        # How many files to download+upload simultaneously (pipeline parallelism)
-        self.BACKUP_CONCURRENCY = int(os.getenv("BACKUP_CONCURRENCY", "50"))
+        # (duplicate removed — single canonical declaration above sets BACKUP_CONCURRENCY)
         # How many resource groups to process in parallel (workload parallelism)
         self.WORKLOAD_CONCURRENCY = int(os.getenv("WORKLOAD_CONCURRENCY", "5"))
         self.RETRY_DELAY_MS = int(os.getenv("RETRY_DELAY_MS", "2000"))

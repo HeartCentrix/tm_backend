@@ -60,21 +60,6 @@ from shared.azure_storage import (
 logger = logging.getLogger(__name__)
 
 
-class ProgressReporter:
-    """Reports backup progress to the progress-tracker service"""
-
-    def __init__(self):
-        self.progress_url = f"{settings.PROGRESS_TRACKER_URL}/api/v1/progress/update"
-
-    async def report(self, resource_id: str, job_id: str, **kwargs):
-        payload = {"resource_id": resource_id, "job_id": job_id, **kwargs}
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(self.progress_url, json=payload)
-        except Exception as e:
-            print(f"[ProgressReporter] Failed to report: {e}")
-
-
 class AuditLogger:
     """Logs backup events via HTTP POST and RabbitMQ"""
 
@@ -116,7 +101,6 @@ class BackupWorker:
     def __init__(self):
         self.worker_id = f"worker-{uuid.uuid4().hex[:8]}"
         self.graph_clients: Dict[str, GraphClient] = {}
-        self.progress_reporter = ProgressReporter()
         self.audit_logger = AuditLogger()
         # Concurrency controls
         self.backup_semaphore = asyncio.Semaphore(8)  # 8 concurrent file streams per worker NIC

@@ -132,7 +132,7 @@ async def _create_batch_backup_jobs(
     try:
         import httpx
         async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post("http://audit-service:8012/api/v1/audit/log", json={
+            await client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
                 "action": "BACKUP_TRIGGERED",
                 "tenant_id": str(list(tenant_groups.keys())[0]),
                 "org_id": None,
@@ -351,7 +351,7 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
     try:
         import httpx
         async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post("http://audit-service:8012/api/v1/audit/log", json={
+            await client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
                 "action": "BACKUP_TRIGGERED",
                 "tenant_id": str(resource.tenant_id),
                 "org_id": None,  # Would need tenant org lookup

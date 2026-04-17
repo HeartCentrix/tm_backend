@@ -235,7 +235,7 @@ async def trigger_discovery(tenant_id: str, background_tasks: BackgroundTasks, d
                 try:
                     import httpx
                     async with httpx.AsyncClient(timeout=5.0) as _c:
-                        await _c.post("http://audit-service:8012/api/v1/audit/log", json={
+                        await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
                             "action": "DISCOVERY_RUN",
                             "tenant_id": tenant_id,
                             "actor_type": "USER",
@@ -251,7 +251,7 @@ async def trigger_discovery(tenant_id: str, background_tasks: BackgroundTasks, d
                 try:
                     import httpx
                     async with httpx.AsyncClient(timeout=5.0) as _c:
-                        await _c.post("http://audit-service:8012/api/v1/audit/log", json={
+                        await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
                             "action": "DISCOVERY_RUN",
                             "tenant_id": tenant_id,
                             "actor_type": "USER",

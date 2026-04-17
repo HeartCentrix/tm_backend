@@ -26,7 +26,10 @@ from sqlalchemy import select, or_, text
 from shared.config import settings
 from shared.database import async_session_factory, init_db
 from shared.models import Tenant, Resource, Snapshot, SnapshotItem, SlaPolicy
-from shared.azure_storage import azure_storage_manager, apply_legal_hold, apply_lifecycle_policy, AzureStorageShard
+from shared.azure_storage import (
+    azure_storage_manager, apply_legal_hold, apply_lifecycle_policy, AzureStorageShard,
+    RESOURCE_TYPE_TO_WORKLOADS,
+)
 from shared.security import decrypt_secret
 
 logging.basicConfig(
@@ -35,23 +38,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dr-replication-worker")
 
-# Workload type to container name mapping
-WORKLOAD_CONTAINERS = {
-    "MAILBOX": "mailbox",
-    "SHARED_MAILBOX": "mailbox",
-    "ROOM_MAILBOX": "mailbox",
-    "ONEDRIVE": "onedrive",
-    "SHAREPOINT_SITE": "sharepoint",
-    "TEAMS_CHANNEL": "teams",
-    "TEAMS_CHAT": "teams",
-    "ENTRA_USER": "entra",
-    "ENTRA_GROUP": "entra",
-    "ENTRA_APP": "entra",
-    "ENTRA_DEVICE": "entra",
-    "AZURE_VM": "azure-vm",
-    "AZURE_SQL_DB": "azure-sql",
-    "AZURE_POSTGRESQL": "azure-postgresql",
-}
+# Container-workload mapping lives in shared/azure_storage.py (RESOURCE_TYPE_TO_WORKLOADS).
+# Do not redeclare here — the previous hand-rolled copy drifted from the backup worker's
+# writes (used "onedrive"/"sharepoint" while backup-worker writes to "files"; used
+# "azure-sql" while backup-worker writes "azure-sql-db") and caused silent 404s on every
+# DR replication. The canonical map is:
+#   resource_type -> (primary_workload, *fallback_workloads)
+# For DR purposes we use the primary (first) workload per type.
+
+def _primary_workload(resource_type: str) -> str:
+    """Return the primary container-workload suffix for a resource type.
+    Falls back to "files" for unknown types to keep replication best-effort."""
+    candidates = RESOURCE_TYPE_TO_WORKLOADS.get(str(resource_type or "").upper(), ())
+    return candidates[0] if candidates else "files"
+
 
 MAX_REPLICATION_ATTEMPTS = 10
 COPY_TIMEOUT_SECONDS = 1800  # 30 min per blob
@@ -192,7 +192,10 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
     snapshot.dr_replication_attempts = (snapshot.dr_replication_attempts or 0) + 1
     await session.flush()
 
-    # Get source shard and container
+    # Get source shard and container. The source container depends on the snapshot's
+    # resource type — backup-worker writes each workload to its own container, so DR
+    # must replicate from the matching one. Previously hardcoded to "files", which
+    # only worked for OneDrive/SharePoint and silently 404'd everything else.
     try:
         source_shard = azure_storage_manager.get_default_shard()
         if not source_shard:
@@ -201,7 +204,11 @@ async def replicate_snapshot(snapshot: Snapshot, tenant: Tenant, session):
             logger.error("[replicate_snapshot] No source storage shard available for snapshot %s", snapshot.id)
             return
 
-        source_container = azure_storage_manager.get_container_name(str(tenant.id), "files")
+        # Resolve the resource type for this snapshot to pick the right workload suffix.
+        resource = await session.get(Resource, snapshot.resource_id)
+        resource_type = resource.type.value if resource and hasattr(resource.type, "value") else (str(resource.type) if resource else "")
+        workload = _primary_workload(resource_type)
+        source_container = azure_storage_manager.get_container_name(str(tenant.id), workload)
         dr_container = f"{source_container}-dr"
     except Exception as e:
         snapshot.dr_replication_status = "failed"
@@ -493,7 +500,13 @@ async def reconcile_dr_lifecycle_policies():
                         tenant.id, hot, cool, "unlimited" if archive is None else f"{archive}d",
                     )
 
-                    for workload in ["files", "azure-vm", "azure-sql", "azure-postgres"]:
+                    # Iterate every workload that backup-worker may have written to.
+                    # Previously hardcoded ["files","azure-vm","azure-sql","azure-postgres"]
+                    # which was missing mailbox/teams/entra/onenote/planner/todo/power-*
+                    # and had wrong suffixes ("azure-sql" vs actual "azure-sql-db",
+                    # "azure-postgres" vs actual "azure-postgresql").
+                    all_workloads = sorted({w for candidates in RESOURCE_TYPE_TO_WORKLOADS.values() for w in candidates})
+                    for workload in all_workloads:
                         container = f"{azure_storage_manager.get_container_name(str(tenant.id), workload)}-dr"
                         try:
                             result = await apply_lifecycle_policy(container, hot, cool, archive, dr_shard)

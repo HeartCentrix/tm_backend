@@ -1511,7 +1511,7 @@ class RestoreWorker:
         """Log restore audit event"""
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post("http://audit-service:8012/api/v1/audit/log", json={
+                await client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
                     "action": "RESTORE_COMPLETED",
                     "tenant_id": message.get("tenantId"),
                     "org_id": None,
