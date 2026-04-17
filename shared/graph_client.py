@@ -1343,6 +1343,32 @@ class GraphClient:
         result["value"] = all_value
         return result
 
+    async def get_all_chat_messages_for_user_delta(
+        self, user_id: str, delta_token: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Incremental chat export via delta query.
+
+        Graph API: GET /users/{id}/chats/getAllMessages/delta
+        Permission: Chat.Read.All (same as the non-delta endpoint).
+
+        First call (no delta_token): full sync, returns every message and an
+        @odata.deltaLink. Subsequent calls (delta_token = previous deltaLink):
+        only messages added/changed since the last sync.
+
+        Hard limit: delta only covers the last 8 months. If the token is
+        expired or too old, Graph returns 410/400 and callers should fall
+        back to get_all_chat_messages_for_user() for a full reseed.
+        """
+        if delta_token:
+            # A deltaLink IS the full URL — use it verbatim, no extra params.
+            url = delta_token
+            params = None
+        else:
+            url = f"{self.GRAPH_URL}/users/{user_id}/chats/getAllMessages/delta"
+            params = {"$top": "50"}
+        # _get already paginates via @odata.nextLink and preserves @odata.deltaLink.
+        return await self._get(url, params=params)
+
     async def get_chat_messages(self, chat_id: str, delta_token: str = None) -> Dict[str, Any]:
         """
         Get messages from a Teams chat.
