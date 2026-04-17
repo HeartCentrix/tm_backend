@@ -16,7 +16,7 @@ import io
 import uuid
 import json as json_lib
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict, Set, Tuple
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, desc, and_, or_, text
@@ -306,8 +306,16 @@ async def list_activities(
                 .order_by(desc(AuditEvent.occurred_at))
                 .limit(max(size, page * size))
             )
-            discovery_count_stmt = select(func.count()).select_from(AuditEvent).where(and_(*discovery_filters))
-            discovery_total = (await db.execute(discovery_count_stmt)).scalar() or 0
+            # Count one row per discovery run. Each run emits a STARTED event
+            # (and usually a paired RUN); counting STARTED gives the merged-row
+            # count. Legacy RUN-only events (pre-STARTED emission) under-count
+            # slightly and decay with time. discovery_filters[0] is the
+            # action-in filter; re-apply the rest with an exact action match.
+            discovery_total = (await db.execute(
+                select(func.count()).select_from(AuditEvent).where(
+                    and_(AuditEvent.action == "DISCOVERY_STARTED", *discovery_filters[1:])
+                )
+            )).scalar() or 0
             discovery_result = await db.execute(discovery_stmt)
             discovery_events = discovery_result.scalars().all()
 
@@ -357,46 +365,98 @@ async def list_activities(
                 "details": details.get("message") or "Backup skipped because the assigned SLA does not cover this resource type.",
             })
 
-        # Discovery events rendered as DISCOVERY activity rows.
-        for event in discovery_events:
-            details = event.details or {}
-            is_start = event.action == "DISCOVERY_STARTED"
-            outcome = (event.outcome or "").upper() if event.outcome else ""
-            if is_start:
+        # Discovery events: pair each DISCOVERY_STARTED with its matching
+        # DISCOVERY_RUN so a single row shows "In Progress" and then flips to
+        # "Done"/"Failed" in place. Pairing key: (tenant_id, resource_type);
+        # earliest STARTED binds to the earliest later RUN for the same key.
+        started_sorted = sorted(
+            (e for e in discovery_events if e.action == "DISCOVERY_STARTED"),
+            key=lambda e: e.occurred_at or datetime.min,
+        )
+        run_sorted = sorted(
+            (e for e in discovery_events if e.action == "DISCOVERY_RUN"),
+            key=lambda e: e.occurred_at or datetime.min,
+        )
+        run_buckets: Dict[Any, List[AuditEvent]] = {}
+        for r in run_sorted:
+            run_buckets.setdefault((r.tenant_id, r.resource_type), []).append(r)
+
+        paired_run_ids: Set[Any] = set()
+        paired: List[Tuple[AuditEvent, Optional[AuditEvent]]] = []
+        for s in started_sorted:
+            bucket = run_buckets.get((s.tenant_id, s.resource_type), [])
+            match: Optional[AuditEvent] = None
+            while bucket:
+                candidate = bucket[0]
+                if (candidate.occurred_at or datetime.min) >= (s.occurred_at or datetime.min) \
+                        and candidate.id not in paired_run_ids:
+                    match = candidate
+                    paired_run_ids.add(candidate.id)
+                    bucket.pop(0)
+                    break
+                bucket.pop(0)
+            paired.append((s, match))
+
+        orphan_runs = [r for r in run_sorted if r.id not in paired_run_ids]
+
+        def _render_discovery_row(
+            started: Optional[AuditEvent],
+            run: Optional[AuditEvent],
+        ) -> Optional[Dict[str, Any]]:
+            anchor = started or run
+            if anchor is None:
+                return None
+            details_src = (run.details if run else started.details) or {}
+            disco_type = details_src.get("type") or anchor.resource_type or "Discovery"
+
+            if run is None:
                 disco_status = "In Progress"
-            elif outcome == "SUCCESS":
-                disco_status = "Done"
-            elif outcome == "FAILURE":
-                disco_status = "Failed"
+                detail_text = f"{disco_type} discovery in progress"
+                finish_time = ""
             else:
-                disco_status = "In Progress"
+                outcome = (run.outcome or "").upper()
+                if outcome == "SUCCESS":
+                    disco_status = "Done"
+                    found = (run.details or {}).get("resourcesFound")
+                    detail_text = f"{disco_type} discovery completed"
+                    if found is not None:
+                        detail_text += f" — {found} resources"
+                elif outcome == "FAILURE":
+                    disco_status = "Failed"
+                    err = (run.details or {}).get("error") or "unknown error"
+                    detail_text = f"{disco_type} discovery failed: {err}"
+                else:
+                    disco_status = "In Progress"
+                    detail_text = f"{disco_type} discovery"
+                finish_time = run.occurred_at.isoformat() if run.occurred_at else ""
 
-            if status and status not in {disco_status}:
-                continue
+            if status and status != disco_status:
+                return None
 
-            disco_type = details.get("type") or event.resource_type or "Discovery"
-            if is_start:
-                detail_text = f"{disco_type} discovery started"
-            elif outcome == "SUCCESS":
-                found = details.get("resourcesFound")
-                detail_text = f"{disco_type} discovery completed"
-                if found is not None:
-                    detail_text += f" — {found} resources"
-            elif outcome == "FAILURE":
-                err = details.get("error") or "unknown error"
-                detail_text = f"{disco_type} discovery failed: {err}"
-            else:
-                detail_text = f"{disco_type} discovery"
+            anchor_for_id = run or started
+            start_time = (started.occurred_at if started else run.occurred_at)
+            object_name = (started.resource_name if started else None) \
+                or (run.resource_name if run else None) or disco_type
 
-            items.append({
-                "id": f"discovery-{event.id}",
-                "start_time": event.occurred_at.isoformat() if event.occurred_at else "",
+            return {
+                "id": f"discovery-{anchor_for_id.id}",
+                "start_time": start_time.isoformat() if start_time else "",
                 "operation": "DISCOVERY",
-                "object": event.resource_name or disco_type,
+                "object": object_name,
                 "status": disco_status,
-                "finish_time": "" if is_start else (event.occurred_at.isoformat() if event.occurred_at else ""),
+                "finish_time": finish_time,
                 "details": detail_text,
-            })
+            }
+
+        for started, run in paired:
+            row = _render_discovery_row(started, run)
+            if row:
+                items.append(row)
+        # Legacy DISCOVERY_RUN events without a matching STARTED still render.
+        for run in orphan_runs:
+            row = _render_discovery_row(None, run)
+            if row:
+                items.append(row)
 
         items.sort(key=lambda item: item["start_time"] or "", reverse=True)
         total = job_total + warning_total + discovery_total
