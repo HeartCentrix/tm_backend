@@ -225,6 +225,25 @@ async def trigger_discovery(tenant_id: str, background_tasks: BackgroundTasks, d
     tenant.status = TenantStatus.DISCOVERING
     await db.commit()
 
+    tenant_display = tenant.display_name
+
+    async def _post_audit(payload: dict) -> None:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as _c:
+                await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload)
+        except Exception:
+            pass
+
+    await _post_audit({
+        "action": "DISCOVERY_STARTED",
+        "tenant_id": tenant_id,
+        "actor_type": "USER",
+        "resource_type": "M365",
+        "resource_name": tenant_display,
+        "details": {"type": "M365"},
+    })
+
     async def _run():
         async with async_session_factory() as bg_db:
             t = await bg_db.get(Tenant, tenant.id)
@@ -232,34 +251,28 @@ async def trigger_discovery(tenant_id: str, background_tasks: BackgroundTasks, d
                 count = await run_tenant_discovery(bg_db, t)
                 await bg_db.commit()
                 print(f"[DISCOVERY] M365 complete for {tenant_id}: {count} resources")
-                try:
-                    import httpx
-                    async with httpx.AsyncClient(timeout=5.0) as _c:
-                        await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
-                            "action": "DISCOVERY_RUN",
-                            "tenant_id": tenant_id,
-                            "actor_type": "USER",
-                            "outcome": "SUCCESS",
-                            "details": {"resourcesFound": count, "type": "M365"},
-                        })
-                except Exception:
-                    pass
+                await _post_audit({
+                    "action": "DISCOVERY_RUN",
+                    "tenant_id": tenant_id,
+                    "actor_type": "USER",
+                    "resource_type": "M365",
+                    "resource_name": tenant_display,
+                    "outcome": "SUCCESS",
+                    "details": {"resourcesFound": count, "type": "M365"},
+                })
             except Exception as e:
                 t.status = TenantStatus.DISCONNECTED
                 await bg_db.commit()
                 print(f"[DISCOVERY] M365 failed for {tenant_id}: {e}")
-                try:
-                    import httpx
-                    async with httpx.AsyncClient(timeout=5.0) as _c:
-                        await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
-                            "action": "DISCOVERY_RUN",
-                            "tenant_id": tenant_id,
-                            "actor_type": "USER",
-                            "outcome": "FAILURE",
-                            "details": {"error": str(e), "type": "M365"},
-                        })
-                except Exception:
-                    pass
+                await _post_audit({
+                    "action": "DISCOVERY_RUN",
+                    "tenant_id": tenant_id,
+                    "actor_type": "USER",
+                    "resource_type": "M365",
+                    "resource_name": tenant_display,
+                    "outcome": "FAILURE",
+                    "details": {"error": str(e), "type": "M365"},
+                })
 
     background_tasks.add_task(_run)
     return {"discoveryId": str(uuid4()), "status": "started", "message": "Discovery running in background"}
