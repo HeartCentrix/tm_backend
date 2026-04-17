@@ -12,7 +12,7 @@ from sqlalchemy import select, func, text
 
 from shared.config import settings
 from shared.database import get_db, close_db, AsyncSession, engine
-from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot, SlaPolicy, ResourceType, ResourceStatus
+from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot, SnapshotItem, SlaPolicy, ResourceType, ResourceStatus
 from shared.schemas import (
     JobResponse, JobListResponse, TriggerBackupRequest, TriggerBulkBackupRequest, TriggerDatasourceBackupRequest
 )
@@ -551,21 +551,34 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         "exportFormat": request.get("exportFormat"),
     }
 
-    # Fetch first snapshot to get tenant/resource info
+    # Fetch tenant/resource info — try snapshot first, then fall back to item lookup.
+    # Without this, item-driven restores (no snapshot_ids passed) end up with
+    # NULL resource_id on the Job row → no audit linkage, no UI rendering, and
+    # no way to know which resource was meant for restore if the queue message
+    # is lost.
+    from sqlalchemy import select as sa_select
     tenant_id = None
     resource_id = None
+    snapshot = None
     if snapshot_ids:
-        from sqlalchemy import select as sa_select
         stmt = sa_select(Snapshot).where(Snapshot.id == uuid.UUID(snapshot_ids[0]))
-        result = await db.execute(stmt)
-        snapshot = result.scalar_one_or_none()
-        if snapshot:
-            resource_id = str(snapshot.resource_id)
-            resource_stmt = sa_select(Resource).where(Resource.id == snapshot.resource_id)
-            resource_result = await db.execute(resource_stmt)
-            resource = resource_result.scalar_one_or_none()
-            if resource:
-                tenant_id = str(resource.tenant_id)
+        snapshot = (await db.execute(stmt)).scalar_one_or_none()
+    if not snapshot and item_ids:
+        # Item-driven restore — derive snapshot from the first item, then
+        # snapshot.resource_id gives us the source resource.
+        item_stmt = sa_select(SnapshotItem).where(SnapshotItem.id == uuid.UUID(item_ids[0]))
+        first_item = (await db.execute(item_stmt)).scalar_one_or_none()
+        if first_item:
+            snapshot = await db.get(Snapshot, first_item.snapshot_id)
+            # Backfill snapshot_ids on the spec so the worker can pull blobs.
+            if snapshot and not snapshot_ids:
+                snapshot_ids = [str(snapshot.id)]
+
+    if snapshot:
+        resource_id = str(snapshot.resource_id)
+        resource = await db.get(Resource, snapshot.resource_id)
+        if resource:
+            tenant_id = str(resource.tenant_id)
 
     job = Job(
         id=uuid4(),
@@ -644,8 +657,49 @@ async def get_export_status(job_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @app.get("/api/v1/jobs/export/{job_id}/download")
-async def get_export_download_url(job_id: str):
-    return {"url": f"/api/v1/exports/{job_id}/download"}
+async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
+    """Stream the export ZIP back to the user.
+
+    Restore-worker uploads the built ZIP to the `exports` Azure container at
+    `exports/{job_id}/export_{timestamp}.zip` and stores the path in
+    `Job.spec.result.blob_path`. We:
+      1. Look up the job + verify it's COMPLETED + EXPORT_ZIP-typed
+      2. Download the blob bytes from `exports`
+      3. Stream them back as a ZIP attachment
+
+    Without this, the frontend gets a 404 when it tries to download — what was
+    happening on Recovery exports."""
+    from fastapi.responses import StreamingResponse
+    job = await db.get(Job, UUID(job_id))
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    status_val = job.status.value if hasattr(job.status, "value") else str(job.status)
+    if status_val != "COMPLETED":
+        raise HTTPException(status_code=409, detail=f"Export not ready (status={status_val})")
+
+    # Worker persists upload metadata in Job.result (not Job.spec).
+    result = job.result or {}
+    blob_path = result.get("blob_path") or result.get("blobPath")
+    if not blob_path:
+        raise HTTPException(status_code=500, detail="Job completed but no blob_path recorded")
+
+    # Reuse the same shard the workers use so credentials line up.
+    try:
+        from shared.azure_storage import azure_storage_manager
+        shard = azure_storage_manager.get_default_shard()
+        content = await shard.download_blob("exports", blob_path)
+    except Exception as exc:
+        print(f"[JOB_SERVICE] export download failed for job {job_id}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch export blob: {exc}")
+    if content is None:
+        raise HTTPException(status_code=404, detail="Export blob not found in storage")
+
+    fname = blob_path.rsplit("/", 1)[-1] or f"export_{job_id}.zip"
+    return StreamingResponse(
+        iter([content]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 @app.get("/api/v1/dlq/stats")

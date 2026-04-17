@@ -704,7 +704,7 @@ class BackupWorker:
             content_hash=content_hash if content_hash else None,
             content_size=content_size,
             blob_path=blob_path,
-            metadata={"structured": metadata},
+            extra_data={"structured": metadata},
             content_checksum=content_hash if content_hash else None,
         )
         async with async_session_factory() as session:
@@ -1050,7 +1050,7 @@ class BackupWorker:
                     name=msg.get("subject", msg_id),
                     folder_path=msg.get("parentFolderName"),
                     content_hash=content_hash, content_size=len(content_bytes),
-                    blob_path=blob_path, metadata={"raw": msg}, content_checksum=content_hash,
+                    blob_path=blob_path, extra_data={"raw": msg}, content_checksum=content_hash,
                 ))
                 bytes_added += len(content_bytes)
 
@@ -1304,7 +1304,7 @@ class BackupWorker:
                     external_id=item_id, item_type=item_type,
                     name=item_name,
                     content_hash=content_hash, content_size=len(content_bytes),
-                    blob_path=blob_path, metadata={"raw": item_data}, content_checksum=content_hash,
+                    blob_path=blob_path, extra_data={"raw": item_data}, content_checksum=content_hash,
                 ))
                 item_count += 1
                 bytes_added += len(content_bytes)
@@ -1527,7 +1527,7 @@ class BackupWorker:
                             content_hash=mhash,
                             content_size=len(mbytes),
                             blob_path=mbp,
-                            metadata={"raw": mdata, "channelId": cid, "channelName": cname, "isReply": is_reply},
+                            extra_data={"raw": mdata, "channelId": cid, "channelName": cname, "isReply": is_reply},
                             content_checksum=mhash,
                         ))
                         ch_bytes += len(mbytes)
@@ -1687,7 +1687,7 @@ class BackupWorker:
                     folder_path=f"chats/{chat_topic}",
                     content_hash=content_hash, content_size=len(content_bytes),
                     blob_path=blob_path,
-                    metadata={"raw": msg, "chatId": chat_id, "chatTopic": chat_topic, "exportedVia": user_id},
+                    extra_data={"raw": msg, "chatId": chat_id, "chatTopic": chat_topic, "exportedVia": user_id},
                     content_checksum=content_hash,
                 ))
                 bytes_added += len(content_bytes)
@@ -2405,7 +2405,7 @@ class BackupWorker:
                     name=resource.display_name or str(resource.id),
                     content_hash=content_hash, content_size=len(content_bytes),
                     blob_path=blob_path,
-                    metadata={"extra_data": resource.extra_data or {}},
+                    extra_data={"extra_data": resource.extra_data or {}},
                     content_checksum=content_hash,
                 ))
                 await session.commit()
@@ -2449,7 +2449,7 @@ class BackupWorker:
                     external_id=plan_id, item_type="PLANNER_PLAN",
                     name=plan.get("title", plan_id),
                     content_hash=content_hash, content_size=len(content_bytes),
-                    blob_path=blob_path, metadata={"raw": plan}, content_checksum=content_hash,
+                    blob_path=blob_path, extra_data={"raw": plan}, content_checksum=content_hash,
                 ))
                 bytes_added += len(content_bytes)
 
@@ -2474,7 +2474,7 @@ class BackupWorker:
                         external_id=task_id, item_type="PLANNER_TASK",
                         name=task.get("title", task_id),
                         content_hash=th, content_size=len(tb),
-                        blob_path=tp, metadata={"raw": task, "planId": plan_id},
+                        blob_path=tp, extra_data={"raw": task, "planId": plan_id},
                         content_checksum=th,
                     ))
                     bytes_added += len(tb)
@@ -2500,7 +2500,7 @@ class BackupWorker:
                             external_id=f"{task_id}:details", item_type="PLANNER_TASK_DETAILS",
                             name=(task.get("title") or task_id) + " (details)",
                             content_hash=dh, content_size=len(db),
-                            blob_path=dp, metadata={"taskId": task_id, "planId": plan_id},
+                            blob_path=dp, extra_data={"taskId": task_id, "planId": plan_id},
                             content_checksum=dh,
                         ))
                         bytes_added += len(db)
@@ -2565,7 +2565,7 @@ class BackupWorker:
                         external_id=f"{task_id}:{kind}", item_type=item_type,
                         name=f"{task_title} ({kind})",
                         content_hash=h, content_size=len(data),
-                        blob_path=path, metadata={"taskId": task_id, "listId": list_id, "count": len(values)},
+                        blob_path=path, extra_data={"taskId": task_id, "listId": list_id, "count": len(values)},
                         content_checksum=h,
                     ))
                     extras_bytes += len(data)
@@ -2589,7 +2589,7 @@ class BackupWorker:
                     external_id=list_id, item_type="TODO_LIST",
                     name=lst.get("displayName", list_id),
                     content_hash=lh, content_size=len(lb),
-                    blob_path=lp, metadata={"raw": lst}, content_checksum=lh,
+                    blob_path=lp, extra_data={"raw": lst}, content_checksum=lh,
                 ))
                 local_bytes += len(lb)
 
@@ -2614,7 +2614,7 @@ class BackupWorker:
                         external_id=task_id, item_type="TODO_TASK",
                         name=task.get("title", task_id),
                         content_hash=th, content_size=len(tb),
-                        blob_path=tp, metadata={"raw": task, "listId": list_id},
+                        blob_path=tp, extra_data={"raw": task, "listId": list_id},
                         content_checksum=th,
                     ))
                     local_bytes += len(tb)
@@ -2692,7 +2692,7 @@ class BackupWorker:
                     external_id=pg_id, item_type="ONENOTE_PAGE",
                     name=page.get("title", pg_id),
                     content_hash=ph, content_size=len(pb), blob_path=pp,
-                    metadata={"raw": page, "sectionId": sec_id, "notebookId": nb_id},
+                    extra_data={"raw": page, "sectionId": sec_id, "notebookId": nb_id},
                     content_checksum=ph,
                 ))
                 local_bytes += len(pb)
@@ -2716,7 +2716,7 @@ class BackupWorker:
                         external_id=f"{pg_id}:content", item_type="ONENOTE_PAGE_CONTENT",
                         name=(page.get("title") or pg_id) + " (content)",
                         content_hash=hh, content_size=len(html), blob_path=hp,
-                        metadata={"pageId": pg_id, "sectionId": sec_id, "notebookId": nb_id,
+                        extra_data={"pageId": pg_id, "sectionId": sec_id, "notebookId": nb_id,
                                   "mime": "text/html"},
                         content_checksum=hh,
                     ))
@@ -2744,7 +2744,7 @@ class BackupWorker:
                                     external_id=rid, item_type="ONENOTE_RESOURCE",
                                     name=rid,
                                     content_hash=rhash, content_size=len(data), blob_path=rpath,
-                                    metadata={"pageId": pg_id, "sourceUrl": u},
+                                    extra_data={"pageId": pg_id, "sourceUrl": u},
                                     content_checksum=rhash,
                                 ))
                                 local_bytes += len(data)
@@ -2772,7 +2772,7 @@ class BackupWorker:
                     external_id=nb_id, item_type="ONENOTE_NOTEBOOK",
                     name=nb.get("displayName", nb_id),
                     content_hash=nb_h, content_size=len(nb_b), blob_path=nb_p,
-                    metadata={"raw": nb}, content_checksum=nb_h,
+                    extra_data={"raw": nb}, content_checksum=nb_h,
                 ))
                 local_bytes += len(nb_b)
 
@@ -2795,7 +2795,7 @@ class BackupWorker:
                         external_id=sec_id, item_type="ONENOTE_SECTION",
                         name=sec.get("displayName", sec_id),
                         content_hash=sh, content_size=len(sb), blob_path=sp,
-                        metadata={"raw": sec, "notebookId": nb_id}, content_checksum=sh,
+                        extra_data={"raw": sec, "notebookId": nb_id}, content_checksum=sh,
                     ))
                     local_bytes += len(sb)
 
@@ -2883,7 +2883,7 @@ class BackupWorker:
             name=resource.display_name or app_id,
             content_hash=content_hash, content_size=len(blob_bytes),
             blob_path=blob_path,
-            metadata={"environmentId": env_id, "appId": app_id, "raw": definition.get("properties", {})},
+            extra_data={"environmentId": env_id, "appId": app_id, "raw": definition.get("properties", {})},
             content_checksum=content_hash,
         )]
         total_bytes = len(blob_bytes)
@@ -2912,7 +2912,7 @@ class BackupWorker:
                     name=(resource.display_name or app_id) + " (package)",
                     content_hash=pkg_hash, content_size=len(pkg_bytes),
                     blob_path=pkg_path,
-                    metadata={"environmentId": env_id, "appId": app_id, "mime": "application/zip"},
+                    extra_data={"environmentId": env_id, "appId": app_id, "mime": "application/zip"},
                     content_checksum=pkg_hash,
                 ))
                 total_bytes += len(pkg_bytes)
@@ -2966,7 +2966,7 @@ class BackupWorker:
             name=resource.display_name or flow_id,
             content_hash=def_hash, content_size=len(def_bytes),
             blob_path=def_path,
-            metadata={"environmentId": env_id, "flowId": flow_id,
+            extra_data={"environmentId": env_id, "flowId": flow_id,
                       "state": definition.get("properties", {}).get("state"),
                       "raw": definition.get("properties", {})},
             content_checksum=def_hash,
@@ -2988,7 +2988,7 @@ class BackupWorker:
                     name=(resource.display_name or flow_id) + " (connections)",
                     content_hash=conn_hash, content_size=len(conn_bytes),
                     blob_path=conn_path,
-                    metadata={"flowId": flow_id, "environmentId": env_id, "count": len(conn_values)},
+                    extra_data={"flowId": flow_id, "environmentId": env_id, "count": len(conn_values)},
                     content_checksum=conn_hash,
                 ))
                 bytes_added += len(conn_bytes)
@@ -3015,7 +3015,7 @@ class BackupWorker:
                     name=(resource.display_name or flow_id) + " (package)",
                     content_hash=pkg_hash, content_size=len(pkg_bytes),
                     blob_path=pkg_path,
-                    metadata={"environmentId": env_id, "flowId": flow_id, "mime": "application/zip"},
+                    extra_data={"environmentId": env_id, "flowId": flow_id, "mime": "application/zip"},
                     content_checksum=pkg_hash,
                 ))
                 bytes_added += len(pkg_bytes)
@@ -3064,7 +3064,7 @@ class BackupWorker:
                 name=resource.display_name or policy_id,
                 content_hash=content_hash, content_size=len(blob_bytes),
                 blob_path=blob_path,
-                metadata={"policyId": policy_id, "raw": definition.get("properties", {})},
+                extra_data={"policyId": policy_id, "raw": definition.get("properties", {})},
                 content_checksum=content_hash,
             ))
             await session.commit()
@@ -3317,7 +3317,7 @@ class BackupWorker:
                         folder_path=msg.get("_full_folder_path") or msg.get("parentFolderName"),
                         content_hash=content_hash, content_size=len(content_bytes),
                         blob_path=blob_path,
-                        metadata={
+                        extra_data={
                             "raw": msg,
                             "source_mailbox": msg.get("_source_mailbox", "primary"),
                         },
@@ -4037,7 +4037,7 @@ class BackupWorker:
                     content_hash=thread_hash,
                     content_size=len(thread_bytes),
                     blob_path=thread_blob_path,
-                    metadata={"raw": thread, "conversationId": conversation_id},
+                    extra_data={"raw": thread, "conversationId": conversation_id},
                     content_checksum=thread_hash,
                 ))
                 local_bytes += len(thread_bytes)
@@ -4072,7 +4072,7 @@ class BackupWorker:
                         content_hash=post_hash,
                         content_size=len(post_bytes),
                         blob_path=post_blob_path,
-                        metadata={"raw": post, "threadId": thread_id, "conversationId": conversation_id},
+                        extra_data={"raw": post, "threadId": thread_id, "conversationId": conversation_id},
                         content_checksum=post_hash,
                     ))
                     local_bytes += len(post_bytes)

@@ -395,6 +395,12 @@ class GraphClient:
                 if not email:
                     return None
 
+                # Try mailboxSettings.userPurpose first — gives us the precise
+                # mailbox type (user / shared / room / equipment). Common cause
+                # of failure: app lacks MailboxSettings.Read.All. We fall back
+                # to a /messages probe in that case so a missing scope doesn't
+                # silently drop every mailbox in the tenant.
+                purpose: Optional[str] = None
                 try:
                     result = await self._get(
                         f"{self.GRAPH_URL}/users/{user['id']}/mailboxSettings",
@@ -404,7 +410,6 @@ class GraphClient:
                 except Exception:
                     purpose = None
 
-                # Step 3: Build resource ONLY if we have a known mailbox type
                 if purpose == "user":
                     rtype = "MAILBOX"
                 elif purpose == "shared":
@@ -412,7 +417,28 @@ class GraphClient:
                 elif purpose in ("room", "equipment"):
                     rtype = "ROOM_MAILBOX"
                 else:
-                    return None  # no mailbox → skip
+                    # Fallback: probe /messages directly. This is the actual
+                    # endpoint backup_mailbox uses, so success here proves the
+                    # mailbox is backup-able regardless of the userPurpose
+                    # field's accessibility. Cost: one extra HEAD-style GET
+                    # per user-without-purpose, which is acceptable for the
+                    # ~1x/discovery-cycle frequency.
+                    try:
+                        probe = await self._get(
+                            f"{self.GRAPH_URL}/users/{user['id']}/messages",
+                            params={"$top": "1", "$select": "id"},
+                        )
+                        if probe and "value" in probe:
+                            # Mailbox reachable. Without userPurpose we can't
+                            # distinguish user vs shared vs room — assume MAILBOX
+                            # (user) since that's the dominant case. UI can let
+                            # users reclassify as needed.
+                            rtype = "MAILBOX"
+                            purpose = "user (probed)"
+                        else:
+                            return None
+                    except Exception:
+                        return None  # truly no mailbox
 
                 print(f"[GraphClient] {email} → userPurpose={purpose} → {rtype}")
 

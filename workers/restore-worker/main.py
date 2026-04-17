@@ -554,20 +554,32 @@ class RestoreWorker:
                     print(f"[{self.worker_id}] Failed to export item {item.id}: {e}")
 
         zip_buffer.seek(0)
-        zip_size = zip_buffer.getbuffer().nbytes
+        zip_bytes = zip_buffer.getvalue()
+        zip_size = len(zip_bytes)
 
-        # Upload ZIP to Azure Blob for download
+        # Upload via the async shard API so the event loop isn't blocked while
+        # we ship potentially-hundreds-of-MB to Azure. Auto-create the
+        # `exports` container on first use — it's separate from per-tenant
+        # backup containers and isn't created by init_db.
         container_name = "exports"
-        blob_name = f"exports/{message.get('jobId')}/export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+        blob_name = f"{message.get('jobId')}/export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
 
-        if self.blob_service_client:
-            blob_client = self.blob_service_client.get_blob_client(container=container_name, blob=blob_name)
-            blob_client.upload_blob(zip_buffer.getvalue(), overwrite=True)
+        from shared.azure_storage import azure_storage_manager
+        shard = azure_storage_manager.get_default_shard()
+        # upload_blob auto-creates the container via _ensure_container.
+        upload_result = await shard.upload_blob(
+            container_name, blob_name, zip_bytes,
+            metadata={"job_id": str(message.get("jobId") or ""), "exported_count": str(exported_count)},
+        )
+        if not (isinstance(upload_result, dict) and upload_result.get("success")):
+            err = (upload_result or {}).get("error", "unknown") if isinstance(upload_result, dict) else upload_result
+            raise RuntimeError(f"export ZIP upload failed: {err}")
 
+        print(f"[{self.worker_id}] export ZIP uploaded: {blob_name} ({zip_size} bytes, {exported_count} items)")
         return {
             "exported_count": exported_count,
             "export_type": "ZIP",
-            "download_url": f"/api/v1/exports/{message.get('jobId')}/download",
+            "download_url": f"/api/v1/jobs/export/{message.get('jobId')}/download",
             "blob_path": blob_name,
             "file_size": zip_size,
         }
