@@ -297,63 +297,33 @@ def _parse_from_header() -> tuple[str, str]:
     return (formataddr(("TM Vault Reports", addr)), addr)
 
 
-async def send_email_notification(
-    report: Dict[str, Any],
-    recipients: List[str],
-    is_empty: bool,
-    empty_message: str,
-    csv_bytes: Optional[bytes] = None,
-    idempotency_key: Optional[str] = None,
-):
-    """Send report via SMTP. Wired for Resend's SMTP service per
-    https://resend.com/docs/send-with-smtp — username is literally 'resend',
-    password is the API key, and the From domain must be verified in the
-    Resend dashboard or the broker will 550 the message.
+def _build_email_subject_and_body(report: Dict[str, Any], is_empty: bool, empty_message: str) -> tuple[str, str]:
+    """Compose subject + HTML body. Shared between the SMTP and Resend HTTP
+    code paths so changes to formatting hit both at once."""
+    period = report.get("period", "")
+    if is_empty:
+        subject = f"Backup report ({period}): No backups occurred"
+        body_html = f"<p style='font-family:sans-serif'>{empty_message or 'No updates. No backups occurred.'}</p>"
+        return subject, body_html
 
-    Supports both bare ('addr@host') and display-name ('"Name" <addr@host>')
-    values in NOTIFICATION_EMAIL_FROM. Envelope uses the bare address; header
-    uses the decorated form.
+    summary = report.get("summary", {})
+    breakdown = report.get("resource_breakdown", {})
+    domain = report.get("tenant_domain", "")
+    subject = f"Backup report ({period}): Everything looks good"
 
-    `idempotency_key`, when supplied, becomes the `Resend-Idempotency-Key`
-    header so Resend dedups if the same send is retried. Recommended value is
-    the report_id so repeated generates don't double-send."""
-    if not recipients:
-        return False
+    breakdown_rows = "".join([
+        f"<tr><td style='padding:4px 12px;color:#555'>{label}</td>"
+        f"<td style='padding:4px 12px'>protected {v['protected']} out of {v['total']}</td></tr>"
+        for label, v in breakdown.items()
+    ])
+    breakdown_rows += (
+        f"<tr><td style='padding:4px 12px;font-weight:bold'>Total</td>"
+        f"<td style='padding:4px 12px;font-weight:bold'>{summary.get('protected_resources', 0)} out of {summary.get('total_resources', 0)} resources protected</td></tr>"
+        f"<tr><td style='padding:4px 12px;color:#555'>Backup storage size</td>"
+        f"<td style='padding:4px 12px'>{summary.get('storage_gb', 0)} GB</td></tr>"
+    )
 
-    if not SMTP_ENABLED:
-        print(f"[REPORT] Email notification skipped (NOTIFICATION_EMAIL_ENABLED=false)")
-        return False
-
-    if not SMTP_USERNAME or not SMTP_PASSWORD:
-        print(f"[REPORT] Email notification skipped (SMTP credentials not configured)")
-        return False
-
-    from_header, envelope_from = _parse_from_header()
-
-    def _send():
-        period = report.get("period", "")
-        if is_empty:
-            subject = f"Backup report ({period}): No backups occurred"
-            body_html = f"<p style='font-family:sans-serif'>{empty_message or 'No updates. No backups occurred.'}</p>"
-        else:
-            summary = report.get("summary", {})
-            breakdown = report.get("resource_breakdown", {})
-            domain = report.get("tenant_domain", "")
-            subject = f"Backup report ({period}): Everything looks good"
-
-            breakdown_rows = "".join([
-                f"<tr><td style='padding:4px 12px;color:#555'>{label}</td>"
-                f"<td style='padding:4px 12px'>protected {v['protected']} out of {v['total']}</td></tr>"
-                for label, v in breakdown.items()
-            ])
-            breakdown_rows += (
-                f"<tr><td style='padding:4px 12px;font-weight:bold'>Total</td>"
-                f"<td style='padding:4px 12px;font-weight:bold'>{summary.get('protected_resources', 0)} out of {summary.get('total_resources', 0)} resources protected</td></tr>"
-                f"<tr><td style='padding:4px 12px;color:#555'>Backup storage size</td>"
-                f"<td style='padding:4px 12px'>{summary.get('storage_gb', 0)} GB</td></tr>"
-            )
-
-            body_html = f"""
+    body_html = f"""
 <div style='font-family:sans-serif;font-size:14px;color:#1a1a1a;max-width:600px'>
   <h2 style='color:#0d9488'>Backup report ({period}): Everything looks good</h2>
 
@@ -372,7 +342,118 @@ async def send_email_notification(
   <p style='margin-top:32px;color:#555'>Sincerely,<br><strong>The TM Vault Team</strong></p>
 </div>
 """
+    return subject, body_html
 
+
+async def _send_via_resend_http_api(
+    from_header: str,
+    recipients: List[str],
+    subject: str,
+    body_html: str,
+    csv_bytes: Optional[bytes],
+    idempotency_key: Optional[str],
+) -> bool:
+    """POST to Resend's HTTPS API at api.resend.com — only path that works
+    from hosting providers that block outbound SMTP (Railway hobby tier,
+    Heroku, AWS Lambda by default, etc.).
+
+    Auth: Bearer <SMTP_PASSWORD> — Resend reuses the same `re_…` API key for
+    SMTP auth and HTTP API auth, so we don't need a separate env var.
+    """
+    import base64
+    payload: Dict[str, Any] = {
+        "from": from_header,
+        "to": recipients,
+        "subject": subject,
+        "html": body_html,
+    }
+    if csv_bytes:
+        # HTTP API accepts attachments as base64-encoded strings
+        payload["attachments"] = [{
+            "filename": "backup_details.csv",
+            "content": base64.b64encode(csv_bytes).decode("ascii"),
+            "content_type": "text/csv",
+        }]
+    headers = {"Authorization": f"Bearer {SMTP_PASSWORD}"}
+    if idempotency_key:
+        # Resend supports this on both SMTP (as a message header) and HTTP (as an HTTP header)
+        headers["Idempotency-Key"] = str(idempotency_key)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            r = await client.post("https://api.resend.com/emails", json=payload, headers=headers)
+        except httpx.RequestError as e:
+            print(f"[REPORT] Resend HTTP API connection error: {type(e).__name__}: {e}")
+            return False
+
+    if r.status_code in (200, 202):
+        try:
+            data = r.json()
+            email_id = data.get("id") if isinstance(data, dict) else None
+        except Exception:
+            email_id = None
+        print(f"[REPORT] Email sent via Resend HTTP API to {len(recipients)} recipient(s) id={email_id} from={from_header}")
+        return True
+
+    # Non-2xx: Resend returns a structured JSON error like
+    #   {"statusCode":403,"name":"validation_error","message":"From email is invalid"}
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text[:300]
+    print(f"[REPORT] Resend HTTP API rejected (status={r.status_code}): {body}")
+    return False
+
+
+async def send_email_notification(
+    report: Dict[str, Any],
+    recipients: List[str],
+    is_empty: bool,
+    empty_message: str,
+    csv_bytes: Optional[bytes] = None,
+    idempotency_key: Optional[str] = None,
+):
+    """Send report via the most appropriate transport for the configured host.
+
+    Auto-routing:
+      - If SMTP_HOST is on resend.com → use Resend's HTTPS API (port 443).
+        Required for Railway hobby and any cloud where outbound SMTP is
+        blocked. Resend reuses the SMTP_PASSWORD as the HTTP API bearer
+        token so no extra env var is needed.
+      - Otherwise → fall through to standard SMTP (works locally, on VPSes,
+        and on cloud providers without SMTP egress restrictions).
+
+    `idempotency_key`, when supplied, becomes Resend's `Idempotency-Key`
+    header so retries don't double-send. Pass the report_id for that."""
+    if not recipients:
+        return False
+
+    if not SMTP_ENABLED:
+        print(f"[REPORT] Email notification skipped (NOTIFICATION_EMAIL_ENABLED=false)")
+        return False
+
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        print(f"[REPORT] Email notification skipped (SMTP credentials not configured)")
+        return False
+
+    from_header, envelope_from = _parse_from_header()
+
+    # Auto-route to HTTPS for Resend hosts (covers both prod hobby-Railway and
+    # any other deployment behind an SMTP-blocking egress).
+    if "resend.com" in (SMTP_HOST or "").lower():
+        subject, body_html = _build_email_subject_and_body(report, is_empty, empty_message)
+        return await _send_via_resend_http_api(
+            from_header=from_header,
+            recipients=recipients,
+            subject=subject,
+            body_html=body_html,
+            csv_bytes=csv_bytes,
+            idempotency_key=idempotency_key,
+        )
+
+    subject, body_html = _build_email_subject_and_body(report, is_empty, empty_message)
+
+    def _send():
         msg = MIMEMultipart("mixed")
         msg["Subject"] = subject
         msg["From"] = from_header
