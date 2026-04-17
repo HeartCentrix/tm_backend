@@ -300,6 +300,7 @@ async def resource_group(request: Request):
 @app.get("/api/v1/reports/history")
 @app.get("/api/v1/reports/history/{report_id}")
 @app.post("/api/v1/reports/generate")
+@app.post("/api/v1/reports/send-test")
 async def report_proxy(request: Request):
     return await proxy_request("report", request.url.path, request,
                                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0))

@@ -19,6 +19,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
+from email.utils import parseaddr, formataddr
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Query
@@ -154,8 +155,15 @@ async def save_report_history(session, config, report_type, period_start, period
 
 # ==================== Report Generation ====================
 
-async def send_report_to_channels(report: Dict[str, Any], config: ReportConfig, is_empty: bool = False, csv_bytes: Optional[bytes] = None):
-    """Send report to configured notification channels"""
+async def send_report_to_channels(
+    report: Dict[str, Any],
+    config: ReportConfig,
+    is_empty: bool = False,
+    csv_bytes: Optional[bytes] = None,
+    idempotency_key: Optional[str] = None,
+):
+    """Fan out a report to configured notification channels.
+    idempotency_key flows through to SMTP as Resend-Idempotency-Key."""
     delivery_status = {"email": "skipped", "slack": "skipped", "teams": "skipped"}
 
     if config.teams_webhooks:
@@ -171,7 +179,10 @@ async def send_report_to_channels(report: Dict[str, Any], config: ReportConfig, 
                 delivery_status["slack"] = "sent" if result else "failed"
 
     if config.email_recipients:
-        result = await send_email_notification(report, config.email_recipients, is_empty, config.empty_message, csv_bytes)
+        result = await send_email_notification(
+            report, config.email_recipients, is_empty, config.empty_message,
+            csv_bytes, idempotency_key=idempotency_key,
+        )
         delivery_status["email"] = "sent" if result else "failed"
 
     return delivery_status
@@ -261,8 +272,51 @@ async def send_slack_webhook_notification(report: Dict[str, Any], webhook_url: s
         return False
 
 
-async def send_email_notification(report: Dict[str, Any], recipients: List[str], is_empty: bool, empty_message: str, csv_bytes: Optional[bytes] = None):
-    """Send report via email using SMTP"""
+def _parse_from_header() -> tuple[str, str]:
+    """Split NOTIFICATION_EMAIL_FROM into (display_header_value, envelope_addr).
+
+    Resend (and all SMTP servers) require the envelope-level MAIL FROM to be a
+    bare address — the `Name <addr@host>` display-name form is only valid in
+    the message header. We accept either:
+      - bare form:   "report@codereport.com"
+      - display form: '"TM Vault Reports" <report@codereport.com>'
+                 or: 'TM Vault Reports <report@codereport.com>'
+    and produce both variants.
+
+    Fallback: if the env value is empty/invalid, use a sensible default."""
+    raw = SMTP_FROM.strip()
+    if not raw:
+        return ("TM Vault Reports <noreply@tm-vault.io>", "noreply@tm-vault.io")
+    display_name, addr = parseaddr(raw)
+    if not addr:
+        # parseaddr returned no address — treat entire string as a bare address.
+        return (raw, raw)
+    if display_name:
+        return (formataddr((display_name, addr)), addr)
+    # No display name — use a tenant-friendly default for the header only.
+    return (formataddr(("TM Vault Reports", addr)), addr)
+
+
+async def send_email_notification(
+    report: Dict[str, Any],
+    recipients: List[str],
+    is_empty: bool,
+    empty_message: str,
+    csv_bytes: Optional[bytes] = None,
+    idempotency_key: Optional[str] = None,
+):
+    """Send report via SMTP. Wired for Resend's SMTP service per
+    https://resend.com/docs/send-with-smtp — username is literally 'resend',
+    password is the API key, and the From domain must be verified in the
+    Resend dashboard or the broker will 550 the message.
+
+    Supports both bare ('addr@host') and display-name ('"Name" <addr@host>')
+    values in NOTIFICATION_EMAIL_FROM. Envelope uses the bare address; header
+    uses the decorated form.
+
+    `idempotency_key`, when supplied, becomes the `Resend-Idempotency-Key`
+    header so Resend dedups if the same send is retried. Recommended value is
+    the report_id so repeated generates don't double-send."""
     if not recipients:
         return False
 
@@ -273,6 +327,8 @@ async def send_email_notification(report: Dict[str, Any], recipients: List[str],
     if not SMTP_USERNAME or not SMTP_PASSWORD:
         print(f"[REPORT] Email notification skipped (SMTP credentials not configured)")
         return False
+
+    from_header, envelope_from = _parse_from_header()
 
     def _send():
         period = report.get("period", "")
@@ -319,8 +375,11 @@ async def send_email_notification(report: Dict[str, Any], recipients: List[str],
 
         msg = MIMEMultipart("mixed")
         msg["Subject"] = subject
-        msg["From"] = SMTP_FROM
+        msg["From"] = from_header
         msg["To"] = ", ".join(recipients)
+        # Resend-specific: dedup identical retries
+        if idempotency_key:
+            msg["Resend-Idempotency-Key"] = str(idempotency_key)
         msg.attach(MIMEText(body_html, "html"))
 
         if csv_bytes:
@@ -330,24 +389,34 @@ async def send_email_notification(report: Dict[str, Any], recipients: List[str],
             part.add_header("Content-Disposition", f'attachment; filename="backup_details.csv"')
             msg.attach(part)
 
-        if SMTP_PORT == 465:
+        if SMTP_PORT in (465, 2465):
+            # Implicit SSL/TLS — connect encrypted from the start
             with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server:
                 server.ehlo()
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
-                server.sendmail(SMTP_FROM, recipients, msg.as_string())
+                server.sendmail(envelope_from, recipients, msg.as_string())
         else:
+            # STARTTLS — connect plaintext then upgrade
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
                 server.ehlo()
                 server.starttls()
+                server.ehlo()
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
-                server.sendmail(SMTP_FROM, recipients, msg.as_string())
+                server.sendmail(envelope_from, recipients, msg.as_string())
 
     try:
         await asyncio.to_thread(_send)
-        print(f"[REPORT] Email sent to {len(recipients)} recipients")
+        print(f"[REPORT] Email sent to {len(recipients)} recipient(s) via {SMTP_HOST}:{SMTP_PORT} from={envelope_from}")
         return True
+    except smtplib.SMTPResponseException as e:
+        # Resend returns structured codes — surface them so "domain not verified" etc. is visible.
+        print(f"[REPORT] SMTP refused (code={e.smtp_code}, msg={e.smtp_error!r}) from={envelope_from} to={recipients}")
+        return False
+    except smtplib.SMTPException as e:
+        print(f"[REPORT] SMTP error: {type(e).__name__}: {e}")
+        return False
     except Exception as e:
-        print(f"[REPORT] Failed to send email: {e}")
+        print(f"[REPORT] Unexpected email failure: {type(e).__name__}: {e}")
         return False
 
 
@@ -556,6 +625,58 @@ class GenerateReportResponse(BaseModel):
     message: str
 
 
+@app.post("/api/v1/reports/send-test")
+async def send_test_email(to: Optional[str] = Query(None)):
+    """Send a small test email using the current SMTP config. Defaults to the
+    recipient list on the first report config; accept a `?to=addr` override
+    for one-off checks. Returns the envelope/header used and the actual send
+    outcome so operators can debug config without generating a full report."""
+    # Resolve target recipients
+    if to:
+        recipients = [to]
+    else:
+        async with async_session_factory() as session:
+            result = await session.execute(select(ReportConfig).limit(1))
+            cfg = result.scalar_one_or_none()
+            if not cfg or not cfg.email_recipients:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No report config or no recipients set. Pass ?to=addr explicitly.",
+                )
+            recipients = cfg.email_recipients
+
+    if not SMTP_ENABLED:
+        return {
+            "sent": False,
+            "reason": "NOTIFICATION_EMAIL_ENABLED is false — flip it to 'true' in .env then restart report-service.",
+            "smtp_host": SMTP_HOST, "smtp_port": SMTP_PORT,
+        }
+
+    from_header, envelope_from = _parse_from_header()
+    test_report = {
+        "period": "Test email",
+        "summary": {
+            "successful_backups": 1, "failed_backups": 0, "successful_discoveries": 1,
+            "total_resources": 1, "protected_resources": 1,
+            "coverage_rate": "100.0%", "storage_gb": 0.01,
+        },
+        "resource_breakdown": {"Test": {"protected": 1, "total": 1}},
+        "tenant_domain": "test",
+    }
+    ok = await send_email_notification(
+        test_report, recipients, is_empty=False,
+        empty_message="", csv_bytes=None,
+        idempotency_key=f"test-{uuid.uuid4()}",
+    )
+    return {
+        "sent": ok,
+        "smtp_host": SMTP_HOST, "smtp_port": SMTP_PORT,
+        "from_header": from_header, "envelope_from": envelope_from,
+        "recipients": recipients,
+        "hint": None if ok else "Check report-service logs for the SMTP response code (e.g. 550 = domain not verified on Resend).",
+    }
+
+
 @app.post("/api/v1/reports/generate", response_model=GenerateReportResponse)
 async def generate_report(request: GenerateReportRequest):
     """Generate and send a report (called by scheduler on schedule)"""
@@ -652,9 +773,12 @@ async def generate_report(request: GenerateReportRequest):
 
         coverage_pct = (protected_resources / total_resources * 100) if total_resources > 0 else 0
 
-        # Total backup storage
+        # Total backup storage. PostgreSQL returns SUM(BigInteger) as NUMERIC
+        # (Decimal) to avoid overflow — cast to int here so downstream math +
+        # JSON serialization into report_data don't hit
+        # "Object of type Decimal is not JSON serializable".
         storage_result = await session.execute(select(func.sum(Resource.storage_bytes)))
-        total_storage_bytes = storage_result.scalar() or 0
+        total_storage_bytes = int(storage_result.scalar() or 0)
         storage_gb = round(total_storage_bytes / (1024 ** 3), 2)
 
         # Discovery job count
@@ -697,6 +821,11 @@ async def generate_report(request: GenerateReportRequest):
             "resource_breakdown": resource_breakdown,
         }
 
+        # Pre-mint the history row id so we can use it as the SMTP idempotency
+        # key. Sends coming from retries of the same generate request then
+        # carry the same key and Resend dedups them at the broker.
+        history_id = uuid.uuid4()
+
         if not is_empty and config.send_detailed_report:
             detail_result = await session.execute(
                 select(Resource.display_name, Job.completed_at, Snapshot.bytes_total)
@@ -719,11 +848,12 @@ async def generate_report(request: GenerateReportRequest):
             for row in detail_rows:
                 writer.writerow([row[0], row[1].isoformat() if row[1] else "", row[2] or 0])
             csv_bytes = buf.getvalue().encode("utf-8")
-            delivery_status = await send_report_to_channels(report, config, is_empty, csv_bytes)
+            delivery_status = await send_report_to_channels(report, config, is_empty, csv_bytes, idempotency_key=str(history_id))
         else:
-            delivery_status = await send_report_to_channels(report, config, is_empty)
+            delivery_status = await send_report_to_channels(report, config, is_empty, idempotency_key=str(history_id))
 
         history_record = ReportHistory(
+            id=history_id,
             org_id=config.org_id,
             report_config_id=config.id,
             report_type=request.report_type,
