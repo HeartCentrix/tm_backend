@@ -17,6 +17,7 @@ Architecture:
   Emails/Chats: Graph API → Python SDK → Azure Blob (JSON/MIME processing)
 """
 import asyncio
+import gzip
 import json
 import uuid
 import hashlib
@@ -2068,11 +2069,15 @@ class BackupWorker:
                     return
                 blob_path = (
                     f"{tenant.id}/teams/messages/{chat_id}/{date_key}/"
-                    f"{shard_idx:04d}.ndjson"
+                    f"{shard_idx:04d}.ndjson.gz"
                 )
-                payload = bytes(buf)
+                raw = bytes(buf)
+                # mtime=0 → reproducible gzip framing (same bytes for same input).
+                payload = gzip.compress(raw, compresslevel=6, mtime=0)
                 result = await upload_blob_with_retry(
-                    container, blob_path, payload, shard_info
+                    container, blob_path, payload, shard_info,
+                    content_encoding="gzip",
+                    content_type="application/x-ndjson",
                 )
                 if result.get("success"):
                     total_bytes += len(payload)

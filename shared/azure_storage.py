@@ -17,7 +17,7 @@ import time
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.storage.blob.aio import BlobServiceClient as AsyncBlobServiceClient
 from azure.core.exceptions import AzureError, ResourceExistsError, ResourceNotFoundError
 
@@ -185,7 +185,9 @@ class AzureStorageShard:
             print(f"[AzureStorage] Warning: Could not create container {container_name}: {e}")
 
     async def upload_blob(self, container_name: str, blob_path: str, content: bytes,
-                         overwrite: bool = True, metadata: Optional[Dict] = None) -> Dict:
+                         overwrite: bool = True, metadata: Optional[Dict] = None,
+                         content_encoding: Optional[str] = None,
+                         content_type: Optional[str] = None) -> Dict:
         """
         Upload content to Azure Blob Storage with parallel block uploads.
         Auto-creates container if it doesn't exist.
@@ -196,6 +198,10 @@ class AzureStorageShard:
             content: Content bytes
             overwrite: Whether to overwrite existing blob
             metadata: Optional metadata dict
+            content_encoding: Optional value for the Content-Encoding system
+                property (e.g. "gzip" for pre-compressed payloads). Blob clients
+                respecting Content-Encoding will transparently decompress on read.
+            content_type: Optional value for the Content-Type system property.
 
         Returns:
             Dict with success status and blob info
@@ -206,6 +212,13 @@ class AzureStorageShard:
             async_client = self.get_async_client()
             blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
 
+            content_settings = None
+            if content_encoding or content_type:
+                content_settings = ContentSettings(
+                    content_encoding=content_encoding,
+                    content_type=content_type,
+                )
+
             # Azure Blob SDK automatically chunks and uploads blocks in parallel
             # with max_concurrency. For large files this is much faster than sequential.
             await asyncio.wait_for(
@@ -213,6 +226,7 @@ class AzureStorageShard:
                     content,
                     overwrite=overwrite,
                     metadata=_sanitize_metadata(metadata),
+                    content_settings=content_settings,
                     max_concurrency=5,  # Upload 5 blocks in parallel
                     length=len(content),
                 ),
@@ -820,14 +834,21 @@ async def upload_blob_with_retry_from_file(container_name: str, blob_path: str, 
     return {"success": False, "error": f"Failed after {max_retries} retries: {last_error}"}
 async def upload_blob_with_retry(container_name: str, blob_path: str, content: bytes,
                                 shard: AzureStorageShard, max_retries: int = 3,
-                                metadata: Optional[Dict] = None) -> Dict:
+                                metadata: Optional[Dict] = None,
+                                content_encoding: Optional[str] = None,
+                                content_type: Optional[str] = None) -> Dict:
     """
     Direct upload with automatic retry and exponential backoff.
     """
     last_error = None
-    
+
     for attempt in range(max_retries):
-        result = await shard.upload_blob(container_name, blob_path, content, metadata=metadata)
+        result = await shard.upload_blob(
+            container_name, blob_path, content,
+            metadata=metadata,
+            content_encoding=content_encoding,
+            content_type=content_type,
+        )
         
         if result["success"]:
             return result
