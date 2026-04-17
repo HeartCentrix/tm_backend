@@ -134,25 +134,24 @@ class BackupWorker:
         """Start consuming from all backup queues"""
         await self.initialize()
 
-        # Override the channel-wide prefetch (set to 50 by message_bus). With
-        # 50, a single worker grabs all queued messages and the other replicas
-        # sit idle while it processes them serially. Setting prefetch=2 gives
-        # each replica one in-flight + one ready, so 3 replicas cover ~6 jobs
-        # at once and fair distribution is enforced by the broker.
+        # Channel-wide prefetch. The consume_queue loop now processes messages
+        # concurrently (up to per-queue prefetch), so the channel cap is the
+        # ceiling across all queues on this replica. 5 gives each worker room
+        # to run ~5 Teams chat exports in parallel while still enforcing fair
+        # broker-side distribution when replicas scale out.
         if message_bus.channel:
             try:
-                await message_bus.channel.set_qos(prefetch_count=2)
-                print(f"[{self.worker_id}] Set channel prefetch_count=2 for fair work distribution")
+                await message_bus.channel.set_qos(prefetch_count=5)
+                print(f"[{self.worker_id}] Set channel prefetch_count=5 for fair work distribution")
             except Exception as exc:
                 print(f"[{self.worker_id}] Could not adjust prefetch_count: {exc}")
 
-        # Per-queue prefetch.
-        # Urgent = manually triggered backups (Teams chats, mailboxes). Each
-        # chat backup's getAllMessages can take 10+ min. Prefetch=1 forces
-        # round-robin across replicas so one slow chat can't starve the others.
-        # Higher-throughput queues stay generous since their items are smaller.
+        # Per-queue prefetch doubles as max-concurrency within that queue on
+        # this replica (consume_queue runs up to prefetch_count tasks in
+        # parallel). Urgent at 5 lets a single worker crunch multiple Teams
+        # chat exports simultaneously; bigger queues stay generous.
         queues = [
-            ("backup.urgent", 1),
+            ("backup.urgent", 5),
             ("backup.high", 5),
             ("backup.normal", 20),
             ("backup.low", 50),
@@ -171,29 +170,40 @@ class BackupWorker:
             return
 
         queue = await message_bus.channel.get_queue(queue_name)
-        print(f"[{self.worker_id}] Listening on {queue_name}...")
+        print(f"[{self.worker_id}] Listening on {queue_name}... (concurrency={prefetch_count})")
 
-        async with queue.iterator() as queue_iter:
-            async for message in queue_iter:
+        # Per-queue bounded concurrency. Messages are handled in tasks so the
+        # iterator can pull up to prefetch_count in flight at once — a single
+        # slow Teams chat export no longer blocks the next user on this replica.
+        sem = asyncio.Semaphore(max(1, prefetch_count))
+        in_flight: set = set()
+
+        async def handle(msg):
+            async with sem:
                 try:
-                    body = json.loads(message.body.decode())
+                    body = json.loads(msg.body.decode())
                     await self.process_backup_message(body)
-                    await message.ack()
+                    await msg.ack()
                 except Exception as e:
                     print(f"[{self.worker_id}] Error: {e}")
                     import traceback
                     traceback.print_exc()
                     try:
-                        # Check delivery count to prevent infinite requeue
-                        headers = message.headers or {}
+                        headers = msg.headers or {}
                         delivery_count = headers.get("x-delivery-count", 0)
                         if delivery_count < settings.MAX_RETRIES:
-                            await message.reject(requeue=True)
+                            await msg.reject(requeue=True)
                         else:
                             print(f"[{self.worker_id}] Message exceeded max retries ({settings.MAX_RETRIES}), routing to DLQ")
-                            await message.reject(requeue=False)
+                            await msg.reject(requeue=False)
                     except Exception:
                         pass
+
+        async with queue.iterator() as queue_iter:
+            async for message in queue_iter:
+                task = asyncio.create_task(handle(message))
+                in_flight.add(task)
+                task.add_done_callback(in_flight.discard)
 
     async def process_backup_message(self, message: Dict[str, Any]):
         job_id = uuid.UUID(message["jobId"])
