@@ -38,6 +38,17 @@ from shared.azure_storage import azure_storage_manager
 class RestoreWorker:
     """Main restore worker that processes restore jobs from RabbitMQ queues"""
 
+    # Maps RestoreModal workload checkboxes → item_type values that should pass the filter.
+    # When spec.workloads is present, items whose item_type is not in the union of selected
+    # workload sets are skipped. Unknown workload names are ignored.
+    WORKLOAD_ITEM_TYPES = {
+        "Mail": {"EMAIL", "EMAIL_ATTACHMENT"},
+        "OneDrive": {"FILE", "ONEDRIVE_FILE", "FILE_VERSION"},
+        "Contacts": {"USER_CONTACT"},
+        "Calendar": {"CALENDAR_EVENT", "EVENT_ATTACHMENT"},
+        "Chats": {"TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY", "TEAMS_CHAT_MESSAGE"},
+    }
+
     def __init__(self):
         self.worker_id = f"restore-worker-{uuid.uuid4().hex[:8]}"
         self.graph_clients: Dict[str, GraphClient] = {}
@@ -123,6 +134,21 @@ class RestoreWorker:
                     item_ids = message.get("itemIds", [])
 
                     items_to_restore = await self.fetch_snapshot_items(session, snapshot_ids, item_ids)
+
+                    # Workload filter (from RestoreModal checkboxes). When spec.workloads is
+                    # None, skip filtering — back-compat for jobs submitted without the field
+                    # and for Azure/Power-platform restores that don't use the M365 checkboxes.
+                    workloads = spec.get("workloads")
+                    if workloads:
+                        allowed: set = set()
+                        for w in workloads:
+                            allowed |= self.WORKLOAD_ITEM_TYPES.get(w, set())
+                        before = len(items_to_restore)
+                        items_to_restore = [
+                            it for it in items_to_restore
+                            if getattr(it, "item_type", None) in allowed
+                        ]
+                        print(f"[{self.worker_id}] Workload filter {workloads}: kept {len(items_to_restore)}/{before} items")
 
                     if not items_to_restore:
                         raise ValueError("No snapshot items found to restore")
@@ -274,6 +300,8 @@ class RestoreWorker:
                         await self._restore_file_to_sharepoint(graph_client, resource, item, conflict_mode=conflict_mode)
                     elif item.item_type == "CALENDAR_EVENT":
                         await self._restore_event_to_calendar(session, graph_client, resource, item)
+                    elif item.item_type == "USER_CONTACT":
+                        await self._restore_contact_to_mailbox(graph_client, resource, item)
                     elif item.item_type == "FILE_VERSION":
                         # Round 1.2 — restore a specific historical version. Delegates
                         # to the per-resource-type uploader; uses the parent file's name
@@ -295,6 +323,14 @@ class RestoreWorker:
                         await self._restore_entra_user(graph_client, resource, item)
                     elif item.item_type in ("ENTRA_GROUP_META",):
                         await self._restore_entra_group(graph_client, resource, item)
+                    elif item.item_type == "APP_REGISTRATION":
+                        await self._restore_entra_app(graph_client, resource, item)
+                    elif item.item_type == "SERVICE_PRINCIPAL":
+                        await self._restore_entra_sp(graph_client, resource, item)
+                    elif item.item_type == "DEVICE":
+                        await self._restore_entra_device(graph_client, resource, item)
+                    elif item.item_type == "CONDITIONAL_ACCESS_POLICY":
+                        await self._restore_ca_policy(graph_client, resource, item)
                     elif item.item_type == "USER_MANAGER":
                         await self._restore_user_manager(graph_client, resource, item)
                     elif item.item_type == "USER_DIRECT_REPORT":
@@ -792,6 +828,31 @@ class RestoreWorker:
         if applied:
             print(f"[{self.worker_id}] [EVENT RESTORE] {raw_event.get('subject', original_event_id)} → {applied} attachment(s) restored")
 
+    async def _restore_contact_to_mailbox(
+        self,
+        graph_client: GraphClient,
+        resource: Resource,
+        contact_item: SnapshotItem,
+    ) -> None:
+        """Restore a personal contact into the target user's default contacts folder.
+
+        Graph mints a new id on POST, same as events — we don't try to preserve
+        the original one. If the raw payload is missing (legacy backup), fall
+        back to a minimal payload built from the SnapshotItem fields.
+        """
+        meta = self._get_item_metadata(contact_item)
+        payload = meta.get("raw") or {}
+        if not payload:
+            display_name = contact_item.name or "Restored contact"
+            payload = {"displayName": display_name}
+
+        try:
+            created = await graph_client.create_user_contact(resource.external_id, payload)
+            print(f"[{self.worker_id}] [CONTACT RESTORE] {payload.get('displayName', contact_item.id)} → {created.get('id', '?')}")
+        except Exception as e:
+            print(f"[{self.worker_id}] contact create failed: {type(e).__name__}: {e}")
+            raise
+
     async def _restore_file_version(
         self,
         session: AsyncSession,
@@ -1035,6 +1096,30 @@ class RestoreWorker:
             f"{graph_client.GRAPH_URL}/groups/{group_id}",
             update_payload
         )
+
+    async def _restore_entra_app(self, graph_client: GraphClient, resource: Resource, item: SnapshotItem):
+        raw = self._get_item_metadata(item).get("raw") or {}
+        if not raw:
+            raise ValueError(f"APP_REGISTRATION {item.id} missing raw payload")
+        await graph_client.restore_entra_app(resource.external_id, raw)
+
+    async def _restore_entra_sp(self, graph_client: GraphClient, resource: Resource, item: SnapshotItem):
+        raw = self._get_item_metadata(item).get("raw") or {}
+        if not raw:
+            raise ValueError(f"SERVICE_PRINCIPAL {item.id} missing raw payload")
+        await graph_client.restore_service_principal(resource.external_id, raw)
+
+    async def _restore_entra_device(self, graph_client: GraphClient, resource: Resource, item: SnapshotItem):
+        raw = self._get_item_metadata(item).get("raw") or {}
+        if not raw:
+            raise ValueError(f"DEVICE {item.id} missing raw payload")
+        await graph_client.restore_entra_device(resource.external_id, raw)
+
+    async def _restore_ca_policy(self, graph_client: GraphClient, resource: Resource, item: SnapshotItem):
+        raw = self._get_item_metadata(item).get("raw") or {}
+        if not raw:
+            raise ValueError(f"CONDITIONAL_ACCESS_POLICY {item.id} missing raw payload")
+        await graph_client.restore_conditional_access_policy(resource.external_id, raw)
 
     async def _restore_power_bi_items(
         self,

@@ -1461,6 +1461,94 @@ class GraphClient:
         """
         return await self._get(f"{self.GRAPH_URL}/users/{user_id}/mailboxSettings")
 
+    # ── Entra restore helpers ────────────────────────────────────────────────
+    # Each follows PATCH-if-exists, POST-if-missing. Graph mints a new id on
+    # POST, so restoring a hard-deleted object produces a new external id; the
+    # caller is responsible for keeping resource.external_id in sync if desired.
+
+    _ENTRA_APP_WRITE_FIELDS = (
+        "displayName", "description", "signInAudience", "tags", "notes",
+        "identifierUris", "api", "web", "spa", "publicClient",
+        "requiredResourceAccess", "optionalClaims", "appRoles", "keyCredentials",
+        "passwordCredentials",
+    )
+    _ENTRA_SP_WRITE_FIELDS = (
+        "displayName", "description", "accountEnabled", "tags", "notes",
+        "servicePrincipalType", "appRoleAssignmentRequired", "loginUrl",
+        "logoutUrl", "homepage", "replyUrls", "preferredSingleSignOnMode",
+    )
+    _ENTRA_DEVICE_WRITE_FIELDS = (
+        "displayName", "accountEnabled", "operatingSystem",
+        "operatingSystemVersion", "profileType", "isManaged", "isCompliant",
+    )
+    _ENTRA_CA_WRITE_FIELDS = (
+        "displayName", "state", "conditions", "grantControls", "sessionControls",
+    )
+
+    @staticmethod
+    def _pick_fields(payload: Dict[str, Any], allowed: tuple) -> Dict[str, Any]:
+        return {k: v for k, v in (payload or {}).items() if k in allowed and v is not None}
+
+    async def restore_entra_app(self, app_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """PATCH /applications/{id} if it exists, else POST /applications."""
+        clean = self._pick_fields(payload, self._ENTRA_APP_WRITE_FIELDS)
+        url = f"{self.GRAPH_URL}/applications/{app_id}"
+        try:
+            await self._get(url)
+            return await self._patch(url, clean)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return await self._post(f"{self.GRAPH_URL}/applications", clean)
+            raise
+
+    async def restore_service_principal(self, sp_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """PATCH /servicePrincipals/{id} if it exists, else POST /servicePrincipals.
+
+        Creation requires an `appId` — if the SP was hard-deleted but the parent
+        application still exists, Graph auto-provisions the SP by appId.
+        """
+        clean = self._pick_fields(payload, self._ENTRA_SP_WRITE_FIELDS)
+        url = f"{self.GRAPH_URL}/servicePrincipals/{sp_id}"
+        try:
+            await self._get(url)
+            return await self._patch(url, clean)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                app_id = (payload or {}).get("appId")
+                if not app_id:
+                    raise ValueError("Cannot recreate service principal without appId in backup payload") from e
+                return await self._post(f"{self.GRAPH_URL}/servicePrincipals", {"appId": app_id, **clean})
+            raise
+
+    async def restore_entra_device(self, device_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """PATCH /devices/{id}. Devices can't be created via Graph without MDM
+        enrollment — if the device is hard-deleted, we report a skip rather
+        than attempting a meaningless POST."""
+        clean = self._pick_fields(payload, self._ENTRA_DEVICE_WRITE_FIELDS)
+        url = f"{self.GRAPH_URL}/devices/{device_id}"
+        try:
+            await self._get(url)
+            return await self._patch(url, clean)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise ValueError(
+                    "Device object no longer exists and cannot be re-created via Graph API "
+                    "(device records are provisioned by MDM enrollment, not by tenant admins)."
+                ) from e
+            raise
+
+    async def restore_conditional_access_policy(self, policy_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """PATCH /identity/conditionalAccess/policies/{id} if it exists, else POST."""
+        clean = self._pick_fields(payload, self._ENTRA_CA_WRITE_FIELDS)
+        url = f"{self.GRAPH_URL}/identity/conditionalAccess/policies/{policy_id}"
+        try:
+            await self._get(url)
+            return await self._patch(url, clean)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return await self._post(f"{self.GRAPH_URL}/identity/conditionalAccess/policies", clean)
+            raise
+
     async def get_user_contacts(self, user_id: str) -> Dict[str, Any]:
         """
         Get user contacts.
@@ -1661,6 +1749,21 @@ class GraphClient:
             "@odata.etag", "@odata.context",
         }
         clean = {k: v for k, v in event_payload.items() if k not in readonly}
+        return await self._post(url, clean)
+
+    async def create_user_contact(self, user_id: str, contact_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /users/{id}/contacts — restore a personal contact.
+
+        Same read-only shape as events: the server re-mints id/timestamps/etag.
+        Nested @odata.type entries inside emailAddresses / phones are kept since
+        Graph requires them on create.
+        """
+        url = f"{self.GRAPH_URL}/users/{user_id}/contacts"
+        readonly = {
+            "id", "createdDateTime", "lastModifiedDateTime", "changeKey",
+            "@odata.etag", "@odata.context",
+        }
+        clean = {k: v for k, v in contact_payload.items() if k not in readonly}
         return await self._post(url, clean)
 
     async def attach_file_to_event(
