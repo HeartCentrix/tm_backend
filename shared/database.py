@@ -225,6 +225,7 @@ async def _ensure_enum_values() -> None:
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'M365_GROUP';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_CONDITIONAL_ACCESS';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_BITLOCKER_KEY';",
+        "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'TEAMS_CHAT_EXPORT';",
         "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'PENDING_DISCOVERY';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'QUEUED';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'RUNNING';",
