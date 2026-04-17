@@ -672,14 +672,28 @@ class BackupWorker:
                         })
 
                     out: List = []
+                    # Direct httpx call (not graph_client._get) so we DON'T
+                    # follow @odata.nextLink — the wrapper would paginate
+                    # the entire chat history for every chat, blowing up
+                    # this Tier 2 quick-look backup. Cap at 50 messages per
+                    # chat for the first slice; full history can come from
+                    # a follow-up "deep" backup if/when we add one.
+                    import httpx as _httpx
+                    chat_token = await graph_client._get_token()
                     for chat_id in chat_ids:
                         info = chat_meta[chat_id]
                         display = info["displayName"]
                         try:
-                            page = await graph_client._get(
-                                f"{graph_client.GRAPH_URL}/chats/{chat_id}/messages",
-                                params={"$top": "50"},
-                            )
+                            async with _httpx.AsyncClient(timeout=30.0) as _c:
+                                _resp = await _c.get(
+                                    f"{graph_client.GRAPH_URL}/chats/{chat_id}/messages",
+                                    headers={"Authorization": f"Bearer {chat_token}"},
+                                    params={"$top": "50"},
+                                )
+                                if _resp.status_code != 200:
+                                    print(f"[{self.worker_id}] [USER_CHATS] chat {chat_id} HTTP {_resp.status_code}")
+                                    continue
+                                page = _resp.json() or {}
                             for m in page.get("value", []):
                                 body = (m.get("body") or {}).get("content") or ""
                                 # Top-level extra_data fields mirror the

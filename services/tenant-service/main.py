@@ -408,6 +408,123 @@ async def discover_user_content(
     }
 
 
+@app.post("/api/v1/tenants/{tenant_id}/users/{user_resource_id}/backup", status_code=202)
+async def backup_user_with_discovery(
+    tenant_id: str,
+    user_resource_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Fire-and-forget user backup: returns 202 immediately, then in the
+    background runs Tier 2 content discovery and queues a bulk backup for
+    parent + every discovered child.
+
+    Replaces the two-step `discover-content` → `trigger-bulk` flow that
+    forced the UI to await both round-trips before the user could navigate
+    away. Now a single POST hands the work off to the server."""
+    tenant = (await db.execute(select(Tenant).where(Tenant.id == UUID(tenant_id)))).scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    user = (await db.execute(
+        select(Resource).where(Resource.id == UUID(user_resource_id), Resource.tenant_id == tenant.id)
+    )).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User resource not found")
+    if user.type != ResourceType.ENTRA_USER:
+        raise HTTPException(status_code=400, detail=f"Resource type {user.type.value} is not a user (must be ENTRA_USER)")
+    if not user.sla_policy_id:
+        raise HTTPException(status_code=400, detail="User must have an SLA policy assigned before triggering a backup")
+
+    # Snapshot the bits we need so the background task doesn't depend on
+    # the request-scoped DB session.
+    user_id = user.id
+    user_external_id = user.external_id
+    user_display_name = user.display_name
+    user_upn = (user.extra_data or {}).get("user_principal_name") or user.email
+    user_sla_policy_id = user.sla_policy_id
+    tenant_external_id = tenant.external_tenant_id
+    tenant_uuid = tenant.id
+
+    async def _orchestrate():
+        client_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
+        client_secret = settings.MICROSOFT_CLIENT_SECRET or settings.AZURE_AD_CLIENT_SECRET
+        ext_tenant_id = tenant_external_id or settings.MICROSOFT_TENANT_ID or settings.AZURE_AD_TENANT_ID or "common"
+        graph = GraphClient(client_id, client_secret, ext_tenant_id)
+
+        try:
+            children = await graph.discover_user_content(
+                user_external_id=user_external_id,
+                user_principal_name=user_upn,
+                user_display_name=user_display_name,
+            )
+        except Exception as e:
+            print(f"[BACKUP-ORCHESTRATOR] discovery failed for user {user_id}: {e}")
+            children = []
+
+        child_ids = []
+        async with async_session_factory() as bg_db:
+            for c in children:
+                rtype = TYPE_MAP.get(c["type"])
+                if rtype is None:
+                    continue
+                existing = (await bg_db.execute(
+                    select(Resource).where(
+                        Resource.tenant_id == tenant_uuid,
+                        Resource.type == rtype,
+                        Resource.parent_resource_id == user_id,
+                    )
+                )).scalar_one_or_none()
+                if existing:
+                    existing.display_name = c["display_name"]
+                    existing.email = c.get("email")
+                    existing.extra_data = c.get("metadata", {})
+                    existing.external_id = c["external_id"]
+                    existing.sla_policy_id = user_sla_policy_id
+                    child_ids.append(str(existing.id))
+                else:
+                    new_id = uuid4()
+                    bg_db.add(Resource(
+                        id=new_id,
+                        tenant_id=tenant_uuid,
+                        type=rtype,
+                        external_id=c["external_id"],
+                        display_name=c["display_name"],
+                        email=c.get("email"),
+                        extra_data=c.get("metadata", {}),
+                        parent_resource_id=user_id,
+                        sla_policy_id=user_sla_policy_id,
+                        status=ResourceStatus.DISCOVERED,
+                    ))
+                    child_ids.append(str(new_id))
+            await bg_db.commit()
+
+        # Hand the bulk backup to the job-service. Direct HTTP call so we
+        # reuse all of trigger-bulk's validation, audit logging, and queue
+        # routing without re-implementing it here.
+        backup_targets = [str(user_id), *child_ids]
+        try:
+            import httpx as _httpx
+            async with _httpx.AsyncClient(timeout=15.0) as _c:
+                r = await _c.post(
+                    f"{settings.JOB_SERVICE_URL}/api/v1/backups/trigger-bulk",
+                    json={"resourceIds": backup_targets, "fullBackup": False, "priority": 1},
+                )
+                if r.status_code >= 300:
+                    print(f"[BACKUP-ORCHESTRATOR] trigger-bulk rejected (status={r.status_code}): {r.text[:300]}")
+                else:
+                    print(f"[BACKUP-ORCHESTRATOR] queued bulk backup for {len(backup_targets)} resource(s) under user {user_id}")
+        except Exception as e:
+            print(f"[BACKUP-ORCHESTRATOR] trigger-bulk call failed for user {user_id}: {e}")
+
+    background_tasks.add_task(_orchestrate)
+    return {
+        "accepted": True,
+        "tenantId": tenant_id,
+        "userResourceId": user_resource_id,
+        "message": "Discovery + backup queued. Status will appear on the Activity page shortly.",
+    }
+
+
 @app.get("/api/v1/tenants/{tenant_id}/discovery-status", response_model=DiscoveryStatus)
 async def get_discovery_status(tenant_id: str, db: AsyncSession = Depends(get_db)):
     stmt = select(Tenant).where(Tenant.id == UUID(tenant_id))

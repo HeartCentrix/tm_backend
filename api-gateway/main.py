@@ -156,6 +156,7 @@ async def dashboard(request: Request):
 @app.post("/api/v1/tenants/{tenant_id}/discover-m365")
 @app.post("/api/v1/tenants/{tenant_id}/discover-azure")
 @app.post("/api/v1/tenants/{tenant_id}/users/{user_resource_id}/discover-content")
+@app.post("/api/v1/tenants/{tenant_id}/users/{user_resource_id}/backup")
 @app.get("/api/v1/tenants/{tenant_id}/discovery-status")
 @app.get("/api/v1/tenants/{tenant_id}/storage-summary")
 @app.post("/api/v1/tenants/{tenant_id}/test-connection")
