@@ -30,7 +30,9 @@ from shared.azure_storage import azure_storage_manager
 from handlers.vm_handler import VmBackupHandler
 from handlers.sql_handler import SqlBackupHandler
 from handlers.sql_restore_handler import SqlRestoreHandler
+from handlers.vm_restore_handler import VmRestoreHandler
 from handlers.postgres_handler import PostgresBackupHandler
+from handlers.postgres_restore_handler import PostgresRestoreHandler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,12 +40,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("azure-workload-worker")
 
-# Queue configuration
-QUEUES = [
+# Queue configuration. Restore queues are separate so a stuck BACPAC import
+# can't stall new VM backups, and so restore and backup share an LRO budget
+# cleanly without fighting restore-worker for generic restore.* slots.
+BACKUP_QUEUES = [
     ("azure.vm", 5),       # Lower concurrency — VM backups are heavy LROs
     ("azure.sql", 3),      # Even lower — BACPAC exports can take hours
     ("azure.postgres", 3), # Similar to SQL
 ]
+RESTORE_QUEUES = [
+    ("azure.restore.vm", 3),
+    ("azure.restore.sql", 2),
+    ("azure.restore.postgres", 2),
+]
+QUEUES = BACKUP_QUEUES + RESTORE_QUEUES
 
 
 class AzureWorkloadWorker:
@@ -53,8 +63,10 @@ class AzureWorkloadWorker:
         self.worker_id = worker_id
         self.vm_handler = VmBackupHandler(worker_id)
         self.sql_handler = SqlBackupHandler(worker_id)
-        self.sql_restore_handler = SqlRestoreHandler(worker_id)
         self.pg_handler = PostgresBackupHandler(worker_id)
+        self.vm_restore_handler = VmRestoreHandler(worker_id)
+        self.sql_restore_handler = SqlRestoreHandler(worker_id)
+        self.pg_restore_handler = PostgresRestoreHandler(worker_id)
 
     async def start(self):
         """Connect to RabbitMQ and start consuming from all queues."""
@@ -101,11 +113,16 @@ class AzureWorkloadWorker:
         queue = await message_bus.channel.get_queue(queue_name)
         logger.info("[%s] Listening on %s...", self.worker_id, queue_name)
 
+        is_restore_queue = queue_name.startswith("azure.restore.")
+
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
                 try:
                     body = json.loads(message.body.decode())
-                    await self.process_backup_message(body)
+                    if is_restore_queue:
+                        await self.process_restore_message(queue_name, body)
+                    else:
+                        await self.process_backup_message(body)
                     await message.ack()
                 except Exception as e:
                     logger.exception("[%s] Error processing message from %s: %s", self.worker_id, queue_name, e)
@@ -119,6 +136,109 @@ class AzureWorkloadWorker:
                             await message.nack(requeue=True)
                     except Exception:
                         pass
+
+    async def process_restore_message(self, queue_name: str, message: Dict[str, Any]):
+        """Dispatch an Azure restore message to the matching handler.
+
+        Expected shape (produced by job-service.create_restore_message):
+            jobId, snapshotIds[], resourceId, tenantId, resourceType, restoreType,
+            spec.azureRestoreMode ("FULL_VM" | "DISK" | "FULL" | "PITR" | ...),
+            spec.azureRestoreParams (pass-through to handler)
+        """
+        job_id = uuid.UUID(message["jobId"])
+        snapshot_ids = message.get("snapshotIds") or []
+        spec = message.get("spec") or {}
+        restore_params = spec.get("azureRestoreParams") or {}
+        mode = (spec.get("azureRestoreMode") or "").upper()
+        resource_type = (message.get("resourceType") or "").upper()
+
+        if not snapshot_ids:
+            logger.error("[%s] Restore message %s has no snapshotIds, skipping", self.worker_id, job_id)
+            return
+
+        snapshot_id = uuid.UUID(snapshot_ids[0])
+
+        async with async_session_factory() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                logger.warning("[%s] Restore job %s not found", self.worker_id, job_id)
+                return
+
+            snapshot = await session.get(Snapshot, snapshot_id)
+            if not snapshot:
+                job.status = JobStatus.FAILED
+                job.error_message = f"Snapshot {snapshot_id} not found"
+                await session.commit()
+                return
+
+            resource = await session.get(Resource, snapshot.resource_id)
+            if not resource:
+                job.status = JobStatus.FAILED
+                job.error_message = f"Resource {snapshot.resource_id} not found"
+                await session.commit()
+                return
+
+            tenant_res = await session.execute(select(Tenant).where(Tenant.id == resource.tenant_id))
+            tenant = tenant_res.scalar_one_or_none()
+            if not tenant:
+                job.status = JobStatus.FAILED
+                job.error_message = f"Tenant {resource.tenant_id} not found"
+                await session.commit()
+                return
+
+            job.status = JobStatus.RUNNING
+            await session.commit()
+
+            logger.info("[%s] Restore start: job=%s resource=%s type=%s mode=%s queue=%s",
+                        self.worker_id, job_id, resource.display_name, resource_type, mode, queue_name)
+
+            try:
+                if queue_name == "azure.restore.vm":
+                    if mode == "DISK":
+                        disk_name = restore_params.get("disk_name") or restore_params.get("target_disk_name")
+                        if not disk_name:
+                            raise ValueError("disk_name required for DISK restore mode")
+                        result = await self.vm_restore_handler.restore_disk(
+                            tenant, snapshot, disk_name, restore_params)
+                    else:
+                        result = await self.vm_restore_handler.restore_vm(
+                            tenant, snapshot, restore_params)
+                elif queue_name == "azure.restore.sql":
+                    if mode == "PITR":
+                        result = await self.sql_restore_handler.restore_pitr(
+                            tenant, snapshot, restore_params)
+                    elif mode == "SCHEMA_ONLY":
+                        result = await self.sql_restore_handler.restore_schema_only(
+                            tenant, snapshot, restore_params)
+                    else:
+                        result = await self.sql_restore_handler.restore_full(
+                            tenant, snapshot, restore_params)
+                elif queue_name == "azure.restore.postgres":
+                    result = await self.pg_restore_handler.restore(
+                        tenant, snapshot, restore_params)
+                else:
+                    result = {"success": False, "error": f"Unknown restore queue {queue_name}"}
+
+                if result.get("success"):
+                    job.status = JobStatus.COMPLETED
+                    job.completed_at = datetime.utcnow()
+                else:
+                    job.status = JobStatus.FAILED
+                    job.error_message = str(result.get("error") or "restore failed")[:1000]
+
+                job.result = result
+                job.progress_pct = 100
+                await session.commit()
+                logger.info("[%s] Restore %s: job=%s result=%s",
+                            self.worker_id,
+                            "completed" if result.get("success") else "failed",
+                            job_id, result)
+
+            except Exception as e:
+                logger.exception("[%s] Restore job %s crashed: %s", self.worker_id, job_id, e)
+                job.status = JobStatus.FAILED
+                job.error_message = str(e)[:1000]
+                await session.commit()
 
     async def process_backup_message(self, message: Dict[str, Any]):
         """Process a single Azure workload backup message."""

@@ -20,7 +20,9 @@ from azure.mgmt.network.aio import NetworkManagementClient
 
 from shared.models import Resource, Tenant, Snapshot
 from shared.azure_storage import azure_storage_manager
-from workers.azure_workload_worker.lib.arm_credentials import get_arm_credential
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+from arm_credentials import get_arm_credential
 
 
 class VmRestoreHandler:
