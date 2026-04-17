@@ -524,10 +524,24 @@ class RestoreWorker:
                 return "teams"
             return "files"
 
+        # Dedup-aware restore: two SnapshotItems with the same content_checksum
+        # point to identical bytes — common for Teams chats where every
+        # participant's TEAMS_CHAT_EXPORT snapshot references the shared message
+        # pool. Write each unique checksum once; skip re-fetch + re-encode on
+        # subsequent hits. Keeps ZIP size and generation time proportional to
+        # unique content, not raw SnapshotItem count.
+        seen_checksums: set = set()
+        dedup_skipped = 0
+
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for item in items:
                 try:
                     metadata = self._get_item_metadata(item)
+
+                    checksum = getattr(item, "content_checksum", None)
+                    if checksum and checksum in seen_checksums:
+                        dedup_skipped += 1
+                        continue
 
                     # Binary-backed items (package ZIPs) bypass the JSON-assuming loader
                     if item.item_type in PACKAGE_TYPES:
@@ -594,9 +608,17 @@ class RestoreWorker:
                             json.dumps(raw_data, indent=2)
                         )
 
+                    if checksum:
+                        seen_checksums.add(checksum)
                     exported_count += 1
                 except Exception as e:
                     print(f"[{self.worker_id}] Failed to export item {item.id}: {e}")
+
+        if dedup_skipped:
+            print(
+                f"[{self.worker_id}] export ZIP dedup: skipped {dedup_skipped} "
+                f"duplicate-checksum items"
+            )
 
         zip_buffer.seek(0)
         zip_bytes = zip_buffer.getvalue()
@@ -623,6 +645,7 @@ class RestoreWorker:
         print(f"[{self.worker_id}] export ZIP uploaded: {blob_name} ({zip_size} bytes, {exported_count} items)")
         return {
             "exported_count": exported_count,
+            "dedup_skipped": dedup_skipped,
             "export_type": "ZIP",
             "download_url": f"/api/v1/jobs/export/{message.get('jobId')}/download",
             "blob_path": blob_name,
