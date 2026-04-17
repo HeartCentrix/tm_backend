@@ -1864,52 +1864,92 @@ class BackupWorker:
         total_bytes = 0
         UPLOAD_BATCH = 500  # bound concurrent upload tasks + memory per gather()
 
+        # Content-addressed dedup: two users in the same chat fetch the same
+        # message bytes. Upload once per unique content_hash per tenant; later
+        # snapshots reference the existing blob_path. Uses SnapshotItem history
+        # as the dedup index so the first successful upload wins even across
+        # separate EXPORT runs.
+        dedup_reused = 0
         for chat_id, chat_msgs in by_chat.items():
             chat_topic = chat_topics.get(chat_id, chat_id)
             folder_path = f"chats/{chat_topic}"
 
             for i in range(0, len(chat_msgs), UPLOAD_BATCH):
                 batch = chat_msgs[i:i + UPLOAD_BATCH]
-                upload_tasks = []
-                item_metas = []
+
+                prepared = []
                 for msg in batch:
                     msg_id = msg.get("id", str(uuid.uuid4()))
                     content_bytes = json.dumps(msg).encode()
                     content_hash = hashlib.sha256(content_bytes).hexdigest()
-                    blob_path = azure_storage_manager.build_blob_path(
-                        str(tenant.id), str(resource.id), str(snapshot.id),
-                        f"chat_{chat_id}_msg_{msg_id}",
+                    shared_blob_path = (
+                        f"{tenant.id}/teams/messages/"
+                        f"{content_hash[:2]}/{content_hash[2:4]}/{content_hash}.json"
                     )
-                    upload_tasks.append(
-                        upload_blob_with_retry(container, blob_path, content_bytes, shard)
-                    )
-                    item_metas.append((msg_id, msg, content_bytes, content_hash, blob_path))
+                    prepared.append((msg_id, msg, content_bytes, content_hash, shared_blob_path))
 
-                results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+                hashes = [p[3] for p in prepared]
+                async with async_session_factory() as session:
+                    existing_rows = (await session.execute(
+                        select(SnapshotItem.content_checksum, SnapshotItem.blob_path)
+                        .where(SnapshotItem.tenant_id == tenant.id,
+                               SnapshotItem.content_checksum.in_(hashes))
+                    )).all()
+                existing_blobs: Dict[str, str] = {row[0]: row[1] for row in existing_rows}
+
+                upload_tasks = []
+                upload_meta = []
+                for msg_id, msg, content_bytes, content_hash, shared_blob_path in prepared:
+                    if content_hash in existing_blobs:
+                        continue
+                    upload_tasks.append(
+                        upload_blob_with_retry(container, shared_blob_path, content_bytes, shard)
+                    )
+                    upload_meta.append((content_hash, shared_blob_path, len(content_bytes)))
+
+                upload_results: Dict[str, Tuple[str, int]] = {}
+                if upload_tasks:
+                    results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+                    for (content_hash, shared_blob_path, size), result in zip(upload_meta, results):
+                        if isinstance(result, dict) and result.get("success"):
+                            upload_results[content_hash] = (shared_blob_path, size)
 
                 db_items = []
-                for (msg_id, msg, content_bytes, content_hash, blob_path), result in zip(item_metas, results):
-                    if isinstance(result, dict) and result.get("success"):
-                        db_items.append(SnapshotItem(
-                            snapshot_id=snapshot.id, tenant_id=tenant.id,
-                            external_id=msg_id, item_type="TEAMS_CHAT_MESSAGE",
-                            name=msg.get("body", {}).get("content", "")[:100] or msg_id,
-                            folder_path=folder_path,
-                            content_hash=content_hash, content_size=len(content_bytes),
-                            blob_path=blob_path,
-                            extra_data={
-                                "raw": msg, "chatId": chat_id,
-                                "chatTopic": chat_topic, "exportedVia": user_id,
-                            },
-                            content_checksum=content_hash,
-                        ))
-                        total_bytes += len(content_bytes)
+                for msg_id, msg, content_bytes, content_hash, shared_blob_path in prepared:
+                    if content_hash in existing_blobs:
+                        final_blob_path = existing_blobs[content_hash]
+                        dedup_reused += 1
+                    elif content_hash in upload_results:
+                        final_blob_path, size = upload_results[content_hash]
+                        total_bytes += size
+                    else:
+                        continue  # upload failed, skip SnapshotItem
+                    db_items.append(SnapshotItem(
+                        snapshot_id=snapshot.id, tenant_id=tenant.id,
+                        external_id=msg_id, item_type="TEAMS_CHAT_MESSAGE",
+                        name=msg.get("body", {}).get("content", "")[:100] or msg_id,
+                        folder_path=folder_path,
+                        content_hash=content_hash, content_size=len(content_bytes),
+                        blob_path=final_blob_path,
+                        extra_data={
+                            "raw": msg, "chatId": chat_id,
+                            "chatTopic": chat_topic, "exportedVia": user_id,
+                            "dedup": content_hash in existing_blobs,
+                        },
+                        content_checksum=content_hash,
+                    ))
 
                 if db_items:
                     async with async_session_factory() as session:
                         session.add_all(db_items)
                         await session.commit()
                     total_items += len(db_items)
+
+        if dedup_reused:
+            print(
+                f"[{self.worker_id}] [CHAT_EXPORT] {user_label} — "
+                f"dedup: {dedup_reused} messages reused existing blobs"
+            )
 
         if new_delta_link:
             async with async_session_factory() as session:

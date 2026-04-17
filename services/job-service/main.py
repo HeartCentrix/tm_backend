@@ -60,6 +60,63 @@ AZURE_RESOURCE_TYPES = [
 ]
 
 
+async def _redirect_teams_chat_to_export(db: AsyncSession, resource: Resource) -> Resource:
+    """If `resource` is a per-chat TEAMS_CHAT row, return the matching
+    per-user TEAMS_CHAT_EXPORT resource (one delta pull per user covers
+    all their chats). If no matching export exists yet, return the
+    original so it drains through the legacy handler.
+
+    For group chats multiple users carry the same chatId in their export's
+    chatIds. Prefer the user whose Graph id appears as a key in the source
+    TEAMS_CHAT's metadata.chat_delta_tokens — that's the user the legacy
+    drain path used, so the fast path stays routed to the same shard. If no
+    such hint exists (chats discovered post-refactor), fall back to the
+    first chatIds match.
+
+    TEAMS_CHAT_EXPORT is UI-hidden, so its SLA is never set by the user.
+    Inherit SLA from the source TEAMS_CHAT so the trigger check passes."""
+    if resource.type != ResourceType.TEAMS_CHAT:
+        return resource
+    chat_external_id = resource.external_id
+    stmt = select(Resource).where(
+        Resource.tenant_id == resource.tenant_id,
+        Resource.type == ResourceType.TEAMS_CHAT_EXPORT,
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+
+    candidates = [
+        r for r in rows
+        if chat_external_id in (r.extra_data or {}).get("chatIds", [])
+    ]
+    if not candidates:
+        return resource
+
+    preferred_user_ids = set(
+        (resource.extra_data or {}).get("chat_delta_tokens", {}).keys()
+    )
+    matched = None
+    if preferred_user_ids:
+        matched = next(
+            (r for r in candidates if r.external_id in preferred_user_ids),
+            None,
+        )
+    if matched is None:
+        matched = candidates[0]
+    if matched.sla_policy_id is None and resource.sla_policy_id is not None:
+        matched.sla_policy_id = resource.sla_policy_id
+        await db.commit()
+        await db.refresh(matched)
+        print(
+            f"[JOB_SERVICE] Inherited SLA {resource.sla_policy_id} "
+            f"from TEAMS_CHAT {resource.id} to TEAMS_CHAT_EXPORT {matched.id}"
+        )
+    print(
+        f"[JOB_SERVICE] TEAMS_CHAT {resource.id} ({chat_external_id}) "
+        f"→ TEAMS_CHAT_EXPORT {matched.id} (user {matched.external_id})"
+    )
+    return matched
+
+
 async def _create_batch_backup_jobs(
     resources_map: Dict[str, Resource],
     db: AsyncSession,
@@ -295,6 +352,9 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
 
+    resource = await _redirect_teams_chat_to_export(db, resource)
+    request.resourceId = str(resource.id)
+
     # Prevent backup on inaccessible/suspended/deleted resources
     status_val = resource.status.value if hasattr(resource.status, 'value') else str(resource.status)
     if status_val in ("INACCESSIBLE", "SUSPENDED", "PENDING_DELETION"):
@@ -386,11 +446,12 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
             res_result = await db.execute(res_stmt)
             res = res_result.scalar_one_or_none()
             if res:
+                res = await _redirect_teams_chat_to_export(db, res)
                 status_val = res.status.value if hasattr(res.status, 'value') else str(res.status)
                 if status_val in ("INACCESSIBLE", "SUSPENDED", "PENDING_DELETION"):
-                    inaccessible_resources.append({"id": rid, "status": status_val})
+                    inaccessible_resources.append({"id": str(res.id), "status": status_val})
                 else:
-                    resources_map[rid] = res
+                    resources_map[str(res.id)] = res
 
         if not resources_map and inaccessible_resources:
             raise HTTPException(
@@ -414,6 +475,9 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
         res = res_result.scalar_one_or_none()
         if not res:
             raise HTTPException(status_code=404, detail="Resource not found")
+
+        res = await _redirect_teams_chat_to_export(db, res)
+        resource_id = str(res.id)
 
         # Prevent backup on inaccessible/suspended/deleted resources
         status_val = res.status.value if hasattr(res.status, 'value') else str(res.status)
