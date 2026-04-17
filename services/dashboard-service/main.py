@@ -322,45 +322,51 @@ async def get_backup_size(
     if service_resource_types:
         filters.append(Resource.type.in_(service_resource_types))
 
-    # Get current total storage bytes
-    total = (await db.execute(select(func.sum(Resource.storage_bytes)).where(*filters))).scalar() or 0
-    total = int(total) if total else 0
-    
-    # Get ALL-TIME total bytes backed up (sum of all bytes_added from all completed snapshots)
-    all_time_stmt = select(func.sum(Snapshot.bytes_added)).join(Resource, Snapshot.resource_id == Resource.id).where(Snapshot.status == "COMPLETED", *filters)
-    all_time_total = (await db.execute(all_time_stmt)).scalar() or 0
-    all_time_total = int(all_time_total) if all_time_total else 0
+    # Single source of truth: Resource.storage_bytes. The snapshots table holds
+    # many legacy FAILED rows and bytes_added is unreliable per snapshot, so using
+    # it produced a dashboard where the headline said 7.9 MB but the chart/pills
+    # read 0. All four fields below are derived from resources only.
+    total = int((await db.execute(select(func.sum(Resource.storage_bytes)).where(*filters))).scalar() or 0)
 
-    # Calculate cumulative daily storage for last 30 days
-    # For each day, sum all bytes_added from snapshots up to and including that day
+    # Per-day growth based on when each resource was last backed up.
+    # Resources last backed up BEFORE the 30-day window seed day 0 as a baseline.
+    today = datetime.utcnow().date()
+    window_start = today - timedelta(days=29)
+    window_start_ts = datetime.combine(window_start, datetime.min.time())
+
+    day_bucket = func.date_trunc("day", Resource.last_backup_at).label("day")
+    per_day_rows = (await db.execute(
+        select(day_bucket, func.sum(Resource.storage_bytes))
+        .where(
+            Resource.last_backup_at.isnot(None),
+            Resource.last_backup_at >= window_start_ts,
+            *filters,
+        )
+        .group_by(day_bucket)
+    )).all()
+    per_day_map: dict = {}
+    for row in per_day_rows:
+        day_val = row[0]
+        if day_val is None:
+            continue
+        day_key = day_val.date() if hasattr(day_val, "date") else day_val
+        per_day_map[day_key] = int(row[1] or 0)
+
+    baseline = int((await db.execute(
+        select(func.sum(Resource.storage_bytes)).where(
+            Resource.last_backup_at.isnot(None),
+            Resource.last_backup_at < window_start_ts,
+            *filters,
+        )
+    )).scalar() or 0)
+
     daily_data = []
-    running_total = 0
+    running_total = baseline
     for i in range(30):
-        date = (datetime.utcnow() - timedelta(days=29-i)).date()
-        date_start = datetime.combine(date, datetime.min.time())
-        date_end = datetime.combine(date, datetime.max.time())
+        date = window_start + timedelta(days=i)
+        running_total += per_day_map.get(date, 0)
+        daily_data.append({"date": date.isoformat(), "bytes": running_total})
 
-        # Sum bytes_added from all completed snapshots for this day
-        day_bytes = (await db.execute(
-            select(func.sum(Snapshot.bytes_added))
-            .join(Resource, Snapshot.resource_id == Resource.id)
-            .where(
-                Snapshot.status == "COMPLETED",
-                Snapshot.created_at >= date_start,
-                Snapshot.created_at <= date_end,
-                *filters
-            )
-        )).scalar() or 0
-        day_bytes = int(day_bytes) if day_bytes else 0
-        
-        running_total += day_bytes
-        daily_data.append({
-            "date": date.isoformat(),
-            "bytes": running_total  # Cumulative total up to this day
-        })
-
-    # Calculate real changes (not mock data)
-    last_7_days_bytes = sum(d["bytes"] for d in daily_data[-7:])
     seven_day_change = daily_data[-1]["bytes"] - (daily_data[-8]["bytes"] if len(daily_data) > 7 else 0)
     one_day_change = daily_data[-1]["bytes"] - (daily_data[-2]["bytes"] if len(daily_data) > 1 else 0)
 
@@ -368,6 +374,6 @@ async def get_backup_size(
         "total": format_bytes(total),
         "oneDayChange": format_bytes(abs(one_day_change)) + (" ↑" if one_day_change > 0 else " ↓"),
         "oneMonthChange": format_bytes(abs(seven_day_change)) + (" ↑" if seven_day_change > 0 else " ↓"),
-        "allTimeTotal": format_bytes(all_time_total),
+        "allTimeTotal": format_bytes(total),
         "dailyData": daily_data,
     }
