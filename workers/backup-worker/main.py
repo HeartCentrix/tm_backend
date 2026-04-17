@@ -206,7 +206,13 @@ class BackupWorker:
         "MAILBOX": "backup_mailbox", "SHARED_MAILBOX": "backup_mailbox", "ROOM_MAILBOX": "backup_mailbox",
         "ONEDRIVE": "backup_onedrive",
         "SHAREPOINT_SITE": "backup_sharepoint",
-        "TEAMS_CHANNEL": "backup_teams_single", "TEAMS_CHAT": "backup_teams_single",
+        "TEAMS_CHANNEL": "backup_teams_single",
+        # TEAMS_CHAT: scheduler denylists this type (SCHEDULER_IGNORED_TYPES);
+        # handler is kept only to drain any in-flight queue messages from
+        # before the cutover. Real chat-message backup runs through
+        # TEAMS_CHAT_EXPORT below.
+        "TEAMS_CHAT": "backup_teams_chat_single",
+        "TEAMS_CHAT_EXPORT": "backup_teams_chat_export",
         "ENTRA_USER": "backup_entra_single", "ENTRA_GROUP": "backup_entra_single",
         "M365_GROUP": "backup_entra_single", "ENTRA_APP": "backup_entra_single",
         "ENTRA_DEVICE": "backup_entra_single", "ENTRA_SERVICE_PRINCIPAL": "backup_entra_single",
@@ -1774,6 +1780,158 @@ class BackupWorker:
                 await session.commit()
 
         return len(db_items), bytes_added
+
+    async def backup_teams_chat_export(
+        self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
+        tenant: Tenant, message: Dict,
+    ) -> Dict:
+        """Backup every Teams chat a single Graph user participates in, in one pass.
+
+        Resource shape: TEAMS_CHAT_EXPORT, external_id = Graph user id.
+        Calls /users/{id}/chats/getAllMessages[/delta] once, groups the result
+        by chatId, writes one SnapshotItem per message. This replaces the
+        per-chat fanout that re-paid the full-export cost for every chat a
+        user was in.
+
+        Delta token is stored flat on resource.extra_data["delta_token"]
+        because the resource IS the user — no per-user keying needed.
+        Upload + commit are chunked by chat to bound memory for heavy users
+        (a single participant with 500 chats × 500 msgs = 250k items).
+        """
+        user_id = resource.external_id
+        user_label = resource.display_name or user_id
+
+        delta_token = (resource.extra_data or {}).get("delta_token")
+        sync_mode = "delta" if delta_token else "full"
+        print(
+            f"[{self.worker_id}] [CHAT_EXPORT START] {user_label} "
+            f"(user={user_id}, {sync_mode} sync)"
+        )
+
+        # Build chat_id -> display_name map from the tenant's TEAMS_CHAT rows so
+        # each message row can carry a human-readable chatTopic / folder_path.
+        # Messages for chats discovery hasn't indexed yet fall back to the raw id.
+        chat_topics: Dict[str, str] = {}
+        async with async_session_factory() as sess:
+            chat_rows = (await sess.execute(
+                select(Resource.external_id, Resource.display_name).where(
+                    Resource.tenant_id == tenant.id,
+                    Resource.type == ResourceType.TEAMS_CHAT,
+                )
+            )).all()
+            for ext_id, dn in chat_rows:
+                if ext_id:
+                    chat_topics[ext_id] = dn or ext_id
+
+        try:
+            payload = await graph_client.get_all_chat_messages_for_user_delta(
+                user_id, delta_token=delta_token
+            )
+        except Exception as e:
+            if delta_token:
+                print(
+                    f"[{self.worker_id}] [CHAT_EXPORT] delta token rejected for "
+                    f"{user_label} ({e}); falling back to full export"
+                )
+                payload = await graph_client.get_all_chat_messages_for_user_delta(user_id)
+            else:
+                raise
+
+        msgs: List[Dict] = payload.get("value", []) if isinstance(payload, dict) else []
+        new_delta_link = (
+            payload.get("@odata.deltaLink") if isinstance(payload, dict) else None
+        )
+
+        # Group by chatId so we can commit per-chat batches and keep the
+        # in-memory upload pipeline bounded regardless of how many chats the
+        # user is in.
+        by_chat: Dict[str, List[Dict]] = {}
+        for m in msgs:
+            cid = m.get("chatId")
+            if not cid:
+                continue
+            by_chat.setdefault(cid, []).append(m)
+
+        print(
+            f"[{self.worker_id}] [CHAT_EXPORT] {user_label} — "
+            f"{len(msgs)} messages across {len(by_chat)} chats"
+        )
+
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
+
+        total_items = 0
+        total_bytes = 0
+        UPLOAD_BATCH = 500  # bound concurrent upload tasks + memory per gather()
+
+        for chat_id, chat_msgs in by_chat.items():
+            chat_topic = chat_topics.get(chat_id, chat_id)
+            folder_path = f"chats/{chat_topic}"
+
+            for i in range(0, len(chat_msgs), UPLOAD_BATCH):
+                batch = chat_msgs[i:i + UPLOAD_BATCH]
+                upload_tasks = []
+                item_metas = []
+                for msg in batch:
+                    msg_id = msg.get("id", str(uuid.uuid4()))
+                    content_bytes = json.dumps(msg).encode()
+                    content_hash = hashlib.sha256(content_bytes).hexdigest()
+                    blob_path = azure_storage_manager.build_blob_path(
+                        str(tenant.id), str(resource.id), str(snapshot.id),
+                        f"chat_{chat_id}_msg_{msg_id}",
+                    )
+                    upload_tasks.append(
+                        upload_blob_with_retry(container, blob_path, content_bytes, shard)
+                    )
+                    item_metas.append((msg_id, msg, content_bytes, content_hash, blob_path))
+
+                results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+
+                db_items = []
+                for (msg_id, msg, content_bytes, content_hash, blob_path), result in zip(item_metas, results):
+                    if isinstance(result, dict) and result.get("success"):
+                        db_items.append(SnapshotItem(
+                            snapshot_id=snapshot.id, tenant_id=tenant.id,
+                            external_id=msg_id, item_type="TEAMS_CHAT_MESSAGE",
+                            name=msg.get("body", {}).get("content", "")[:100] or msg_id,
+                            folder_path=folder_path,
+                            content_hash=content_hash, content_size=len(content_bytes),
+                            blob_path=blob_path,
+                            extra_data={
+                                "raw": msg, "chatId": chat_id,
+                                "chatTopic": chat_topic, "exportedVia": user_id,
+                            },
+                            content_checksum=content_hash,
+                        ))
+                        total_bytes += len(content_bytes)
+
+                if db_items:
+                    async with async_session_factory() as session:
+                        session.add_all(db_items)
+                        await session.commit()
+                    total_items += len(db_items)
+
+        if new_delta_link:
+            async with async_session_factory() as session:
+                r = await session.get(Resource, resource.id)
+                if r is not None:
+                    r.extra_data = r.extra_data or {}
+                    r.extra_data["delta_token"] = new_delta_link
+                    await session.commit()
+
+        print(
+            f"[{self.worker_id}] [CHAT_EXPORT COMPLETE] {user_label} — "
+            f"{total_items} messages, {total_bytes} bytes, "
+            f"delta={'saved' if new_delta_link else 'missing'}"
+        )
+
+        async with async_session_factory() as sess:
+            await self.update_resource_backup_info(sess, resource, None, snapshot.id, {
+                "item_count": total_items,
+                "bytes_added": total_bytes,
+            })
+
+        return {"item_count": total_items, "bytes_added": total_bytes}
 
     async def backup_power_bi_workspace(
         self,

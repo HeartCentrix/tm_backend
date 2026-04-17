@@ -35,7 +35,10 @@ async def lifespan(app: FastAPI):
 
 # Resource types hidden from UI listing endpoints by default.
 # Caller can still opt in via ?includeHidden=true.
-UI_HIDDEN_TYPES: set[str] = set()
+# TEAMS_CHAT_EXPORT is a backup-scheduler-internal per-user shard that carries the
+# Graph delta token for the whole-user chat export; TEAMS_CHAT rows remain the
+# user-facing entity.
+UI_HIDDEN_TYPES: set[str] = {"TEAMS_CHAT_EXPORT"}
 
 
 def format_bytes(bytes_val: int) -> str:

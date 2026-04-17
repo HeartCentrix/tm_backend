@@ -51,6 +51,7 @@ class ResourceType(str, enum.Enum):
     SHAREPOINT_SITE = "SHAREPOINT_SITE"
     TEAMS_CHANNEL = "TEAMS_CHANNEL"
     TEAMS_CHAT = "TEAMS_CHAT"
+    TEAMS_CHAT_EXPORT = "TEAMS_CHAT_EXPORT"
     ENTRA_USER = "ENTRA_USER"
     ENTRA_GROUP = "ENTRA_GROUP"
     M365_GROUP = "M365_GROUP"  # Unified (modern) group — links group mailbox + SP site + (optional) Team

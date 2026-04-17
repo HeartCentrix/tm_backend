@@ -76,6 +76,7 @@ TYPE_MAP: Dict[str, ResourceType] = {
     "SHAREPOINT_SITE": ResourceType.SHAREPOINT_SITE,
     "TEAMS_CHANNEL": ResourceType.TEAMS_CHANNEL,
     "TEAMS_CHAT": ResourceType.TEAMS_CHAT,
+    "TEAMS_CHAT_EXPORT": ResourceType.TEAMS_CHAT_EXPORT,
     "ENTRA_USER": ResourceType.ENTRA_USER,
     "ENTRA_GROUP": ResourceType.ENTRA_GROUP,
     "M365_GROUP": ResourceType.M365_GROUP,
@@ -106,7 +107,7 @@ DISCOVERY_SCOPE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "onedrive": {"method": "discover_onedrive", "resource_types": {ResourceType.ONEDRIVE}},
     "sharepoint": {"method": "discover_sharepoint", "resource_types": {ResourceType.SHAREPOINT_SITE}},
-    "teams": {"method": "discover_teams", "resource_types": {ResourceType.TEAMS_CHANNEL, ResourceType.TEAMS_CHAT}},
+    "teams": {"method": "discover_teams", "resource_types": {ResourceType.TEAMS_CHANNEL, ResourceType.TEAMS_CHAT, ResourceType.TEAMS_CHAT_EXPORT}},
     "planner": {"method": "discover_planner", "resource_types": {ResourceType.PLANNER}},
     "todo": {"method": "discover_todo", "resource_types": {ResourceType.TODO}},
     "power_platform": {

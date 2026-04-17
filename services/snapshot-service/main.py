@@ -594,14 +594,21 @@ async def list_snapshot_messages(
     snapshot_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(500, ge=1),
+    chatId: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return Teams messages with sender/body/date extracted from metadata."""
+    """Return Teams messages with sender/body/date extracted from metadata.
+
+    Pass chatId to narrow a per-user TEAMS_CHAT_EXPORT snapshot down to one
+    chat (the post-refactor path — snapshots are now user-scoped, so restore
+    or the viewer need to filter by chat themselves)."""
     CHAT_TYPES = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
     filters = [
         SnapshotItem.snapshot_id == UUID(snapshot_id),
         SnapshotItem.item_type.in_(CHAT_TYPES),
     ]
+    if chatId:
+        filters.append(SnapshotItem.extra_data["chatId"].astext == chatId)
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
 
