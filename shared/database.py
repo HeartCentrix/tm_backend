@@ -1,9 +1,10 @@
 """Shared database connection and schema bootstrap helpers."""
 
 import asyncio
+import json
 import logging
 from time import monotonic
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -94,6 +95,54 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             raise
         finally:
             await session.close()
+
+
+_SNAPSHOT_ITEM_COPY_COLUMNS = (
+    "snapshot_id", "tenant_id", "external_id", "item_type", "name",
+    "folder_path", "content_hash", "content_checksum", "content_size",
+    "blob_path", "byte_offset", "byte_length", "metadata", "is_deleted",
+)
+
+
+async def bulk_insert_snapshot_items(items: List[Dict[str, Any]]) -> int:
+    """Bulk-insert snapshot_items rows via asyncpg's COPY protocol.
+
+    Accepts a list of plain dicts; omitted columns (id, created_at) fall to
+    DB-level defaults. The metadata JSON column is serialized with json.dumps
+    because asyncpg's default codec for the ``json`` type takes a string, not
+    a dict. Used by hot paths (e.g. Teams chat packed-blob export) where
+    session.add_all + ORM flush is the bottleneck on batches of thousands.
+    """
+    if not items:
+        return 0
+    records = [
+        (
+            it.get("snapshot_id"),
+            it.get("tenant_id"),
+            it.get("external_id"),
+            it.get("item_type"),
+            it.get("name"),
+            it.get("folder_path"),
+            it.get("content_hash"),
+            it.get("content_checksum"),
+            int(it.get("content_size") or 0),
+            it.get("blob_path"),
+            it.get("byte_offset"),
+            it.get("byte_length"),
+            json.dumps(it.get("extra_data") or {}),
+            bool(it.get("is_deleted", False)),
+        )
+        for it in items
+    ]
+    async with engine.begin() as conn:
+        raw = await conn.get_raw_connection()
+        asyncpg_conn = raw.driver_connection
+        await asyncpg_conn.copy_records_to_table(
+            "snapshot_items",
+            records=records,
+            columns=list(_SNAPSHOT_ITEM_COPY_COLUMNS),
+        )
+    return len(items)
 
 
 async def _has_required_tables(conn) -> bool:

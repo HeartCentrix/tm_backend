@@ -34,7 +34,7 @@ from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from shared.database import async_session_factory
+from shared.database import async_session_factory, bulk_insert_snapshot_items
 from shared.models import (
     Resource, Tenant, Job, Snapshot, SnapshotItem,
     SlaPolicy, ResourceType, ResourceStatus, JobStatus, SnapshotType, SnapshotStatus
@@ -2061,7 +2061,7 @@ class BackupWorker:
             shard_idx = 0
             buf = bytearray()
             pack_entries: List[Tuple[int, int, str, str, Dict]] = []
-            bucket_items: List[SnapshotItem] = []
+            bucket_items: List[Dict] = []
 
             async def flush_pack():
                 nonlocal shard_idx, buf, pack_entries, total_bytes, total_items
@@ -2082,21 +2082,21 @@ class BackupWorker:
                 if result.get("success"):
                     total_bytes += len(payload)
                     for offset, length, content_hash, msg_id, msg in pack_entries:
-                        bucket_items.append(SnapshotItem(
-                            snapshot_id=snapshot.id, tenant_id=tenant.id,
-                            external_id=msg_id, item_type="TEAMS_CHAT_MESSAGE",
-                            name=msg.get("body", {}).get("content", "")[:100] or msg_id,
-                            folder_path=folder_path,
-                            content_hash=content_hash, content_size=length,
-                            blob_path=blob_path,
-                            byte_offset=offset, byte_length=length,
-                            extra_data={
+                        bucket_items.append({
+                            "snapshot_id": snapshot.id, "tenant_id": tenant.id,
+                            "external_id": msg_id, "item_type": "TEAMS_CHAT_MESSAGE",
+                            "name": msg.get("body", {}).get("content", "")[:100] or msg_id,
+                            "folder_path": folder_path,
+                            "content_hash": content_hash, "content_size": length,
+                            "blob_path": blob_path,
+                            "byte_offset": offset, "byte_length": length,
+                            "extra_data": {
                                 "raw": msg, "chatId": chat_id,
                                 "chatTopic": chat_topic, "exportedVia": user_id,
                                 "packed": True,
                             },
-                            content_checksum=content_hash,
-                        ))
+                            "content_checksum": content_hash,
+                        })
                     total_items += len(pack_entries)
                 else:
                     print(
@@ -2110,21 +2110,21 @@ class BackupWorker:
             for msg_id, msg, content_bytes, content_hash in prepared:
                 if content_hash in existing:
                     ex_path, ex_off, ex_len, ex_size = existing[content_hash]
-                    bucket_items.append(SnapshotItem(
-                        snapshot_id=snapshot.id, tenant_id=tenant.id,
-                        external_id=msg_id, item_type="TEAMS_CHAT_MESSAGE",
-                        name=msg.get("body", {}).get("content", "")[:100] or msg_id,
-                        folder_path=folder_path,
-                        content_hash=content_hash, content_size=ex_size,
-                        blob_path=ex_path,
-                        byte_offset=ex_off, byte_length=ex_len,
-                        extra_data={
+                    bucket_items.append({
+                        "snapshot_id": snapshot.id, "tenant_id": tenant.id,
+                        "external_id": msg_id, "item_type": "TEAMS_CHAT_MESSAGE",
+                        "name": msg.get("body", {}).get("content", "")[:100] or msg_id,
+                        "folder_path": folder_path,
+                        "content_hash": content_hash, "content_size": ex_size,
+                        "blob_path": ex_path,
+                        "byte_offset": ex_off, "byte_length": ex_len,
+                        "extra_data": {
                             "raw": msg, "chatId": chat_id,
                             "chatTopic": chat_topic, "exportedVia": user_id,
                             "packed": ex_off is not None, "dedup": True,
                         },
-                        content_checksum=content_hash,
-                    ))
+                        "content_checksum": content_hash,
+                    })
                     dedup_reused += 1
                     total_items += 1
                     continue
@@ -2140,9 +2140,9 @@ class BackupWorker:
             await flush_pack()
 
             if bucket_items:
-                async with async_session_factory() as session:
-                    session.add_all(bucket_items)
-                    await session.commit()
+                # asyncpg COPY — ~10-30x faster than session.add_all + flush on
+                # thousands of rows; avoids per-row ORM overhead.
+                await bulk_insert_snapshot_items(bucket_items)
 
         if dedup_reused:
             print(
