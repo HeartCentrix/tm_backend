@@ -73,6 +73,7 @@ class SqlRestoreHandler:
 
         self._log(f"Starting full SQL restore to {target_db} on {target_server}/{target_rg}")
 
+        added_firewall_rule: Optional[str] = None
         try:
             # Step 1: Get BACPAC blob info
             bacpac_blob = snapshot.extra_data.get("bacpac_blob")
@@ -83,9 +84,11 @@ class SqlRestoreHandler:
             shard = azure_storage_manager.get_default_shard()
             blob_uri = f"https://{shard.account_name}.blob.core.windows.net/{container}/{bacpac_blob}"
 
-            # Step 2: Configure firewall (if requested)
+            # Step 2: Open Azure-services firewall rule so the BACPAC import control
+            # plane can reach the SQL engine. Rule is named per-job and torn down in
+            # finally so we don't leave the server open after the restore.
             if configure_firewall:
-                await self._configure_firewall_for_restore(sql, target_rg, target_server)
+                added_firewall_rule = await self._configure_firewall_for_restore(sql, target_rg, target_server)
 
             # Step 3: Import BACPAC
             admin_user, admin_password = self._get_sql_credentials(tenant)
@@ -127,32 +130,47 @@ class SqlRestoreHandler:
                 "resource_group": target_rg,
                 "subscription_id": target_sub,
                 "status": getattr(db, 'status', None),
+                "firewall_rule": added_firewall_rule,
             }
 
         except Exception as e:
             self._log(f"Full SQL restore FAILED: {e}", "ERROR")
             return {"success": False, "error": str(e)[:1000]}
+        finally:
+            if added_firewall_rule:
+                await self._remove_firewall_rule(sql, target_rg, target_server, added_firewall_rule)
 
     async def restore_schema_only(self, tenant: Tenant, snapshot: Snapshot,
                                    restore_params: Dict) -> Dict:
-        """
-        Schema-only restore from SQL scripts.
-        Useful for creating empty database structures for testing.
-        """
-        self._log(f"Starting schema-only restore for {snapshot.id.hex[:8]}")
+        """Schema-only restore.
 
-        # Load schema artifacts from backup
+        Honest failure path: the SQL backup handler captures schema metadata as
+        annotated comments (INFORMATION_SCHEMA rows formatted as `-- Column: ...`),
+        not executable DDL. Running those blobs against a target server would
+        create zero objects, so we refuse instead of silently reporting success.
+
+        The working alternatives today:
+          • `restore_full` — imports the BACPAC (schema + data) into a scratch
+            database, then callers can TRUNCATE tables if they want empty structure.
+          • `restore_pitr` — creates a new database at a past point in time via
+            Azure SQL's native capability (no BACPAC needed).
+
+        A real schema-only restore needs backup-side changes: DACPAC extraction
+        or reverse-engineered CREATE DDL — both larger than this path is scoped for.
+        """
         schema_blob = snapshot.extra_data.get("schema_blob")
-        if not schema_blob:
-            raise ValueError("No schema blob found in snapshot")
-
-        # TODO: Execute SQL scripts against target database
-        # For now, return success with schema info
+        msg = (
+            "Schema-only restore is not supported: TM Vault's SQL backup captures "
+            "schema as annotated metadata, not executable DDL. Use restore_full "
+            "against a scratch database, or restore_pitr for a point-in-time copy."
+        )
+        self._log(msg, "WARNING")
         return {
-            "success": True,
+            "success": False,
             "mode": "SCHEMA_ONLY",
+            "error": msg,
             "schema_blob": schema_blob,
-            "message": "Schema-only restore requires SQL execution via pyodbc/aioodbc (not yet implemented)",
+            "alternatives": ["FULL", "PITR"],
         }
 
     async def restore_pitr(self, tenant: Tenant, snapshot: Snapshot,
@@ -211,16 +229,41 @@ class SqlRestoreHandler:
 
     # ==================== Helper Methods ====================
 
-    async def _configure_firewall_for_restore(self, sql, rg: str, server_name: str):
-        """
-        Add temporary firewall rules to allow backup/restore operations.
-        Afi.ai does this automatically during restore.
-        """
-        self._log(f"  Configuring firewall for {server_name}...")
+    async def _configure_firewall_for_restore(self, sql, rg: str, server_name: str) -> Optional[str]:
+        """Open Azure-services access on the SQL server for the duration of the restore.
 
-        # TODO: Detect current IP and add temporary firewall rule
-        # For now, this is a placeholder
-        self._log(f"  Firewall configuration placeholder (manual setup required)")
+        Creates a rule `tmvault-restore-<epoch>` with range 0.0.0.0-0.0.0.0 (Azure
+        SDK convention for "Allow Azure services and resources"). Returns the rule
+        name so the caller can tear it down in `finally`.
+        """
+        rule_name = f"tmvault-restore-{int(datetime.now(timezone.utc).timestamp())}"
+        self._log(f"  Opening firewall rule {rule_name} on {server_name} (Allow Azure services)")
+        try:
+            await sql.firewall_rules.create_or_update(
+                resource_group_name=rg,
+                server_name=server_name,
+                firewall_rule_name=rule_name,
+                parameters={
+                    "start_ip_address": "0.0.0.0",
+                    "end_ip_address": "0.0.0.0",
+                },
+            )
+            return rule_name
+        except HttpResponseError as e:
+            self._log(f"  Failed to add firewall rule: {e}", "WARNING")
+            return None
+
+    async def _remove_firewall_rule(self, sql, rg: str, server_name: str, rule_name: str):
+        """Best-effort teardown of a temporary firewall rule added for a restore."""
+        try:
+            await sql.firewall_rules.delete(
+                resource_group_name=rg,
+                server_name=server_name,
+                firewall_rule_name=rule_name,
+            )
+            self._log(f"  Removed firewall rule {rule_name}")
+        except Exception as e:
+            self._log(f"  Could not remove firewall rule {rule_name}: {e}", "WARNING")
 
     def _get_sql_credentials(self, tenant: Tenant) -> tuple:
         """Retrieve SQL admin credentials from tenant extra_data."""

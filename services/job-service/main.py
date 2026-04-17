@@ -549,6 +549,18 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         "targetResourceId": request.get("targetResourceId"),
         "targetEnvironmentId": request.get("targetEnvironmentId"),
         "exportFormat": request.get("exportFormat"),
+        "targetFolder": request.get("targetFolder"),
+        "overwrite": request.get("overwrite", False),
+        # RestoreModal sends labels like ["Mail","OneDrive","Contacts","Calendar","Chats"].
+        # None / missing = restore everything (back-compat). Restore-worker maps each
+        # label to the matching item_type values and skips anything else in the snapshot.
+        "workloads": request.get("workloads"),
+        # Pass-through params consumed by Azure restore handlers (target RG, VM/DB name,
+        # subscription, PITR time, firewall flag, disk name, etc). Kept as a nested
+        # dict so non-Azure restores ignore it cleanly.
+        "azureRestoreParams": request.get("azureRestoreParams", {}),
+        # Sub-mode selector for Azure restores: VM → FULL_VM|DISK, SQL → FULL|PITR|SCHEMA_ONLY
+        "azureRestoreMode": request.get("azureRestoreMode"),
     }
 
     # Fetch tenant/resource info — try snapshot first, then fall back to item lookup.
@@ -574,11 +586,13 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
             if snapshot and not snapshot_ids:
                 snapshot_ids = [str(snapshot.id)]
 
+    resource_type = None
     if snapshot:
         resource_id = str(snapshot.resource_id)
         resource = await db.get(Resource, snapshot.resource_id)
         if resource:
             tenant_id = str(resource.tenant_id)
+            resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
 
     job = Job(
         id=uuid4(),
@@ -607,6 +621,7 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
             resource_id=resource_id,
             tenant_id=tenant_id,
             spec=spec,
+            resource_type=resource_type,
         )
         queue = restore_message.get("queue", "restore.normal")
         await message_bus.publish(queue, restore_message, priority=restore_message.get("priority", 5))

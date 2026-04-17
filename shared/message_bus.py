@@ -55,6 +55,11 @@ class MessageBus:
                 await self._declare_queue("azure.sql", routing_key="azure.sql")
                 await self._declare_queue("azure.postgres", routing_key="azure.postgres")
 
+                # Azure restore queues — routed to azure-workload-worker, not restore-worker
+                await self._declare_queue("azure.restore.vm", routing_key="azure.restore.vm")
+                await self._declare_queue("azure.restore.sql", routing_key="azure.restore.sql")
+                await self._declare_queue("azure.restore.postgres", routing_key="azure.restore.postgres")
+
                 # Set channel QoS (per-consumer prefetch)
                 await self.channel.set_qos(prefetch_count=50)
 
@@ -166,6 +171,16 @@ def create_mass_backup_message(
     }
 
 
+AZURE_RESTORE_QUEUE_BY_TYPE = {
+    "AZURE_VM": "azure.restore.vm",
+    "AZURE_SQL_DB": "azure.restore.sql",
+    "AZURE_SQL": "azure.restore.sql",
+    "AZURE_POSTGRESQL": "azure.restore.postgres",
+    "AZURE_POSTGRESQL_SINGLE": "azure.restore.postgres",
+    "AZURE_PG": "azure.restore.postgres",
+}
+
+
 def create_restore_message(
     job_id: str,
     restore_type: str = "IN_PLACE",
@@ -173,9 +188,14 @@ def create_restore_message(
     item_ids: list = None,
     resource_id: str = None,
     tenant_id: str = None,
-    spec: dict = None
+    spec: dict = None,
+    resource_type: str = None,
 ) -> dict:
-    """Create a restore message for the restore worker"""
+    """Create a restore message for the appropriate restore worker.
+
+    Azure resources route to the azure-workload-worker's azure.restore.* queues
+    so long-running Azure LROs don't starve M365 item restores on restore.normal.
+    """
     priority_map = {
         "IN_PLACE": 5,
         "CROSS_USER": 3,
@@ -194,9 +214,14 @@ def create_restore_message(
         "DOWNLOAD": "restore.low",
     }
 
+    queue = AZURE_RESTORE_QUEUE_BY_TYPE.get(resource_type or "")
+    if not queue:
+        queue = queue_map.get(restore_type, "restore.normal")
+
     return {
         "jobId": job_id,
         "restoreType": restore_type,
+        "resourceType": resource_type,
         "snapshotIds": snapshot_ids or [],
         "itemIds": item_ids or [],
         "resourceId": resource_id,
@@ -204,7 +229,7 @@ def create_restore_message(
         "spec": spec or {},
         "type": "RESTORE",
         "priority": priority_map.get(restore_type, 5),
-        "queue": queue_map.get(restore_type, "restore.normal"),
+        "queue": queue,
         "createdAt": datetime.utcnow().isoformat(),
     }
 
