@@ -125,11 +125,28 @@ class BackupWorker:
         """Start consuming from all backup queues"""
         await self.initialize()
 
+        # Override the channel-wide prefetch (set to 50 by message_bus). With
+        # 50, a single worker grabs all queued messages and the other replicas
+        # sit idle while it processes them serially. Setting prefetch=2 gives
+        # each replica one in-flight + one ready, so 3 replicas cover ~6 jobs
+        # at once and fair distribution is enforced by the broker.
+        if message_bus.channel:
+            try:
+                await message_bus.channel.set_qos(prefetch_count=2)
+                print(f"[{self.worker_id}] Set channel prefetch_count=2 for fair work distribution")
+            except Exception as exc:
+                print(f"[{self.worker_id}] Could not adjust prefetch_count: {exc}")
+
+        # Per-queue prefetch.
+        # Urgent = manually triggered backups (Teams chats, mailboxes). Each
+        # chat backup's getAllMessages can take 10+ min. Prefetch=1 forces
+        # round-robin across replicas so one slow chat can't starve the others.
+        # Higher-throughput queues stay generous since their items are smaller.
         queues = [
-            ("backup.urgent", 10),
-            ("backup.high", 20),
-            ("backup.normal", 50),
-            ("backup.low", 100),
+            ("backup.urgent", 1),
+            ("backup.high", 5),
+            ("backup.normal", 20),
+            ("backup.low", 50),
         ]
 
         tasks = []
