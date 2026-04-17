@@ -126,7 +126,7 @@ ACTIONS = {
     "RANSOMWARE_SIGNAL": "AI ransomware signal detected",
 }
 
-WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE"}
+WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE", "RANSOMWARE_SIGNAL"}
 
 # Discovery events (run start + completion, per-tenant) are surfaced in the
 # activity feed so users can see auto- and manual-triggered discoveries.

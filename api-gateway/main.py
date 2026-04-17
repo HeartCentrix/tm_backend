@@ -273,7 +273,23 @@ async def alert(request: Request):
 @app.delete("/api/v1/policies/{policy_id}")
 @app.get("/api/v1/policies/{policy_id}/resources")
 @app.post("/api/v1/policies/{policy_id}/auto-assign")
+# Phase 2 — exclusions hang off a policy
+@app.get("/api/v1/policies/{policy_id}/exclusions")
+@app.post("/api/v1/policies/{policy_id}/exclusions")
+@app.delete("/api/v1/policies/{policy_id}/exclusions/{exclusion_id}")
 async def policy(request: Request):
+    return await proxy_request("resource", request.url.path, request)
+
+
+# Phase 2 — resource groups (afi-style auto-protection rules)
+@app.get("/api/v1/resource-groups")
+@app.post("/api/v1/resource-groups")
+@app.get("/api/v1/resource-groups/{group_id}")
+@app.put("/api/v1/resource-groups/{group_id}")
+@app.delete("/api/v1/resource-groups/{group_id}")
+@app.post("/api/v1/resource-groups/{group_id}/policies")
+@app.delete("/api/v1/resource-groups/{group_id}/policies/{policy_id}")
+async def resource_group(request: Request):
     return await proxy_request("resource", request.url.path, request)
 
 

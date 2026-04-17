@@ -28,7 +28,7 @@ def _m365_presets(tenant_id) -> List[dict]:
         dict(
             name="Gold",
             service_type="m365",
-            frequency="HOURLY",
+            frequency="THREE_DAILY",
             retention_mode="GFS",
             gfs_daily_count=14, gfs_weekly_count=8, gfs_monthly_count=12, gfs_yearly_count=7,
             retention_hot_days=30, retention_cool_days=180, retention_archive_days=2555,
@@ -48,7 +48,7 @@ def _m365_presets(tenant_id) -> List[dict]:
         dict(
             name="Bronze",
             service_type="m365",
-            frequency="WEEKLY",
+            frequency="DAILY",
             retention_mode="FLAT",
             retention_hot_days=7, retention_cool_days=30, retention_archive_days=365,
             is_default=False, enabled=True,
@@ -77,7 +77,7 @@ def _azure_presets(tenant_id) -> List[dict]:
         dict(
             name="Gold",
             service_type="azure",
-            frequency="HOURLY",
+            frequency="THREE_DAILY",
             retention_mode="GFS",
             gfs_daily_count=14, gfs_weekly_count=8, gfs_monthly_count=12, gfs_yearly_count=7,
             retention_hot_days=30, retention_cool_days=180, retention_archive_days=2555,
@@ -97,7 +97,7 @@ def _azure_presets(tenant_id) -> List[dict]:
         dict(
             name="Bronze",
             service_type="azure",
-            frequency="WEEKLY",
+            frequency="DAILY",
             retention_mode="FLAT",
             retention_hot_days=7, retention_cool_days=30, retention_archive_days=365,
             is_default=False, enabled=True,

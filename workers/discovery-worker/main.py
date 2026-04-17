@@ -78,6 +78,9 @@ TYPE_MAP: Dict[str, ResourceType] = {
     "TEAMS_CHAT": ResourceType.TEAMS_CHAT,
     "ENTRA_USER": ResourceType.ENTRA_USER,
     "ENTRA_GROUP": ResourceType.ENTRA_GROUP,
+    "M365_GROUP": ResourceType.M365_GROUP,
+    "ENTRA_CONDITIONAL_ACCESS": ResourceType.ENTRA_CONDITIONAL_ACCESS,
+    "ENTRA_BITLOCKER_KEY": ResourceType.ENTRA_BITLOCKER_KEY,
     "ENTRA_APP": ResourceType.ENTRA_APP,
     "ENTRA_DEVICE": ResourceType.ENTRA_DEVICE,
     "AZURE_VM": ResourceType.AZURE_VM,
@@ -94,7 +97,9 @@ TYPE_MAP: Dict[str, ResourceType] = {
 
 DISCOVERY_SCOPE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "users": {"method": "discover_users", "resource_types": {ResourceType.ENTRA_USER}},
-    "groups": {"method": "discover_groups", "resource_types": {ResourceType.ENTRA_GROUP}},
+    # discover_groups emits a mix of ENTRA_GROUP (DLs / security groups) and
+    # M365_GROUP (Unified groups) — list both so stale-marking covers them.
+    "groups": {"method": "discover_groups", "resource_types": {ResourceType.ENTRA_GROUP, ResourceType.M365_GROUP}},
     "mailboxes": {
         "method": "discover_mailboxes",
         "resource_types": {ResourceType.MAILBOX, ResourceType.SHARED_MAILBOX, ResourceType.ROOM_MAILBOX},
@@ -107,6 +112,17 @@ DISCOVERY_SCOPE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "power_platform": {
         "method": "discover_power_platform",
         "resource_types": {ResourceType.POWER_BI, ResourceType.POWER_APPS, ResourceType.POWER_AUTOMATE},
+    },
+    # Phase 2 P2 — security-critical Entra extras. CA policies and BitLocker
+    # keys are tenant-singleton resources; afi captures both so a takeover or
+    # misconfiguration can be reverted from the last clean snapshot.
+    "conditional_access": {
+        "method": "discover_conditional_access",
+        "resource_types": {ResourceType.ENTRA_CONDITIONAL_ACCESS},
+    },
+    "bitlocker": {
+        "method": "discover_bitlocker_keys",
+        "resource_types": {ResourceType.ENTRA_BITLOCKER_KEY},
     },
 }
 

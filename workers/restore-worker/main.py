@@ -255,6 +255,13 @@ class RestoreWorker:
                 failed_count += result.get("failed_count", 0)
                 continue
 
+            # afi-style conflict handling — default to SEPARATE_FOLDER ("Restored by TM/{date}/...")
+            # so a restore never silently overwrites live data. OVERWRITE replaces
+            # in-place, matching afi's "Overwrite/In-place" mode.
+            conflict_mode = (spec.get("conflictMode") or "SEPARATE_FOLDER").upper()
+            if conflict_mode not in ("SEPARATE_FOLDER", "OVERWRITE"):
+                conflict_mode = "SEPARATE_FOLDER"
+
             # Route by item type
             teams_skipped = 0  # per-resource counter; rolled into total_teams_skipped
             for item in resource_items:
@@ -262,9 +269,22 @@ class RestoreWorker:
                     if item.item_type in ("EMAIL",):
                         await self._restore_email_to_mailbox(graph_client, resource, item)
                     elif item.item_type in ("FILE", "ONEDRIVE_FILE"):
-                        await self._restore_file_to_onedrive(graph_client, resource, item)
+                        await self._restore_file_to_onedrive(graph_client, resource, item, conflict_mode=conflict_mode)
                     elif item.item_type in ("SHAREPOINT_FILE", "SHAREPOINT_LIST_ITEM"):
-                        await self._restore_file_to_sharepoint(graph_client, resource, item)
+                        await self._restore_file_to_sharepoint(graph_client, resource, item, conflict_mode=conflict_mode)
+                    elif item.item_type == "CALENDAR_EVENT":
+                        await self._restore_event_to_calendar(session, graph_client, resource, item)
+                    elif item.item_type == "FILE_VERSION":
+                        # Round 1.2 — restore a specific historical version. Delegates
+                        # to the per-resource-type uploader; uses the parent file's name
+                        # with a version suffix so it lands alongside the current file
+                        # rather than overwriting it.
+                        await self._restore_file_version(session, graph_client, resource, item)
+                    elif item.item_type in ("EMAIL_ATTACHMENT", "EVENT_ATTACHMENT"):
+                        # Attachments restore as part of their parent EMAIL / CALENDAR_EVENT;
+                        # standalone restore isn't an afi-supported flow either.
+                        print(f"[{self.worker_id}] Skipping standalone attachment restore for {item.id} — restore the parent item instead")
+                        continue
                     elif item.item_type in ("TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY", "TEAMS_CHAT_MESSAGE"):
                         # Microsoft Graph has no app-only API to create chat/channel
                         # messages as another user. This is a platform limit, not a
@@ -534,20 +554,32 @@ class RestoreWorker:
                     print(f"[{self.worker_id}] Failed to export item {item.id}: {e}")
 
         zip_buffer.seek(0)
-        zip_size = zip_buffer.getbuffer().nbytes
+        zip_bytes = zip_buffer.getvalue()
+        zip_size = len(zip_bytes)
 
-        # Upload ZIP to Azure Blob for download
+        # Upload via the async shard API so the event loop isn't blocked while
+        # we ship potentially-hundreds-of-MB to Azure. Auto-create the
+        # `exports` container on first use — it's separate from per-tenant
+        # backup containers and isn't created by init_db.
         container_name = "exports"
-        blob_name = f"exports/{message.get('jobId')}/export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+        blob_name = f"{message.get('jobId')}/export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
 
-        if self.blob_service_client:
-            blob_client = self.blob_service_client.get_blob_client(container=container_name, blob=blob_name)
-            blob_client.upload_blob(zip_buffer.getvalue(), overwrite=True)
+        from shared.azure_storage import azure_storage_manager
+        shard = azure_storage_manager.get_default_shard()
+        # upload_blob auto-creates the container via _ensure_container.
+        upload_result = await shard.upload_blob(
+            container_name, blob_name, zip_bytes,
+            metadata={"job_id": str(message.get("jobId") or ""), "exported_count": str(exported_count)},
+        )
+        if not (isinstance(upload_result, dict) and upload_result.get("success")):
+            err = (upload_result or {}).get("error", "unknown") if isinstance(upload_result, dict) else upload_result
+            raise RuntimeError(f"export ZIP upload failed: {err}")
 
+        print(f"[{self.worker_id}] export ZIP uploaded: {blob_name} ({zip_size} bytes, {exported_count} items)")
         return {
             "exported_count": exported_count,
             "export_type": "ZIP",
-            "download_url": f"/api/v1/exports/{message.get('jobId')}/download",
+            "download_url": f"/api/v1/jobs/export/{message.get('jobId')}/download",
             "blob_path": blob_name,
             "file_size": zip_size,
         }
@@ -618,63 +650,336 @@ class RestoreWorker:
             message_payload
         )
 
+    @staticmethod
+    def _conflict_path_prefix(conflict_mode: str) -> str:
+        """Build the path prefix used by SEPARATE_FOLDER mode. Empty string for
+        OVERWRITE — landing path is the original location."""
+        if conflict_mode == "SEPARATE_FOLDER":
+            return f"Restored by TM/{datetime.utcnow().strftime('%Y-%m-%d')}/"
+        return ""
+
     async def _restore_file_to_onedrive(
         self,
         graph_client: GraphClient,
         resource: Resource,
-        item: SnapshotItem
+        item: SnapshotItem,
+        conflict_mode: str = "SEPARATE_FOLDER",
     ):
-        """Restore file to OneDrive via Graph API"""
+        """Restore file to OneDrive via Graph API."""
         metadata = self._get_item_metadata(item)
         raw_data = metadata.get("raw", {})
 
         user_id = resource.external_id
-
-        # Upload file content
         file_content = raw_data.get("content", "")
         file_name = raw_data.get("name", item.name or f"restored_{item.external_id}")
 
-        # Determine parent folder
-        parent_ref = raw_data.get("parentReference", {})
-        folder_id = parent_ref.get("id", "root")
+        # SEPARATE_FOLDER: stash under "Restored by TM/{date}/{original_folder}/"
+        # OVERWRITE: write to the original path (`...root:/{file_name}:/content`).
+        prefix = self._conflict_path_prefix(conflict_mode)
+        target_path = f"{prefix}{file_name}"
+        url = f"{graph_client.GRAPH_URL}/users/{user_id}/drive/root:/{target_path}:/content"
 
-        # PUT to /users/{id}/drive/root/children/{name}/content
-        # or POST to /users/{id}/drive/root:/path/{name}:/content
-        url = f"{graph_client.GRAPH_URL}/users/{user_id}/drive/root:/{file_name}:/content"
-
-        await graph_client._put(
+        result = await graph_client._put(
             url,
             content=file_content,
             headers={"Content-Type": "application/octet-stream"}
         )
+
+        # Round 1.1 — replay captured ACLs onto the restored item.
+        await self._replay_file_permissions(graph_client, item, result)
 
     async def _restore_file_to_sharepoint(
         self,
         graph_client: GraphClient,
         resource: Resource,
-        item: SnapshotItem
+        item: SnapshotItem,
+        conflict_mode: str = "SEPARATE_FOLDER",
     ):
-        """Restore file to SharePoint site via Graph API"""
+        """Restore file to SharePoint site via Graph API."""
         metadata = self._get_item_metadata(item)
         raw_data = metadata.get("raw", {})
 
         site_id = resource.external_id
-
-        # Upload file content
         file_content = raw_data.get("content", "")
         file_name = raw_data.get("name", item.name or f"restored_{item.external_id}")
 
-        # Determine parent folder
-        parent_ref = raw_data.get("parentReference", {})
-        folder_path = parent_ref.get("path", "")
+        prefix = self._conflict_path_prefix(conflict_mode)
+        target_path = f"{prefix}{file_name}"
+        url = f"{graph_client.GRAPH_URL}/sites/{site_id}/drive/root:/{target_path}:/content"
 
-        url = f"{graph_client.GRAPH_URL}/sites/{site_id}/drive/root:/{file_name}:/content"
-
-        await graph_client._put(
+        result = await graph_client._put(
             url,
             content=file_content,
             headers={"Content-Type": "application/octet-stream"}
         )
+
+        # Round 1.1 — replay captured ACLs onto the restored item.
+        await self._replay_file_permissions(graph_client, item, result)
+
+    async def _restore_event_to_calendar(
+        self,
+        session: AsyncSession,
+        graph_client: GraphClient,
+        resource: Resource,
+        event_item: SnapshotItem,
+    ) -> None:
+        """Restore a calendar event AND its captured attachments.
+
+        Two-step:
+          1. POST /users/{id}/events with the captured event payload — Graph
+             generates a new event_id (we can't re-use the original because
+             the original event was either deleted or still exists).
+          2. For each EVENT_ATTACHMENT SnapshotItem with parent_item_id ==
+             original event_id, fetch its blob bytes and POST to
+             /events/{newId}/attachments.
+
+        afi notes that on restore "attendees are added as a list in the event
+        body" rather than as real recipients (to avoid sending notifications);
+        we preserve the original attendees field as-is — the Graph default of
+        sending invitations is acceptable for tenant-scoped restore."""
+        meta = self._get_item_metadata(event_item)
+        raw_event = meta.get("raw") or {}
+        if not raw_event:
+            print(f"[{self.worker_id}] CALENDAR_EVENT {event_item.id} has no raw payload")
+            return
+
+        original_event_id = raw_event.get("id")
+        try:
+            created = await graph_client.create_calendar_event(resource.external_id, raw_event)
+        except Exception as e:
+            print(f"[{self.worker_id}] event create failed: {type(e).__name__}: {e}")
+            return
+        new_event_id = created.get("id")
+        if not new_event_id:
+            return
+
+        # Find captured EVENT_ATTACHMENT rows linked to the original event.
+        # External ID convention from backup-worker._backup_event_attachments:
+        #   "{event_id}::{attachment_id}"
+        if not original_event_id:
+            return
+        att_stmt = (
+            select(SnapshotItem)
+            .where(
+                SnapshotItem.snapshot_id == event_item.snapshot_id,
+                SnapshotItem.item_type == "EVENT_ATTACHMENT",
+                SnapshotItem.external_id.like(f"{original_event_id}::%"),
+            )
+        )
+        attachments = (await session.execute(att_stmt)).scalars().all()
+        if not attachments:
+            return
+
+        applied = 0
+        for att in attachments:
+            att_meta = self._get_item_metadata(att)
+            content = await self._download_blob_content(att)
+            if not content:
+                continue
+            try:
+                await graph_client.attach_file_to_event(
+                    user_id=resource.external_id,
+                    event_id=new_event_id,
+                    name=att.name or "attachment",
+                    content_bytes=content,
+                    content_type=att_meta.get("content_type"),
+                    is_inline=bool(att_meta.get("is_inline")),
+                )
+                applied += 1
+            except Exception as e:
+                print(f"[{self.worker_id}] event attachment replay failed: {type(e).__name__}: {e}")
+
+        if applied:
+            print(f"[{self.worker_id}] [EVENT RESTORE] {raw_event.get('subject', original_event_id)} → {applied} attachment(s) restored")
+
+    async def _restore_file_version(
+        self,
+        session: AsyncSession,
+        graph_client: GraphClient,
+        resource: Resource,
+        version_item: SnapshotItem,
+    ) -> None:
+        """Restore a specific historical version of a file.
+
+        Behavior:
+          - Looks up the parent FILE SnapshotItem to get the original file_name.
+          - Uploads the version's blob content to the same drive but with a
+            "_v{version_id}" suffix so it lands NEXT TO the current file
+            instead of overwriting. Mirrors afi's "restore as new" UX —
+            users almost always want to compare before promoting.
+          - Replays permissions captured on the parent FILE row (versions
+            don't carry their own ACLs in Graph; they inherit the parent's).
+        """
+        meta = self._get_item_metadata(version_item)
+        parent_id = meta.get("parent_item_id")
+        version_id = meta.get("version_id")
+        if not (parent_id and version_id):
+            print(f"[{self.worker_id}] FILE_VERSION {version_item.id} missing parent_item_id or version_id")
+            return
+
+        # Pull the parent FILE row for this snapshot to get the original name +
+        # captured permissions. Most-recent FILE row for the same external_id
+        # in the same snapshot is the right match.
+        parent_stmt = (
+            select(SnapshotItem)
+            .where(
+                SnapshotItem.snapshot_id == version_item.snapshot_id,
+                SnapshotItem.external_id == parent_id,
+                SnapshotItem.item_type == "FILE",
+            )
+            .limit(1)
+        )
+        parent = (await session.execute(parent_stmt)).scalars().first()
+        original_name = (parent.name if parent else None) or version_item.name or f"version_{version_id}"
+
+        # Build a versioned filename: "report.docx" → "report_v3.0.docx"
+        if "." in original_name:
+            stem, ext = original_name.rsplit(".", 1)
+            versioned_name = f"{stem}_v{version_id}.{ext}"
+        else:
+            versioned_name = f"{original_name}_v{version_id}"
+
+        # Fetch the version blob via the same path the FILE_VERSION row was
+        # uploaded to. Reuses the existing _download_blob helper if present.
+        content = await self._download_blob_content(version_item)
+        if content is None:
+            print(f"[{self.worker_id}] FILE_VERSION {version_item.id} blob not retrievable")
+            return
+
+        resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+        if resource_type == "ONEDRIVE":
+            url = f"{graph_client.GRAPH_URL}/users/{resource.external_id}/drive/root:/{versioned_name}:/content"
+        elif resource_type == "SHAREPOINT_SITE":
+            url = f"{graph_client.GRAPH_URL}/sites/{resource.external_id}/drive/root:/{versioned_name}:/content"
+        else:
+            print(f"[{self.worker_id}] FILE_VERSION restore: unsupported resource type {resource_type}")
+            return
+
+        result = await graph_client._put(
+            url, content=content,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+        # If the parent had permissions captured, replay them onto the restored
+        # version too — Graph treats this as a fresh item with no ACL otherwise.
+        if parent:
+            await self._replay_file_permissions(graph_client, parent, result)
+
+        print(f"[{self.worker_id}] [VERSION RESTORE] {original_name} v={version_id} → {versioned_name}")
+
+    async def _download_blob_content(self, item: SnapshotItem) -> Optional[bytes]:
+        """Fetch a SnapshotItem's content from Azure Blob Storage. Returns the
+        raw bytes or None on failure (logged). Used by version + attachment
+        restore paths where the original `raw_data.content` isn't available."""
+        if not item.blob_path:
+            return None
+        try:
+            from shared.azure_storage import azure_storage_manager
+            shard = azure_storage_manager.get_shard_for_resource(
+                str(item.tenant_id), str(item.tenant_id),
+            )
+            # Blob path stored on SnapshotItem includes the container-relative path.
+            # Container name follows the same workload mapping used at backup time;
+            # for FILE / FILE_VERSION it's the "files" container.
+            container = azure_storage_manager.get_container_name(str(item.tenant_id), "files")
+            blob_client = shard.get_blob_client(container, item.blob_path)
+            stream = await blob_client.download_blob()
+            return await stream.readall()
+        except Exception as e:
+            print(f"[{self.worker_id}] [DOWNLOAD] failed for {item.blob_path}: {type(e).__name__}: {e}")
+            return None
+
+    async def _replay_file_permissions(
+        self,
+        graph_client: GraphClient,
+        item: SnapshotItem,
+        restore_response: Optional[Dict[str, Any]],
+    ) -> None:
+        """Re-apply the permissions captured at backup time onto a freshly
+        restored drive item.
+
+        Source: SnapshotItem.extra_data.structured.permissions (populated by
+        backup-worker._create_file_snapshot_item via list_file_permissions).
+
+        Two grant shapes supported:
+          - User/group invite — POST /items/{id}/invite
+          - Sharing link      — POST /items/{id}/createLink
+
+        Inherited permissions (inheritedFrom != null) are skipped — they get
+        re-created automatically when the parent folder's ACL is set, and
+        explicitly POSTing them would create a duplicate explicit grant.
+
+        Best-effort: a single permission failure logs and continues. afi
+        documents this as 'partial restore — permissions may differ'."""
+        if not restore_response:
+            return
+        new_drive_id = (restore_response.get("parentReference") or {}).get("driveId")
+        new_item_id = restore_response.get("id")
+        if not new_drive_id or not new_item_id:
+            return
+
+        metadata = self._get_item_metadata(item)
+        # Permissions live under metadata.structured.permissions on FILE rows;
+        # tolerate the older flat shape as well in case any legacy rows exist.
+        structured = metadata.get("structured") or {}
+        permissions = structured.get("permissions") or metadata.get("permissions") or []
+        if not permissions:
+            return
+
+        applied_invites = 0
+        applied_links = 0
+        skipped_inherited = 0
+        for perm in permissions:
+            if perm.get("inheritedFrom"):
+                skipped_inherited += 1
+                continue
+
+            roles = perm.get("roles") or []
+            link = perm.get("link") or {}
+
+            if link.get("type"):
+                # Sharing link — re-create with the original type/scope. The
+                # generated webUrl will be different but functionally equivalent.
+                try:
+                    await graph_client.create_drive_item_link(
+                        new_drive_id, new_item_id,
+                        link_type=link.get("type"),
+                        scope=link.get("scope"),
+                    )
+                    applied_links += 1
+                except Exception as e:
+                    print(f"[restore] [PERMS] link replay failed: {type(e).__name__}: {e}")
+                continue
+
+            granted = perm.get("grantedToV2") or perm.get("grantedTo") or {}
+            user = granted.get("user") or {}
+            group = granted.get("group") or {}
+            recipient_email = user.get("email") or group.get("email")
+            recipient_id = user.get("id") or group.get("id")
+            if not (recipient_email or recipient_id):
+                continue
+
+            recipient: Dict[str, str] = {}
+            if recipient_email:
+                recipient["email"] = recipient_email
+            if recipient_id:
+                recipient["objectId"] = recipient_id
+
+            try:
+                await graph_client.invite_to_drive_item(
+                    new_drive_id, new_item_id,
+                    recipients=[recipient],
+                    roles=roles or ["read"],
+                )
+                applied_invites += 1
+            except Exception as e:
+                print(f"[restore] [PERMS] invite replay failed for {recipient_email or recipient_id}: {type(e).__name__}: {e}")
+
+        if applied_invites or applied_links or skipped_inherited:
+            print(
+                f"[restore] [PERMS] item={item.name}: invites={applied_invites}, "
+                f"links={applied_links}, inherited_skipped={skipped_inherited}"
+            )
 
     async def _restore_entra_user(
         self,

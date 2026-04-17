@@ -125,11 +125,28 @@ class BackupWorker:
         """Start consuming from all backup queues"""
         await self.initialize()
 
+        # Override the channel-wide prefetch (set to 50 by message_bus). With
+        # 50, a single worker grabs all queued messages and the other replicas
+        # sit idle while it processes them serially. Setting prefetch=2 gives
+        # each replica one in-flight + one ready, so 3 replicas cover ~6 jobs
+        # at once and fair distribution is enforced by the broker.
+        if message_bus.channel:
+            try:
+                await message_bus.channel.set_qos(prefetch_count=2)
+                print(f"[{self.worker_id}] Set channel prefetch_count=2 for fair work distribution")
+            except Exception as exc:
+                print(f"[{self.worker_id}] Could not adjust prefetch_count: {exc}")
+
+        # Per-queue prefetch.
+        # Urgent = manually triggered backups (Teams chats, mailboxes). Each
+        # chat backup's getAllMessages can take 10+ min. Prefetch=1 forces
+        # round-robin across replicas so one slow chat can't starve the others.
+        # Higher-throughput queues stay generous since their items are smaller.
         queues = [
-            ("backup.urgent", 10),
-            ("backup.high", 20),
-            ("backup.normal", 50),
-            ("backup.low", 100),
+            ("backup.urgent", 1),
+            ("backup.high", 5),
+            ("backup.normal", 20),
+            ("backup.low", 50),
         ]
 
         tasks = []
@@ -181,149 +198,154 @@ class BackupWorker:
 
     # ==================== Single Backup ====================
 
+    # Handler dispatch table — defined once at the class level so we don't
+    # rebuild a 25-entry dict on every backup message. Bound at first access.
+    _HANDLER_TABLE: Dict[str, str] = {
+        "MAILBOX": "backup_mailbox", "SHARED_MAILBOX": "backup_mailbox", "ROOM_MAILBOX": "backup_mailbox",
+        "ONEDRIVE": "backup_onedrive",
+        "SHAREPOINT_SITE": "backup_sharepoint",
+        "TEAMS_CHANNEL": "backup_teams_single", "TEAMS_CHAT": "backup_teams_single",
+        "ENTRA_USER": "backup_entra_single", "ENTRA_GROUP": "backup_entra_single",
+        "M365_GROUP": "backup_entra_single", "ENTRA_APP": "backup_entra_single",
+        "ENTRA_DEVICE": "backup_entra_single", "ENTRA_SERVICE_PRINCIPAL": "backup_entra_single",
+        "ENTRA_CONDITIONAL_ACCESS": "backup_conditional_access",
+        "ENTRA_BITLOCKER_KEY": "backup_bitlocker_key",
+        "PLANNER": "_backup_metadata_only", "TODO": "_backup_metadata_only",
+        "ONENOTE": "_backup_metadata_only", "COPILOT": "_backup_metadata_only",
+        "POWER_BI": "backup_power_bi_workspace",
+        "POWER_APPS": "_backup_metadata_only", "POWER_AUTOMATE": "_backup_metadata_only",
+        "POWER_DLP": "_backup_metadata_only",
+        "RESOURCE_GROUP": "_backup_metadata_only", "DYNAMIC_GROUP": "_backup_metadata_only",
+    }
+
     async def _process_single_backup(self, job_id: uuid.UUID, message: Dict, resource_id: str):
-        """Process a backup for a single resource"""
+        """Process a backup for a single resource.
+
+        R2.4 — short-lived session pattern:
+          1. Brief read session: fetch Job + Resource + Tenant, expunge,
+             release the connection.
+          2. Slow network work (graph_client setup, snapshot creation,
+             handler call) runs WITHOUT pinning a DB connection — these
+             can take many minutes for Power BI / large mailboxes.
+          3. Each finalization step opens its own short session.
+
+        Without this, a single Power BI backup can hold a connection for
+        5+ minutes while making HTTPS calls, starving the pool and blocking
+        every other handler in the worker."""
+
+        # ── Step 1: brief read session ─────────────────────────────────────
         async with async_session_factory() as session:
-            # Check if the job still exists (stale messages may reference deleted jobs)
             job = await session.get(Job, job_id)
             if not job:
                 print(f"[{self.worker_id}] Job {job_id} not found, skipping stale message for {resource_id}")
                 return
-
             resource = await session.get(Resource, uuid.UUID(resource_id))
             if not resource:
                 print(f"[{self.worker_id}] Resource {resource_id} not found, skipping")
                 return
-
-            # Query tenant directly (avoid lazy loading issues)
-            result = await session.execute(
+            tenant = (await session.execute(
                 select(Tenant).where(Tenant.id == resource.tenant_id)
-            )
-            tenant = result.scalar_one_or_none()
-
+            )).scalar_one_or_none()
             if not tenant:
                 print(f"[{self.worker_id}] Tenant not found for resource {resource_id}, skipping")
                 return
+            # Detach so we can use these objects after the session closes.
+            session.expunge_all()
+        # Connection released to pool here.
 
-            graph_client = await self.get_graph_client(tenant)
-            if not graph_client:
-                print(f"[{self.worker_id}] Graph client not available for resource {resource_id}, skipping")
-                return
+        # ── Step 2: network work without a pinned session ─────────────────
+        graph_client = await self.get_graph_client(tenant)
+        if not graph_client:
+            print(f"[{self.worker_id}] Graph client not available for resource {resource_id}, skipping")
+            return
 
-            # Route to appropriate handler based on resource type
-            resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
-            print(f"[{self.worker_id}] Processing backup for {resource_id} (type={resource_type}, tenant={tenant.id})")
+        resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
+        print(f"[{self.worker_id}] Processing backup for {resource_id} (type={resource_type}, tenant={tenant.id})")
 
-            snapshot = await self.create_snapshot(resource, message, job_id)
+        # create_snapshot opens + closes its own short-lived session.
+        snapshot = await self.create_snapshot(resource, message, job_id)
 
-            handlers = {
-                # Exchange
-                "MAILBOX": self.backup_mailbox,
-                "SHARED_MAILBOX": self.backup_mailbox,
-                "ROOM_MAILBOX": self.backup_mailbox,
-                # Files
-                "ONEDRIVE": self.backup_onedrive,
-                "SHAREPOINT_SITE": self.backup_sharepoint,
-                # Teams
-                "TEAMS_CHANNEL": self.backup_teams_single,
-                "TEAMS_CHAT": self.backup_teams_single,
-                # Entra ID
-                "ENTRA_USER": self.backup_entra_single,
-                "ENTRA_GROUP": self.backup_entra_single,
-                "ENTRA_APP": self.backup_entra_single,
-                "ENTRA_DEVICE": self.backup_entra_single,
-                "ENTRA_SERVICE_PRINCIPAL": self.backup_entra_single,
-                # Planner / Tasks — dispatched to real handlers via _backup_metadata_only
-                "PLANNER": self._backup_metadata_only,
-                "TODO": self._backup_metadata_only,
-                "ONENOTE": self._backup_metadata_only,
-                # Copilot: Graph exposes very little for backup — metadata blob is the correct
-                # approach until Microsoft extends the API. Not a gap, a data-source limit.
-                "COPILOT": self._backup_metadata_only,
-                # Power Platform: POWER_BI has a real handler; the others are
-                # metadata-only until Phase 2 (Power Platform Admin API client).
-                "POWER_BI": self.backup_power_bi_workspace,
-                "POWER_APPS": self._backup_metadata_only,
-                "POWER_AUTOMATE": self._backup_metadata_only,
-                "POWER_DLP": self._backup_metadata_only,
-                # NOTE: Azure workloads (AZURE_VM, AZURE_SQL_DB, AZURE_POSTGRESQL) are
-                # routed by backup-scheduler to azure.vm / azure.sql / azure.postgres queues
-                # and handled by azure-workload-worker. They should NEVER reach this worker;
-                # if they do, the fallback below logs a warning and stores metadata.
-                # Other
-                "RESOURCE_GROUP": self._backup_metadata_only,
-                "DYNAMIC_GROUP": self._backup_metadata_only,
-            }
+        handler_name = self._HANDLER_TABLE.get(resource_type)
+        if not handler_name:
+            if str(resource_type).startswith("AZURE_"):
+                print(f"[{self.worker_id}] [ROUTING WARNING] Azure workload {resource_type} reached backup-worker; "
+                      f"scheduler should route to azure-workload-worker via azure.* queue. "
+                      f"Falling back to metadata-only for resource {resource.id}")
+            else:
+                print(f"[{self.worker_id}] [ROUTING WARNING] No dedicated handler for {resource_type}; "
+                      f"falling back to metadata-only for resource {resource.id}")
+            handler_name = "_backup_metadata_only"
+        handler = getattr(self, handler_name)
 
-            if resource_type not in handlers:
-                if resource_type and str(resource_type).startswith("AZURE_"):
-                    print(f"[{self.worker_id}] [ROUTING WARNING] Azure workload {resource_type} reached backup-worker; "
-                          f"scheduler should route to azure-workload-worker via azure.* queue. "
-                          f"Falling back to metadata-only for resource {resource.id}")
-                else:
-                    print(f"[{self.worker_id}] [ROUTING WARNING] No dedicated handler for {resource_type}; "
-                          f"falling back to metadata-only for resource {resource.id}")
-            handler = handlers.get(resource_type, self._backup_metadata_only)
+        try:
+            print(f"[{self.worker_id}] Calling handler for {resource_type}: {resource.display_name}")
+            result = await handler(graph_client, resource, snapshot, tenant, message)
+        except Exception as e:
+            error_str = str(e).lower()
+            is_inaccessible = any(kw in error_str for kw in [
+                "not found", "404", "resource_not_found",
+                "locked", "423", "account_locked",
+                "authorization_failed", "access_denied",
+            ])
+
+            # ── Step 3a: error finalization — short sessions per write ────
+            if is_inaccessible:
+                print(f"[{self.worker_id}] Resource {resource.display_name} is INACCESSIBLE (404/423) — marking to skip future backups")
+                try:
+                    async with async_session_factory() as s:
+                        live = await s.get(Resource, resource.id)
+                        if live:
+                            live.status = "INACCESSIBLE"
+                            await s.commit()
+                except Exception as up_exc:
+                    print(f"[{self.worker_id}] Could not mark resource INACCESSIBLE: {up_exc}")
 
             try:
-                print(f"[{self.worker_id}] Calling handler for {resource_type}: {resource.display_name}")
-                result = await handler(graph_client, resource, snapshot, tenant, message)
-            except Exception as e:
-                error_str = str(e).lower()
-                # Detect 404/423 errors — resource no longer exists or is locked
-                is_inaccessible = any(kw in error_str for kw in [
-                    "not found", "404", "resource_not_found",
-                    "locked", "423", "account_locked",
-                    "authorization_failed", "access_denied",
-                ])
+                async with async_session_factory() as s:
+                    await self.fail_snapshot(s, snapshot, e)
+            except Exception as fail_exc:
+                print(f"[{self.worker_id}] Could not mark snapshot FAILED: {fail_exc}")
 
-                if is_inaccessible:
-                    print(f"[{self.worker_id}] Resource {resource.display_name} is INACCESSIBLE (404/423) — marking to skip future backups")
-                    resource.status = "INACCESSIBLE"
-                    await session.commit()
+            try:
+                async with async_session_factory() as s:
+                    await self.update_job_status(s, job_id, JobStatus.FAILED, {"error": str(e)[:2000]})
+            except Exception as job_exc:
+                print(f"[{self.worker_id}] Could not mark job FAILED: {job_exc}")
 
-                # Mark snapshot FAILED so it doesn't stay IN_PROGRESS forever
-                try:
-                    await self.fail_snapshot(session, snapshot, e)
-                except Exception as fail_exc:
-                    print(f"[{self.worker_id}] Could not mark snapshot FAILED: {fail_exc}")
+            print(f"[{self.worker_id}] Handler FAILED for {resource_type}: {resource.display_name} — {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
-                # Mark job FAILED so the UI sees a terminal state
-                try:
-                    await self.update_job_status(session, job_id, JobStatus.FAILED, {"error": str(e)[:2000]})
-                except Exception as job_exc:
-                    print(f"[{self.worker_id}] Could not mark job FAILED: {job_exc}")
+        # ── Step 3b: success finalization — short sessions per write ──────
+        async with async_session_factory() as s:
+            await self.complete_snapshot(s, snapshot, result)
 
-                print(f"[{self.worker_id}] Handler FAILED for {resource_type}: {resource.display_name} — {e}")
-                import traceback
-                traceback.print_exc()
-                raise
+        async with async_session_factory() as s:
+            await self.update_job_status(s, job_id, JobStatus.COMPLETED, result)
 
-            # Complete the snapshot with results
-            await self.complete_snapshot(session, snapshot, result)
+        async with async_session_factory() as s:
+            await self.update_resource_backup_info(s, resource, job_id, snapshot.id, result)
 
-            await self.update_job_status(session, job_id, JobStatus.COMPLETED, result)
-            await self.update_resource_backup_info(session, resource, job_id, snapshot.id, result)
+        # Audit event — fire-and-forget over HTTP, no DB session needed.
+        await self.audit_logger.log(
+            action="BACKUP_COMPLETED",
+            tenant_id=str(tenant.id),
+            org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
+            actor_type="WORKER",
+            resource_id=str(resource.id),
+            resource_type=resource_type,
+            resource_name=resource.display_name or resource.email or str(resource.id),
+            outcome="SUCCESS",
+            job_id=str(job_id),
+            snapshot_id=str(snapshot.id),
+            details={
+                "item_count": result.get("item_count", 0),
+                "bytes_added": result.get("bytes_added", 0),
+            },
+        )
 
-            # Log audit event
-            await self.audit_logger.log(
-                action="BACKUP_COMPLETED",
-                tenant_id=str(tenant.id),
-                org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
-                actor_type="WORKER",
-                resource_id=str(resource.id),
-                resource_type=resource_type,
-                resource_name=resource.display_name or resource.email or str(resource.id),
-                outcome="SUCCESS",
-                job_id=str(job_id),
-                snapshot_id=str(snapshot.id),
-                details={
-                    "item_count": result.get("item_count", 0),
-                    "bytes_added": result.get("bytes_added", 0),
-                },
-            )
-
-            print(f"[{self.worker_id}] Completed backup for {resource_id}")
+        print(f"[{self.worker_id}] Completed backup for {resource_id}")
 
     # ==================== Mass Backup (Parallel) ====================
 
@@ -573,7 +595,8 @@ class BackupWorker:
                 metadata={"source": "empty", "original-name": file_name})
             if upload_result.get("success"):
                 await self._create_file_snapshot_item(
-                    snapshot, tenant, file_id, file_name, 0, blob_path, {}, file_item, drive_id
+                    snapshot, tenant, file_id, file_name, 0, blob_path, {}, file_item, drive_id,
+                    graph_client=graph_client,
                 )
             return {"success": upload_result.get("success", False), "size": 0, "method": "empty",
                     "item_id": file_id, "file_name": file_name}
@@ -628,7 +651,25 @@ class BackupWorker:
                 raise RuntimeError(f"blob upload failed: {upload_result.get('error')}")
             await self._create_file_snapshot_item(
                 snapshot, tenant, file_id, file_name, size, blob_path,
-                {"sha256": sha256, "quickxor": qxh}, file_item, drive_id)
+                {"sha256": sha256, "quickxor": qxh}, file_item, drive_id,
+                graph_client=graph_client,
+            )
+
+            # Capture historical file versions — afi keeps every version. We cap
+            # at MAX_FILE_VERSIONS (default 5) to bound storage. Only runs on
+            # newly-streamed files; skip-already-present files keep their prior
+            # snapshot's versions.
+            try:
+                ver_count, ver_bytes = await self._backup_file_versions(
+                    graph_client, tenant, snapshot, drive_id, file_id, file_name,
+                    container, shard, current_etag=source_etag,
+                )
+                if ver_count:
+                    print(f"[{self.worker_id}]   [VERSIONS] {file_name}: {ver_count} prior version(s), {ver_bytes} bytes")
+            except Exception as ve:
+                # Version capture is best-effort — don't fail the file backup.
+                print(f"[{self.worker_id}]   [VERSIONS WARN] {file_name}: {type(ve).__name__}: {ve}")
+
             return {"success": True, "size": size, "method": "streaming",
                     "blob_path": blob_path, "sha256": sha256,
                     "item_id": file_id, "file_name": file_name}
@@ -647,13 +688,29 @@ class BackupWorker:
 
     async def _create_file_snapshot_item(self, snapshot, tenant, file_id, file_name,
                                          content_size, blob_path, hashes, file_item,
-                                         drive_id: Optional[str] = None):
-        """Create a SnapshotItem DB record for a successfully backed-up file."""
+                                         drive_id: Optional[str] = None,
+                                         graph_client: Optional[GraphClient] = None):
+        """Create a SnapshotItem DB record for a successfully backed-up file.
+
+        If graph_client is provided, also fetches the item's permissions and
+        stores them inline on the SnapshotItem — afi captures these so restore
+        can re-establish exact ACLs (sharing links, SP groups, inheritance)."""
         metadata = MetadataExtractor.extract_sharepoint_item_metadata(file_item)
         metadata["drive_id"] = drive_id or (file_item.get("parentReference") or {}).get("driveId")
         if file_item.get("_site_label"):
             metadata["site_label"] = file_item["_site_label"]
         content_hash = hashes.get("sha256") or hashes.get("quickxor") or ""
+
+        # Best-effort permission capture. Failure here doesn't fail the file
+        # backup — we'd rather have the bytes without the ACL than nothing.
+        if graph_client and metadata.get("drive_id"):
+            try:
+                perms = await graph_client.list_file_permissions(metadata["drive_id"], file_id)
+                if perms:
+                    metadata["permissions"] = perms
+            except Exception as pe:
+                print(f"[{self.worker_id}]   [PERMS WARN] {file_name}: {type(pe).__name__}: {pe}")
+
         snapshot_item = SnapshotItem(
             snapshot_id=snapshot.id,
             tenant_id=tenant.id,
@@ -664,12 +721,106 @@ class BackupWorker:
             content_hash=content_hash if content_hash else None,
             content_size=content_size,
             blob_path=blob_path,
-            metadata={"structured": metadata},
+            extra_data={"structured": metadata},
             content_checksum=content_hash if content_hash else None,
         )
         async with async_session_factory() as session:
             session.add(snapshot_item)
             await session.commit()
+
+    # Maximum prior versions to capture per file. 5 = the 5 most recent
+    # historical versions (current version is captured separately as the live
+    # FILE row). Override per-deployment via env var; expose per-policy later.
+    MAX_FILE_VERSIONS = int(os.environ.get("MAX_FILE_VERSIONS", "5"))
+
+    async def _backup_file_versions(
+        self,
+        graph_client: GraphClient,
+        tenant: Tenant,
+        snapshot: Snapshot,
+        drive_id: str,
+        file_id: str,
+        file_name: str,
+        container: str,
+        shard,
+        current_etag: str,
+    ) -> Tuple[int, int]:
+        """Capture historical versions of a single file as separate blobs.
+
+        Behavior:
+          - Lists /versions newest-first.
+          - Skips the most recent entry (it matches the live file we just uploaded).
+          - Caps the number of older versions captured at MAX_FILE_VERSIONS.
+          - Each version becomes a SnapshotItem(item_type="FILE_VERSION") with
+            extra_data.parent_item_id = file_id.
+
+        Tradeoff: capturing every version mirrors afi's behavior but multiplies
+        storage roughly by (avg version count + 1). The cap keeps the worst case
+        bounded; raise it per-policy when retention requirements demand it.
+        """
+        if self.MAX_FILE_VERSIONS <= 0:
+            return 0, 0
+        versions = await graph_client.list_file_versions(drive_id, file_id)
+        if not versions or len(versions) < 2:
+            # 0 or 1 entries — only the live version exists; nothing to back up.
+            return 0, 0
+
+        # Skip index 0 (the current version, already captured) — capture at most
+        # MAX_FILE_VERSIONS older entries.
+        prior = versions[1 : 1 + self.MAX_FILE_VERSIONS]
+        items_to_insert: List[SnapshotItem] = []
+        total_bytes = 0
+
+        for v in prior:
+            version_id = v.get("id")
+            if not version_id:
+                continue
+            v_size = v.get("size") or 0
+            v_modified = v.get("lastModifiedDateTime")
+            try:
+                content_bytes = await graph_client.get_file_version_content(
+                    drive_id, file_id, version_id,
+                )
+            except Exception as e:
+                print(f"[{self.worker_id}]     [VERSION FAIL] {file_name} v={version_id}: {type(e).__name__}: {e}")
+                continue
+            if not content_bytes:
+                continue
+            content_hash = hashlib.sha256(content_bytes).hexdigest()
+            blob_path = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(snapshot.resource_id), str(snapshot.id),
+                f"ver_{file_id}_{version_id}",
+            )
+            upload_result = await upload_blob_with_retry(
+                container, blob_path, content_bytes, shard, max_retries=3,
+            )
+            if not (isinstance(upload_result, dict) and upload_result.get("success")):
+                continue
+            total_bytes += len(content_bytes)
+            items_to_insert.append(SnapshotItem(
+                snapshot_id=snapshot.id, tenant_id=tenant.id,
+                external_id=f"{file_id}::v::{version_id}",
+                item_type="FILE_VERSION",
+                name=file_name,
+                content_hash=content_hash,
+                content_size=len(content_bytes),
+                blob_path=blob_path,
+                content_checksum=content_hash,
+                extra_data={
+                    "parent_item_id": file_id,
+                    "drive_id": drive_id,
+                    "version_id": version_id,
+                    "modified_at": v_modified,
+                    "current_file_etag": current_etag,
+                    "size": v_size,
+                },
+            ))
+
+        if items_to_insert:
+            async with async_session_factory() as session:
+                session.add_all(items_to_insert)
+                await session.commit()
+        return len(items_to_insert), total_bytes
 
     async def _download_to_temp_resumable(
         self,
@@ -916,7 +1067,7 @@ class BackupWorker:
                     name=msg.get("subject", msg_id),
                     folder_path=msg.get("parentFolderName"),
                     content_hash=content_hash, content_size=len(content_bytes),
-                    blob_path=blob_path, metadata={"raw": msg}, content_checksum=content_hash,
+                    blob_path=blob_path, extra_data={"raw": msg}, content_checksum=content_hash,
                 ))
                 bytes_added += len(content_bytes)
 
@@ -1170,7 +1321,7 @@ class BackupWorker:
                     external_id=item_id, item_type=item_type,
                     name=item_name,
                     content_hash=content_hash, content_size=len(content_bytes),
-                    blob_path=blob_path, metadata={"raw": item_data}, content_checksum=content_hash,
+                    blob_path=blob_path, extra_data={"raw": item_data}, content_checksum=content_hash,
                 ))
                 item_count += 1
                 bytes_added += len(content_bytes)
@@ -1182,6 +1333,21 @@ class BackupWorker:
                 session.add_all(db_items)
                 await session.commit()
 
+        # Calendar event attachments — for ENTRA_USER backups only. afi captures
+        # event attachments the same way it captures email attachments.
+        if resource_type == "ENTRA_USER" and backup_calendars:
+            event_items_with_atts = [
+                d for (t, d) in items_to_backup
+                if t == "CALENDAR_EVENT" and d.get("hasAttachments")
+            ]
+            if event_items_with_atts:
+                att_count, att_bytes = await self._backup_event_attachments(
+                    graph_client, resource, snapshot, tenant, container, shard, event_items_with_atts,
+                )
+                item_count += att_count
+                bytes_added += att_bytes
+                print(f"[{self.worker_id}]   [ATTACHMENTS] Captured {att_count} event attachment(s), {att_bytes} bytes")
+
         if db_items or item_count or bytes_added:
             async with async_session_factory() as session:
                 await self.update_resource_backup_info(session, resource, job_id, snapshot.id, {
@@ -1191,6 +1357,114 @@ class BackupWorker:
 
         print(f"[{self.worker_id}] [ENTRA_{resource_type} COMPLETE] {resource.display_name} — {item_count} items, {bytes_added} bytes")
         return {"item_count": item_count, "bytes_added": bytes_added}
+
+    async def _backup_event_attachments(
+        self,
+        graph_client: GraphClient,
+        resource: Resource,
+        snapshot: Snapshot,
+        tenant: Tenant,
+        container: str,
+        shard,
+        events_with_attachments: List[Dict[str, Any]],
+    ) -> Tuple[int, int]:
+        """Mirror of _backup_message_attachments for calendar events."""
+        sem = asyncio.Semaphore(8)
+        all_items: List[SnapshotItem] = []
+        total_bytes = 0
+
+        async def process_one_event(ev: Dict[str, Any]) -> Tuple[List[SnapshotItem], int]:
+            event_id = ev.get("id")
+            if not event_id:
+                return [], 0
+            async with sem:
+                try:
+                    attachments = await graph_client.list_event_attachments(
+                        resource.external_id, event_id,
+                    )
+                except Exception as e:
+                    print(f"[{self.worker_id}]   [EVENT ATT LIST FAIL] event {event_id}: {type(e).__name__}: {e}")
+                    return [], 0
+
+            local_items: List[SnapshotItem] = []
+            local_bytes = 0
+            for att in attachments:
+                att_id = att.get("id")
+                if not att_id:
+                    continue
+                att_kind = att.get("@odata.type", "")
+                att_name = att.get("name") or att_id
+                att_size = att.get("size") or 0
+                content_bytes: Optional[bytes] = None
+                blob_path: Optional[str] = None
+                content_hash: Optional[str] = None
+
+                if att_kind.endswith("fileAttachment"):
+                    raw_b64 = att.get("contentBytes")
+                    if raw_b64:
+                        import base64 as _b64
+                        try:
+                            content_bytes = _b64.b64decode(raw_b64)
+                        except Exception:
+                            content_bytes = None
+                    if content_bytes is None:
+                        try:
+                            async with sem:
+                                content_bytes = await graph_client.get_event_attachment_content(
+                                    resource.external_id, event_id, att_id,
+                                )
+                        except Exception as e:
+                            print(f"[{self.worker_id}]   [EVENT ATT FAIL] {att_name} on event {event_id}: {type(e).__name__}: {e}")
+                            continue
+
+                    if content_bytes is None:
+                        continue
+                    content_hash = hashlib.sha256(content_bytes).hexdigest()
+                    blob_path = azure_storage_manager.build_blob_path(
+                        str(tenant.id), str(resource.id), str(snapshot.id),
+                        f"evatt_{event_id}_{att_id}",
+                    )
+                    upload_result = await upload_blob_with_retry(
+                        container, blob_path, content_bytes, shard, max_retries=3,
+                    )
+                    if not (isinstance(upload_result, dict) and upload_result.get("success")):
+                        continue
+                    local_bytes += len(content_bytes)
+
+                local_items.append(SnapshotItem(
+                    snapshot_id=snapshot.id, tenant_id=tenant.id,
+                    external_id=f"{event_id}::{att_id}",
+                    item_type="EVENT_ATTACHMENT",
+                    name=att_name,
+                    content_hash=content_hash,
+                    content_size=len(content_bytes) if content_bytes else att_size,
+                    blob_path=blob_path,
+                    content_checksum=content_hash,
+                    extra_data={
+                        "parent_item_id": event_id,
+                        "attachment_kind": att_kind,
+                        "content_type": att.get("contentType"),
+                        "is_inline": att.get("isInline", False),
+                        "source_url": att.get("sourceUrl"),
+                    },
+                ))
+            return local_items, local_bytes
+
+        results = await asyncio.gather(
+            *[process_one_event(e) for e in events_with_attachments],
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, tuple):
+                items, b = r
+                all_items.extend(items)
+                total_bytes += b
+
+        if all_items:
+            async with async_session_factory() as session:
+                session.add_all(all_items)
+                await session.commit()
+        return len(all_items), total_bytes
 
     async def _backup_teams_resource(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
                                      graph_client: GraphClient, job_id: uuid.UUID) -> Dict:
@@ -1270,7 +1544,7 @@ class BackupWorker:
                             content_hash=mhash,
                             content_size=len(mbytes),
                             blob_path=mbp,
-                            metadata={"raw": mdata, "channelId": cid, "channelName": cname, "isReply": is_reply},
+                            extra_data={"raw": mdata, "channelId": cid, "channelName": cname, "isReply": is_reply},
                             content_checksum=mhash,
                         ))
                         ch_bytes += len(mbytes)
@@ -1430,7 +1704,7 @@ class BackupWorker:
                     folder_path=f"chats/{chat_topic}",
                     content_hash=content_hash, content_size=len(content_bytes),
                     blob_path=blob_path,
-                    metadata={"raw": msg, "chatId": chat_id, "chatTopic": chat_topic, "exportedVia": user_id},
+                    extra_data={"raw": msg, "chatId": chat_id, "chatTopic": chat_topic, "exportedVia": user_id},
                     content_checksum=content_hash,
                 ))
                 bytes_added += len(content_bytes)
@@ -2148,7 +2422,7 @@ class BackupWorker:
                     name=resource.display_name or str(resource.id),
                     content_hash=content_hash, content_size=len(content_bytes),
                     blob_path=blob_path,
-                    metadata={"extra_data": resource.extra_data or {}},
+                    extra_data={"extra_data": resource.extra_data or {}},
                     content_checksum=content_hash,
                 ))
                 await session.commit()
@@ -2192,7 +2466,7 @@ class BackupWorker:
                     external_id=plan_id, item_type="PLANNER_PLAN",
                     name=plan.get("title", plan_id),
                     content_hash=content_hash, content_size=len(content_bytes),
-                    blob_path=blob_path, metadata={"raw": plan}, content_checksum=content_hash,
+                    blob_path=blob_path, extra_data={"raw": plan}, content_checksum=content_hash,
                 ))
                 bytes_added += len(content_bytes)
 
@@ -2217,7 +2491,7 @@ class BackupWorker:
                         external_id=task_id, item_type="PLANNER_TASK",
                         name=task.get("title", task_id),
                         content_hash=th, content_size=len(tb),
-                        blob_path=tp, metadata={"raw": task, "planId": plan_id},
+                        blob_path=tp, extra_data={"raw": task, "planId": plan_id},
                         content_checksum=th,
                     ))
                     bytes_added += len(tb)
@@ -2243,7 +2517,7 @@ class BackupWorker:
                             external_id=f"{task_id}:details", item_type="PLANNER_TASK_DETAILS",
                             name=(task.get("title") or task_id) + " (details)",
                             content_hash=dh, content_size=len(db),
-                            blob_path=dp, metadata={"taskId": task_id, "planId": plan_id},
+                            blob_path=dp, extra_data={"taskId": task_id, "planId": plan_id},
                             content_checksum=dh,
                         ))
                         bytes_added += len(db)
@@ -2308,7 +2582,7 @@ class BackupWorker:
                         external_id=f"{task_id}:{kind}", item_type=item_type,
                         name=f"{task_title} ({kind})",
                         content_hash=h, content_size=len(data),
-                        blob_path=path, metadata={"taskId": task_id, "listId": list_id, "count": len(values)},
+                        blob_path=path, extra_data={"taskId": task_id, "listId": list_id, "count": len(values)},
                         content_checksum=h,
                     ))
                     extras_bytes += len(data)
@@ -2332,7 +2606,7 @@ class BackupWorker:
                     external_id=list_id, item_type="TODO_LIST",
                     name=lst.get("displayName", list_id),
                     content_hash=lh, content_size=len(lb),
-                    blob_path=lp, metadata={"raw": lst}, content_checksum=lh,
+                    blob_path=lp, extra_data={"raw": lst}, content_checksum=lh,
                 ))
                 local_bytes += len(lb)
 
@@ -2357,7 +2631,7 @@ class BackupWorker:
                         external_id=task_id, item_type="TODO_TASK",
                         name=task.get("title", task_id),
                         content_hash=th, content_size=len(tb),
-                        blob_path=tp, metadata={"raw": task, "listId": list_id},
+                        blob_path=tp, extra_data={"raw": task, "listId": list_id},
                         content_checksum=th,
                     ))
                     local_bytes += len(tb)
@@ -2435,7 +2709,7 @@ class BackupWorker:
                     external_id=pg_id, item_type="ONENOTE_PAGE",
                     name=page.get("title", pg_id),
                     content_hash=ph, content_size=len(pb), blob_path=pp,
-                    metadata={"raw": page, "sectionId": sec_id, "notebookId": nb_id},
+                    extra_data={"raw": page, "sectionId": sec_id, "notebookId": nb_id},
                     content_checksum=ph,
                 ))
                 local_bytes += len(pb)
@@ -2459,7 +2733,7 @@ class BackupWorker:
                         external_id=f"{pg_id}:content", item_type="ONENOTE_PAGE_CONTENT",
                         name=(page.get("title") or pg_id) + " (content)",
                         content_hash=hh, content_size=len(html), blob_path=hp,
-                        metadata={"pageId": pg_id, "sectionId": sec_id, "notebookId": nb_id,
+                        extra_data={"pageId": pg_id, "sectionId": sec_id, "notebookId": nb_id,
                                   "mime": "text/html"},
                         content_checksum=hh,
                     ))
@@ -2487,7 +2761,7 @@ class BackupWorker:
                                     external_id=rid, item_type="ONENOTE_RESOURCE",
                                     name=rid,
                                     content_hash=rhash, content_size=len(data), blob_path=rpath,
-                                    metadata={"pageId": pg_id, "sourceUrl": u},
+                                    extra_data={"pageId": pg_id, "sourceUrl": u},
                                     content_checksum=rhash,
                                 ))
                                 local_bytes += len(data)
@@ -2515,7 +2789,7 @@ class BackupWorker:
                     external_id=nb_id, item_type="ONENOTE_NOTEBOOK",
                     name=nb.get("displayName", nb_id),
                     content_hash=nb_h, content_size=len(nb_b), blob_path=nb_p,
-                    metadata={"raw": nb}, content_checksum=nb_h,
+                    extra_data={"raw": nb}, content_checksum=nb_h,
                 ))
                 local_bytes += len(nb_b)
 
@@ -2538,7 +2812,7 @@ class BackupWorker:
                         external_id=sec_id, item_type="ONENOTE_SECTION",
                         name=sec.get("displayName", sec_id),
                         content_hash=sh, content_size=len(sb), blob_path=sp,
-                        metadata={"raw": sec, "notebookId": nb_id}, content_checksum=sh,
+                        extra_data={"raw": sec, "notebookId": nb_id}, content_checksum=sh,
                     ))
                     local_bytes += len(sb)
 
@@ -2626,7 +2900,7 @@ class BackupWorker:
             name=resource.display_name or app_id,
             content_hash=content_hash, content_size=len(blob_bytes),
             blob_path=blob_path,
-            metadata={"environmentId": env_id, "appId": app_id, "raw": definition.get("properties", {})},
+            extra_data={"environmentId": env_id, "appId": app_id, "raw": definition.get("properties", {})},
             content_checksum=content_hash,
         )]
         total_bytes = len(blob_bytes)
@@ -2655,7 +2929,7 @@ class BackupWorker:
                     name=(resource.display_name or app_id) + " (package)",
                     content_hash=pkg_hash, content_size=len(pkg_bytes),
                     blob_path=pkg_path,
-                    metadata={"environmentId": env_id, "appId": app_id, "mime": "application/zip"},
+                    extra_data={"environmentId": env_id, "appId": app_id, "mime": "application/zip"},
                     content_checksum=pkg_hash,
                 ))
                 total_bytes += len(pkg_bytes)
@@ -2709,7 +2983,7 @@ class BackupWorker:
             name=resource.display_name or flow_id,
             content_hash=def_hash, content_size=len(def_bytes),
             blob_path=def_path,
-            metadata={"environmentId": env_id, "flowId": flow_id,
+            extra_data={"environmentId": env_id, "flowId": flow_id,
                       "state": definition.get("properties", {}).get("state"),
                       "raw": definition.get("properties", {})},
             content_checksum=def_hash,
@@ -2731,7 +3005,7 @@ class BackupWorker:
                     name=(resource.display_name or flow_id) + " (connections)",
                     content_hash=conn_hash, content_size=len(conn_bytes),
                     blob_path=conn_path,
-                    metadata={"flowId": flow_id, "environmentId": env_id, "count": len(conn_values)},
+                    extra_data={"flowId": flow_id, "environmentId": env_id, "count": len(conn_values)},
                     content_checksum=conn_hash,
                 ))
                 bytes_added += len(conn_bytes)
@@ -2758,7 +3032,7 @@ class BackupWorker:
                     name=(resource.display_name or flow_id) + " (package)",
                     content_hash=pkg_hash, content_size=len(pkg_bytes),
                     blob_path=pkg_path,
-                    metadata={"environmentId": env_id, "flowId": flow_id, "mime": "application/zip"},
+                    extra_data={"environmentId": env_id, "flowId": flow_id, "mime": "application/zip"},
                     content_checksum=pkg_hash,
                 ))
                 bytes_added += len(pkg_bytes)
@@ -2807,7 +3081,7 @@ class BackupWorker:
                 name=resource.display_name or policy_id,
                 content_hash=content_hash, content_size=len(blob_bytes),
                 blob_path=blob_path,
-                metadata={"policyId": policy_id, "raw": definition.get("properties", {})},
+                extra_data={"policyId": policy_id, "raw": definition.get("properties", {})},
                 content_checksum=content_hash,
             ))
             await session.commit()
@@ -2832,27 +3106,189 @@ class BackupWorker:
         """Single-resource Entra ID backup (matches handler signature)"""
         return await self._backup_entra_resource(resource, tenant, snapshot, graph_client, None, message)
 
+    async def backup_conditional_access(
+        self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
+        tenant: Tenant, message: Dict,
+    ) -> Dict:
+        """Backup a single Conditional Access policy as a JSON definition blob.
+
+        Source: GET /identity/conditionalAccess/policies/{id}. Falls back to
+        the cached metadata captured at discovery time if the live fetch fails
+        (e.g. permission lost between discovery and backup)."""
+        print(f"[{self.worker_id}] [CA POLICY START] {resource.display_name}")
+        definition = await graph_client.get_conditional_access_policy(resource.external_id)
+        if definition is None:
+            cached = (resource.extra_data or {}).get("raw")
+            if not cached:
+                print(f"[{self.worker_id}] [CA POLICY] policy {resource.external_id} not found and no cached copy — skipping")
+                return {"item_count": 0, "bytes_added": 0, "note": "not_found"}
+            definition = cached
+
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "entra")
+        blob_bytes = json.dumps(definition).encode()
+        content_hash = hashlib.sha256(blob_bytes).hexdigest()
+        blob_path = azure_storage_manager.build_blob_path(
+            str(tenant.id), str(resource.id), str(snapshot.id),
+            f"ca_{resource.external_id}",
+        )
+        upload_result = await upload_blob_with_retry(container, blob_path, blob_bytes, shard, max_retries=3)
+        if not (isinstance(upload_result, dict) and upload_result.get("success")):
+            raise RuntimeError(f"CA policy upload failed: {upload_result.get('error') if isinstance(upload_result, dict) else upload_result}")
+
+        item = SnapshotItem(
+            snapshot_id=snapshot.id, tenant_id=tenant.id,
+            external_id=resource.external_id,
+            item_type="CONDITIONAL_ACCESS_POLICY",
+            name=resource.display_name,
+            content_hash=content_hash, content_size=len(blob_bytes),
+            blob_path=blob_path,
+            extra_data={
+                "state": definition.get("state"),
+                "modified_at": definition.get("modifiedDateTime"),
+            },
+            content_checksum=content_hash,
+        )
+        async with async_session_factory() as session:
+            session.add(item)
+            await session.commit()
+        print(f"[{self.worker_id}] [CA POLICY COMPLETE] {resource.display_name} — state={definition.get('state')}, {len(blob_bytes)} bytes")
+        return {"item_count": 1, "bytes_added": len(blob_bytes)}
+
+    async def backup_bitlocker_key(
+        self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
+        tenant: Tenant, message: Dict,
+    ) -> Dict:
+        """Backup a BitLocker recovery key. The actual key bytes are only
+        returned by /recoveryKeys/{id}?$select=key — without BitlockerKey.Read.All
+        we fall back to metadata-only (still useful for inventory)."""
+        print(f"[{self.worker_id}] [BITLOCKER START] {resource.display_name}")
+        full = await graph_client.get_bitlocker_key_value(resource.external_id)
+        if full is None:
+            full = {
+                "id": resource.external_id,
+                "deviceId": (resource.extra_data or {}).get("device_id"),
+                "volumeType": (resource.extra_data or {}).get("volume_type"),
+                "createdDateTime": (resource.extra_data or {}).get("created_at"),
+                "_metadata_only": True,  # marker — no key bytes available
+            }
+
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "entra")
+        blob_bytes = json.dumps(full).encode()
+        content_hash = hashlib.sha256(blob_bytes).hexdigest()
+        blob_path = azure_storage_manager.build_blob_path(
+            str(tenant.id), str(resource.id), str(snapshot.id),
+            f"bitlocker_{resource.external_id}",
+        )
+        upload_result = await upload_blob_with_retry(container, blob_path, blob_bytes, shard, max_retries=3)
+        if not (isinstance(upload_result, dict) and upload_result.get("success")):
+            raise RuntimeError(f"BitLocker key upload failed: {upload_result.get('error') if isinstance(upload_result, dict) else upload_result}")
+
+        item = SnapshotItem(
+            snapshot_id=snapshot.id, tenant_id=tenant.id,
+            external_id=resource.external_id,
+            item_type="BITLOCKER_RECOVERY_KEY",
+            name=resource.display_name,
+            content_hash=content_hash, content_size=len(blob_bytes),
+            blob_path=blob_path,
+            extra_data={
+                "device_id": full.get("deviceId"),
+                "volume_type": full.get("volumeType"),
+                "has_key_value": "key" in full,
+            },
+            content_checksum=content_hash,
+        )
+        async with async_session_factory() as session:
+            session.add(item)
+            await session.commit()
+        print(f"[{self.worker_id}] [BITLOCKER COMPLETE] {resource.display_name} — has_key={'key' in full}, {len(blob_bytes)} bytes")
+        return {"item_count": 1, "bytes_added": len(blob_bytes)}
+
     async def backup_mailbox(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                              tenant: Tenant, message: Dict) -> Dict:
-        """Backup a single mailbox"""
-        print(f"[{self.worker_id}] [MAILBOX START] {resource.display_name} ({resource.external_id})")
+        """Backup a single mailbox.
 
-        print(f"[{self.worker_id}]   [EMAIL] Fetching messages (paginated)...")
-        delta_token = (resource.extra_data or {}).get("mail_delta_token")
+        Source coverage (afi parity):
+          - primary mailbox          — always
+          - online archive mailbox   — when policy.backup_exchange_archive
+          - recoverable items folder — when policy.backup_exchange_recoverable
+
+        Folder fidelity: builds a folder_id → "/Inbox/SubFolder" map per source
+        and tags every message with its full path so restore can rebuild the
+        exact hierarchy."""
+        print(f"[{self.worker_id}] [MAILBOX START] {resource.display_name} ({resource.external_id})")
+        user_id = resource.external_id
+
+        # Policy gates for which mailbox tiers to include.
+        policy = await self.get_sla_policy(resource, message)
+        backup_archive = bool(getattr(policy, "backup_exchange_archive", False)) if policy else False
+        backup_recoverable = bool(getattr(policy, "backup_exchange_recoverable", False)) if policy else False
+        exclusions = await self.get_policy_exclusions(policy.id) if policy else []
+
+        # Build folder trees — one per source. Empty dict = source not present.
+        folder_trees: Dict[str, Dict[str, str]] = {}
         try:
-            messages = await graph_client.get_messages_delta(resource.external_id, delta_token)
+            folder_trees["primary"] = await graph_client.get_mail_folder_tree(user_id)
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
-                print(f"[{self.worker_id}]   [EMAIL] No mailbox found for this user — skipping (user has no Exchange Online license)")
+                print(f"[{self.worker_id}]   [EMAIL] No mailbox found — user has no Exchange Online license")
+                return {"item_count": 0, "bytes_added": 0, "new_delta_token": None, "note": "no_mailbox"}
+            raise
+        if backup_archive:
+            folder_trees["archive"] = await graph_client.get_mail_folder_tree(user_id, well_known_root="archive")
+            if folder_trees["archive"]:
+                print(f"[{self.worker_id}]   [ARCHIVE] Found {len(folder_trees['archive'])} folder(s)")
+        if backup_recoverable:
+            folder_trees["recoverable"] = await graph_client.get_mail_folder_tree(user_id, well_known_root="recoverableitemsroot")
+            if folder_trees["recoverable"]:
+                print(f"[{self.worker_id}]   [RECOVERABLE] Found {len(folder_trees['recoverable'])} folder(s)")
+
+        # Fetch messages from each source. Primary uses the existing /messages
+        # top-level call (covers all primary folders in one paginated query);
+        # archive + recoverable need per-folder fetches because there's no
+        # equivalent top-level endpoint that crosses mailbox boundaries.
+        print(f"[{self.worker_id}]   [EMAIL] Fetching primary messages (paginated)...")
+        delta_token = (resource.extra_data or {}).get("mail_delta_token")
+        try:
+            messages = await graph_client.get_messages_delta(user_id, delta_token)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                print(f"[{self.worker_id}]   [EMAIL] No mailbox found — user has no Exchange Online license")
                 return {"item_count": 0, "bytes_added": 0, "new_delta_token": None, "note": "no_mailbox"}
             raise
 
-        items = messages.get("value", [])
-        print(f"[{self.worker_id}]   [EMAIL] Found {len(items)} messages to backup")
+        primary_items = messages.get("value", [])
+        for m in primary_items:
+            m["_source_mailbox"] = "primary"
+            m["_full_folder_path"] = folder_trees["primary"].get(m.get("parentFolderId", ""), m.get("parentFolderName") or "")
+
+        items = list(primary_items)
+
+        async def _collect_from_secondary(source: str) -> int:
+            tree = folder_trees.get(source) or {}
+            if not tree:
+                return 0
+            collected = 0
+            for fid, path in tree.items():
+                folder_msgs = await graph_client.list_messages_in_folder(user_id, fid)
+                for m in folder_msgs:
+                    m["_source_mailbox"] = source
+                    m["_full_folder_path"] = path
+                items.extend(folder_msgs)
+                collected += len(folder_msgs)
+            return collected
+
+        if backup_archive:
+            n = await _collect_from_secondary("archive")
+            print(f"[{self.worker_id}]   [ARCHIVE] Collected {n} messages from {len(folder_trees.get('archive') or {})} folder(s)")
+        if backup_recoverable:
+            n = await _collect_from_secondary("recoverable")
+            print(f"[{self.worker_id}]   [RECOVERABLE] Collected {n} messages from {len(folder_trees.get('recoverable') or {})} folder(s)")
+
+        print(f"[{self.worker_id}]   [EMAIL] Total {len(items)} messages to backup ({len(primary_items)} primary)")
 
         # SLA exclusions — filter before upload so excluded items never touch storage
-        policy = await self.get_sla_policy(resource, message)
-        exclusions = await self.get_policy_exclusions(policy.id) if policy else []
         if exclusions:
             before = len(items)
             items = [m for m in items if not self._item_is_excluded("EMAIL", m, exclusions)]
@@ -2892,9 +3328,17 @@ class BackupWorker:
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
                         external_id=msg_id, item_type="EMAIL",
                         name=msg.get("subject", msg_id),
-                        folder_path=msg.get("parentFolderName"),
+                        # Full hierarchical path (e.g. "/Inbox/Project X") so
+                        # restore can recreate the folder tree, not just dump
+                        # everything to the inbox root.
+                        folder_path=msg.get("_full_folder_path") or msg.get("parentFolderName"),
                         content_hash=content_hash, content_size=len(content_bytes),
-                        blob_path=blob_path, metadata={"raw": msg}, content_checksum=content_hash,
+                        blob_path=blob_path,
+                        extra_data={
+                            "raw": msg,
+                            "source_mailbox": msg.get("_source_mailbox", "primary"),
+                        },
+                        content_checksum=content_hash,
                     ))
                     b_bytes += len(content_bytes)
                 elif not isinstance(result, Exception):
@@ -2912,9 +3356,143 @@ class BackupWorker:
                 item_count += r[0]
                 bytes_added += r[1]
 
+        # Phase: capture attachments for messages that have them. afi.ai stores
+        # each fileAttachment as a separate restorable item linked to the parent
+        # message — without this, restored emails have empty attachment stubs.
+        att_msgs = [m for m in items if m.get("hasAttachments")]
+        if att_msgs:
+            att_count, att_bytes = await self._backup_message_attachments(
+                graph_client, resource, snapshot, tenant, container, shard, att_msgs,
+            )
+            item_count += att_count
+            bytes_added += att_bytes
+            print(f"[{self.worker_id}]   [ATTACHMENTS] Captured {att_count} email attachment(s), {att_bytes} bytes")
+
         new_delta = messages.get("@odata.deltaLink")
-        print(f"[{self.worker_id}] [BACKUP COMPLETE] Mailbox: {resource.display_name} — {item_count} emails, {bytes_added} bytes")
+        print(f"[{self.worker_id}] [BACKUP COMPLETE] Mailbox: {resource.display_name} — {item_count} items total, {bytes_added} bytes")
         return {"item_count": item_count, "bytes_added": bytes_added, "new_delta_token": new_delta}
+
+    async def _backup_message_attachments(
+        self,
+        graph_client: GraphClient,
+        resource: Resource,
+        snapshot: Snapshot,
+        tenant: Tenant,
+        container: str,
+        shard,
+        messages_with_attachments: List[Dict[str, Any]],
+    ) -> Tuple[int, int]:
+        """For each message flagged hasAttachments, list and capture its
+        attachments. fileAttachment binaries are downloaded as separate blobs;
+        item/reference attachments are recorded as metadata-only SnapshotItems
+        (their content is either nested or external).
+
+        Bounded concurrency keeps us under Graph throttling — each message
+        round-trip + N attachment downloads can add up fast on big inboxes."""
+        sem = asyncio.Semaphore(8)
+        all_items: List[SnapshotItem] = []
+        total_bytes = 0
+
+        async def process_one_message(msg: Dict[str, Any]) -> Tuple[List[SnapshotItem], int]:
+            msg_id = msg.get("id")
+            if not msg_id:
+                return [], 0
+            async with sem:
+                try:
+                    attachments = await graph_client.list_message_attachments(
+                        resource.external_id, msg_id,
+                    )
+                except Exception as e:
+                    print(f"[{self.worker_id}]   [ATTACHMENT LIST FAIL] msg {msg_id}: {type(e).__name__}: {e}")
+                    return [], 0
+
+            local_items: List[SnapshotItem] = []
+            local_bytes = 0
+            for att in attachments:
+                att_id = att.get("id")
+                if not att_id:
+                    continue
+                att_kind = att.get("@odata.type", "")
+                att_name = att.get("name") or att_id
+                att_size = att.get("size") or 0
+                content_bytes: Optional[bytes] = None
+                blob_path: Optional[str] = None
+                content_hash: Optional[str] = None
+
+                if att_kind.endswith("fileAttachment"):
+                    # Inline contentBytes is included for small attachments;
+                    # for larger ones we hit /$value.
+                    raw_b64 = att.get("contentBytes")
+                    if raw_b64:
+                        import base64 as _b64
+                        try:
+                            content_bytes = _b64.b64decode(raw_b64)
+                        except Exception:
+                            content_bytes = None
+                    if content_bytes is None:
+                        try:
+                            async with sem:
+                                content_bytes = await graph_client.get_message_attachment_content(
+                                    resource.external_id, msg_id, att_id,
+                                )
+                        except Exception as e:
+                            print(f"[{self.worker_id}]   [ATTACHMENT FAIL] {att_name} on msg {msg_id}: {type(e).__name__}: {e}")
+                            continue
+
+                    if content_bytes is None:
+                        continue
+                    content_hash = hashlib.sha256(content_bytes).hexdigest()
+                    blob_path = azure_storage_manager.build_blob_path(
+                        str(tenant.id), str(resource.id), str(snapshot.id),
+                        f"att_{msg_id}_{att_id}",
+                    )
+                    upload_result = await upload_blob_with_retry(
+                        container, blob_path, content_bytes, shard, max_retries=3,
+                    )
+                    if not (isinstance(upload_result, dict) and upload_result.get("success")):
+                        continue
+                    local_bytes += len(content_bytes)
+                # itemAttachment / referenceAttachment: record metadata only.
+                # The nested item content (for itemAttachment) would require a
+                # separate $expand round-trip; reference attachments have no
+                # content at all (just a URL). afi flags both as restorable
+                # references — we do the same.
+
+                local_items.append(SnapshotItem(
+                    snapshot_id=snapshot.id, tenant_id=tenant.id,
+                    external_id=f"{msg_id}::{att_id}",
+                    item_type="EMAIL_ATTACHMENT",
+                    name=att_name,
+                    folder_path=msg.get("parentFolderName"),
+                    content_hash=content_hash,
+                    content_size=len(content_bytes) if content_bytes else att_size,
+                    blob_path=blob_path,
+                    content_checksum=content_hash,
+                    extra_data={
+                        "parent_item_id": msg_id,
+                        "attachment_kind": att_kind,
+                        "content_type": att.get("contentType"),
+                        "is_inline": att.get("isInline", False),
+                        "source_url": att.get("sourceUrl"),  # referenceAttachment
+                    },
+                ))
+            return local_items, local_bytes
+
+        results = await asyncio.gather(
+            *[process_one_message(m) for m in messages_with_attachments],
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, tuple):
+                items, b = r
+                all_items.extend(items)
+                total_bytes += b
+
+        if all_items:
+            async with async_session_factory() as session:
+                session.add_all(all_items)
+                await session.commit()
+        return len(all_items), total_bytes
 
     async def backup_onedrive(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                               tenant: Tenant, message: Dict) -> Dict:
@@ -3157,6 +3735,141 @@ class BackupWorker:
                 await session.merge(resource)
                 await session.commit()
 
+        # Anomaly detection — afi-style ransomware/mass-delete tripwire. Only
+        # runs on COMPLETED snapshots; PARTIAL/FAILED ones are too noisy.
+        if snapshot.status == SnapshotStatus.COMPLETED:
+            try:
+                await self._check_snapshot_anomaly(snapshot)
+            except Exception as e:
+                # Anomaly check is best-effort — never fail a backup over it.
+                print(f"[{self.worker_id}] [ANOMALY WARN] check failed for snapshot {snapshot.id}: {type(e).__name__}: {e}")
+
+    # Anomaly thresholds — generous defaults so we don't flood ops with false
+    # positives on small mailboxes / new resources. Tunable via env at deploy.
+    ANOMALY_MIN_PRIOR_SNAPSHOTS = int(os.environ.get("ANOMALY_MIN_PRIOR_SNAPSHOTS", "3"))
+    ANOMALY_DROP_RATIO = float(os.environ.get("ANOMALY_DROP_RATIO", "0.5"))  # current < 50% of avg
+    ANOMALY_MIN_AVG_ITEMS = int(os.environ.get("ANOMALY_MIN_AVG_ITEMS", "20"))  # ignore tiny resources
+
+    async def _check_snapshot_anomaly(self, snapshot: Snapshot) -> None:
+        """Compare this snapshot's item_count against the rolling average of
+        the last N completed snapshots for the same resource. If it dropped
+        sharply, raise an Alert and tag the most recent prior snapshot as
+        last_clean — that's the recovery point an operator should restore from
+        if this turns out to be ransomware/mass-deletion.
+
+        Heuristic v1: item_count drop ratio. v2 will incorporate is_deleted
+        markers + content_hash churn for finer-grained detection."""
+        from shared.models import Alert
+        async with async_session_factory() as session:
+            stmt = (
+                select(Snapshot)
+                .where(
+                    Snapshot.resource_id == snapshot.resource_id,
+                    Snapshot.id != snapshot.id,
+                    Snapshot.status == SnapshotStatus.COMPLETED,
+                )
+                .order_by(Snapshot.completed_at.desc())
+                .limit(5)
+            )
+            prior = (await session.execute(stmt)).scalars().all()
+            if len(prior) < self.ANOMALY_MIN_PRIOR_SNAPSHOTS:
+                return  # not enough history to judge
+
+            avg = sum((p.item_count or 0) for p in prior) / len(prior)
+            if avg < self.ANOMALY_MIN_AVG_ITEMS:
+                return  # resource too small to be meaningful
+
+            current = snapshot.item_count or 0
+            ratio = current / avg if avg else 1.0
+            if ratio >= self.ANOMALY_DROP_RATIO:
+                return  # within normal variance
+
+            # Anomaly — raise alert + mark prior snapshot as last_clean
+            resource = await session.get(Resource, snapshot.resource_id)
+            last_clean = prior[0]  # most recent completed snapshot before this one
+            last_clean.extra_data = (last_clean.extra_data or {}) | {
+                "is_clean_marker": True,
+                "marked_clean_by_snapshot": str(snapshot.id),
+                "marked_clean_at": datetime.utcnow().isoformat(),
+            }
+            await session.merge(last_clean)
+
+            alert = Alert(
+                tenant_id=resource.tenant_id if resource else None,
+                org_id=None,
+                type="BACKUP_ANOMALY",
+                severity="HIGH",
+                message=(
+                    f"Snapshot item count dropped {int((1 - ratio) * 100)}% "
+                    f"vs prior average ({current} vs avg {int(avg)}). "
+                    f"Possible mass deletion / ransomware. Last clean snapshot: {last_clean.id}."
+                ),
+                resource_id=resource.id if resource else None,
+                resource_type=resource.type.value if resource else None,
+                resource_name=resource.display_name if resource else None,
+                triggered_by="anomaly-detector",
+                details={
+                    "snapshot_id": str(snapshot.id),
+                    "last_clean_snapshot_id": str(last_clean.id),
+                    "current_item_count": current,
+                    "avg_prior_item_count": int(avg),
+                    "drop_ratio": round(ratio, 3),
+                    "prior_snapshot_ids": [str(p.id) for p in prior],
+                },
+            )
+            session.add(alert)
+            await session.commit()
+            print(
+                f"[{self.worker_id}] [ANOMALY] resource={resource.display_name if resource else snapshot.resource_id} "
+                f"snapshot={snapshot.id} dropped to {current} items (avg {int(avg)}, ratio {ratio:.2f}). "
+                f"Marked {last_clean.id} as last_clean."
+            )
+
+            # Mirror the anomaly to the audit trail. RANSOMWARE_SIGNAL is the
+            # canonical action in audit-service's ACTIONS catalog — this surfaces
+            # the event in the Activity feed + risk-signals API + audit exports.
+            # Best-effort: audit-service might be unreachable; we still raised
+            # the Alert above which is the operational source of truth.
+            try:
+                org_id = None
+                async with async_session_factory() as outer:
+                    if resource:
+                        tenant = await outer.get(Tenant, resource.tenant_id)
+                        if tenant:
+                            org_id = str(tenant.org_id) if tenant.org_id else None
+                await self.audit_logger.log(
+                    action="RANSOMWARE_SIGNAL",
+                    tenant_id=str(resource.tenant_id) if resource and resource.tenant_id else None,
+                    org_id=org_id,
+                    actor_type="WORKER",
+                    actor_id=None,
+                    actor_email=None,
+                    resource_id=str(resource.id) if resource else None,
+                    resource_type=resource.type.value if resource else None,
+                    resource_name=resource.display_name if resource else None,
+                    outcome="WARNING",
+                    snapshot_id=str(snapshot.id),
+                    details={
+                        "alert_id": str(alert.id),
+                        "anomaly_type": "ITEM_COUNT_DROP",
+                        "current_item_count": current,
+                        "avg_prior_item_count": int(avg),
+                        "drop_ratio": round(ratio, 3),
+                        "drop_pct": int((1 - ratio) * 100),
+                        "last_clean_snapshot_id": str(last_clean.id),
+                        "prior_snapshot_ids": [str(p.id) for p in prior],
+                        "thresholds": {
+                            "drop_ratio": self.ANOMALY_DROP_RATIO,
+                            "min_prior_snapshots": self.ANOMALY_MIN_PRIOR_SNAPSHOTS,
+                            "min_avg_items": self.ANOMALY_MIN_AVG_ITEMS,
+                        },
+                    },
+                )
+            except Exception as audit_exc:
+                # Audit logging never blocks the anomaly path; the Alert is the
+                # source of truth for ops and is already persisted.
+                print(f"[{self.worker_id}] [ANOMALY AUDIT WARN] {type(audit_exc).__name__}: {audit_exc}")
+
     # ==================== Helpers ====================
 
     async def get_graph_client(self, tenant: Tenant) -> Optional[GraphClient]:
@@ -3341,7 +4054,7 @@ class BackupWorker:
                     content_hash=thread_hash,
                     content_size=len(thread_bytes),
                     blob_path=thread_blob_path,
-                    metadata={"raw": thread, "conversationId": conversation_id},
+                    extra_data={"raw": thread, "conversationId": conversation_id},
                     content_checksum=thread_hash,
                 ))
                 local_bytes += len(thread_bytes)
@@ -3376,7 +4089,7 @@ class BackupWorker:
                         content_hash=post_hash,
                         content_size=len(post_bytes),
                         blob_path=post_blob_path,
-                        metadata={"raw": post, "threadId": thread_id, "conversationId": conversation_id},
+                        extra_data={"raw": post, "threadId": thread_id, "conversationId": conversation_id},
                         content_checksum=post_hash,
                     ))
                     local_bytes += len(post_bytes)
