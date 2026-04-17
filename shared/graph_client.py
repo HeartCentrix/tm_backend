@@ -1618,6 +1618,93 @@ class GraphClient:
             items.extend(result.get("value", []))
         return items
 
+    # ── Event creation + attachment (re)attach ──────────────────────────────
+    # Used by restore-worker. Event creation returns the new event_id; the
+    # attachment endpoint accepts inline base64 (no /$value upload step needed
+    # for restore — the event is freshly created so size limits aren't an issue
+    # in practice for typical attachments under 3MB).
+
+    async def create_calendar_event(self, user_id: str, event_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /users/{id}/events — restore a calendar event.
+        Strip server-managed fields the caller might still have in the payload."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/events"
+        # Graph rejects creates that include these read-only / server-set fields.
+        readonly = {
+            "id", "createdDateTime", "lastModifiedDateTime", "changeKey",
+            "iCalUId", "webLink", "onlineMeeting", "transactionId",
+            "@odata.etag", "@odata.context",
+        }
+        clean = {k: v for k, v in event_payload.items() if k not in readonly}
+        return await self._post(url, clean)
+
+    async def attach_file_to_event(
+        self, user_id: str, event_id: str, name: str,
+        content_bytes: bytes, content_type: Optional[str] = None,
+        is_inline: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """POST /users/{id}/events/{eid}/attachments — inline base64 upload."""
+        import base64 as _b64
+        url = f"{self.GRAPH_URL}/users/{user_id}/events/{event_id}/attachments"
+        payload = {
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": name,
+            "contentType": content_type or "application/octet-stream",
+            "contentBytes": _b64.b64encode(content_bytes).decode("ascii"),
+            "isInline": is_inline,
+        }
+        try:
+            return await self._post(url, payload)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (403, 404):
+                return None
+            raise
+
+    # ── Permission RESTORE ──────────────────────────────────────────────────
+    # Replay sharing grants captured by list_file_permissions onto a freshly
+    # restored file. Two grant shapes:
+    #   - User/group invite — POST /items/{id}/invite  with recipients + roles
+    #   - Anonymous / org link — POST /items/{id}/createLink  with type + scope
+    # Inherited permissions can't be re-created via API (they come from the
+    # parent folder), so callers should filter them out before calling.
+
+    async def invite_to_drive_item(
+        self, drive_id: str, item_id: str, recipients: List[Dict[str, str]],
+        roles: List[str], require_signin: bool = True, send_invitation: bool = False,
+        message: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """POST /drives/{did}/items/{iid}/invite — grants users specific roles."""
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/invite"
+        payload = {
+            "recipients": recipients,
+            "roles": roles,
+            "requireSignIn": require_signin,
+            "sendInvitation": send_invitation,
+        }
+        if message:
+            payload["message"] = message
+        try:
+            return await self._post(url, payload)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (403, 404):
+                return None
+            raise
+
+    async def create_drive_item_link(
+        self, drive_id: str, item_id: str, link_type: str, scope: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """POST /drives/{did}/items/{iid}/createLink — recreates a sharing link.
+        link_type: 'view' | 'edit' | 'embed'. scope: 'anonymous' | 'organization' | 'users'."""
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/createLink"
+        payload: Dict[str, Any] = {"type": link_type}
+        if scope:
+            payload["scope"] = scope
+        try:
+            return await self._post(url, payload)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (403, 404):
+                return None
+            raise
+
     # ── Mailbox folder tree ─────────────────────────────────────────────────
     # Each message's `parentFolderId` is opaque; to reconstruct "/Inbox/Project X"
     # we must walk the folder tree once per user. afi rebuilds the hierarchy on

@@ -181,153 +181,154 @@ class BackupWorker:
 
     # ==================== Single Backup ====================
 
+    # Handler dispatch table — defined once at the class level so we don't
+    # rebuild a 25-entry dict on every backup message. Bound at first access.
+    _HANDLER_TABLE: Dict[str, str] = {
+        "MAILBOX": "backup_mailbox", "SHARED_MAILBOX": "backup_mailbox", "ROOM_MAILBOX": "backup_mailbox",
+        "ONEDRIVE": "backup_onedrive",
+        "SHAREPOINT_SITE": "backup_sharepoint",
+        "TEAMS_CHANNEL": "backup_teams_single", "TEAMS_CHAT": "backup_teams_single",
+        "ENTRA_USER": "backup_entra_single", "ENTRA_GROUP": "backup_entra_single",
+        "M365_GROUP": "backup_entra_single", "ENTRA_APP": "backup_entra_single",
+        "ENTRA_DEVICE": "backup_entra_single", "ENTRA_SERVICE_PRINCIPAL": "backup_entra_single",
+        "ENTRA_CONDITIONAL_ACCESS": "backup_conditional_access",
+        "ENTRA_BITLOCKER_KEY": "backup_bitlocker_key",
+        "PLANNER": "_backup_metadata_only", "TODO": "_backup_metadata_only",
+        "ONENOTE": "_backup_metadata_only", "COPILOT": "_backup_metadata_only",
+        "POWER_BI": "backup_power_bi_workspace",
+        "POWER_APPS": "_backup_metadata_only", "POWER_AUTOMATE": "_backup_metadata_only",
+        "POWER_DLP": "_backup_metadata_only",
+        "RESOURCE_GROUP": "_backup_metadata_only", "DYNAMIC_GROUP": "_backup_metadata_only",
+    }
+
     async def _process_single_backup(self, job_id: uuid.UUID, message: Dict, resource_id: str):
-        """Process a backup for a single resource"""
+        """Process a backup for a single resource.
+
+        R2.4 — short-lived session pattern:
+          1. Brief read session: fetch Job + Resource + Tenant, expunge,
+             release the connection.
+          2. Slow network work (graph_client setup, snapshot creation,
+             handler call) runs WITHOUT pinning a DB connection — these
+             can take many minutes for Power BI / large mailboxes.
+          3. Each finalization step opens its own short session.
+
+        Without this, a single Power BI backup can hold a connection for
+        5+ minutes while making HTTPS calls, starving the pool and blocking
+        every other handler in the worker."""
+
+        # ── Step 1: brief read session ─────────────────────────────────────
         async with async_session_factory() as session:
-            # Check if the job still exists (stale messages may reference deleted jobs)
             job = await session.get(Job, job_id)
             if not job:
                 print(f"[{self.worker_id}] Job {job_id} not found, skipping stale message for {resource_id}")
                 return
-
             resource = await session.get(Resource, uuid.UUID(resource_id))
             if not resource:
                 print(f"[{self.worker_id}] Resource {resource_id} not found, skipping")
                 return
-
-            # Query tenant directly (avoid lazy loading issues)
-            result = await session.execute(
+            tenant = (await session.execute(
                 select(Tenant).where(Tenant.id == resource.tenant_id)
-            )
-            tenant = result.scalar_one_or_none()
-
+            )).scalar_one_or_none()
             if not tenant:
                 print(f"[{self.worker_id}] Tenant not found for resource {resource_id}, skipping")
                 return
+            # Detach so we can use these objects after the session closes.
+            session.expunge_all()
+        # Connection released to pool here.
 
-            graph_client = await self.get_graph_client(tenant)
-            if not graph_client:
-                print(f"[{self.worker_id}] Graph client not available for resource {resource_id}, skipping")
-                return
+        # ── Step 2: network work without a pinned session ─────────────────
+        graph_client = await self.get_graph_client(tenant)
+        if not graph_client:
+            print(f"[{self.worker_id}] Graph client not available for resource {resource_id}, skipping")
+            return
 
-            # Route to appropriate handler based on resource type
-            resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
-            print(f"[{self.worker_id}] Processing backup for {resource_id} (type={resource_type}, tenant={tenant.id})")
+        resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
+        print(f"[{self.worker_id}] Processing backup for {resource_id} (type={resource_type}, tenant={tenant.id})")
 
-            snapshot = await self.create_snapshot(resource, message, job_id)
+        # create_snapshot opens + closes its own short-lived session.
+        snapshot = await self.create_snapshot(resource, message, job_id)
 
-            handlers = {
-                # Exchange
-                "MAILBOX": self.backup_mailbox,
-                "SHARED_MAILBOX": self.backup_mailbox,
-                "ROOM_MAILBOX": self.backup_mailbox,
-                # Files
-                "ONEDRIVE": self.backup_onedrive,
-                "SHAREPOINT_SITE": self.backup_sharepoint,
-                # Teams
-                "TEAMS_CHANNEL": self.backup_teams_single,
-                "TEAMS_CHAT": self.backup_teams_single,
-                # Entra ID
-                "ENTRA_USER": self.backup_entra_single,
-                "ENTRA_GROUP": self.backup_entra_single,
-                "M365_GROUP": self.backup_entra_single,
-                "ENTRA_APP": self.backup_entra_single,
-                "ENTRA_DEVICE": self.backup_entra_single,
-                "ENTRA_SERVICE_PRINCIPAL": self.backup_entra_single,
-                # Phase 2 P2 — security-critical singletons
-                "ENTRA_CONDITIONAL_ACCESS": self.backup_conditional_access,
-                "ENTRA_BITLOCKER_KEY": self.backup_bitlocker_key,
-                # Planner / Tasks — dispatched to real handlers via _backup_metadata_only
-                "PLANNER": self._backup_metadata_only,
-                "TODO": self._backup_metadata_only,
-                "ONENOTE": self._backup_metadata_only,
-                # Copilot: Graph exposes very little for backup — metadata blob is the correct
-                # approach until Microsoft extends the API. Not a gap, a data-source limit.
-                "COPILOT": self._backup_metadata_only,
-                # Power Platform: POWER_BI has a real handler; the others are
-                # metadata-only until Phase 2 (Power Platform Admin API client).
-                "POWER_BI": self.backup_power_bi_workspace,
-                "POWER_APPS": self._backup_metadata_only,
-                "POWER_AUTOMATE": self._backup_metadata_only,
-                "POWER_DLP": self._backup_metadata_only,
-                # NOTE: Azure workloads (AZURE_VM, AZURE_SQL_DB, AZURE_POSTGRESQL) are
-                # routed by backup-scheduler to azure.vm / azure.sql / azure.postgres queues
-                # and handled by azure-workload-worker. They should NEVER reach this worker;
-                # if they do, the fallback below logs a warning and stores metadata.
-                # Other
-                "RESOURCE_GROUP": self._backup_metadata_only,
-                "DYNAMIC_GROUP": self._backup_metadata_only,
-            }
+        handler_name = self._HANDLER_TABLE.get(resource_type)
+        if not handler_name:
+            if str(resource_type).startswith("AZURE_"):
+                print(f"[{self.worker_id}] [ROUTING WARNING] Azure workload {resource_type} reached backup-worker; "
+                      f"scheduler should route to azure-workload-worker via azure.* queue. "
+                      f"Falling back to metadata-only for resource {resource.id}")
+            else:
+                print(f"[{self.worker_id}] [ROUTING WARNING] No dedicated handler for {resource_type}; "
+                      f"falling back to metadata-only for resource {resource.id}")
+            handler_name = "_backup_metadata_only"
+        handler = getattr(self, handler_name)
 
-            if resource_type not in handlers:
-                if resource_type and str(resource_type).startswith("AZURE_"):
-                    print(f"[{self.worker_id}] [ROUTING WARNING] Azure workload {resource_type} reached backup-worker; "
-                          f"scheduler should route to azure-workload-worker via azure.* queue. "
-                          f"Falling back to metadata-only for resource {resource.id}")
-                else:
-                    print(f"[{self.worker_id}] [ROUTING WARNING] No dedicated handler for {resource_type}; "
-                          f"falling back to metadata-only for resource {resource.id}")
-            handler = handlers.get(resource_type, self._backup_metadata_only)
+        try:
+            print(f"[{self.worker_id}] Calling handler for {resource_type}: {resource.display_name}")
+            result = await handler(graph_client, resource, snapshot, tenant, message)
+        except Exception as e:
+            error_str = str(e).lower()
+            is_inaccessible = any(kw in error_str for kw in [
+                "not found", "404", "resource_not_found",
+                "locked", "423", "account_locked",
+                "authorization_failed", "access_denied",
+            ])
+
+            # ── Step 3a: error finalization — short sessions per write ────
+            if is_inaccessible:
+                print(f"[{self.worker_id}] Resource {resource.display_name} is INACCESSIBLE (404/423) — marking to skip future backups")
+                try:
+                    async with async_session_factory() as s:
+                        live = await s.get(Resource, resource.id)
+                        if live:
+                            live.status = "INACCESSIBLE"
+                            await s.commit()
+                except Exception as up_exc:
+                    print(f"[{self.worker_id}] Could not mark resource INACCESSIBLE: {up_exc}")
 
             try:
-                print(f"[{self.worker_id}] Calling handler for {resource_type}: {resource.display_name}")
-                result = await handler(graph_client, resource, snapshot, tenant, message)
-            except Exception as e:
-                error_str = str(e).lower()
-                # Detect 404/423 errors — resource no longer exists or is locked
-                is_inaccessible = any(kw in error_str for kw in [
-                    "not found", "404", "resource_not_found",
-                    "locked", "423", "account_locked",
-                    "authorization_failed", "access_denied",
-                ])
+                async with async_session_factory() as s:
+                    await self.fail_snapshot(s, snapshot, e)
+            except Exception as fail_exc:
+                print(f"[{self.worker_id}] Could not mark snapshot FAILED: {fail_exc}")
 
-                if is_inaccessible:
-                    print(f"[{self.worker_id}] Resource {resource.display_name} is INACCESSIBLE (404/423) — marking to skip future backups")
-                    resource.status = "INACCESSIBLE"
-                    await session.commit()
+            try:
+                async with async_session_factory() as s:
+                    await self.update_job_status(s, job_id, JobStatus.FAILED, {"error": str(e)[:2000]})
+            except Exception as job_exc:
+                print(f"[{self.worker_id}] Could not mark job FAILED: {job_exc}")
 
-                # Mark snapshot FAILED so it doesn't stay IN_PROGRESS forever
-                try:
-                    await self.fail_snapshot(session, snapshot, e)
-                except Exception as fail_exc:
-                    print(f"[{self.worker_id}] Could not mark snapshot FAILED: {fail_exc}")
+            print(f"[{self.worker_id}] Handler FAILED for {resource_type}: {resource.display_name} — {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
-                # Mark job FAILED so the UI sees a terminal state
-                try:
-                    await self.update_job_status(session, job_id, JobStatus.FAILED, {"error": str(e)[:2000]})
-                except Exception as job_exc:
-                    print(f"[{self.worker_id}] Could not mark job FAILED: {job_exc}")
+        # ── Step 3b: success finalization — short sessions per write ──────
+        async with async_session_factory() as s:
+            await self.complete_snapshot(s, snapshot, result)
 
-                print(f"[{self.worker_id}] Handler FAILED for {resource_type}: {resource.display_name} — {e}")
-                import traceback
-                traceback.print_exc()
-                raise
+        async with async_session_factory() as s:
+            await self.update_job_status(s, job_id, JobStatus.COMPLETED, result)
 
-            # Complete the snapshot with results
-            await self.complete_snapshot(session, snapshot, result)
+        async with async_session_factory() as s:
+            await self.update_resource_backup_info(s, resource, job_id, snapshot.id, result)
 
-            await self.update_job_status(session, job_id, JobStatus.COMPLETED, result)
-            await self.update_resource_backup_info(session, resource, job_id, snapshot.id, result)
+        # Audit event — fire-and-forget over HTTP, no DB session needed.
+        await self.audit_logger.log(
+            action="BACKUP_COMPLETED",
+            tenant_id=str(tenant.id),
+            org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
+            actor_type="WORKER",
+            resource_id=str(resource.id),
+            resource_type=resource_type,
+            resource_name=resource.display_name or resource.email or str(resource.id),
+            outcome="SUCCESS",
+            job_id=str(job_id),
+            snapshot_id=str(snapshot.id),
+            details={
+                "item_count": result.get("item_count", 0),
+                "bytes_added": result.get("bytes_added", 0),
+            },
+        )
 
-            # Log audit event
-            await self.audit_logger.log(
-                action="BACKUP_COMPLETED",
-                tenant_id=str(tenant.id),
-                org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
-                actor_type="WORKER",
-                resource_id=str(resource.id),
-                resource_type=resource_type,
-                resource_name=resource.display_name or resource.email or str(resource.id),
-                outcome="SUCCESS",
-                job_id=str(job_id),
-                snapshot_id=str(snapshot.id),
-                details={
-                    "item_count": result.get("item_count", 0),
-                    "bytes_added": result.get("bytes_added", 0),
-                },
-            )
-
-            print(f"[{self.worker_id}] Completed backup for {resource_id}")
+        print(f"[{self.worker_id}] Completed backup for {resource_id}")
 
     # ==================== Mass Backup (Parallel) ====================
 

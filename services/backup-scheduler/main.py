@@ -11,6 +11,7 @@ Responsibilities:
 - Track SLA compliance and violations
 """
 import asyncio
+import os
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
@@ -136,29 +137,81 @@ DAY_MAP = {
 }
 
 
-def frequency_to_cron_params(frequency: str, backup_days: list[str] | None = None):
-    """
-    Convert SLA policy frequency string to APScheduler cron parameters.
+def _parse_window_start(window_start: str | None) -> tuple[int, int]:
+    """Parse 'HH:MM' (or 'HHMM') from policy.backup_window_start. Returns
+    (hour, minute) UTC. Falls back to (2, 0) — afi default 02:00 — on any
+    parse failure so a malformed value never breaks the scheduler."""
+    if not window_start:
+        return (2, 0)
+    try:
+        s = window_start.strip()
+        if ":" in s:
+            h, m = s.split(":", 1)
+            return (int(h) % 24, int(m) % 60)
+        if len(s) >= 3 and s.isdigit():  # "0830"
+            return (int(s[:-2]) % 24, int(s[-2:]) % 60)
+    except Exception:
+        pass
+    return (2, 0)
 
-    Supported frequencies:
-    - THREE_DAILY: 3x per day (every 8 hours at 00:00, 08:00, 16:00 UTC)
-    - DAILY: 1x per day (at 02:00 UTC) — runs every day
-    - WEEKLY: 1x per week (Sunday at 03:00 UTC)
-    - CUSTOM: runs on user-selected days at 02:00 UTC (uses backup_days)
+
+def _policy_minute_jitter(policy_id: str | None) -> int:
+    """Deterministic minute offset (0–54) for a given policy ID.
+
+    R3.1 — without jitter, every DAILY policy fires at HH:00:00 and a
+    100-tenant deployment thundering-herds the worker pool + Graph API at
+    the same moment. A stable per-policy offset spreads load across the
+    hour while keeping the schedule predictable for the same policy across
+    deploys (deterministic from the ID, not random)."""
+    if not policy_id:
+        return 0
+    import hashlib
+    h = hashlib.md5(str(policy_id).encode()).digest()
+    return h[0] % 55  # 0..54 — leaves the last 5 minutes of the hour clear
+
+
+def frequency_to_cron_params(
+    frequency: str,
+    backup_days: list[str] | None = None,
+    window_start: str | None = None,
+    policy_id: str | None = None,
+):
+    """Convert SLA policy frequency + window into APScheduler cron parameters.
+
+    afi-parity behaviour:
+      THREE_DAILY — 3x/day, fires at window_start + 0h/+8h/+16h
+      DAILY       — 1x/day at window_start (default 02:00 UTC)
+      MANUAL      — returns None; caller must skip schedule registration
+
+    Per-policy minute jitter (R3.1) is added to base_minute so concurrent
+    policies stagger naturally without operator intervention.
+
+    backup_days restricts to a day-of-week subset (only applied when fewer
+    than 7 days are selected — selecting all 7 is equivalent to no restriction).
     """
-    if frequency == "THREE_DAILY":
-        return {"trigger": "cron", "hour": "0,8,16", "minute": 0}
-    elif frequency == "WEEKLY":
-        return {"trigger": "cron", "day_of_week": "sun", "hour": 3, "minute": 0}
-    elif frequency == "CUSTOM" and backup_days:
-        # Convert user-selected days to APScheduler format
+    if frequency == "MANUAL":
+        return None
+
+    base_hour, base_minute = _parse_window_start(window_start)
+    jitter = _policy_minute_jitter(policy_id)
+    final_minute = (base_minute + jitter) % 60
+    # Only roll forward an hour if jitter pushes us past 60min
+    hour_carry = (base_minute + jitter) // 60
+
+    # Day-of-week restriction
+    dow_clause: dict = {}
+    if backup_days:
         aps_days = [DAY_MAP.get(d.upper(), d.lower()) for d in backup_days if DAY_MAP.get(d.upper())]
-        if aps_days:
-            return {"trigger": "cron", "day_of_week": ",".join(aps_days), "hour": 2, "minute": 0}
-        # Fallback if no valid days
-        return {"trigger": "cron", "hour": 2, "minute": 0}
-    else:  # DAILY (default)
-        return {"trigger": "cron", "hour": 2, "minute": 0}
+        if aps_days and len(aps_days) < 7:
+            dow_clause["day_of_week"] = ",".join(aps_days)
+
+    if frequency == "THREE_DAILY":
+        # Three windows starting at base_hour, base_hour+8, base_hour+16 (mod 24)
+        hours = ",".join(str((base_hour + hour_carry + offset) % 24) for offset in (0, 8, 16))
+        return {"trigger": "cron", "hour": hours, "minute": final_minute, **dow_clause}
+
+    # DAILY (and any legacy / unrecognized value)
+    return {"trigger": "cron", "hour": (base_hour + hour_carry) % 24, "minute": final_minute, **dow_clause}
 
 
 def resource_type_enabled(resource_type: str, policy: SlaPolicy) -> bool:
@@ -260,6 +313,16 @@ async def startup():
     # Phase 2: Retention cleanup — FLAT/GFS snapshot pruning per SLA policy (daily)
     scheduler.add_job(run_retention_cleanup, "interval", hours=24)
 
+    # Round 1.5 — daily retry of FAILED snapshots (one shot, throttled).
+    scheduler.add_job(retry_failed_snapshots, "interval", hours=24)
+
+    # R3.2 — daily backup integrity sample (random snapshots, hash check).
+    scheduler.add_job(run_backup_verification, "interval", hours=24)
+
+    # Round 1.5 — DLQ consumer (poison-message alerting). Runs as a background
+    # task, NOT an APScheduler job; consumes continuously from backup.*.dlq.
+    asyncio.create_task(consume_backup_dlq())
+
     # Schedule daily backup report (email/Slack/Teams)
     scheduler.add_job(send_daily_backup_report, "cron", hour=8, minute=0, timezone="UTC")
 
@@ -299,14 +362,23 @@ async def schedule_all_policies():
 
 
 async def schedule_policy_job(policy: SlaPolicy):
-    """Schedule or reschedule a backup job for a specific SLA policy"""
+    """Schedule or reschedule a backup job for a specific SLA policy.
+
+    MANUAL policies are intentionally never scheduled — they only run when
+    explicitly triggered via the /trigger endpoint. afi behaves identically."""
     job_id = f"policy_backup_{policy.id}"
 
-    # Remove existing job if it exists (for rescheduling)
+    # Remove existing job if it exists (covers reschedule + frequency change to MANUAL)
     if scheduler.get_job(job_id):
         scheduler.remove_job(job_id)
 
-    cron_params = frequency_to_cron_params(policy.frequency, policy.backup_days)
+    cron_params = frequency_to_cron_params(
+        policy.frequency, policy.backup_days, policy.backup_window_start,
+        policy_id=str(policy.id),
+    )
+    if cron_params is None:
+        print(f"[SCHEDULER] Skipping '{policy.name}' (MANUAL policy — admin-triggered only)")
+        return
 
     scheduler.add_job(
         dispatch_policy_backups,
@@ -318,7 +390,7 @@ async def schedule_policy_job(policy: SlaPolicy):
         **cron_params,
     )
 
-    days_info = f" days={policy.backup_days}" if policy.frequency == "CUSTOM" and policy.backup_days else ""
+    days_info = f" days={policy.backup_days}" if policy.backup_days and len(policy.backup_days) < 7 else ""
     print(f"[SCHEDULER] Scheduled '{policy.name}' ({policy.frequency}{days_info}) -> job_id={job_id}")
 
 
@@ -459,6 +531,35 @@ async def dispatch_policy_backups(policy_id: str):
         if not enabled_resources:
             print(f"[SCHEDULER] No enabled resources for policy '{policy.name}' after flag filtering")
             return
+
+        # R2.2 — honor max_concurrent_backups. Count Jobs already in flight for
+        # this policy (QUEUED + RUNNING) and cap how many new resources we
+        # publish this tick. The remainder will be picked up by the next
+        # scheduled trigger — we'd rather spread load across cycles than
+        # overload Graph and induce 429 throttling.
+        max_concurrent = getattr(policy, "max_concurrent_backups", None) or 0
+        if max_concurrent > 0:
+            inflight_stmt = (
+                select(func.count(Job.id)).where(and_(
+                    Job.spec["sla_policy_id"].astext == str(policy.id),
+                    Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+                ))
+            )
+            inflight = (await session.execute(inflight_stmt)).scalar() or 0
+            budget = max(0, max_concurrent - inflight)
+            if budget == 0:
+                print(f"[SCHEDULER] Policy '{policy.name}' at concurrency cap "
+                      f"({inflight}/{max_concurrent} in-flight) — deferring this tick")
+                return
+            if budget < len(enabled_resources):
+                print(f"[SCHEDULER] Policy '{policy.name}' concurrency cap "
+                      f"({inflight}/{max_concurrent} in-flight) — dispatching {budget} of {len(enabled_resources)} resources")
+                # Prefer the resources with the OLDEST last_backup — they're the
+                # most behind on SLA. None means never backed up → highest priority.
+                enabled_resources.sort(
+                    key=lambda r: (r.last_backup_at or datetime.min)
+                )
+                enabled_resources = enabled_resources[:budget]
 
         power_bi_resources = [resource for resource in enabled_resources if resource.type == ResourceType.POWER_BI]
         if power_bi_resources:
@@ -671,128 +772,104 @@ async def check_sla_violations():
 # ==================== Pre-emptive Backup Triggers ====================
 
 async def check_preemptive_backup_triggers():
-    """
-    Check for anomaly signals that might indicate ransomware or data loss.
-    Triggers pre-emptive backups when suspicious patterns are detected.
+    """Consume unresolved BACKUP_ANOMALY alerts emitted by backup-worker's
+    per-resource anomaly detector and fire a per-resource preemptive backup
+    for each one. R2.3 — single signal source, no duplicate scoring.
 
-    Signals checked:
-    - Sudden spike in file deletions/modifications
-    - Unusual file extension changes (ransomware encryption)
-    - Mass permission changes
-    - Suspicious sign-in patterns (from audit logs)
-    """
-    print("[PREEMPTIVE] Checking for backup trigger signals...")
+    Flow:
+      1. backup-worker._check_snapshot_anomaly raises BACKUP_ANOMALY Alert
+         after each completed snapshot (compares item_count vs rolling avg).
+      2. THIS job (every 15min) picks up unresolved alerts from the last
+         hour and triggers an urgent backup of just that resource.
+      3. Marks each alert resolved with a note pointing to the trigger job.
+
+    Window of 1h prevents repeatedly re-acting on the same alert if the
+    preemptive backup itself takes longer than one tick to start."""
+    from shared.models import Alert
+    print("[PREEMPTIVE] Checking unresolved BACKUP_ANOMALY alerts...")
 
     async with async_session_factory() as session:
-        # Get all active tenants
-        tenants_result = await session.execute(
-            select(Tenant).where(Tenant.status == TenantStatus.ACTIVE)
+        cutoff = datetime.utcnow() - timedelta(hours=1)
+        stmt = (
+            select(Alert).where(and_(
+                Alert.type == "BACKUP_ANOMALY",
+                Alert.resolved.is_(False),
+                Alert.created_at >= cutoff,
+            )).order_by(Alert.created_at.asc())
         )
-        tenants = tenants_result.scalars().all()
+        alerts = (await session.execute(stmt)).scalars().all()
+        if not alerts:
+            print("[PREEMPTIVE] No unresolved anomaly alerts in last hour")
+            return
 
-        triggered_count = 0
-        for tenant in tenants:
+        triggered = 0
+        skipped = 0
+        for alert in alerts:
+            if not alert.resource_id:
+                # Tenant-level alerts don't have a single resource to back up.
+                # We could expand to all tenant resources but that's wasteful;
+                # log + resolve so it doesn't keep getting picked up.
+                alert.resolved = True
+                alert.resolution_note = "no resource_id attached — skipped"
+                alert.resolved_at = datetime.utcnow()
+                skipped += 1
+                continue
+
+            resource = await session.get(Resource, alert.resource_id)
+            if not resource:
+                alert.resolved = True
+                alert.resolution_note = "resource gone"
+                alert.resolved_at = datetime.utcnow()
+                skipped += 1
+                continue
+
             try:
-                # Check for anomaly signals
-                anomaly_score = await calculate_anomaly_score(session, tenant)
-
-                if anomaly_score > 0.7:  # High anomaly - trigger backup
-                    print(f"[PREEMPTIVE] High anomaly score ({anomaly_score:.2f}) for tenant {tenant.display_name}")
-                    await trigger_preemptive_backup(session, tenant, f"anomaly_score={anomaly_score:.2f}")
-                    triggered_count += 1
-                elif anomaly_score > 0.5:  # Medium anomaly - log warning
-                    print(f"[PREEMPTIVE] Medium anomaly score ({anomaly_score:.2f}) for tenant {tenant.display_name}")
-
+                preemptive_job_id = await trigger_preemptive_backup_for_resource(
+                    session, resource, reason=f"anomaly_alert={alert.id}",
+                )
+                alert.resolved = True
+                alert.resolution_note = f"triggered preemptive backup job {preemptive_job_id}"
+                alert.resolved_at = datetime.utcnow()
+                triggered += 1
             except Exception as e:
-                print(f"[PREEMPTIVE] Failed to check tenant {tenant.display_name}: {e}")
+                print(f"[PREEMPTIVE] failed to trigger backup for resource {resource.id}: {e}")
 
-        if triggered_count > 0:
-            print(f"[PREEMPTIVE] Triggered {triggered_count} pre-emptive backups")
-        else:
-            print("[PREEMPTIVE] No pre-emptive backups triggered")
+        await session.commit()
+        print(f"[PREEMPTIVE] triggered={triggered}, skipped={skipped}, total_alerts={len(alerts)}")
 
 
-async def calculate_anomaly_score(session: AsyncSession, tenant: Tenant) -> float:
-    """
-    Calculate anomaly score based on recent backup patterns and resource changes.
-    Returns score between 0.0 (normal) and 1.0 (highly anomalous)
-    """
-    score = 0.0
-    signals = 0
-
-    # Signal 1: Check for resources with failed backups in last 24h
-    now = datetime.utcnow()
-    failed_backups_result = await session.execute(
-        select(func.count(Job.id)).where(
-            and_(
-                Job.tenant_id == tenant.id,
-                Job.type == JobType.BACKUP,
-                Job.status == JobStatus.FAILED,
-                Job.created_at >= now - timedelta(hours=24)
-            )
-        )
+async def trigger_preemptive_backup_for_resource(
+    session: AsyncSession, resource: Resource, reason: str,
+) -> str:
+    """Per-resource preemptive backup. Publishes a single-resource job to
+    backup.urgent at priority 1 — jumps the queue ahead of scheduled work.
+    Returns the job ID for audit linkage."""
+    job_id = uuid.uuid4()
+    job = Job(
+        id=job_id,
+        type=JobType.BACKUP,
+        tenant_id=resource.tenant_id,
+        batch_resource_ids=[resource.id],
+        status=JobStatus.QUEUED,
+        priority=1,
+        spec={
+            "triggered_by": "PREEMPTIVE",
+            "reason": reason,
+            "resource_type": resource.type.value if hasattr(resource.type, "value") else str(resource.type),
+            "preemptive": True,
+        },
     )
-    failed_backups = failed_backups_result.scalar() or 0
-    if failed_backups > 5:
-        score += 0.2
-        signals += 1
-
-    # Signal 2: Check for resources with sudden status changes
-    resources_changed_result = await session.execute(
-        select(func.count(Resource.id)).where(
-            and_(
-                Resource.tenant_id == tenant.id,
-                Resource.updated_at >= now - timedelta(hours=24),
-                Resource.status.in_(['SUSPENDED', 'PENDING_DELETION'])
-            )
-        )
-    )
-    resources_changed = resources_changed_result.scalar() or 0
-    if resources_changed > 10:
-        score += 0.3
-        signals += 1
-
-    # Signal 3: Check for resources without recent backups (>48h)
-    resources_no_backup_result = await session.execute(
-        select(func.count(Resource.id)).where(
-            and_(
-                Resource.tenant_id == tenant.id,
-                Resource.status.in_([ResourceStatus.DISCOVERED, ResourceStatus.ACTIVE]),
-                (Resource.last_backup_at == None) | (Resource.last_backup_at <= now - timedelta(hours=48))
-            )
-        )
-    )
-    resources_no_backup = resources_no_backup_result.scalar() or 0
-    if resources_no_backup > 20:
-        score += 0.3
-        signals += 1
-
-    # Signal 4: Check for unusual snapshot item counts (sudden drops might indicate deletion)
-    recent_snapshots_result = await session.execute(
-        select(Snapshot).where(
-            and_(
-                Snapshot.resource_id.in_(
-                    select(Resource.id).where(Resource.tenant_id == tenant.id)
-                ),
-                Snapshot.started_at >= now - timedelta(hours=48)
-            )
-        ).order_by(Snapshot.started_at.desc()).limit(10)
-    )
-    recent_snapshots = recent_snapshots_result.scalars().all()
-    if len(recent_snapshots) >= 2:
-        # Compare item counts between last two snapshots
-        last_items = recent_snapshots[0].item_count or 0
-        prev_items = recent_snapshots[1].item_count or 0
-        if prev_items > 0 and last_items < prev_items * 0.5:
-            # More than 50% drop in item count
-            score += 0.4
-            signals += 1
-
-    # Normalize score
-    if signals > 0:
-        score = min(1.0, score)
-
-    return score
+    session.add(job)
+    payload = {
+        "jobId": str(job_id),
+        "resourceId": str(resource.id),
+        "workload": resource.type.value if hasattr(resource.type, "value") else str(resource.type),
+        "triggeredBy": "PREEMPTIVE",
+        "reason": reason,
+    }
+    await message_bus.publish("backup.urgent", payload, priority=1)
+    print(f"[PREEMPTIVE] queued backup for resource={resource.display_name} ({resource.id}), job={job_id}, reason={reason}")
+    return str(job_id)
 
 
 async def trigger_preemptive_backup(session: AsyncSession, tenant: Tenant, reason: str):
@@ -1021,6 +1098,312 @@ async def start_reconciler_loop():
                 print(f"[RECONCILER] Reconciler loop error: {e}")
 
     asyncio.create_task(_reconciler())
+
+
+# ── R3.2: Backup verification cron ──
+
+# Default sample size — small enough that a daily run is cheap on storage
+# (each verify = one blob download), large enough that a corrupt backup gets
+# noticed within ~weeks even if it lives in a low-priority tenant.
+BACKUP_VERIFY_SAMPLE_SIZE = int(os.environ.get("BACKUP_VERIFY_SAMPLE_SIZE", "50"))
+BACKUP_VERIFY_LOOKBACK_HOURS = int(os.environ.get("BACKUP_VERIFY_LOOKBACK_HOURS", "24"))
+
+
+async def run_backup_verification():
+    """Sample-and-verify recent snapshots: download a random SnapshotItem's
+    blob and compare its SHA256 against the captured `content_checksum`.
+    Mismatches raise a `BACKUP_VERIFICATION_FAILED` Alert.
+
+    afi claims data is "fingerprinted for integrity verification" but doesn't
+    document when it's actually checked. We do it daily on a random sample —
+    cheap enough that we can run it on every deploy, large enough that
+    silent corruption gets flagged within weeks of occurring."""
+    import hashlib as _hashlib
+    import random
+    from shared.models import Snapshot, SnapshotStatus, SnapshotItem, Resource, Alert
+    from shared.azure_storage import azure_storage_manager, workload_candidates_for_resource_type
+
+    print("[VERIFY] === START: backup integrity sample ===")
+    cutoff = datetime.utcnow() - timedelta(hours=BACKUP_VERIFY_LOOKBACK_HOURS)
+    checked = 0
+    passed = 0
+    failed = 0
+    no_blob = 0
+    no_checksum = 0
+
+    try:
+        async with async_session_factory() as session:
+            snap_stmt = (
+                select(Snapshot.id, Snapshot.resource_id)
+                .where(and_(
+                    Snapshot.status == SnapshotStatus.COMPLETED,
+                    Snapshot.completed_at >= cutoff,
+                    Snapshot.item_count > 0,
+                ))
+                .order_by(func.random())
+                .limit(BACKUP_VERIFY_SAMPLE_SIZE)
+            )
+            snap_rows = (await session.execute(snap_stmt)).all()
+            if not snap_rows:
+                print("[VERIFY] No completed snapshots in lookback window — nothing to sample")
+                return
+
+            for snap_id, resource_id in snap_rows:
+                # Pick one random item from this snapshot to verify
+                item_stmt = (
+                    select(SnapshotItem)
+                    .where(and_(
+                        SnapshotItem.snapshot_id == snap_id,
+                        SnapshotItem.blob_path.isnot(None),
+                    ))
+                    .order_by(func.random())
+                    .limit(1)
+                )
+                item = (await session.execute(item_stmt)).scalars().first()
+                if not item:
+                    no_blob += 1
+                    continue
+                if not item.content_checksum:
+                    no_checksum += 1
+                    continue
+
+                resource = await session.get(Resource, resource_id)
+                if not resource:
+                    continue
+
+                # Find the right container for this item — same workload mapping
+                # the backup worker uses on write.
+                rtype = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+                workloads = workload_candidates_for_resource_type(rtype) or ("entra",)
+                shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(resource.tenant_id))
+
+                content: bytes | None = None
+                used_workload: str | None = None
+                for wl in workloads:
+                    container = azure_storage_manager.get_container_name(str(resource.tenant_id), wl)
+                    try:
+                        # shard.download_blob returns None on 404 (ResourceNotFound)
+                        # and only raises on auth/network errors — try the next
+                        # candidate workload either way.
+                        content = await shard.download_blob(container, item.blob_path)
+                        if content is not None:
+                            used_workload = wl
+                            break
+                    except Exception:
+                        continue
+
+                checked += 1
+                if content is None:
+                    print(f"[VERIFY] FAIL blob unreachable: snapshot={snap_id} item={item.id} blob={item.blob_path}")
+                    failed += 1
+                    await _raise_verification_alert(
+                        session, resource, snap_id, item, reason="blob_unreachable",
+                        expected=item.content_checksum, actual=None,
+                    )
+                    continue
+
+                actual = _hashlib.sha256(content).hexdigest()
+                if actual == item.content_checksum:
+                    passed += 1
+                    continue
+
+                print(f"[VERIFY] FAIL checksum mismatch: snapshot={snap_id} item={item.id} expected={item.content_checksum[:12]}.. actual={actual[:12]}.. workload={used_workload}")
+                failed += 1
+                await _raise_verification_alert(
+                    session, resource, snap_id, item, reason="checksum_mismatch",
+                    expected=item.content_checksum, actual=actual,
+                )
+
+            await session.commit()
+        print(
+            f"[VERIFY] === COMPLETE: sampled={len(snap_rows)} checked={checked} "
+            f"passed={passed} failed={failed} no_blob={no_blob} no_checksum={no_checksum} ==="
+        )
+    except Exception as e:
+        import traceback as _tb
+        print(f"[VERIFY] FATAL: {e}\n{_tb.format_exc()}")
+
+
+async def _raise_verification_alert(
+    session, resource, snapshot_id, item, reason: str,
+    expected: str | None, actual: str | None,
+) -> None:
+    """Persist a BACKUP_VERIFICATION_FAILED alert. Severity HIGH because a
+    silent corruption in storage means the next restore will produce wrong data."""
+    from shared.models import Alert
+    session.add(Alert(
+        tenant_id=resource.tenant_id if resource else None,
+        type="BACKUP_VERIFICATION_FAILED",
+        severity="HIGH",
+        message=(
+            f"Snapshot integrity check failed ({reason}) for resource "
+            f"{resource.display_name if resource else snapshot_id}. "
+            f"Stored blob no longer matches the SHA256 captured at backup time — "
+            f"restore from this snapshot may produce corrupted data."
+        ),
+        resource_id=resource.id if resource else None,
+        resource_type=resource.type.value if resource and hasattr(resource.type, "value") else None,
+        resource_name=resource.display_name if resource else None,
+        triggered_by="verification-cron",
+        details={
+            "snapshot_id": str(snapshot_id),
+            "snapshot_item_id": str(item.id),
+            "blob_path": item.blob_path,
+            "reason": reason,
+            "expected_sha256": expected,
+            "actual_sha256": actual,
+        },
+    ))
+
+
+# ── Round 1.5: DLQ consumer + failed-snapshot retry ──
+
+async def consume_backup_dlq():
+    """Long-running consumer for backup.*.dlq queues — every poison message
+    becomes an Alert so ops can investigate. Without this, dead-lettered
+    messages sit in RabbitMQ forever with no signal to operators."""
+    from shared.models import Alert
+    dlq_queues = ["backup.urgent.dlq", "backup.high.dlq", "backup.normal.dlq", "backup.low.dlq"]
+
+    # Wait for message_bus to be ready (startup ordering)
+    for _ in range(30):
+        if message_bus.channel:
+            break
+        await asyncio.sleep(1)
+    if not message_bus.channel:
+        print("[DLQ] message bus not connected — DLQ consumer giving up")
+        return
+
+    async def consume_one(queue_name: str):
+        try:
+            queue = await message_bus.channel.get_queue(queue_name)
+        except Exception as exc:
+            print(f"[DLQ] cannot bind to {queue_name}: {exc}")
+            return
+        print(f"[DLQ] consuming from {queue_name}")
+        async with queue.iterator() as it:
+            async for msg in it:
+                try:
+                    body = json.loads(msg.body.decode())
+                    job_id = body.get("jobId")
+                    resource_id = body.get("resourceId") or (body.get("resourceIds") or [None])[0]
+                    workload = body.get("workload")
+                    delivery_count = (msg.headers or {}).get("x-delivery-count", "?")
+                    print(f"[DLQ] poison message in {queue_name}: job={job_id} resource={resource_id} workload={workload} delivery_count={delivery_count}")
+                    async with async_session_factory() as session:
+                        # Look up tenant via resource if available
+                        tenant_id = None
+                        if resource_id:
+                            try:
+                                from shared.models import Resource
+                                r = await session.get(Resource, uuid.UUID(resource_id))
+                                tenant_id = r.tenant_id if r else None
+                            except Exception:
+                                pass
+                        session.add(Alert(
+                            tenant_id=tenant_id,
+                            type="BACKUP_DLQ",
+                            severity="HIGH",
+                            message=(
+                                f"Backup message dead-lettered after {delivery_count} delivery attempts on {queue_name}. "
+                                f"Job {job_id} for resource {resource_id} ({workload}) is stuck — investigate."
+                            ),
+                            resource_id=uuid.UUID(resource_id) if resource_id else None,
+                            triggered_by="dlq-consumer",
+                            details={
+                                "queue": queue_name,
+                                "delivery_count": delivery_count,
+                                "job_id": job_id,
+                                "resource_id": resource_id,
+                                "workload": workload,
+                            },
+                        ))
+                        await session.commit()
+                    await msg.ack()
+                except Exception as e:
+                    # Ack anyway — re-rejecting would just re-queue to DLQ infinitely
+                    print(f"[DLQ] failed to alert on poison message: {type(e).__name__}: {e}")
+                    try:
+                        await msg.ack()
+                    except Exception:
+                        pass
+
+    await asyncio.gather(*[consume_one(q) for q in dlq_queues], return_exceptions=True)
+
+
+async def retry_failed_snapshots():
+    """Daily: find FAILED snapshots between 1h and 25h old and re-queue ONE
+    backup attempt. Marker on snapshot.extra_data prevents an infinite retry
+    loop on the same failed snapshot. Skips resources whose next scheduled
+    backup will likely cover them anyway."""
+    from shared.models import Snapshot, SnapshotStatus, Resource
+    from sqlalchemy import select, and_
+
+    print("[RETRY] === START: failed-snapshot retry sweep ===")
+    requeued = 0
+    skipped_marked = 0
+    skipped_recent_success = 0
+
+    cutoff_old = datetime.utcnow() - timedelta(hours=25)
+    cutoff_recent = datetime.utcnow() - timedelta(hours=1)
+
+    try:
+        async with async_session_factory() as session:
+            stmt = (
+                select(Snapshot)
+                .where(and_(
+                    Snapshot.status == SnapshotStatus.FAILED,
+                    Snapshot.completed_at >= cutoff_old,
+                    Snapshot.completed_at < cutoff_recent,
+                ))
+            )
+            failed = (await session.execute(stmt)).scalars().all()
+
+            for snap in failed:
+                if (snap.extra_data or {}).get("retry_attempted"):
+                    skipped_marked += 1
+                    continue
+
+                # If a newer COMPLETED snapshot for the same resource exists,
+                # the failure has already been "healed" by the next scheduled
+                # run — skip the retry to avoid wasted work.
+                newer_stmt = select(Snapshot.id).where(and_(
+                    Snapshot.resource_id == snap.resource_id,
+                    Snapshot.status == SnapshotStatus.COMPLETED,
+                    Snapshot.completed_at > snap.completed_at,
+                )).limit(1)
+                if (await session.execute(newer_stmt)).first():
+                    snap.extra_data = (snap.extra_data or {}) | {"retry_attempted": True, "retry_skipped_reason": "newer_success_exists"}
+                    await session.merge(snap)
+                    skipped_recent_success += 1
+                    continue
+
+                resource = await session.get(Resource, snap.resource_id)
+                if not resource:
+                    continue
+
+                # Pick the queue based on workload — Azure goes to its own queue.
+                resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+                queue = AZURE_WORKLOAD_QUEUES.get(resource.type, "backup.normal")
+                payload = {
+                    "jobId": str(uuid.uuid4()),
+                    "resourceId": str(resource.id),
+                    "workload": resource_type,
+                    "retry_of_snapshot": str(snap.id),
+                }
+                try:
+                    await message_bus.publish(queue, payload, priority=4)
+                    snap.extra_data = (snap.extra_data or {}) | {"retry_attempted": True, "retry_at": datetime.utcnow().isoformat()}
+                    await session.merge(snap)
+                    requeued += 1
+                except Exception as e:
+                    print(f"[RETRY] failed to re-publish for snapshot {snap.id}: {e}")
+
+            await session.commit()
+        print(f"[RETRY] === COMPLETE: requeued={requeued}, skipped_marked={skipped_marked}, skipped_already_healed={skipped_recent_success} ===")
+    except Exception as e:
+        import traceback as _tb
+        print(f"[RETRY] FATAL: {e}\n{_tb.format_exc()}")
 
 
 # ── Phase 2: Retention Cleanup ──
