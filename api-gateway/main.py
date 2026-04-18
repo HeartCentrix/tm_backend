@@ -242,6 +242,10 @@ async def job(request: Request):
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/emails")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/messages")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/calendar")
+# Power BI / generic "all items" listing — consumed by the Recovery page's
+# Files view for resource kinds outside the five fixed tabs.
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/files")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/onedrive/ids")
 async def snapshot_folders(request: Request):
     return await proxy_request("snapshot", request.url.path, request)
 

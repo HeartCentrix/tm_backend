@@ -1156,6 +1156,42 @@ async def list_onedrive_ids_by_prefix(
     return {"ids": [str(r[0]) for r in rows], "count": len(rows)}
 
 
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/files")
+async def list_snapshot_files(
+    snapshot_id: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(200, ge=1),
+    search: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return EVERY item in a snapshot as a uniform 'file' row.
+
+    Used by the Recovery page for resource kinds that don't fit the five
+    fixed tabs (Power BI workspaces, SharePoint sites, Azure resources,
+    etc.) — one flat list of items with name / size / captured-at /
+    blob-path so the frontend can render a simple files table.
+
+    No item_type filter — whatever is in the snapshot shows up. Mail /
+    OneDrive / Contacts / Calendar / Chats have their own dedicated
+    endpoints that filter by type; this one is intentionally broad."""
+    filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
+    if search:
+        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
+    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
+    items = (await db.execute(
+        select(SnapshotItem).where(*filters)
+        .order_by(func.lower(SnapshotItem.name).asc())
+        .offset((page - 1) * size).limit(size)
+    )).scalars().all()
+    return {
+        "content": [_item_to_response(i) for i in items],
+        "totalElements": total,
+        "totalPages": max(1, (total + size - 1) // size),
+        "size": size,
+        "number": page,
+    }
+
+
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/contacts")
 async def list_snapshot_contacts(
     snapshot_id: str,
