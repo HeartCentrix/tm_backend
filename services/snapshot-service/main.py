@@ -1105,15 +1105,22 @@ async def list_snapshot_contacts(
 async def get_item_content(
     snapshot_id: str,
     item_id: str,
+    download: bool = Query(False, description="If true, stream as a file attachment with Content-Disposition"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return the raw content of a snapshot item, reading from blob if metadata is empty.
+    """Return the raw content of a snapshot item, reading from blob when present.
 
-    Blob location: the worker writes to container=backup-{workload}-{tenant[:8]}
-    using blob_path={tenant}/{resource}/{snapshot}/{ts}/{item}. We derive the
-    workload from the resource type (via workload_candidates_for_resource_type)
-    rather than parsing blob_path, and we pick the shard by resource_id to match
-    the worker's write call."""
+    Behavior:
+      - Blob-backed items (e.g. EMAIL_ATTACHMENT) stream the bytes. When the
+        payload parses as JSON we wrap it in `{"source":"blob","content":…}`
+        for frontend convenience; otherwise we stream octets with a proper
+        Content-Type (pulled from extra_data) and — if ?download=1 — a
+        Content-Disposition: attachment header carrying the original
+        filename so the browser saves it with the right name/extension.
+      - Inline items (extra_data.raw) return JSON as before.
+      - Missing items return an empty shape so the caller doesn't 404."""
+    from fastapi.responses import Response
+
     item = await db.get(SnapshotItem, UUID(item_id))
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -1126,11 +1133,27 @@ async def get_item_content(
             raise HTTPException(status_code=500, detail=f"Blob read failed: {e}")
         if data:
             import json as _json
-            try:
-                return {"source": "blob", "content": _json.loads(data.decode("utf-8"))}
-            except Exception:
-                from fastapi.responses import Response
-                return Response(content=data, media_type="application/octet-stream")
+            meta = item.extra_data or {}
+            # Only try JSON parsing when the caller didn't ask for a raw
+            # download. EMAIL_ATTACHMENTS of type application/json round-trip
+            # through the browser fine as raw bytes too.
+            if not download:
+                try:
+                    return {"source": "blob", "content": _json.loads(data.decode("utf-8"))}
+                except Exception:
+                    pass
+
+            content_type = (meta.get("content_type")
+                            or ("application/json" if item.item_type in ("EMAIL", "CALENDAR_EVENT", "TEAMS_CHAT_MESSAGE") else "application/octet-stream"))
+            headers = {}
+            if download:
+                # RFC 5987 filename* for non-ASCII safety; plain filename
+                # kept as a fallback for older browsers.
+                import urllib.parse as _urlp
+                fname = (item.name or f"item-{item.id}").strip()
+                safe = _urlp.quote(fname)
+                headers["Content-Disposition"] = f"attachment; filename=\"{fname}\"; filename*=UTF-8''{safe}"
+            return Response(content=data, media_type=content_type, headers=headers)
 
     # Fall back to inline metadata (e.g. email bodies stored directly in extra_data)
     meta = item.extra_data or {}
@@ -1139,3 +1162,54 @@ async def get_item_content(
         return {"source": "metadata", "content": raw}
 
     return {"source": "none", "content": {}}
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/attachments")
+async def get_item_attachments(
+    snapshot_id: str,
+    item_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the EMAIL_ATTACHMENT rows parented to a given email item.
+
+    The Tier 2 USER_MAIL backup stores each attachment as its own
+    SnapshotItem with `extra_data.parent_item_id` = the email's Graph id.
+    This endpoint lets the frontend's EmailPreview render downloadable
+    attachment chips for the selected email without scanning every item
+    in the snapshot.
+
+    Returns minimal fields needed to build a download link:
+      { id, name, size, kind, contentType, isInline, resolved }
+    `resolved` is true when the bytes are actually in blob storage (so the
+    chip links to the content endpoint); false for referenceAttachments
+    whose sharing URL couldn't be resolved (metadata-only row)."""
+    parent = await db.get(SnapshotItem, UUID(item_id))
+    if not parent:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    # Email external_id IS the Graph message id — what the backup handler
+    # stored as parent_item_id on each attachment.
+    parent_msg_id = parent.external_id
+    filters = [
+        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.item_type == "EMAIL_ATTACHMENT",
+        func.json_extract_path_text(SnapshotItem.extra_data, "parent_item_id") == parent_msg_id,
+    ]
+    rows = (await db.execute(
+        select(SnapshotItem).where(*filters).order_by(SnapshotItem.name)
+    )).scalars().all()
+
+    def fmt(r):
+        meta = r.extra_data or {}
+        return {
+            "id": str(r.id),
+            "name": r.name,
+            "size": r.content_size or 0,
+            "kind": meta.get("attachment_kind"),
+            "contentType": meta.get("content_type"),
+            "isInline": bool(meta.get("is_inline")),
+            "resolved": bool(meta.get("resolved")) and bool(r.blob_path),
+            "sourceUrl": meta.get("source_url"),
+        }
+
+    return [fmt(r) for r in rows]

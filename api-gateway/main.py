@@ -231,7 +231,7 @@ async def snapshot_folders(request: Request):
 @app.get("/api/v1/resources/snapshots/{snapshot_id}")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")
-@app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/content")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/attachments")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/search")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/items/{item_id}/preview")

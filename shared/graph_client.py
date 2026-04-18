@@ -1888,6 +1888,52 @@ class GraphClient:
             resp.raise_for_status()
             return resp.content
 
+    async def fetch_shared_url_content(self, source_url: str) -> Optional[bytes]:
+        """Resolve a OneDrive / SharePoint share URL to its actual file bytes.
+
+        Used for referenceAttachments on mail (and later chat) messages — the
+        attachment payload only has a `sourceUrl`, not content. Graph's
+        `/shares/{id}/driveItem` endpoint converts a sharing URL into a
+        driveItem we can then download via `@microsoft.graph.downloadUrl`.
+
+        Encoding: the share id is `u!` + URL-safe base64 of the URL, with
+        trailing `=` stripped — per Microsoft's docs:
+        https://learn.microsoft.com/graph/api/shares-get
+
+        Returns None when the URL isn't resolvable (external link, missing
+        grant, deleted item, 403/404 on shares endpoint). Callers should
+        degrade to metadata-only storage in that case."""
+        if not source_url:
+            return None
+        import base64 as _b64
+        try:
+            share_id = "u!" + _b64.urlsafe_b64encode(source_url.encode("utf-8")).decode("ascii").rstrip("=")
+        except Exception:
+            return None
+
+        try:
+            drive_item = await self._get(
+                f"{self.GRAPH_URL}/shares/{share_id}/driveItem",
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (400, 403, 404):
+                return None
+            raise
+        except Exception:
+            return None
+
+        download_url = drive_item.get("@microsoft.graph.downloadUrl")
+        if not download_url:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                resp = await client.get(download_url)
+                resp.raise_for_status()
+                return resp.content
+        except Exception as e:
+            print(f"[GraphClient] shared URL download failed ({source_url[:60]}…): {type(e).__name__}: {e}")
+            return None
+
     async def list_event_attachments(self, user_id: str, event_id: str) -> List[Dict[str, Any]]:
         """List attachments on a calendar event."""
         url = f"{self.GRAPH_URL}/users/{user_id}/events/{event_id}/attachments"

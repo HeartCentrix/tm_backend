@@ -504,6 +504,14 @@ RESOURCE_TYPE_TO_WORKLOADS: Dict[str, Tuple[str, ...]] = {
     "AZURE_SQL_DB": ("azure-sql-db",),
     "AZURE_POSTGRESQL": ("azure-postgresql",),
     "AZURE_POSTGRESQL_SINGLE": ("azure-postgresql-single",),
+    # Tier 2 per-user content types. Email attachments land in the "email"
+    # container; fall back to "mailbox" for any legacy rows. OneDrive Tier 2
+    # reuses the Tier 1 "files" container once we start blobbing file bytes.
+    "USER_MAIL": ("email", "mailbox"),
+    "USER_ONEDRIVE": ("files",),
+    "USER_CONTACTS": ("mailbox",),
+    "USER_CALENDAR": ("mailbox",),
+    "USER_CHATS": ("teams",),
 }
 
 
