@@ -521,10 +521,24 @@ async def get_resource(resource_id: str, db: AsyncSession = Depends(get_db)):
     resource = result.scalar_one_or_none()
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
+
+    # Frontend uses lastBackup (non-null) + sla to decide whether to enable
+    # the Recover button and show "Done" instead of "Queued". The list
+    # endpoint already returns these; the by-id handler was missing them,
+    # which left a freshly-completed backup looking stuck in Queued state.
+    sla_name: Optional[str] = None
+    if resource.sla_policy_id:
+        policy = (await db.execute(
+            select(SlaPolicy.name).where(SlaPolicy.id == resource.sla_policy_id)
+        )).scalar_one_or_none()
+        sla_name = policy
+
     return ResourceResponse(
         id=str(resource.id), name=resource.display_name, email=resource.email,
         type=resource.type.value if hasattr(resource.type, 'value') else str(resource.type),
+        sla=sla_name,
         totalSize=format_bytes(resource.storage_bytes or 0),
+        lastBackup=resource.last_backup_at.isoformat() if resource.last_backup_at else None,
         status=resource.status.value if hasattr(resource.status, 'value') else str(resource.status),
         tenantId=str(resource.tenant_id),
     )

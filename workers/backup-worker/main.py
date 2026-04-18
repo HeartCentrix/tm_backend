@@ -161,29 +161,36 @@ class BackupWorker:
         """Start consuming from all backup queues"""
         await self.initialize()
 
-        # Channel-wide prefetch. The consume_queue loop now processes messages
-        # concurrently (up to per-queue prefetch), so the channel cap is the
-        # ceiling across all queues on this replica. 5 gives each worker room
-        # to run ~5 Teams chat exports in parallel while still enforcing fair
-        # broker-side distribution when replicas scale out.
+        # backup.chat lane: drive concurrency from TEAMS_CHAT_EXPORT_CONCURRENCY
+        # (= count of configured Graph app registrations). With N apps,
+        # multi_app_manager rotates tokens per page so N parallel users each
+        # ride a different throttle bucket. Without this, prefetch=1 was the
+        # binding constraint and the env var was a no-op.
+        chat_concurrency = _chat_export_concurrency()
+
+        # Channel-wide prefetch. The consume_queue loop processes messages
+        # concurrently (up to per-queue prefetch), so the channel cap must
+        # cover SLA/manual slots (5) + chat slots (chat_concurrency). The
+        # dedicated backup.chat lane stays additive — long Teams chat exports
+        # never starve SLA-scheduled backups for other workloads.
+        channel_qos = 5 + chat_concurrency
         if message_bus.channel:
             try:
-                await message_bus.channel.set_qos(prefetch_count=5)
-                print(f"[{self.worker_id}] Set channel prefetch_count=5 for fair work distribution")
+                await message_bus.channel.set_qos(prefetch_count=channel_qos)
+                print(f"[{self.worker_id}] Set channel prefetch_count={channel_qos} (5 SLA + {chat_concurrency} chat)")
             except Exception as exc:
                 print(f"[{self.worker_id}] Could not adjust prefetch_count: {exc}")
 
         # Per-queue prefetch doubles as max-concurrency within that queue on
         # this replica (consume_queue runs up to prefetch_count tasks in
-        # parallel). Urgent stays at 1 because Teams chat exports dominate the
-        # urgent queue and Graph getAllMessages self-throttles when multiple
-        # run against the same app registration — _CHAT_EXPORT_SEM caps
-        # concurrent exports explicitly based on configured app count.
+        # parallel). backup.chat is its own lane (prefetch=chat_concurrency,
+        # additionally gated by _CHAT_EXPORT_SEM at the same value).
         queues = [
             ("backup.urgent", 1),
             ("backup.high", 5),
             ("backup.normal", 20),
             ("backup.low", 50),
+            ("backup.chat", chat_concurrency),
         ]
 
         tasks = []
@@ -321,6 +328,13 @@ class BackupWorker:
             if not tenant:
                 print(f"[{self.worker_id}] Tenant not found for resource {resource_id}, skipping")
                 return
+            # Flip QUEUED → RUNNING so the dashboard + activity feed reflect
+            # live progress. Mass backups do this in _process_mass_backup;
+            # without it, single-resource jobs (e.g. TEAMS_CHAT_EXPORT) sit
+            # on QUEUED for the entire run and only flip to COMPLETED at end.
+            if job.status == JobStatus.QUEUED:
+                job.status = JobStatus.RUNNING
+                await session.commit()
             # Detach so we can use these objects after the session closes.
             session.expunge_all()
         # Connection released to pool here.
@@ -2082,6 +2096,23 @@ class BackupWorker:
         FLUSH_BYTES = 8 * 1024 * 1024
         FLUSH_MSGS = 5000
         BULK_INSERT_BATCH = 5000
+        # Force-flush triggers. Chat delta disperses msgs across thousands of
+        # tiny (chat_id, date_key) buckets that never individually hit
+        # FLUSH_BYTES — so end-of-stream becomes a flush storm of 1500+
+        # sequential blob uploads, blowing past the AMQP message-ack window
+        # (~30 min) and getting the whole task requeued with no data persisted.
+        # Two complementary triggers:
+        #   1. GLOBAL_BUCKET_CAP — flush when too many buckets are open at once,
+        #      regardless of their size. This is what actually fires on chat
+        #      delta in practice. Larger packs amortize Azure round-trips and
+        #      keep the per-page tail short so the run finishes inside AMQP's
+        #      window.
+        #   2. GLOBAL_BUF_CAP — RAM bound. Lower than before (16 MB vs 64 MB)
+        #      because once 200 buckets are open, end-of-stream flush time
+        #      dominates and we want to keep it bounded.
+        GLOBAL_BUF_CAP = 16 * 1024 * 1024
+        GLOBAL_BUCKET_CAP = 200
+        FORCE_FLUSH_TOP_K = 32
 
         shard_info = azure_storage_manager.get_shard_for_resource(
             str(resource.id), str(tenant.id)
@@ -2105,6 +2136,36 @@ class BackupWorker:
             if force or len(pending_items) >= BULK_INSERT_BATCH:
                 await bulk_insert_snapshot_items(pending_items)
                 pending_items = []
+
+        async def enforce_ram_cap():
+            """Flush biggest-first until BOTH the byte cap AND the bucket-count
+            cap are satisfied. Bucket-count is the dominant trigger for chat
+            delta (where buckets are many but individually small); byte cap
+            still applies for non-chat workloads with fewer/larger buckets."""
+            non_empty = lambda: [s for s in bucket_state.values() if s["pack_entries"]]
+            total_buf = sum(len(s["buf"]) for s in bucket_state.values())
+            non_empty_count = len(non_empty())
+            if total_buf < GLOBAL_BUF_CAP and non_empty_count < GLOBAL_BUCKET_CAP:
+                return
+            flushed_count = 0
+            freed_total = 0
+            while True:
+                total_buf = sum(len(s["buf"]) for s in bucket_state.values())
+                non_empty_list = non_empty()
+                if total_buf < GLOBAL_BUF_CAP and len(non_empty_list) < GLOBAL_BUCKET_CAP:
+                    break
+                batch = sorted(non_empty_list, key=lambda s: len(s["buf"]), reverse=True)[:FORCE_FLUSH_TOP_K]
+                if not batch:
+                    break
+                freed_total += sum(len(s["buf"]) for s in batch)
+                for s in batch:
+                    await flush_pack(s)
+                flushed_count += len(batch)
+            if flushed_count:
+                print(
+                    f"[{self.worker_id}] [CHAT_EXPORT_PACKED] {user_label} — "
+                    f"RAM cap: flushed {flushed_count} buckets, freed {freed_total} bytes"
+                )
 
         async def flush_pack(state: Dict[str, Any]):
             nonlocal total_bytes, total_items
@@ -2174,6 +2235,12 @@ class BackupWorker:
         async for page in iter_pages():
             page_count += 1
             page_msgs = page.get("value", []) if isinstance(page, dict) else []
+            # Only deltaLink is a durable resume cursor. nextLink (mid-stream
+            # @odata.nextLink) was tried earlier as an eager-persist mechanism
+            # but Microsoft expires those within minutes — saving them as
+            # delta_token caused 410 Gone on the next run and forced a full
+            # reseed. Real durability comes from flushing data sooner so the
+            # whole run finishes inside one AMQP window.
             if isinstance(page, dict) and page.get("@odata.deltaLink"):
                 new_delta_link = page["@odata.deltaLink"]
             if not page_msgs:
@@ -2266,6 +2333,7 @@ class BackupWorker:
                         await flush_pack(state)
 
             await maybe_flush_items()
+            await enforce_ram_cap()
 
             if page_count % 10 == 0:
                 print(
@@ -4267,17 +4335,43 @@ class BackupWorker:
             print(f"[{self.worker_id}] Updated storage_bytes for {resource.id}: {resource.storage_bytes} -> {storage_bytes} bytes (added {bytes_added}, removed {bytes_removed})")
         
         new_status = ResourceStatus.ACTIVE if resource.status == ResourceStatus.DISCOVERED else resource.status
+        now = datetime.utcnow()
         await session.execute(
             sa_update(Resource)
             .where(Resource.id == resource.id)
             .values(
                 last_backup_job_id=job_id,
-                last_backup_at=datetime.utcnow(),
+                last_backup_at=now,
                 last_backup_status="COMPLETED",
                 status=new_status,
                 storage_bytes=storage_bytes,
             )
         )
+
+        # TEAMS_CHAT_EXPORT covers every TEAMS_CHAT the user participates in
+        # (one delta pull per user). The UI lists per-chat TEAMS_CHAT rows,
+        # so without this propagation those rows stay stuck on "Queued" /
+        # Recover-disabled even though the backup data is in storage. Mirror
+        # the completion timestamp + status onto every matching catalog row
+        # using the chatIds list this export already tracks.
+        if resource.type == ResourceType.TEAMS_CHAT_EXPORT:
+            chat_ids = (resource.extra_data or {}).get("chatIds") or []
+            if chat_ids:
+                await session.execute(
+                    sa_update(Resource)
+                    .where(
+                        Resource.tenant_id == resource.tenant_id,
+                        Resource.type == ResourceType.TEAMS_CHAT,
+                        Resource.external_id.in_(chat_ids),
+                    )
+                    .values(
+                        last_backup_job_id=job_id,
+                        last_backup_at=now,
+                        last_backup_status="COMPLETED",
+                        status=ResourceStatus.ACTIVE,
+                    )
+                )
+
         await session.commit()
 
     async def complete_snapshot(self, session: AsyncSession, snapshot: Snapshot, result: Dict):
@@ -4346,6 +4440,14 @@ class BackupWorker:
         markers + content_hash churn for finer-grained detection."""
         from shared.models import Alert
         async with async_session_factory() as session:
+            resource = await session.get(Resource, snapshot.resource_id)
+            # Delta-sync workloads (TEAMS_CHAT_EXPORT) legitimately produce
+            # 0-item snapshots when no new messages have arrived since the
+            # last pull. That is not an anomaly — excluding them here avoids
+            # flooding the Activity feed with false-positive RANSOMWARE_SIGNAL
+            # warnings on quiet chats.
+            if resource and resource.type == ResourceType.TEAMS_CHAT_EXPORT:
+                return
             stmt = (
                 select(Snapshot)
                 .where(
@@ -4370,7 +4472,6 @@ class BackupWorker:
                 return  # within normal variance
 
             # Anomaly — raise alert + mark prior snapshot as last_clean
-            resource = await session.get(Resource, snapshot.resource_id)
             last_clean = prior[0]  # most recent completed snapshot before this one
             last_clean.extra_data = (last_clean.extra_data or {}) | {
                 "is_clean_marker": True,

@@ -25,6 +25,11 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+      # consumer_timeout 14_400_000 ms = 4 hours. Default is 30 min which
+      # auto-requeued long Teams chat exports mid-flight, dropping all in-RAM
+      # buffered messages and causing duplicate full-resyncs with stale
+      # nextLink cursors. 4 hours covers any single-user export.
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit consumer_timeout 14400000"
     # Config mounted from host - if mount fails, comment out and use defaults:
     # volumes:
     #   - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro

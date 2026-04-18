@@ -607,6 +607,16 @@ async def _persist_discovery_rows(
         # Non-fatal: group matching should never block a discovery run from finishing.
         logger.warning("Auto-protect group evaluation failed for tenant %s: %s", tenant_id, exc)
 
+    # Phase 3 — default-SLA fallback (afi.ai parity): for any resource still without
+    # a policy after group matching, stamp the tenant's is_default SLA. This closes
+    # the gap where a newly-discovered resource matches no resource-group rule and
+    # would otherwise sit in DISCOVERED forever (no scheduler cron picks up rows
+    # with sla_policy_id IS NULL — see backup-scheduler/main.py:738-740).
+    try:
+        await _apply_default_sla(db, tenant_id)
+    except Exception as exc:
+        logger.warning("Default-SLA fallback failed for tenant %s: %s", tenant_id, exc)
+
     return staged_count, inserted_count, updated_count, stale_marked_count
 
 
@@ -674,6 +684,42 @@ async def _apply_auto_protect_groups(db, tenant_id: UUID) -> int:
         await db.commit()
         logger.info("[auto-protect] Assigned policies to %d newly-discovered resource(s) for tenant %s",
                     assigned, tenant_id)
+    return assigned
+
+
+async def _apply_default_sla(db, tenant_id: UUID) -> int:
+    """Stamp the tenant's is_default SLA on resources that still have no policy.
+
+    Runs after _apply_auto_protect_groups, so resource-group matches always win.
+    Mirrors afi.ai's "Auto-protect new resources" behaviour: once a tenant has a
+    default policy, no DISCOVERED resource can sit unassigned past the next
+    discovery run.
+
+    Returns the count of resources stamped."""
+    from shared.models import SlaPolicy, Resource as _Res
+
+    default_stmt = select(SlaPolicy.id).where(
+        SlaPolicy.tenant_id == tenant_id,
+        SlaPolicy.is_default.is_(True),
+        SlaPolicy.enabled.is_(True),
+    ).limit(1)
+    default_id = (await db.execute(default_stmt)).scalar_one_or_none()
+    if not default_id:
+        return 0
+
+    update_stmt = (
+        text(
+            "UPDATE resources SET sla_policy_id = :pid, updated_at = CURRENT_TIMESTAMP "
+            "WHERE tenant_id = :tid AND sla_policy_id IS NULL"
+        )
+        .bindparams(pid=default_id, tid=tenant_id)
+    )
+    result = await db.execute(update_stmt)
+    assigned = result.rowcount or 0
+    if assigned:
+        await db.commit()
+        logger.info("[default-sla] Stamped default policy %s on %d resource(s) for tenant %s",
+                    default_id, assigned, tenant_id)
     return assigned
 
 

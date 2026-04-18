@@ -753,6 +753,15 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_group_policy_assignments_policy ON group_policy_assignments(policy_id)",
         # Teams chat packed-blob dedup lookup
         "CREATE INDEX IF NOT EXISTS idx_snapshot_items_tenant_checksum ON snapshot_items(tenant_id, content_checksum)",
+        # snapshot_items.metadata->>'chatId' filter — used when the UI scopes a
+        # user-snapshot down to a single chat. BTREE on the text projection is
+        # fine for equality (and cheap to build). `->>` works on JSON; if/when
+        # the metadata column is migrated to JSONB we can add a GIN companion
+        # for containment queries (current code does the chatIds containment
+        # in Python, which is fine for the typical 5k-user shard count).
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_items_metadata_chat_id "
+        "ON snapshot_items ((metadata->>'chatId')) "
+        "WHERE item_type = 'TEAMS_CHAT_MESSAGE'",
     ]
 
     add_column_statements = [

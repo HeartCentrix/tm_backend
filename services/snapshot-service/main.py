@@ -9,7 +9,7 @@ from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy import select, func, distinct, and_, or_
 
 from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus
+from shared.models import Snapshot, SnapshotItem, Resource, ResourceType, SnapshotType, SnapshotStatus
 from shared.power_bi_snapshot import assemble_power_bi_items
 from shared.azure_storage import azure_storage_manager, workload_candidates_for_resource_type
 from shared.schemas import (
@@ -76,6 +76,36 @@ async def _get_power_bi_assembled_items(db: AsyncSession, snapshot_id: str) -> O
     return assemble_power_bi_items(snapshots, items_result.scalars().all(), up_to_snapshot_id=snapshot_id)
 
 
+async def _resolve_chat_export_resource_ids(
+    db: AsyncSession, resource: Resource
+) -> Optional[List[UUID]]:
+    """For a TEAMS_CHAT resource (per-chat row that owns no snapshots), find
+    every TEAMS_CHAT_EXPORT user-shard whose extra_data.chatIds contains this
+    chat's external_id. Snapshots for those user-shards collectively hold this
+    chat's messages (filtered downstream by metadata.chatId on items).
+
+    Returns None if `resource` is not a TEAMS_CHAT (caller should query the
+    direct resource_id). Returns [] if no shards have indexed this chat yet
+    (no exports have run) — caller should still query the direct id and get
+    an empty list back.
+
+    Group chats with K participants → K matching user-shards. Caller dedups
+    across shards via content_checksum on the items endpoint.
+    """
+    if resource.type != ResourceType.TEAMS_CHAT:
+        return None
+    chat_external_id = resource.external_id
+    stmt = select(Resource.id, Resource.extra_data).where(
+        Resource.tenant_id == resource.tenant_id,
+        Resource.type == ResourceType.TEAMS_CHAT_EXPORT,
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        rid for (rid, extra) in rows
+        if chat_external_id in (extra or {}).get("chatIds", [])
+    ]
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "snapshot"}
@@ -88,7 +118,20 @@ async def list_snapshots(
     size: int = Query(50, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
-    filters = [Snapshot.resource_id == UUID(resource_id)]
+    resource_uuid = UUID(resource_id)
+    resource = await db.get(Resource, resource_uuid)
+
+    target_ids: List[UUID] = [resource_uuid]
+    if resource is not None:
+        chat_export_ids = await _resolve_chat_export_resource_ids(db, resource)
+        if chat_export_ids is not None:
+            # TEAMS_CHAT row: snapshots live on the per-user TEAMS_CHAT_EXPORT
+            # shards. Empty list → no exports yet, fall through to query the
+            # original id (returns []) so the UI sees an empty page rather
+            # than a 500.
+            target_ids = chat_export_ids or [resource_uuid]
+
+    filters = [Snapshot.resource_id.in_(target_ids)]
     total = (await db.execute(select(func.count(Snapshot.id)).where(*filters))).scalar() or 0
     stmt = select(Snapshot).where(*filters).order_by(Snapshot.created_at.desc()).offset((page-1)*size).limit(size)
     result = await db.execute(stmt)
@@ -112,10 +155,30 @@ async def list_snapshots(
     )
 
 
+def _apply_chat_id_filter(filters: list, chat_id: Optional[str]) -> list:
+    """If a chatId is supplied, restrict to items whose extra_data.chatId matches.
+    Used when the UI navigates into a TEAMS_CHAT — the underlying TEAMS_CHAT_EXPORT
+    snapshot holds messages from many chats; this filter scopes to one."""
+    if chat_id:
+        filters.append(SnapshotItem.extra_data["chatId"].astext == chat_id)
+    return filters
+
+
+def _apply_folder_filter(filters: list, folder_path: Optional[str]) -> list:
+    """Restrict items to a single folder_path. The Recovery UI's left-nav lists
+    folder paths returned by /folders; clicking one should narrow the items
+    pane to just that folder. Works for any item type (chats, files, channels)
+    because folder_path is populated by every backup path."""
+    if folder_path and folder_path != "all":
+        filters.append(SnapshotItem.folder_path == folder_path)
+    return filters
+
+
 @app.get("/api/v1/resources/snapshots/folders")
 async def get_snapshot_folders(
     snapshot_id: str = Query(...),
     item_type: Optional[str] = Query(None),
+    chatId: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     """Get distinct folder paths for items in a snapshot, optionally filtered by item type."""
@@ -131,6 +194,7 @@ async def get_snapshot_folders(
     filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
     if item_type:
         filters.append(SnapshotItem.item_type == item_type)
+    _apply_chat_id_filter(filters, chatId)
 
     stmt = (
         select(SnapshotItem.folder_path, func.count(SnapshotItem.id).label("count"))
@@ -150,6 +214,7 @@ async def get_snapshot_folders(
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/content-types")
 async def get_snapshot_content_types(
     snapshot_id: str,
+    chatId: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     """Get distinct content types available in a snapshot."""
@@ -157,9 +222,11 @@ async def get_snapshot_content_types(
     if assembled_items is not None:
         return {"contentTypes": sorted({item.item_type for item in assembled_items if item.item_type})}
 
+    filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
+    _apply_chat_id_filter(filters, chatId)
     stmt = (
         select(distinct(SnapshotItem.item_type))
-        .where(SnapshotItem.snapshot_id == UUID(snapshot_id))
+        .where(*filters)
         .order_by(SnapshotItem.item_type)
     )
     result = await db.execute(stmt)
@@ -192,6 +259,8 @@ async def list_snapshot_items(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1),
     itemType: Optional[str] = Query(None),
+    chatId: Optional[str] = Query(None),
+    folderPath: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
@@ -210,12 +279,14 @@ async def list_snapshot_items(
     filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
     if itemType:
         filters.append(SnapshotItem.item_type == itemType)
-    
+    _apply_chat_id_filter(filters, chatId)
+    _apply_folder_filter(filters, folderPath)
+
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     stmt = select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size)
     result = await db.execute(stmt)
     items = result.scalars().all()
-    
+
     return SnapshotItemListResponse(
         content=[_item_to_response(item) for item in items],
         totalPages=max(1, (total + size - 1) // size),
@@ -236,6 +307,8 @@ async def browse_snapshot_items(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1),
     itemType: Optional[str] = Query(None),
+    chatId: Optional[str] = Query(None),
+    folderPath: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     assembled_items = await _get_power_bi_assembled_items(db, snapshot_id)
@@ -251,9 +324,23 @@ async def browse_snapshot_items(
             number=page,
         )
 
+    # If the route's resource_id is a TEAMS_CHAT (per-chat row), auto-derive the
+    # chatId filter from its external_id so the UI doesn't have to pass it
+    # explicitly. Explicit ?chatId= overrides the derivation.
+    derived_chat_id = chatId
+    if not derived_chat_id:
+        try:
+            res = await db.get(Resource, UUID(resource_id))
+            if res is not None and res.type == ResourceType.TEAMS_CHAT:
+                derived_chat_id = res.external_id
+        except Exception:
+            pass
+
     filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
     if itemType:
         filters.append(SnapshotItem.item_type == itemType)
+    _apply_chat_id_filter(filters, derived_chat_id)
+    _apply_folder_filter(filters, folderPath)
 
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     stmt = select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size)
@@ -595,13 +682,15 @@ async def list_snapshot_messages(
     page: int = Query(1, ge=1),
     size: int = Query(500, ge=1),
     chatId: Optional[str] = Query(None),
+    folderPath: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     """Return Teams messages with sender/body/date extracted from metadata.
 
     Pass chatId to narrow a per-user TEAMS_CHAT_EXPORT snapshot down to one
     chat (the post-refactor path — snapshots are now user-scoped, so restore
-    or the viewer need to filter by chat themselves)."""
+    or the viewer need to filter by chat themselves). Pass folderPath to
+    narrow by the folder path the UI's left-nav uses (e.g. 'chats/Topic')."""
     CHAT_TYPES = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
     filters = [
         SnapshotItem.snapshot_id == UUID(snapshot_id),
@@ -609,6 +698,7 @@ async def list_snapshot_messages(
     ]
     if chatId:
         filters.append(SnapshotItem.extra_data["chatId"].astext == chatId)
+    _apply_folder_filter(filters, folderPath)
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
 

@@ -355,6 +355,17 @@ async def list_activities(
 
         for event in warning_events:
             details = event.details or {}
+            # Per-action fallback text so a RANSOMWARE_SIGNAL row doesn't
+            # render with the SLA-skip copy when details.message is absent.
+            if event.action == "RANSOMWARE_SIGNAL":
+                drop_pct = details.get("drop_pct")
+                default_msg = (
+                    f"AI ransomware signal: item count dropped {drop_pct}% vs prior average."
+                    if isinstance(drop_pct, (int, float))
+                    else "AI ransomware signal detected on latest snapshot."
+                )
+            else:
+                default_msg = "Backup skipped because the assigned SLA does not cover this resource type."
             items.append({
                 "id": f"audit-{event.id}",
                 "start_time": event.occurred_at.isoformat() if event.occurred_at else "",
@@ -362,7 +373,7 @@ async def list_activities(
                 "object": event.resource_name or event.resource_type or "Unknown resource",
                 "status": "Warning",
                 "finish_time": event.occurred_at.isoformat() if event.occurred_at else "",
-                "details": details.get("message") or "Backup skipped because the assigned SLA does not cover this resource type.",
+                "details": details.get("message") or default_msg,
             })
 
         # Discovery events: pair each DISCOVERY_STARTED with its matching

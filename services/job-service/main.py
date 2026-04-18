@@ -16,7 +16,7 @@ from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot, S
 from shared.schemas import (
     JobResponse, JobListResponse, TriggerBackupRequest, TriggerBulkBackupRequest, TriggerDatasourceBackupRequest
 )
-from shared.message_bus import message_bus, create_backup_message, create_restore_message
+from shared.message_bus import message_bus, create_backup_message, create_restore_message, resolve_backup_queue
 
 # AZ-4: Azure workload resources go to dedicated queues (not backup.*)
 AZURE_WORKLOAD_QUEUES = {
@@ -184,7 +184,8 @@ async def _create_batch_backup_jobs(
     await db.commit()
 
     for msg in pending_publishes:
-        await message_bus.publish("backup.urgent", msg, priority=priority)
+        queue = resolve_backup_queue(msg.get("resourceType"), "backup.urgent")
+        await message_bus.publish(queue, msg, priority=priority)
 
     try:
         import httpx
@@ -392,9 +393,11 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
 
     # Publish to RabbitMQ
     if settings.RABBITMQ_ENABLED:
-        # AZ-4: Route Azure workload resources to dedicated queues
+        # AZ-4: Route Azure workload resources to dedicated queues. TEAMS_CHAT_EXPORT
+        # gets its own lane via resolve_backup_queue so a 30+ min chat export
+        # can't squat the urgent slot on a worker pod.
         resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
-        routing_key = AZURE_WORKLOAD_QUEUES.get(resource_type, "backup.urgent")
+        routing_key = AZURE_WORKLOAD_QUEUES.get(resource_type) or resolve_backup_queue(resource_type, "backup.urgent")
 
         msg = create_backup_message(
             job_id=str(job.id), resource_id=request.resourceId,
@@ -511,7 +514,9 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
         await db.commit()  # commit before publish so worker finds the job
 
         if settings.RABBITMQ_ENABLED:
-            await message_bus.publish("backup.urgent", create_backup_message(
+            res_type = res.type.value if hasattr(res.type, 'value') else str(res.type)
+            queue = resolve_backup_queue(res_type, "backup.urgent")
+            await message_bus.publish(queue, create_backup_message(
                 job_id=str(job.id), resource_id=resource_id,
                 tenant_id=str(res.tenant_id), full_backup=effective_full_backup
             ), priority=1)

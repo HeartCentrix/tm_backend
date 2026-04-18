@@ -46,6 +46,11 @@ class MessageBus:
                 await self._declare_queue("backup.high", routing_key="backup.high")
                 await self._declare_queue("backup.normal", routing_key="backup.normal")
                 await self._declare_queue("backup.low", routing_key="backup.low")
+                # Dedicated lane for TEAMS_CHAT_EXPORT — keeps 30+ min chat
+                # exports off the urgent/high/normal lanes so SLA-scheduled
+                # backups for other workloads aren't starved by a manual
+                # chat trigger. See resolve_backup_queue() below.
+                await self._declare_queue("backup.chat", routing_key="backup.chat")
                 await self._declare_queue("restore.urgent", routing_key="restore.urgent")
                 await self._declare_queue("restore.normal", routing_key="restore.normal")
                 await self._declare_queue("restore.low", routing_key="restore.low")
@@ -177,6 +182,21 @@ def create_mass_backup_message(
         "createdAt": datetime.utcnow().isoformat(),
         "batchSize": len(resource_ids),
     }
+
+
+CHAT_BACKUP_QUEUE = "backup.chat"
+
+
+def resolve_backup_queue(resource_type: str | None, default_queue: str) -> str:
+    """Pick the right backup queue for a resource type.
+
+    TEAMS_CHAT_EXPORT goes to the dedicated chat lane regardless of priority
+    (urgent/high/normal). Everything else stays on the caller's chosen queue.
+    Centralizing the rule here means publishers don't each have to encode it.
+    """
+    if resource_type == "TEAMS_CHAT_EXPORT":
+        return CHAT_BACKUP_QUEUE
+    return default_queue
 
 
 AZURE_RESTORE_QUEUE_BY_TYPE = {

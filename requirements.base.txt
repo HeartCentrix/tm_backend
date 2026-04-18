@@ -15,6 +15,7 @@ asyncpg==0.29.0
 
 # --- HTTP client ---
 httpx==0.26.0
+h2==4.1.0  # HTTP/2 support for httpx — multiplexes serial Graph pagination over one TCP connection
 
 # --- Message queue ---
 aio-pika==9.4.0

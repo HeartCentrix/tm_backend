@@ -32,6 +32,7 @@ from shared.message_bus import (
     create_mass_backup_message,
     create_backup_message,
     create_audit_event_message,
+    resolve_backup_queue,
 )
 from shared.config import settings
 from shared.power_bi_client import PowerBIClient
@@ -466,9 +467,11 @@ async def trigger_single_backup(resource_id: str, full_backup: bool = False):
         session.add(job)
         await session.commit()
 
-        # Send to urgent queue
+        # Send to urgent queue (chat exports get the dedicated chat lane)
+        rtype = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+        manual_queue = resolve_backup_queue(rtype, "backup.urgent")
         await message_bus.publish(
-            "backup.urgent",
+            manual_queue,
             {
                 "jobId": str(job_id),
                 "resourceId": resource_id,
@@ -658,9 +661,12 @@ async def dispatch_policy_backups(policy_id: str):
             except ValueError:
                 pass
 
-            group_queue = azure_queue or ("backup.high" if policy.frequency == "THREE_DAILY" else "backup.normal")
+            sla_default_queue = "backup.high" if policy.frequency == "THREE_DAILY" else "backup.normal"
+            group_queue = azure_queue or resolve_backup_queue(resource_type, sla_default_queue)
             if azure_queue:
                 print(f"[SCHEDULER] Azure workload {resource_type} → queue {azure_queue} (not backup.*)")
+            elif group_queue != sla_default_queue:
+                print(f"[SCHEDULER] {resource_type} → dedicated queue {group_queue} (isolation)")
 
             # Split into batches
             for i in range(0, len(group_resources), BATCH_SIZE):
@@ -876,14 +882,16 @@ async def trigger_preemptive_backup_for_resource(
         },
     )
     session.add(job)
+    rtype = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
     payload = {
         "jobId": str(job_id),
         "resourceId": str(resource.id),
-        "workload": resource.type.value if hasattr(resource.type, "value") else str(resource.type),
+        "workload": rtype,
         "triggeredBy": "PREEMPTIVE",
         "reason": reason,
     }
-    await message_bus.publish("backup.urgent", payload, priority=1)
+    preemptive_queue = resolve_backup_queue(rtype, "backup.urgent")
+    await message_bus.publish(preemptive_queue, payload, priority=1)
     print(f"[PREEMPTIVE] queued backup for resource={resource.display_name} ({resource.id}), job={job_id}, reason={reason}")
     return str(job_id)
 
@@ -948,7 +956,8 @@ async def trigger_preemptive_backup(session: AsyncSession, tenant: Tenant, reaso
         message["triggeredBy"] = "PREEMPTIVE"
         message["reason"] = reason
 
-        await message_bus.publish("backup.urgent", message, priority=1)
+        preemptive_batch_queue = resolve_backup_queue(rtype, "backup.urgent")
+        await message_bus.publish(preemptive_batch_queue, message, priority=1)
 
     await session.commit()
 
