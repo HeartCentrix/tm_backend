@@ -61,8 +61,8 @@ async def _seed(shard):
 
 
 @pytest.mark.asyncio
-async def test_full_mbox_export_against_azurite(azurite_connection_string, tmp_path):
-    shard = AzureStorageShard.from_connection_string(azurite_connection_string)
+async def test_full_mbox_export_against_azurite(azure_test_connection_string, tmp_path):
+    shard = AzureStorageShard.from_connection_string(azure_test_connection_string)
     try:
         items = await _seed(shard)
         manifest = ExportManifestBuilder(job_id="job-azurite", snapshot_ids=["snap-1"])

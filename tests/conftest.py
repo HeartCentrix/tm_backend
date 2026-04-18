@@ -18,12 +18,16 @@ def tmpdir_path(tmp_path):
 
 
 @pytest.fixture
-def azurite_connection_string():
-    """Azurite default connection string — used by integration tests.
-    The docker-compose `azurite` service must be running before integration tests."""
-    return os.getenv(
-        "AZURITE_CONNECTION_STRING",
-        "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;"
-        "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;"
-        "BlobEndpoint=http://localhost:10000/devstoreaccount1;"
-    )
+def azure_test_connection_string():
+    """Azure Storage connection string for integration tests — real Azure, no emulator.
+
+    Set `AZURE_TEST_CONNECTION_STRING` in the shell or CI secret before running
+    `pytest -m integration`. Tests depending on this fixture skip gracefully
+    when the env var is absent so unit-test runs stay green without credentials."""
+    conn = os.getenv("AZURE_TEST_CONNECTION_STRING")
+    if not conn:
+        pytest.skip(
+            "AZURE_TEST_CONNECTION_STRING not set — skipping Azure integration test. "
+            "Export a real connection string to run these tests against Azure."
+        )
+    return conn

@@ -8,8 +8,8 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
-async def shard(azurite_connection_string):
-    s = AzureStorageShard.from_connection_string(azurite_connection_string, shard_index=0)
+async def shard(azure_test_connection_string):
+    s = AzureStorageShard.from_connection_string(azure_test_connection_string, shard_index=0)
     yield s
     await s.close()
 
@@ -58,11 +58,6 @@ async def test_stage_and_commit_blocks(shard):
     assert len(result) == 3 * 1_048_576
 
 
-@pytest.mark.skip(
-    reason="Azurite 3.29.0 returns APINotImplemented for stage_block_from_url; "
-    "helper is correct and works on real Azure. Re-enable against real Azure "
-    "in CI or when Azurite implements the op."
-)
 async def test_put_block_from_url_roundtrip(shard):
     """Server-side copy via put_block_from_url stitches source blobs into destination."""
     await shard.ensure_container("test-ssc")
