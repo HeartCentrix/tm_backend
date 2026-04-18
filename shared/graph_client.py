@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import httpx
-from typing import List, Optional, Dict, Any, Tuple
+from typing import AsyncGenerator, List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 import hashlib
 import time
@@ -33,6 +33,9 @@ class GraphClient:
         self.power_bi_refresh_token = power_bi_refresh_token
         self._access_token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
+        # Per-app token cache for multi-app rotation on paginated endpoints.
+        # Key is client_id; value is (token, expiry_utc).
+        self._multi_token_cache: Dict[str, Tuple[str, datetime]] = {}
 
     @property
     def app_client_id(self) -> str:
@@ -143,6 +146,97 @@ class GraphClient:
         if delta_link:
             result["@odata.deltaLink"] = delta_link
         return result
+
+    async def _get_token_for_app(self, app) -> str:
+        """Fetch a token for a specific AppRegistry and cache it by client_id.
+
+        Enables per-page rotation across multiple app registrations on paginated
+        endpoints (each app has an independent Graph quota → ~Nx throttle headroom).
+        Falls back to normal _get_token() if caller didn't provide an app override.
+        """
+        cached = self._multi_token_cache.get(app.client_id)
+        if cached and datetime.utcnow() < cached[1]:
+            return cached[0]
+        async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT) as client:
+            resp = await client.post(
+                self.TOKEN_URL.format(tenant_id=app.tenant_id),
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": app.client_id,
+                    "client_secret": app.client_secret,
+                    "scope": "https://graph.microsoft.com/.default",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            expires_in = data.get("expires_in", 3600)
+            expiry = datetime.utcnow() + timedelta(seconds=expires_in - 300)
+            self._multi_token_cache[app.client_id] = (data["access_token"], expiry)
+            return data["access_token"]
+
+    async def _iter_pages(
+        self, url: str, params: Optional[Dict] = None, rotate_apps: bool = True,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Streaming variant of _get: yields each page as it arrives.
+
+        Overlaps downstream work (upload/DB) with Graph pagination — callers can
+        flush data mid-iteration instead of waiting for the full response.
+        Preserves 429 Retry-After + timeout retry semantics.
+
+        rotate_apps=True uses multi_app_manager.get_next_app() per request to
+        spread quota across app registrations (no-op when only 1 app is configured).
+        """
+        from shared.multi_app_manager import multi_app_manager
+
+        next_url = url
+        max_retries = 5
+        retry_count = 0
+
+        while next_url:
+            if rotate_apps and multi_app_manager.app_count > 1:
+                app = multi_app_manager.get_next_app()
+                token = await self._get_token_for_app(app)
+                active_client_id = app.client_id
+            else:
+                token = await self._get_token()
+                active_client_id = self.client_id
+
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    if params and params.get("$count") == "true":
+                        headers = {"Authorization": f"Bearer {token}", "ConsistencyLevel": "eventual"}
+                    else:
+                        headers = {"Authorization": f"Bearer {token}"}
+                    resp = await client.get(
+                        next_url, headers=headers,
+                        params=params if not next_url.startswith("http") else None,
+                    )
+
+                    if resp.status_code == 429:
+                        retry_after = int(resp.headers.get("Retry-After", "30"))
+                        multi_app_manager.mark_throttled(active_client_id, retry_after)
+                        if retry_count < max_retries:
+                            retry_count += 1
+                            await asyncio.sleep(retry_after)
+                            continue
+                        resp.raise_for_status()
+
+                    resp.raise_for_status()
+                    data = resp.json()
+                    retry_count = 0
+                    yield data
+
+                    next_url = data.get("@odata.nextLink")
+                    params = None  # params only on the first request
+
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
+                if retry_count < max_retries:
+                    retry_count += 1
+                    wait = min(5 * retry_count, 30)
+                    print(f"[GraphClient] Timeout on {next_url} (attempt {retry_count}/{max_retries}), retrying in {wait}s: {e}")
+                    await asyncio.sleep(wait)
+                    continue
+                raise
 
     async def _post(self, url: str, payload: Dict[str, Any], headers: Optional[Dict] = None) -> Dict[str, Any]:
         """Make authenticated POST request"""
@@ -1414,6 +1508,25 @@ class GraphClient:
             params = {"$top": "50", "$select": self._CHAT_MESSAGE_SELECT}
         # _get already paginates via @odata.nextLink and preserves @odata.deltaLink.
         return await self._get(url, params=params)
+
+    async def iter_all_chat_messages_for_user_delta(
+        self, user_id: str, delta_token: Optional[str] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Streaming counterpart to get_all_chat_messages_for_user_delta.
+
+        Yields one page dict at a time ({"value": [...], "@odata.deltaLink"?, ...}),
+        letting callers pack/flush incrementally instead of buffering every message
+        in RAM before doing any work. Rotates app-registration tokens per page
+        when multi_app_manager has more than one app configured.
+        """
+        if delta_token:
+            url = delta_token
+            params = None
+        else:
+            url = f"{self.GRAPH_URL}/users/{user_id}/chats/getAllMessages/delta"
+            params = {"$top": "50", "$select": self._CHAT_MESSAGE_SELECT}
+        async for page in self._iter_pages(url, params=params):
+            yield page
 
     async def get_chat_messages(self, chat_id: str, delta_token: str = None) -> Dict[str, Any]:
         """
