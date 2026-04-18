@@ -499,6 +499,57 @@ class RestoreWorker:
         spec: Dict
     ) -> Dict:
         """Export items as downloadable ZIP file"""
+        # v2 mail export — feature-flagged. When EXPORT_MAIL_V2_ENABLED is true and
+        # the selected items are all EMAIL type, route to MailExportOrchestrator and
+        # return its result directly — bypasses the legacy in-memory ZIP path that
+        # OOMs at ~2 GB. See docs/superpowers/specs/2026-04-19-mbox-mail-export-design.md.
+        from shared.config import settings as _mail_export_settings
+        if (
+            _mail_export_settings.EXPORT_MAIL_V2_ENABLED
+            and items
+            and all(getattr(it, "item_type", None) == "EMAIL" for it in items)
+        ):
+            from mail_export import MailExportOrchestrator
+            from shared.azure_storage import azure_storage_manager
+            shard = azure_storage_manager.get_default_shard()
+
+            _spec = spec or {}
+            fmt = (_spec.get("exportFormat") or (message or {}).get("exportFormat") or "EML").upper()
+            include_attachments = bool(_spec.get("includeAttachments", True))
+            snapshot_ids = [
+                str(s) for s in (
+                    (message or {}).get("snapshotIds")
+                    or _spec.get("snapshot_ids")
+                    or []
+                )
+            ]
+            job_id = str((message or {}).get("jobId") or (message or {}).get("job_id") or "unknown")
+
+            orch = MailExportOrchestrator(
+                job_id=job_id,
+                snapshot_ids=snapshot_ids,
+                items=items,
+                shard=shard,
+                source_container="mailbox",
+                dest_container="exports",
+                parallelism=_mail_export_settings.EXPORT_PARALLELISM,
+                split_bytes=_mail_export_settings.EXPORT_MBOX_SPLIT_BYTES,
+                block_size=_mail_export_settings.EXPORT_BLOCK_SIZE_BYTES,
+                fetch_batch_size=_mail_export_settings.EXPORT_FETCH_BATCH_SIZE,
+                queue_maxsize=_mail_export_settings.EXPORT_FOLDER_QUEUE_MAXSIZE,
+                format=fmt,
+                include_attachments=include_attachments,
+                manifest=None,
+            )
+            result = await orch.run()
+            return {
+                "exported_count": result["exported_count"],
+                "failed_count": result["failed_count"],
+                "export_type": fmt,
+                "blob_path": result["blob_path"],
+                "manifest": result.get("manifest"),
+            }
+
         zip_buffer = io.BytesIO()
         exported_count = 0
 
