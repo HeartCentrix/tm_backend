@@ -329,6 +329,21 @@ async def startup():
     # Phase 2: Retention cleanup — FLAT/GFS snapshot pruning per SLA policy (daily)
     scheduler.add_job(run_retention_cleanup, "interval", hours=24)
 
+    # Task 26: Delete orphaned export ZIPs older than 1 day (3am UTC daily).
+    # Primary mechanism is Azure lifecycle rule (ops/azure-lifecycle-exports.json);
+    # this is a fallback for envs without lifecycle API access (local Azurite, restricted tenants).
+    async def _exports_cleanup_daily():
+        try:
+            from services.exports_cleanup import cleanup_exports
+            from shared.azure_storage import azure_storage_manager
+            shard = azure_storage_manager.get_default_shard()
+            deleted = await cleanup_exports(shard=shard, container="exports")
+            print(f"[backup-scheduler] exports_cleanup: deleted {len(deleted)} blobs")
+        except Exception as exc:
+            print(f"[backup-scheduler] exports_cleanup failed: {exc}")
+
+    scheduler.add_job(_exports_cleanup_daily, "cron", hour=3, minute=0, timezone="UTC", id="exports_cleanup_daily")
+
     # Round 1.5 — daily retry of FAILED snapshots (one shot, throttled).
     scheduler.add_job(retry_failed_snapshots, "interval", hours=24)
 

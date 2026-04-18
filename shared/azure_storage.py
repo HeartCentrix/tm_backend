@@ -439,6 +439,30 @@ class AzureStorageShard:
         blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
         return blob_client.url
 
+    async def list_blobs(self, container_name: str):
+        """Yield blob names in the container. Async generator — safe to
+        iterate large containers without buffering."""
+        async_client = self.get_async_client()
+        container = async_client.get_container_client(container_name)
+        async for b in container.list_blobs():
+            yield b.name
+
+    async def list_blobs_with_properties(self, container_name: str):
+        """Yield (name, {last_modified, size}) tuples. Used by retention cleanup."""
+        async_client = self.get_async_client()
+        container = async_client.get_container_client(container_name)
+        async for b in container.list_blobs():
+            yield b.name, {"last_modified": b.last_modified, "size": b.size}
+
+    async def delete_blob(self, container_name: str, blob_path: str) -> None:
+        """Idempotent delete. Swallows missing-blob errors."""
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        try:
+            await blob_client.delete_blob()
+        except Exception:
+            pass
+
     async def get_blob_properties(self, container_name: str, blob_path: str) -> Optional[Dict]:
         """Get blob properties including copy status"""
         try:
