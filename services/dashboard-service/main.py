@@ -8,7 +8,7 @@ from fastapi import FastAPI, Depends, Query, HTTPException
 from sqlalchemy import select, func, text, and_, or_
 
 from shared.database import get_db, close_db, AsyncSession, engine
-from shared.models import Resource, Job, JobType, JobStatus, Snapshot, ResourceType, ResourceStatus
+from shared.models import Resource, Job, JobType, JobStatus, Snapshot, SnapshotItem, SnapshotStatus, ResourceType, ResourceStatus, Tenant, TenantType
 
 
 @asynccontextmanager
@@ -63,6 +63,16 @@ M365_RESOURCE_TYPES = {
     ResourceType.TODO,
     ResourceType.ONENOTE,
     ResourceType.DYNAMIC_GROUP,
+    # Tier 2 per-user content types — these hold the actual backup bytes
+    # post-refactor, so they MUST be in this set. Leaving them out
+    # silently zeroed out the M365 filter on the dashboard (backup-size
+    # dropped from 2.5 GB → 18 KB, 24h / 7d job counts dropped to 0).
+    ResourceType.USER_MAIL,
+    ResourceType.USER_ONEDRIVE,
+    ResourceType.USER_CONTACTS,
+    ResourceType.USER_CALENDAR,
+    ResourceType.USER_CHATS,
+    ResourceType.TEAMS_CHAT_EXPORT,
 }
 
 AZURE_RESOURCE_TYPES = {
@@ -152,14 +162,32 @@ async def get_24hour_status(
 
     service_clause = None
     if service_key and service_resource_types:
+        # Two shapes of backup job exist:
+        #   1. Per-resource: Job.resource_id points at a single Resource.
+        #      Match by that resource's type.
+        #   2. Batch (MANUAL_BATCH / USER_ORCHESTRATION): Job.resource_id is
+        #      NULL and batch_resource_ids holds the fan-out. We can't join
+        #      array → resources cheaply, so we match by Tenant.type
+        #      instead — a tenant is either M365 or AZURE, not both, so the
+        #      tenant's type tells us which service bucket the batch belongs
+        #      to. Replaces the old MANUAL_DATASOURCE_{service} label check
+        #      which didn't match the MANUAL_BATCH / USER_ORCHESTRATION
+        #      labels our batch jobs actually carry.
+        service_tenant_type = TenantType.M365 if service_key == "m365" else TenantType.AZURE
         service_clause = or_(
             and_(Job.resource_id.is_not(None), Resource.type.in_(service_resource_types)),
-            and_(Job.resource_id.is_(None), func.json_extract_path_text(Job.spec, "triggered_by") == datasource_batch_trigger_label(service_key)),
+            and_(Job.resource_id.is_(None), Tenant.type == service_tenant_type),
         )
 
-    success_stmt = select(func.count()).select_from(Job).outerjoin(Resource, Job.resource_id == Resource.id)
-    warning_stmt = select(func.count()).select_from(Job).outerjoin(Resource, Job.resource_id == Resource.id)
-    failure_stmt = select(func.count()).select_from(Job).outerjoin(Resource, Job.resource_id == Resource.id)
+    success_stmt = (select(func.count()).select_from(Job)
+        .outerjoin(Resource, Job.resource_id == Resource.id)
+        .outerjoin(Tenant, Job.tenant_id == Tenant.id))
+    warning_stmt = (select(func.count()).select_from(Job)
+        .outerjoin(Resource, Job.resource_id == Resource.id)
+        .outerjoin(Tenant, Job.tenant_id == Tenant.id))
+    failure_stmt = (select(func.count()).select_from(Job)
+        .outerjoin(Resource, Job.resource_id == Resource.id)
+        .outerjoin(Tenant, Job.tenant_id == Tenant.id))
 
     if service_clause is not None:
         success_stmt = success_stmt.where(service_clause)
@@ -197,15 +225,17 @@ async def get_7day_status(
         )
         .select_from(Job)
         .outerjoin(Resource, Job.resource_id == Resource.id)
+        .outerjoin(Tenant, Job.tenant_id == Tenant.id)
         .where(*filters)
         .group_by(func.date(Job.created_at))
         .order_by(func.date(Job.created_at))
     )
     if service_key and service_resource_types:
+        service_tenant_type = TenantType.M365 if service_key == "m365" else TenantType.AZURE
         stmt = stmt.where(
             or_(
                 and_(Job.resource_id.is_not(None), Resource.type.in_(service_resource_types)),
-                and_(Job.resource_id.is_(None), func.json_extract_path_text(Job.spec, "triggered_by") == datasource_batch_trigger_label(service_key)),
+                and_(Job.resource_id.is_(None), Tenant.type == service_tenant_type),
             )
         )
     result = await db.execute(stmt)

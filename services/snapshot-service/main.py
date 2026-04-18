@@ -152,9 +152,21 @@ async def list_snapshots(
     resource_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1),
+    include_children: bool = Query(False, description="Also include snapshots of child resources (Tier 2 USER_MAIL/ONEDRIVE/etc. under an ENTRA_USER parent). Needed so the Recovery sparkline can plot the actual content bytes instead of the parent's tiny metadata row."),
     db: AsyncSession = Depends(get_db),
 ):
-    filters = [Snapshot.resource_id == UUID(resource_id)]
+    # Build the set of resource IDs whose snapshots we want. By default
+    # just the requested resource; with include_children=true we also
+    # pull the children linked via parent_resource_id (the Tier 2 fan-out
+    # from ENTRA_USER).
+    target_ids = [UUID(resource_id)]
+    if include_children:
+        child_rows = (await db.execute(
+            select(Resource.id).where(Resource.parent_resource_id == UUID(resource_id))
+        )).all()
+        target_ids.extend(r[0] for r in child_rows)
+
+    filters = [Snapshot.resource_id.in_(target_ids)]
     total = (await db.execute(select(func.count(Snapshot.id)).where(*filters))).scalar() or 0
     stmt = select(Snapshot).where(*filters).order_by(Snapshot.created_at.desc()).offset((page-1)*size).limit(size)
     result = await db.execute(stmt)
