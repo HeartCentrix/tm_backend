@@ -381,6 +381,64 @@ class AzureStorageShard:
                 for i in range(0, len(chunk), chunk_size):
                     yield chunk[i : i + chunk_size]
 
+    async def stage_block(
+        self,
+        container_name: str,
+        blob_path: str,
+        block_id: str,
+        data: bytes,
+    ) -> None:
+        """Stage a single block for a BlockBlob. Block IDs must be base64-encoded
+        strings of equal length — we accept the plain string and let the SDK encode."""
+        import base64
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        encoded = base64.b64encode(block_id.encode("ascii").ljust(16, b"=")).decode("ascii")
+        await blob_client.stage_block(block_id=encoded, data=data)
+
+    async def commit_block_list_manual(
+        self,
+        container_name: str,
+        blob_path: str,
+        block_ids: list,
+        metadata: dict = None,
+    ) -> None:
+        """Commit previously-staged blocks in the given order."""
+        import base64
+        from azure.storage.blob import BlobBlock
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        blocks = [
+            BlobBlock(block_id=base64.b64encode(bid.encode("ascii").ljust(16, b"=")).decode("ascii"))
+            for bid in block_ids
+        ]
+        await blob_client.commit_block_list(blocks, metadata=metadata)
+
+    async def put_block_from_url(
+        self,
+        container_name: str,
+        blob_path: str,
+        block_id: str,
+        source_url: str,
+    ) -> None:
+        """Stage a block by copying bytes server-side from another blob URL.
+        Zero bytes traverse the worker. Used for final ZIP assembly to stitch
+        per-folder MBOX blobs without re-downloading."""
+        import base64
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        encoded = base64.b64encode(block_id.encode("ascii").ljust(16, b"=")).decode("ascii")
+        await blob_client.stage_block_from_url(block_id=encoded, source_url=source_url)
+
+    async def get_blob_url(self, container_name: str, blob_path: str) -> str:
+        """Return a full URL for a blob. Used as source_url input to put_block_from_url.
+        In Azurite + account-key mode the raw URL is authenticated by shared-key
+        headers on the server side; SAS-authenticated URLs come from a dedicated
+        helper added later (Task 27)."""
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        return blob_client.url
+
     async def get_blob_properties(self, container_name: str, blob_path: str) -> Optional[Dict]:
         """Get blob properties including copy status"""
         try:
