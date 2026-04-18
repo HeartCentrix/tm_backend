@@ -100,6 +100,12 @@ services:
     env_file: .env
     environment:
       DB_HOST: postgres
+      # Manual discovery triggered from Protection/Tenant pages runs
+      # here too — needs cert access for the SharePoint admin API.
+      SHAREPOINT_CERT_PATH: ${SHAREPOINT_CERT_PATH:-/app/secrets/sharepoint_auth.pem}
+      SHAREPOINT_CERT_THUMBPRINT: ${SHAREPOINT_CERT_THUMBPRINT:-}
+    volumes:
+      - ../secrets:/app/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -202,6 +208,12 @@ services:
       RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
       RABBITMQ_USER: ${RABBITMQ_USER:-guest}
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      # SharePoint admin API requires a cert-signed JWT. Same setup as
+      # backup-worker — see secrets/sharepoint_auth.pem.
+      SHAREPOINT_CERT_PATH: ${SHAREPOINT_CERT_PATH:-/app/secrets/sharepoint_auth.pem}
+      SHAREPOINT_CERT_THUMBPRINT: ${SHAREPOINT_CERT_THUMBPRINT:-}
+    volumes:
+      - ../secrets:/app/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -287,6 +299,20 @@ services:
       APP_3_TENANT_ID: ${APP_3_TENANT_ID:-}
       AZURE_AD_CLIENT_ID: ${AZURE_AD_CLIENT_ID}
       AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
+      # Cert-based auth for SharePoint REST. Optional — falls back to
+      # the client-secret path when unset (Graph works, SP REST 401s
+      # with "Unsupported app only token"). See
+      # scripts/generate_sharepoint_cert.py + secrets/.
+      SHAREPOINT_CERT_PATH: ${SHAREPOINT_CERT_PATH:-/app/secrets/sharepoint_auth.pem}
+      SHAREPOINT_CERT_THUMBPRINT: ${SHAREPOINT_CERT_THUMBPRINT:-}
+    volumes:
+      # Bind-mount the generated cert in read-only. The secrets/ dir
+      # lives one level above the backend (sibling of tm_backend/) so
+      # private keys and certs don't get dragged into the backend image
+      # or accidentally committed with backend code. For Railway/prod,
+      # set SHAREPOINT_CERT_PEM_B64 on the service env instead and drop
+      # this mount.
+      - ../secrets:/app/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy

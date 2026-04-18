@@ -194,6 +194,13 @@ async def resources_with_backups(request: Request):
     return await proxy_request("snapshot", request.url.path, request)
 
 
+@app.get("/api/v1/resources/{resource_id}/subsites")
+async def resource_subsites(request: Request):
+    # Live SharePoint subsite listing for the Recovery page's Subsites
+    # panel. Handled by tenant-service because it has Graph auth wired.
+    return await proxy_request("tenant", request.url.path, request)
+
+
 @app.get("/api/v1/resources")
 @app.get("/api/v1/resources/search")
 @app.get("/api/v1/resources/by-type")
