@@ -512,7 +512,11 @@ class BackupWorker:
                     import httpx as _httpx
                     mail_token = await graph_client._get_token()
                     PAGE_SIZE = 50
-                    MAX_PAGES = 20  # ~1000 messages hard cap per run
+                    # Unbounded pagination — follow @odata.nextLink until
+                    # Graph returns no more. Huge-but-finite `MAX_PAGES`
+                    # is an emergency-brake against a Graph bug that
+                    # might keep handing out nextLinks indefinitely.
+                    MAX_PAGES = 10000
                     out = []
                     next_url = f"{graph_client.GRAPH_URL}/users/{user_id}/messages"
                     params = {
@@ -554,8 +558,6 @@ class BackupWorker:
                                 ))
                             next_url = page.get("@odata.nextLink")
                             pages_done += 1
-                            if len(out) >= ITEM_LIMIT * 5:
-                                break  # safety cap
                     return out
 
                 if kind == "USER_ONEDRIVE":
@@ -569,7 +571,7 @@ class BackupWorker:
                     out = []
                     next_url = f"{graph_client.GRAPH_URL}/drives/{drive_id}/root/delta"
                     pages_seen = 0
-                    while next_url and len(out) < ITEM_LIMIT * 5:  # safety cap
+                    while next_url:
                         page = await graph_client._get(next_url, params={"$top": "200"} if pages_seen == 0 else None)
                         for f in page.get("value", []):
                             # Skip the root folder itself (no name / no parentReference).
@@ -584,8 +586,8 @@ class BackupWorker:
                             out.append(("ONEDRIVE_FILE", f.get("name") or "(unnamed)", f.get("id"), {"raw": f}, clean))
                         next_url = page.get("@odata.nextLink")
                         pages_seen += 1
-                        if pages_seen > 20:
-                            break
+                        if pages_seen > 10000:
+                            break  # runaway guard, not an intentional cap
                     return out
 
                 if kind == "USER_CONTACTS":
@@ -723,8 +725,14 @@ class BackupWorker:
                     # across ALL the user's chats with real pagination —
                     # we bucket by chatId client-side using chat_meta.
                     chat_token = await graph_client._get_token()
+                    # Unbounded: follow @odata.nextLink until Graph stops
+                    # handing out a nextLink. No intentional message cap —
+                    # the huge-but-finite MAX_PAGES is just a runaway
+                    # guard against a Graph bug that could otherwise keep
+                    # paginating forever. 10k × 50 = 500k, which is
+                    # comfortably more than any real user will have.
                     PAGE_SIZE = 50
-                    MAX_PAGES = 100       # safety cap: 100 × 50 = 5000 msgs / run
+                    MAX_PAGES = 10000
                     all_msgs: List[Dict[str, Any]] = []
                     next_url: Optional[str] = (
                         f"{graph_client.GRAPH_URL}/users/{user_id}/chats/getAllMessages"
