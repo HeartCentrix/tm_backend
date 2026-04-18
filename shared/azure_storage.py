@@ -336,6 +336,51 @@ class AzureStorageShard:
         except ResourceNotFoundError:
             return None
 
+    @classmethod
+    def from_connection_string(cls, connection_string: str, shard_index: int = 0):
+        """Construct a shard from an Azure connection string (used by tests + Azurite)."""
+        instance = cls.__new__(cls)
+        instance.shard_index = shard_index
+        instance._async_client = AsyncBlobServiceClient.from_connection_string(connection_string)
+        instance._sync_client = None
+        instance.account_name = "devstoreaccount1"
+        return instance
+
+    async def ensure_container(self, container_name: str) -> None:
+        """Create container if it does not exist. Idempotent. Public alias for _ensure_container."""
+        await self._ensure_container(container_name)
+
+    async def close(self) -> None:
+        """Dispose the async Azure client."""
+        if getattr(self, "_async_client", None):
+            await self._async_client.close()
+            self._async_client = None
+
+    async def download_blob_stream(
+        self,
+        container_name: str,
+        blob_path: str,
+        chunk_size: int = 4 * 1024 * 1024,
+    ):
+        """Stream a blob's bytes as async chunks. Yields nothing if blob missing.
+
+        Used by mail-export to pipe attachment bytes into the MIME base64 encoder
+        without loading the full attachment into RAM. Essential for production-grade
+        export — a single referenceAttachment can be 150 MB and we'd OOM with readall.
+        """
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        try:
+            stream = await blob_client.download_blob()
+        except ResourceNotFoundError:
+            return
+        async for chunk in stream.chunks():
+            if len(chunk) <= chunk_size:
+                yield chunk
+            else:
+                for i in range(0, len(chunk), chunk_size):
+                    yield chunk[i : i + chunk_size]
+
     async def get_blob_properties(self, container_name: str, blob_path: str) -> Optional[Dict]:
         """Get blob properties including copy status"""
         try:
