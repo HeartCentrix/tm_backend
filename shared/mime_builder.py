@@ -111,3 +111,72 @@ def build_eml(graph_msg: dict, attachments: Iterable[AttachmentRef]) -> bytes:
         )
 
     return bytes(msg)
+
+
+async def build_eml_streaming(
+    graph_msg: dict,
+    attachments: Iterable[AttachmentRef],
+) -> AsyncIterator[bytes]:
+    """Stream EML bytes chunk-by-chunk. Attachments with a `data_stream` are
+    base64-encoded on the fly — no attachment materializes fully in RAM."""
+
+    headers_msg = EmailMessage(policy=SMTP)
+    headers_msg["Subject"] = graph_msg.get("subject") or ""
+    sender = graph_msg.get("from") or graph_msg.get("sender") or {}
+    headers_msg["From"] = _format_addr(sender)
+    headers_msg["To"] = _format_addr_list(graph_msg.get("toRecipients"))
+    cc = _format_addr_list(graph_msg.get("ccRecipients"))
+    if cc:
+        headers_msg["Cc"] = cc
+    sent = _parse_date(graph_msg.get("sentDateTime") or graph_msg.get("receivedDateTime"))
+    if sent:
+        headers_msg["Date"] = format_datetime(sent)
+    imi = graph_msg.get("internetMessageId")
+    if imi:
+        headers_msg["Message-ID"] = imi
+
+    import uuid as _uuid
+    boundary = f"----=_Part_{_uuid.uuid4().hex}"
+    headers_msg["MIME-Version"] = "1.0"
+    headers_msg["Content-Type"] = f'multipart/mixed; boundary="{boundary}"'
+
+    header_bytes = headers_msg.as_bytes(policy=SMTP).rstrip(b"\r\n") + b"\r\n\r\n"
+    yield header_bytes
+
+    body = graph_msg.get("body") or {}
+    body_content = (body.get("content") or "").encode("utf-8")
+    body_type = (body.get("contentType") or "text").lower()
+    ctype = "text/html" if body_type == "html" else "text/plain"
+
+    yield (
+        f"--{boundary}\r\n"
+        f"Content-Type: {ctype}; charset=utf-8\r\n"
+        f"Content-Transfer-Encoding: base64\r\n\r\n"
+    ).encode("ascii")
+    yield base64.b64encode(body_content) + b"\r\n"
+
+    for att in attachments:
+        maintype_sub = att.content_type or "application/octet-stream"
+        yield (
+            f"--{boundary}\r\n"
+            f"Content-Type: {maintype_sub}\r\n"
+            f"Content-Transfer-Encoding: base64\r\n"
+            f'Content-Disposition: attachment; filename="{att.name}"\r\n\r\n'
+        ).encode("ascii")
+
+        if att.data_bytes is not None:
+            yield base64.b64encode(att.data_bytes) + b"\r\n"
+        elif att.data_stream is not None:
+            buf = bytearray()
+            async for chunk in att.data_stream:
+                buf.extend(chunk)
+                cut = (len(buf) // 57) * 57
+                if cut:
+                    yield base64.b64encode(bytes(buf[:cut])) + b"\r\n"
+                    del buf[:cut]
+            if buf:
+                yield base64.b64encode(bytes(buf)) + b"\r\n"
+        else:
+            raise ValueError(f"AttachmentRef {att.name} has no data")
+
+    yield f"--{boundary}--\r\n".encode("ascii")
