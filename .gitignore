@@ -37,7 +37,7 @@ ENV/
 # Logs
 *.log
 logs/
-
+.env.railway.bak
 # Testing
 .pytest_cache/
 .coverage
