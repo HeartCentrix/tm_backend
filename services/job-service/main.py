@@ -759,6 +759,13 @@ async def get_restore_history(page: int = 1, size: int = 50, db: AsyncSession = 
 
 @app.post("/api/v1/jobs/export")
 async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
+    """Queue an export job: persist the Job row, publish to RabbitMQ so
+    the restore-worker picks it up, and fire an EXPORT_TRIGGERED audit.
+
+    Scope fields (tenant_id / resource_id / resource_type) are derived by
+    walking snapshot → resource in the DB rather than trusting whatever
+    the frontend happened to send on the request body — gives us reliable
+    audit scoping even when the caller omits those fields."""
     restore_type = request.get("restoreType", "EXPORT_ZIP")
     snapshot_ids = request.get("snapshotIds", [])
     item_ids = request.get("itemIds", [])
@@ -804,6 +811,10 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
     await db.commit()  # commit before publish so worker finds job
 
     if settings.RABBITMQ_ENABLED:
+        # Reuse the restore pipeline: restore-worker already has EXPORT_ZIP,
+        # EXPORT_PST, and DOWNLOAD handlers routed off its restore queues.
+        # Publishing here means the dedicated export.normal queue stays
+        # unused, which matches what the code actually supports today.
         restore_message = create_restore_message(
             job_id=str(job.id),
             restore_type=restore_type,
@@ -818,6 +829,32 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
         await message_bus.publish(queue, restore_message, priority=restore_message.get("priority", 5))
     else:
         print(f"[JOB_SERVICE] RabbitMQ not enabled, export job {job.id} will stay QUEUED")
+
+    # Audit: EXPORT_TRIGGERED — captures who exported what, when, and which
+    # items/snapshots are in scope so the trail is reconstructable for
+    # compliance review. Non-blocking: if audit-service is down we don't
+    # fail the export itself.
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=5.0) as _c:
+            await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
+                "action": "EXPORT_TRIGGERED",
+                "tenant_id": tenant_id,
+                "actor_type": "USER",
+                "resource_id": resource_id,
+                "resource_type": resource_type,
+                "outcome": "SUCCESS",
+                "job_id": str(job.id),
+                "details": {
+                    "restoreType": restore_type,
+                    "snapshotIds": snapshot_ids,
+                    "itemIds": item_ids,
+                    "itemCount": len(item_ids),
+                    "snapshotCount": len(snapshot_ids),
+                },
+            })
+    except Exception:
+        pass
 
     return {"jobId": str(job.id)}
 
@@ -871,6 +908,36 @@ async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Export blob not found in storage")
 
     fname = blob_path.rsplit("/", 1)[-1] or f"export_{job_id}.zip"
+
+    # Audit: EXPORT_DOWNLOADED — records the user actually pulled the built
+    # zip (distinct from EXPORT_TRIGGERED, which only records the request).
+    # Spec carries the original restoreType + items so the audit trail
+    # matches what was queued earlier.
+    try:
+        import httpx as _httpx
+        spec = job.spec or {}
+        async with _httpx.AsyncClient(timeout=5.0) as _c:
+            await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
+                "action": "EXPORT_DOWNLOADED",
+                "tenant_id": str(job.tenant_id) if job.tenant_id else spec.get("tenantId"),
+                "actor_type": "USER",
+                "resource_id": str(job.resource_id) if job.resource_id else spec.get("resourceId"),
+                "resource_type": spec.get("resourceType"),
+                "outcome": "SUCCESS",
+                "job_id": str(job.id),
+                "details": {
+                    "blobPath": blob_path,
+                    "filename": fname,
+                    "byteSize": len(content),
+                    "restoreType": spec.get("restoreType") or "EXPORT_ZIP",
+                    "snapshotIds": spec.get("snapshotIds") or [],
+                    "itemIds": spec.get("itemIds") or [],
+                    "itemCount": len(spec.get("itemIds") or []),
+                },
+            })
+    except Exception:
+        pass
+
     return StreamingResponse(
         iter([content]),
         media_type="application/zip",

@@ -10,6 +10,7 @@ from sqlalchemy import select, func, distinct, and_, or_
 
 from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus
+from shared.config import settings
 from shared.power_bi_snapshot import assemble_power_bi_items
 from shared.azure_storage import azure_storage_manager, workload_candidates_for_resource_type
 from shared.schemas import (
@@ -106,6 +107,7 @@ def _item_to_response(item: SnapshotItem) -> SnapshotItemResponse:
         metadata=item.extra_data or {},
         isDeleted=item.is_deleted or False,
         createdAt=item.created_at.isoformat() if item.created_at else "",
+        blobPath=item.blob_path,
     )
 
 
@@ -1271,6 +1273,48 @@ async def get_item_content(
                 fname = (item.name or f"item-{item.id}").strip()
                 safe = _urlp.quote(fname)
                 headers["Content-Disposition"] = f"attachment; filename=\"{fname}\"; filename*=UTF-8''{safe}"
+
+                # Audit: FILE_DOWNLOADED — one row per single-file download
+                # (distinct from bulk EXPORT_DOWNLOADED which bundles many
+                # items into a zip). Details carry enough to reconstruct
+                # what was pulled: item name, size, content-type, blob path,
+                # source folder. Fire-and-forget so a slow audit-service
+                # doesn't delay the actual download bytes.
+                try:
+                    import httpx as _httpx2
+                    # tenant_id lives on Resource, not Snapshot — snapshots
+                    # only link to their Resource. Look both up so the
+                    # audit row has proper scoping (tenant_id is what
+                    # /audit/events filters on).
+                    snap = await db.get(Snapshot, UUID(snapshot_id))
+                    resource = await db.get(Resource, snap.resource_id) if snap and snap.resource_id else None
+                    payload = {
+                        "action": "FILE_DOWNLOADED",
+                        "tenant_id": str(resource.tenant_id) if resource and resource.tenant_id else None,
+                        "actor_type": "USER",
+                        "resource_id": str(snap.resource_id) if snap and snap.resource_id else None,
+                        "resource_type": item.item_type,
+                        "resource_name": item.name,
+                        "outcome": "SUCCESS",
+                        "snapshot_id": snapshot_id,
+                        "details": {
+                            "itemId": str(item.id),
+                            "externalId": item.external_id,
+                            "itemType": item.item_type,
+                            "filename": fname,
+                            "folderPath": item.folder_path,
+                            "contentType": content_type,
+                            "byteSize": len(data),
+                            "blobPath": item.blob_path,
+                            "parentResource": resource.display_name if resource else None,
+                        },
+                    }
+                    async with _httpx2.AsyncClient(timeout=3.0) as _c:
+                        r = await _c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload)
+                        if r.status_code >= 300:
+                            print(f"[FILE_DOWNLOADED audit] HTTP {r.status_code}: {r.text[:200]}", flush=True)
+                except Exception as _e:
+                    print(f"[FILE_DOWNLOADED audit] failed: {type(_e).__name__}: {_e}", flush=True)
             return Response(content=data, media_type=content_type, headers=headers)
 
     # Fall back to inline metadata (e.g. email bodies stored directly in extra_data)

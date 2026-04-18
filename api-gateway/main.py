@@ -79,10 +79,32 @@ async def proxy_request(service: str, path: str, request: Request, timeout: http
                 timeout=timeout,
             )
 
+            # Forward response headers the browser actually needs —
+            # Content-Disposition is critical for downloads (browser uses
+            # it to pick the saved filename). Skip hop-by-hop and
+            # connection-managed headers that httpx/uvicorn will compute
+            # themselves so we don't double-set them.
+            _skip = {
+                "content-type",  # set via media_type below
+                "content-length",
+                "transfer-encoding",
+                "connection",
+                "keep-alive",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "te",
+                "trailers",
+                "upgrade",
+            }
+            forward_headers = {
+                k: v for k, v in response.headers.items()
+                if k.lower() not in _skip
+            }
             return Response(
                 content=response.content,
                 status_code=response.status_code,
                 media_type=response.headers.get("content-type", "application/json"),
+                headers=forward_headers,
             )
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
             last_error = e
