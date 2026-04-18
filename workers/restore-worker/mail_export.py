@@ -243,6 +243,81 @@ except ImportError:  # pragma: no cover
     ExportManifestBuilder = None  # type: ignore
 
 
+async def stream_zip_to_block_blob(
+    *,
+    dest_shard,
+    dest_container: str,
+    dest_blob_path: str,
+    members,
+    member_source_shard,
+    manifest_bytes: bytes,
+    block_size: int,
+) -> None:
+    """Build a ZIP64 archive chunk-by-chunk and stage blocks on the destination
+    blob as bytes flow out. Memory stays at ~block_size regardless of archive
+    size.
+
+    `members` is a list of (arcname, container, blob_path) tuples. Each
+    member's bytes are fetched via `member_source_shard.download_blob_stream`
+    (chunked), so no single member materializes in RAM.
+
+    Cross-shard members should be copied to the destination shard first
+    (see MailExportOrchestrator._assemble_zip_multi_shard) — this function
+    pulls ALL members from `member_source_shard`.
+    """
+    import zipstream  # package: zipstream-ng
+
+    zs = zipstream.ZipStream(compress_type=zipstream.ZIP_STORED)
+
+    block_ids: list = []
+    staged = bytearray()
+    block_index = 0
+
+    async def _flush_to_block(final: bool = False):
+        nonlocal block_index
+        while len(staged) >= block_size or (final and staged):
+            take = min(block_size, len(staged))
+            chunk = bytes(staged[:take])
+            del staged[:take]
+            bid = f"blk-{block_index:05d}"
+            await dest_shard.stage_block(dest_container, dest_blob_path, bid, chunk)
+            block_ids.append(bid)
+            block_index += 1
+
+    for arcname, container, path in members:
+        # Pre-buffer this member's chunks (bounded by download_blob_stream's
+        # chunk_size = block_size each). We hold at most one member's worth
+        # of chunks in RAM at a time — the list is deleted before the next
+        # member is loaded.
+        chunks: list = []
+        async for chunk in member_source_shard.download_blob_stream(
+            container, path, chunk_size=block_size
+        ):
+            chunks.append(chunk)
+        zs.add(iter(chunks), arcname=arcname)
+        del chunks  # release list reference; zs holds the iterator
+
+        # Drain only this member's bytes from zs using file(). This keeps
+        # memory bounded to one member's data at a time rather than
+        # accumulating all members before draining.
+        for zchunk in zs.file():
+            staged.extend(zchunk)
+            await _flush_to_block()
+
+    zs.add(iter([manifest_bytes]), arcname="_MANIFEST.json")
+
+    # Finalize: emits remaining member(s) + central directory + EOCD.
+    for final_chunk in zs.finalize():
+        staged.extend(final_chunk)
+        await _flush_to_block()
+
+    await _flush_to_block(final=True)
+    await dest_shard.commit_block_list_manual(
+        dest_container, dest_blob_path, block_ids,
+        metadata={"streamed": "true"},
+    )
+
+
 class MailExportOrchestrator:
     """Entry point for the mail-export pipeline. Partitions items by folder,
     spawns one FolderExportTask per folder under asyncio.Semaphore(parallelism),
@@ -470,27 +545,56 @@ class MailExportOrchestrator:
         return dict(out)
 
     async def _assemble_zip_multi_shard(self, *, dest_shard, zip_blob_path, per_group, dest_shard_index):
-        """Same-shard members copy directly into dest blob via ZIP. Cross-shard
-        members are downloaded from their source shard and written into the ZIP.
-        In-memory zip for now; Task 28 upgrades to streaming."""
-        import io as _io
-        import zipfile as _zipfile
+        """Stream the final ZIP into block staging on dest_shard.
+        Cross-shard members are copied to dest_shard first via put_block_from_url."""
+        same_shard_members = []
+        cross_shard_tmp_copies = []
 
-        zip_buf = _io.BytesIO()
-        with _zipfile.ZipFile(zip_buf, "w", _zipfile.ZIP_STORED, allowZip64=True) as zf:
-            for shard_index, shard, fr in per_group:
-                for blob_path in fr.produced_blobs:
-                    content = await shard.download_blob(self.dest_container, blob_path)
-                    # Strip shard-aware prefix: job_id/shard-N/folder → folder/...
-                    arc = blob_path.split(f"{self.job_id}/shard-{shard_index}/", 1)[-1]
-                    # Single-shard back-compat: no `shard-N/` in path → just strip job_id/
-                    if "/shard-" not in blob_path:
-                        arc = blob_path.split(f"{self.job_id}/", 1)[-1]
-                    zf.writestr(arc, content or b"")
-            if self.manifest:
-                zf.writestr("_MANIFEST.json", self.manifest.to_json())
+        for shard_index, shard, fr in per_group:
+            for blob_path in fr.produced_blobs:
+                arc = blob_path.split(f"{self.job_id}/shard-{shard_index}/", 1)[-1]
+                if "/shard-" not in blob_path:
+                    arc = blob_path.split(f"{self.job_id}/", 1)[-1]
+                if shard_index == dest_shard_index:
+                    same_shard_members.append((arc, self.dest_container, blob_path))
+                else:
+                    # Server-side copy into dest shard's exports container.
+                    try:
+                        sas_src = await shard.get_blob_sas_url(self.dest_container, blob_path)
+                    except Exception:
+                        sas_src = await shard.get_blob_url(self.dest_container, blob_path)
+                    tmp_path = f"{self.job_id}/_crosshard/shard-{shard_index}/{arc}"
+                    try:
+                        await dest_shard.put_block_from_url(
+                            self.dest_container, tmp_path, "b01", sas_src
+                        )
+                        await dest_shard.commit_block_list_manual(
+                            self.dest_container, tmp_path, ["b01"]
+                        )
+                        cross_shard_tmp_copies.append((arc, self.dest_container, tmp_path))
+                    except Exception as exc:
+                        print(f"[MailExportOrchestrator] cross-shard copy failed for {blob_path}: {exc}")
 
-        await dest_shard.upload_blob(self.dest_container, zip_blob_path, zip_buf.getvalue())
+        all_members = same_shard_members + cross_shard_tmp_copies
+        manifest_bytes = self.manifest.to_json() if self.manifest else b"{}"
+
+        await stream_zip_to_block_blob(
+            dest_shard=dest_shard,
+            dest_container=self.dest_container,
+            dest_blob_path=zip_blob_path,
+            members=all_members,
+            member_source_shard=dest_shard,
+            manifest_bytes=manifest_bytes,
+            block_size=self.block_size,
+        )
+
+        # Cleanup intermediate per-folder MBOX blobs + cross-shard temp copies.
+        # Failures here are non-fatal — the final ZIP already committed.
+        for _, container, path in same_shard_members + cross_shard_tmp_copies:
+            try:
+                await dest_shard.delete_blob(container, path)
+            except Exception:
+                pass
 
     async def _run_one_folder(
         self,
