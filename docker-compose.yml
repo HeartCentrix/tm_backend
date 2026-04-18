@@ -57,6 +57,18 @@ services:
     networks:
       - tm-network
 
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.29.0
+    container_name: tm_vault_azurite
+    command: "azurite-blob --blobHost 0.0.0.0 --loose"
+    ports:
+      - "10000:10000"
+    volumes:
+      - azurite_data:/data
+    profiles:
+      - test
+    restart: unless-stopped
+
   api-gateway:
     build:
       context: .
@@ -459,6 +471,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  azurite_data:
 
 networks:
   tm-network:
