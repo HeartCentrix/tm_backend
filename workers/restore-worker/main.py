@@ -531,6 +531,29 @@ class RestoreWorker:
             ]
             job_id = str((message or {}).get("jobId") or (message or {}).get("job_id") or "unknown")
 
+            # Task 24 — resumable exports: pull prior checkpoint from Job.result
+            # and install a persister that writes back after each folder completes.
+            import uuid as _uuid
+            from shared.models import Job as _Job
+
+            async def _load_checkpoint():
+                async with async_session_factory() as s:
+                    j = await s.get(_Job, _uuid.UUID(job_id))
+                    if j and isinstance(j.result, dict):
+                        return j.result.get("checkpoint")
+                    return None
+
+            async def _persist_cp(cp_dict):
+                async with async_session_factory() as s:
+                    j = await s.get(_Job, _uuid.UUID(job_id))
+                    if j:
+                        r = dict(j.result or {})
+                        r["checkpoint"] = cp_dict
+                        j.result = r
+                        await s.commit()
+
+            prior_checkpoint = await _load_checkpoint()
+
             orch = MailExportOrchestrator(
                 job_id=job_id,
                 snapshot_ids=snapshot_ids,
@@ -546,6 +569,8 @@ class RestoreWorker:
                 format=fmt,
                 include_attachments=include_attachments,
                 manifest=None,
+                checkpoint=prior_checkpoint,
+                persist_checkpoint=_persist_cp,
             )
             async with self._export_semaphore:
                 result = await orch.run()

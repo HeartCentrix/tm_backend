@@ -268,6 +268,8 @@ class MailExportOrchestrator:
         format: str,
         include_attachments: bool,
         manifest: Optional["ExportManifestBuilder"] = None,
+        checkpoint: Optional[dict] = None,
+        persist_checkpoint=None,  # async callable(dict) — e.g. update Job.result in DB
     ):
         self.job_id = job_id
         self.snapshot_ids = snapshot_ids
@@ -287,6 +289,8 @@ class MailExportOrchestrator:
             if ExportManifestBuilder
             else None
         )
+        self.checkpoint = dict(checkpoint or {"completed_folders": [], "produced_blobs": {}})
+        self.persist_checkpoint = persist_checkpoint
 
     def preflight(self) -> List[str]:
         """M5 — warn if total export size is pathologically large."""
@@ -326,11 +330,40 @@ class MailExportOrchestrator:
 
         try:
             folders = self._partition_by_folder()
+            completed = set(self.checkpoint.get("completed_folders", []))
+            remaining = {k: v for k, v in folders.items() if k not in completed}
             sem = asyncio.Semaphore(self.parallelism)
-            folder_results = await asyncio.gather(
-                *(self._run_one_folder(sem, folder_name, folder_items)
-                  for folder_name, folder_items in folders.items())
+
+            async def _run_and_persist(folder_name, folder_items):
+                result = await self._run_one_folder(sem, folder_name, folder_items)
+                # Update checkpoint after each folder so resume-after-crash is granular.
+                cp_folders = list(self.checkpoint.get("completed_folders", []))
+                cp_blobs = dict(self.checkpoint.get("produced_blobs", {}))
+                if folder_name not in cp_folders:
+                    cp_folders.append(folder_name)
+                cp_blobs[folder_name] = list(result.produced_blobs)
+                self.checkpoint["completed_folders"] = cp_folders
+                self.checkpoint["produced_blobs"] = cp_blobs
+                if self.persist_checkpoint:
+                    try:
+                        await self.persist_checkpoint(dict(self.checkpoint))
+                    except Exception as exc:
+                        print(f"[MailExportOrchestrator] checkpoint persist failed (non-fatal): {exc}")
+                return result
+
+            new_folder_results = await asyncio.gather(
+                *(_run_and_persist(fn, fi) for fn, fi in remaining.items())
             )
+
+            # Rebuild full folder_results list for ZIP assembly — include prior
+            # folders whose blobs were written in earlier attempts.
+            folder_results: List[FolderExportResult] = list(new_folder_results)
+            done_folder_names = {fr.folder_name for fr in new_folder_results}
+            for prior_folder, prior_blobs in self.checkpoint.get("produced_blobs", {}).items():
+                if prior_folder not in done_folder_names:
+                    rec = FolderExportResult(folder_name=prior_folder)
+                    rec.produced_blobs = list(prior_blobs)
+                    folder_results.append(rec)
 
             zip_blob_path = f"{self.job_id}/export_{int(time.time())}.zip"
             await self._assemble_zip(zip_blob_path, folder_results)
@@ -342,11 +375,12 @@ class MailExportOrchestrator:
 
             return {
                 "blob_path": zip_blob_path,
-                "exported_count": self.manifest.exported_count if self.manifest else sum(fr.exported_count for fr in folder_results),
-                "failed_count": self.manifest.failed_count if self.manifest else sum(len(fr.failed_items) for fr in folder_results),
+                "exported_count": self.manifest.exported_count if self.manifest else sum(fr.exported_count for fr in new_folder_results),
+                "failed_count": self.manifest.failed_count if self.manifest else sum(len(fr.failed_items) for fr in new_folder_results),
                 "folder_count": len(folders),
                 "status": status,
                 "manifest": json.loads(self.manifest.to_json().decode("utf-8")) if self.manifest else None,
+                "checkpoint": dict(self.checkpoint),
             }
         finally:
             await monitor.stop()

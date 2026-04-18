@@ -128,3 +128,45 @@ async def test_preflight_logs_warning_for_huge_export():
     )
     warnings = orch.preflight()
     assert any("large export" in w for w in warnings)
+
+
+async def test_resume_skips_completed_folders():
+    """Second run with an existing checkpoint skips the folder already done."""
+    shard = FakeShard()
+    import json as _json
+    for folder, mid in [("Inbox", "m1"), ("Sent", "m2")]:
+        msg = {
+            "id": mid, "subject": f"{folder}",
+            "from": {"emailAddress": {"address": "a@x"}},
+            "toRecipients": [{"emailAddress": {"address": "b@x"}}],
+            "body": {"contentType": "text", "content": "b"},
+            "sentDateTime": "2026-04-10T12:00:00Z",
+        }
+        await shard.upload_blob("mailbox", f"{mid}.json", _json.dumps(msg).encode())
+
+    items = [
+        _Item("m1", "m1", "Inbox", "m1.json"),
+        _Item("m2", "m2", "Sent", "m2.json"),
+    ]
+
+    from shared.export_manifest import ExportManifestBuilder
+    manifest = ExportManifestBuilder(job_id="job-r", snapshot_ids=["s"])
+
+    prior_checkpoint = {
+        "completed_folders": ["Inbox"],
+        "produced_blobs": {"Inbox": ["job-r/Inbox.01.mbox"]},
+    }
+    await shard.upload_blob("exports", "job-r/Inbox.01.mbox", b"From dummy\nDUMMY\r\n")
+
+    orch = MailExportOrchestrator(
+        job_id="job-r", snapshot_ids=["s"], items=items, shard=shard,
+        source_container="mailbox", dest_container="exports", parallelism=2,
+        split_bytes=10**9, block_size=1024, fetch_batch_size=5, queue_maxsize=5,
+        format="MBOX", include_attachments=False, manifest=manifest,
+        checkpoint=prior_checkpoint,
+    )
+    result = await orch.run()
+    # Only the Sent folder should be counted as exported in this run.
+    assert result["exported_count"] == 1
+    assert "Inbox" in result["checkpoint"]["completed_folders"]
+    assert "Sent" in result["checkpoint"]["completed_folders"]
