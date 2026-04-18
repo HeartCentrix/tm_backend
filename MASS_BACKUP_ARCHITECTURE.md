@@ -452,8 +452,6 @@ AZURE_AD_TENANT_ID=<tenant-id>
 # Scale backup workers
 docker compose up -d --scale backup-worker=10
 
-# In production (Kubernetes):
-kubectl scale deployment backup-worker --replicas=20
 ```
 
 ### 9.2 Queue Prefetch Tuning

@@ -577,6 +577,13 @@ class BackupWorker:
                             # Skip the root folder itself (no name / no parentReference).
                             if not f.get("parentReference"):
                                 continue
+                            # Skip folders — we only back up actual file bytes.
+                            # Folders carry no downloadable content; their
+                            # structure is reconstructable from each file's
+                            # parentReference.path so we don't need rows for
+                            # them (and they'd inflate item counts in the UI).
+                            if f.get("folder") is not None or f.get("file") is None:
+                                continue
                             parent_path = (f["parentReference"].get("path") or "")
                             # Graph paths look like "/drives/<id>/root:" or
                             # "/drives/<id>/root:/Documents/Sub". Slice off
@@ -875,6 +882,21 @@ class BackupWorker:
                     if chats_with_att:
                         att_items, att_bytes = await self._userchats_backup_attachments(
                             graph_client, resource, snapshot, tenant, chats_with_att,
+                        )
+                elif resource.type.value == "USER_ONEDRIVE":
+                    drive_id = (resource.extra_data or {}).get("drive_id")
+                    file_items = [
+                        extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
+                        if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
+                    ]
+                    if drive_id and file_items:
+                        # This updates the ONEDRIVE_FILE rows in-place (adds
+                        # blob_path, real content_size, sha256). att_bytes
+                        # captures the REAL file bytes uploaded to blob so
+                        # the snapshot's bytes_total reflects actual storage
+                        # consumed, not just the JSON metadata footprint.
+                        _uploaded, att_bytes = await self._useronedrive_backup_files(
+                            graph_client, resource, snapshot, tenant, drive_id, file_items,
                         )
 
                 if att_items:
@@ -1215,6 +1237,154 @@ class BackupWorker:
                 all_items.extend(items)
                 total_bytes += b
         return all_items, total_bytes
+
+    # ==================== Tier 2 USER_ONEDRIVE file-bytes capture ====================
+
+    # Initial-slice cap for USER_ONEDRIVE. Keeps a single backup run bounded
+    # so a 500k-file drive doesn't block the queue forever — remaining files
+    # pick up on the next run via the delta token. Either bound trips first.
+    USER_ONEDRIVE_MAX_FILES = 50
+    USER_ONEDRIVE_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
+
+    async def _useronedrive_backup_files(
+        self,
+        graph_client: GraphClient,
+        resource: Resource,
+        snapshot: Snapshot,
+        tenant: Tenant,
+        drive_id: str,
+        file_items: List[Dict[str, Any]],
+    ) -> Tuple[int, int]:
+        """Download a capped slice of OneDrive files to blob and update the
+        already-persisted ONEDRIVE_FILE snapshot-item rows with blob_path +
+        real content_size + sha256.
+
+        Returns (uploaded_count, bytes_uploaded). Files skipped by the cap
+        still have their metadata row; their blob_path stays NULL so the
+        Recovery UI can show "not yet downloaded" while future runs catch
+        up via the delta token.
+        """
+        from sqlalchemy import update as sa_update
+
+        # Sort smallest-first so the cap captures the most files per run —
+        # a single 400 MB blob would otherwise exhaust the byte budget on
+        # one item. Graph's 'size' is authoritative; missing → treat as 0.
+        ordered = sorted(
+            (f for f in file_items if f.get("id")),
+            key=lambda f: int(f.get("size") or 0),
+        )
+
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "files")
+
+        uploaded_count = 0
+        bytes_uploaded = 0
+        # Per-file updates we'll apply in a single transaction at the end,
+        # keyed by external_id so the UPDATE targets exactly one row.
+        updates: List[Tuple[str, str, int, str, Dict[str, Any]]] = []
+
+        for f in ordered:
+            if uploaded_count >= self.USER_ONEDRIVE_MAX_FILES:
+                break
+            if bytes_uploaded >= self.USER_ONEDRIVE_MAX_BYTES:
+                break
+
+            file_id = f.get("id")
+            file_name = f.get("name") or "(unnamed)"
+            size_hint = int(f.get("size") or 0)
+
+            # Skip zero-byte files — nothing to download, but leave the
+            # metadata row so it still shows up in the file listing.
+            if size_hint == 0:
+                continue
+
+            # Would-overflow check: don't start a file that alone blows
+            # the byte budget (unless it's the first one, so we make at
+            # least some forward progress on huge-file drives).
+            if uploaded_count > 0 and (bytes_uploaded + size_hint) > self.USER_ONEDRIVE_MAX_BYTES:
+                continue
+
+            blob_path = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id), file_id,
+            )
+
+            try:
+                download_url, real_size, qxh = await graph_client.get_download_url(drive_id, file_id)
+            except RuntimeError as e:
+                # Whiteboards, OneNote pages, cloud-native objects etc.
+                # have a 'file' facet but aren't downloadable. Skip
+                # silently — the metadata row is already persisted.
+                if "downloadurl" in str(e).lower() or "download url" in str(e).lower():
+                    continue
+                print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {e}")
+                continue
+            except Exception as e:
+                print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {type(e).__name__}: {e}")
+                continue
+
+            tmp_path = None
+            try:
+                async with self.backup_semaphore:
+                    tmp_path, sha256 = await self._download_to_temp_resumable(
+                        download_url=download_url, expected_size=real_size, file_name=file_name,
+                    )
+                    upload_result = await upload_blob_with_retry_from_file(
+                        container_name=container, blob_path=blob_path,
+                        file_path=tmp_path, shard=shard, file_size=real_size,
+                        metadata={
+                            "source_item_id": file_id,
+                            "source_drive_id": drive_id,
+                            "original-name": file_name,
+                            "sha256": sha256,
+                        },
+                    )
+            except Exception as e:
+                print(f"[{self.worker_id}] [USER_ONEDRIVE] download/upload failed for {file_name}: {type(e).__name__}: {e}")
+                continue
+            finally:
+                if tmp_path:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+
+            if not upload_result.get("success"):
+                print(f"[{self.worker_id}] [USER_ONEDRIVE] blob upload failed for {file_name}: {upload_result.get('error')}")
+                continue
+
+            # Enrich the existing row's extra_data with dedup + provenance
+            # hints without clobbering the raw Graph object already there.
+            extra_patch = {
+                "raw": f,
+                "sha256": sha256,
+                "quickxor": qxh,
+                "blobbed_at": datetime.utcnow().isoformat() + "Z",
+            }
+            updates.append((file_id, blob_path, real_size, sha256, extra_patch))
+            uploaded_count += 1
+            bytes_uploaded += real_size
+
+        if updates:
+            async with async_session_factory() as session:
+                for ext_id, bp, size, sha, extra in updates:
+                    await session.execute(
+                        sa_update(SnapshotItem)
+                        .where(
+                            SnapshotItem.snapshot_id == snapshot.id,
+                            SnapshotItem.external_id == ext_id,
+                        )
+                        .values(
+                            blob_path=bp,
+                            content_size=size,
+                            content_hash=sha,
+                            content_checksum=sha,
+                            extra_data=extra,
+                        )
+                    )
+                await session.commit()
+
+        print(f"[{self.worker_id}] [USER_ONEDRIVE] blobbed {uploaded_count}/{len(ordered)} files ({bytes_uploaded} bytes)")
+        return uploaded_count, bytes_uploaded
 
     # ==================== Server-Side Copy for Files ====================
 
