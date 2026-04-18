@@ -399,8 +399,14 @@ services:
     restart: unless-stopped
     networks:
       - tm-network
+    mem_limit: 4g
     deploy:
       replicas: ${RESTORE_WORKER_REPLICAS:-2}
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
 
   # search-service removed — see note above graph-proxy/delta-token. Gateway
   # routes /resources/search to resource-service; this service had no callers.
