@@ -517,7 +517,6 @@ class RestoreWorker:
         ):
             from mail_export import MailExportOrchestrator
             from shared.azure_storage import azure_storage_manager
-            shard = azure_storage_manager.get_default_shard()
 
             _spec = spec or {}
             fmt = (_spec.get("exportFormat") or (message or {}).get("exportFormat") or "EML").upper()
@@ -554,11 +553,23 @@ class RestoreWorker:
 
             prior_checkpoint = await _load_checkpoint()
 
+            # Annotate items with the shard index that holds their source data
+            # so the orchestrator can group by (folder, shard) — Task 27 (M8).
+            for it in items:
+                try:
+                    s = azure_storage_manager.get_shard_for_resource(
+                        str(getattr(it, "resource_id", "") or ""),
+                        str(getattr(it, "tenant_id", "") or ""),
+                    )
+                    it.shard_index = getattr(s, "shard_index", 0)
+                except Exception:
+                    it.shard_index = 0
+
             orch = MailExportOrchestrator(
                 job_id=job_id,
                 snapshot_ids=snapshot_ids,
                 items=items,
-                shard=shard,
+                shard_manager=azure_storage_manager,
                 source_container="mailbox",
                 dest_container="exports",
                 parallelism=_mail_export_settings.EXPORT_PARALLELISM,

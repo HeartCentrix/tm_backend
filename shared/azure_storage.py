@@ -454,6 +454,33 @@ class AzureStorageShard:
         async for b in container.list_blobs():
             yield b.name, {"last_modified": b.last_modified, "size": b.size}
 
+    async def get_blob_sas_url(self, container_name: str, blob_path: str, valid_for_hours: int = 6) -> str:
+        """Return a URL with a short-lived SAS token. Needed for cross-shard
+        put_block_from_url — destination shard must authenticate to read the
+        source. Falls back to the plain URL when the shard uses an account key
+        directly (sufficient in same-account scenarios)."""
+        from datetime import datetime, timedelta, timezone
+        from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+
+        account_key = getattr(self, "_account_key", None) or getattr(self, "account_key", None)
+        if not account_key:
+            return blob_client.url
+
+        try:
+            sas = generate_blob_sas(
+                account_name=self.account_name,
+                container_name=container_name,
+                blob_name=blob_path,
+                account_key=account_key,
+                permission=BlobSasPermissions(read=True),
+                expiry=datetime.now(timezone.utc) + timedelta(hours=valid_for_hours),
+            )
+            return f"{blob_client.url}?{sas}"
+        except Exception:
+            return blob_client.url
+
     async def delete_blob(self, container_name: str, blob_path: str) -> None:
         """Idempotent delete. Swallows missing-blob errors."""
         async_client = self.get_async_client()
@@ -575,6 +602,15 @@ class AzureStorageManager:
         if not self.shards:
             raise RuntimeError("No storage shards configured — set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY")
         return self.shards[0]
+
+    def get_shard_for_item(self, item) -> AzureStorageShard:
+        """Resolve the shard that owns the source data for the given item.
+        Delegates to get_shard_for_resource with the item's tenant + resource
+        IDs. Falls back to the default shard when attributes are missing."""
+        try:
+            return self.get_shard_for_resource(str(item.resource_id), str(item.tenant_id))
+        except Exception:
+            return self.get_default_shard()
     
     def get_container_name(self, tenant_id: str, resource_type: str) -> str:
         """

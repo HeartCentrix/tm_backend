@@ -248,6 +248,12 @@ class MailExportOrchestrator:
     spawns one FolderExportTask per folder under asyncio.Semaphore(parallelism),
     assembles the final ZIP + manifest.
 
+    When shard_manager is provided (Task 27+), items are grouped by
+    (folder, shard_index) and each FolderExportTask runs on the shard that
+    holds its source data. The final ZIP lands on the shard with the biggest
+    byte contribution. The legacy shard= kwarg is preserved for single-shard
+    callers.
+
     Final ZIP is built in memory for this task; Task 28 upgrades to streaming
     into stage_block calls via zipstream-ng."""
 
@@ -257,7 +263,8 @@ class MailExportOrchestrator:
         job_id: str,
         snapshot_ids: List[str],
         items: List[Any],
-        shard,
+        shard=None,                     # legacy — single shard
+        shard_manager=None,             # NEW — preferred, per-item resolution
         source_container: str,
         dest_container: str,
         parallelism: int,
@@ -271,10 +278,13 @@ class MailExportOrchestrator:
         checkpoint: Optional[dict] = None,
         persist_checkpoint=None,  # async callable(dict) — e.g. update Job.result in DB
     ):
+        if shard_manager is None and shard is None:
+            raise ValueError("pass either shard_manager (preferred) or shard (legacy)")
+        self.shard_manager = shard_manager
+        self.shard = shard
         self.job_id = job_id
         self.snapshot_ids = snapshot_ids
         self.items = items
-        self.shard = shard
         self.source_container = source_container
         self.dest_container = dest_container
         self.parallelism = max(1, parallelism)
@@ -329,14 +339,37 @@ class MailExportOrchestrator:
         await monitor.start()
 
         try:
-            folders = self._partition_by_folder()
+            if self.shard_manager:
+                groups = self._partition_by_folder_and_shard()
+            else:
+                groups = {(fn, 0): items for fn, items in self._partition_by_folder().items()}
+
             completed = set(self.checkpoint.get("completed_folders", []))
-            remaining = {k: v for k, v in folders.items() if k not in completed}
             sem = asyncio.Semaphore(self.parallelism)
 
-            async def _run_and_persist(folder_name, folder_items):
-                result = await self._run_one_folder(sem, folder_name, folder_items)
-                # Update checkpoint after each folder so resume-after-crash is granular.
+            async def _run_and_persist(folder_name, shard_index, folder_items):
+                shard = self.shard_manager.get_shard_by_index(shard_index) if self.shard_manager else self.shard
+                async with sem:
+                    task = FolderExportTask(
+                        folder_name=folder_name,
+                        items=folder_items,
+                        shard=shard,
+                        source_container=self.source_container,
+                        dest_container=self.dest_container,
+                        dest_blob_prefix=(
+                            f"{self.job_id}/shard-{shard_index}/{folder_name}"
+                            if self.shard_manager else f"{self.job_id}/{folder_name}"
+                        ),
+                        split_bytes=self.split_bytes,
+                        block_size=self.block_size,
+                        fetch_batch_size=self.fetch_batch_size,
+                        queue_maxsize=self.queue_maxsize,
+                        format=self.format,
+                        include_attachments=self.include_attachments,
+                        manifest=self.manifest,
+                    )
+                    result = await task.run()
+
                 cp_folders = list(self.checkpoint.get("completed_folders", []))
                 cp_blobs = dict(self.checkpoint.get("produced_blobs", {}))
                 if folder_name not in cp_folders:
@@ -349,24 +382,53 @@ class MailExportOrchestrator:
                         await self.persist_checkpoint(dict(self.checkpoint))
                     except Exception as exc:
                         print(f"[MailExportOrchestrator] checkpoint persist failed (non-fatal): {exc}")
-                return result
+                return shard_index, shard, result
 
-            new_folder_results = await asyncio.gather(
-                *(_run_and_persist(fn, fi) for fn, fi in remaining.items())
+            remaining_groups = {
+                k: v for k, v in groups.items() if k[0] not in completed
+            }
+            per_group = await asyncio.gather(
+                *(_run_and_persist(fn, si, items)
+                  for (fn, si), items in remaining_groups.items())
             )
 
-            # Rebuild full folder_results list for ZIP assembly — include prior
-            # folders whose blobs were written in earlier attempts.
-            folder_results: List[FolderExportResult] = list(new_folder_results)
-            done_folder_names = {fr.folder_name for fr in new_folder_results}
-            for prior_folder, prior_blobs in self.checkpoint.get("produced_blobs", {}).items():
-                if prior_folder not in done_folder_names:
-                    rec = FolderExportResult(folder_name=prior_folder)
-                    rec.produced_blobs = list(prior_blobs)
-                    folder_results.append(rec)
+            # For legacy single-shard path: also recover prior checkpoint blobs
+            # into folder_results so ZIP assembly includes them.
+            if not self.shard_manager:
+                done_folder_names = {fr.folder_name for (_, _, fr) in per_group}
+                extra = []
+                for prior_folder, prior_blobs in self.checkpoint.get("produced_blobs", {}).items():
+                    if prior_folder not in done_folder_names:
+                        rec = FolderExportResult(folder_name=prior_folder)
+                        rec.produced_blobs = list(prior_blobs)
+                        extra.append((0, self.shard, rec))
+                per_group = list(per_group) + extra
+
+            # Pick destination shard: the one with the largest contribution.
+            bytes_per_shard: dict = {}
+            for shard_index, shard, fr in per_group:
+                total = 0
+                for p in fr.produced_blobs:
+                    try:
+                        props = await shard.get_blob_properties(self.dest_container, p)
+                        total += (props or {}).get("size", 0) or 0
+                    except Exception:
+                        pass
+                bytes_per_shard[shard_index] = bytes_per_shard.get(shard_index, 0) + total
+
+            dest_shard_index = max(bytes_per_shard, key=bytes_per_shard.get) if bytes_per_shard else 0
+            dest_shard = (
+                self.shard_manager.get_shard_by_index(dest_shard_index)
+                if self.shard_manager else self.shard
+            )
 
             zip_blob_path = f"{self.job_id}/export_{int(time.time())}.zip"
-            await self._assemble_zip(zip_blob_path, folder_results)
+            await self._assemble_zip_multi_shard(
+                dest_shard=dest_shard,
+                zip_blob_path=zip_blob_path,
+                per_group=per_group,
+                dest_shard_index=dest_shard_index,
+            )
 
             status = "COMPLETED"
             if breached.is_set():
@@ -375,9 +437,10 @@ class MailExportOrchestrator:
 
             return {
                 "blob_path": zip_blob_path,
-                "exported_count": self.manifest.exported_count if self.manifest else sum(fr.exported_count for fr in new_folder_results),
-                "failed_count": self.manifest.failed_count if self.manifest else sum(len(fr.failed_items) for fr in new_folder_results),
-                "folder_count": len(folders),
+                "dest_shard_index": dest_shard_index,
+                "exported_count": self.manifest.exported_count if self.manifest else sum(fr.exported_count for (_, _, fr) in per_group),
+                "failed_count": self.manifest.failed_count if self.manifest else sum(len(fr.failed_items) for (_, _, fr) in per_group),
+                "folder_count": len(groups),
                 "status": status,
                 "manifest": json.loads(self.manifest.to_json().decode("utf-8")) if self.manifest else None,
                 "checkpoint": dict(self.checkpoint),
@@ -393,6 +456,41 @@ class MailExportOrchestrator:
             folder = (getattr(it, "folder_path", None) or "Inbox").strip("/")
             out[folder].append(it)
         return dict(out)
+
+    def _partition_by_folder_and_shard(self) -> dict:
+        """Group items by (folder_name, shard_index). Used when shard_manager
+        is set so each FolderExportTask runs on the shard that owns its data."""
+        from collections import defaultdict
+
+        out: dict = defaultdict(list)
+        for it in self.items:
+            folder = (getattr(it, "folder_path", None) or "Inbox").strip("/")
+            shard_index = getattr(it, "shard_index", 0) if self.shard_manager else 0
+            out[(folder, shard_index)].append(it)
+        return dict(out)
+
+    async def _assemble_zip_multi_shard(self, *, dest_shard, zip_blob_path, per_group, dest_shard_index):
+        """Same-shard members copy directly into dest blob via ZIP. Cross-shard
+        members are downloaded from their source shard and written into the ZIP.
+        In-memory zip for now; Task 28 upgrades to streaming."""
+        import io as _io
+        import zipfile as _zipfile
+
+        zip_buf = _io.BytesIO()
+        with _zipfile.ZipFile(zip_buf, "w", _zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for shard_index, shard, fr in per_group:
+                for blob_path in fr.produced_blobs:
+                    content = await shard.download_blob(self.dest_container, blob_path)
+                    # Strip shard-aware prefix: job_id/shard-N/folder → folder/...
+                    arc = blob_path.split(f"{self.job_id}/shard-{shard_index}/", 1)[-1]
+                    # Single-shard back-compat: no `shard-N/` in path → just strip job_id/
+                    if "/shard-" not in blob_path:
+                        arc = blob_path.split(f"{self.job_id}/", 1)[-1]
+                    zf.writestr(arc, content or b"")
+            if self.manifest:
+                zf.writestr("_MANIFEST.json", self.manifest.to_json())
+
+        await dest_shard.upload_blob(self.dest_container, zip_blob_path, zip_buf.getvalue())
 
     async def _run_one_folder(
         self,
