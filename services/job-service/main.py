@@ -843,7 +843,7 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
         except Exception:
             total_bytes = 0
 
-        from services.job_service_utils import pick_export_queue
+        from shared.export_routing import pick_export_queue
         queue = pick_export_queue(
             total_bytes=total_bytes,
             include_attachments=bool(request.get("includeAttachments", True)),
