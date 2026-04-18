@@ -759,9 +759,66 @@ async def get_restore_history(page: int = 1, size: int = 50, db: AsyncSession = 
 
 @app.post("/api/v1/jobs/export")
 async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
-    job = Job(id=uuid4(), type=JobType.EXPORT, status=JobStatus.QUEUED, priority=5, spec=request)
+    restore_type = request.get("restoreType", "EXPORT_ZIP")
+    snapshot_ids = request.get("snapshotIds", [])
+    item_ids = request.get("itemIds", [])
+
+    tenant_id = None
+    resource_id = None
+    resource_type = None
+    snapshot = None
+    if snapshot_ids:
+        snapshot = (await db.execute(
+            select(Snapshot).where(Snapshot.id == UUID(snapshot_ids[0]))
+        )).scalar_one_or_none()
+    if not snapshot and item_ids:
+        first_item = (await db.execute(
+            select(SnapshotItem).where(SnapshotItem.id == UUID(item_ids[0]))
+        )).scalar_one_or_none()
+        if first_item:
+            snapshot = await db.get(Snapshot, first_item.snapshot_id)
+            if snapshot and not snapshot_ids:
+                snapshot_ids = [str(snapshot.id)]
+    if snapshot:
+        resource_id = str(snapshot.resource_id)
+        resource = await db.get(Resource, snapshot.resource_id)
+        if resource:
+            tenant_id = str(resource.tenant_id)
+            resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+
+    job = Job(
+        id=uuid4(),
+        type=JobType.EXPORT,
+        tenant_id=UUID(tenant_id) if tenant_id else None,
+        resource_id=UUID(resource_id) if resource_id else None,
+        status=JobStatus.QUEUED,
+        priority=5,
+        spec={
+            "restore_type": restore_type,
+            "snapshot_ids": snapshot_ids,
+            "item_ids": item_ids,
+            **request,
+        },
+    )
     db.add(job)
-    await db.flush()
+    await db.commit()  # commit before publish so worker finds job
+
+    if settings.RABBITMQ_ENABLED:
+        restore_message = create_restore_message(
+            job_id=str(job.id),
+            restore_type=restore_type,
+            snapshot_ids=snapshot_ids,
+            item_ids=item_ids,
+            resource_id=resource_id,
+            tenant_id=tenant_id,
+            spec=request,
+            resource_type=resource_type,
+        )
+        queue = restore_message.get("queue", "restore.normal")
+        await message_bus.publish(queue, restore_message, priority=restore_message.get("priority", 5))
+    else:
+        print(f"[JOB_SERVICE] RabbitMQ not enabled, export job {job.id} will stay QUEUED")
+
     return {"jobId": str(job.id)}
 
 
