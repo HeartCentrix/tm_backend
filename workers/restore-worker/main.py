@@ -54,6 +54,10 @@ class RestoreWorker:
         self.graph_clients: Dict[str, GraphClient] = {}
         self.blob_service_client: Optional[BlobServiceClient] = None
         self.semaphore = asyncio.Semaphore(30)  # Max 30 concurrent restores
+        # M1 — cap simultaneous export jobs per worker. Beyond this, additional export
+        # messages wait on this semaphore. See docs/superpowers/specs/2026-04-19-mbox-mail-export-design.md §8.
+        from shared.config import settings as _s
+        self._export_semaphore = asyncio.Semaphore(_s.MAX_CONCURRENT_EXPORTS_PER_WORKER)
 
     async def initialize(self):
         """Initialize connections and clients"""
@@ -541,7 +545,8 @@ class RestoreWorker:
                 include_attachments=include_attachments,
                 manifest=None,
             )
-            result = await orch.run()
+            async with self._export_semaphore:
+                result = await orch.run()
             return {
                 "exported_count": result["exported_count"],
                 "failed_count": result["failed_count"],
