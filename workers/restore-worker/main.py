@@ -572,8 +572,55 @@ class RestoreWorker:
                 checkpoint=prior_checkpoint,
                 persist_checkpoint=_persist_cp,
             )
+            import time as _time
+            _started = _time.monotonic()
             async with self._export_semaphore:
                 result = await orch.run()
+            _duration = int(_time.monotonic() - _started)
+
+            # Task 25 — user notification on non-trivial or non-clean exports.
+            if _duration >= 60 or result.get("status", "COMPLETED") != "COMPLETED":
+                try:
+                    import httpx as _httpx
+                    from shared.config import settings as _cfg_ns
+
+                    user_email, user_display_name = "", "User"
+                    uid = (message or {}).get("userId") or (message or {}).get("user_id")
+                    if uid:
+                        try:
+                            from shared.models import PlatformUser as _PlatformUser
+                            async with async_session_factory() as _s2:
+                                u = await _s2.get(_PlatformUser, __import__("uuid").UUID(str(uid)))
+                                if u:
+                                    user_email = getattr(u, "email", "") or ""
+                                    user_display_name = (
+                                        getattr(u, "display_name", None)
+                                        or getattr(u, "name", None)
+                                        or user_email
+                                        or "User"
+                                    )
+                        except Exception:
+                            pass
+
+                    download_url = f"{_cfg_ns.FRONTEND_URL}/recovery?job={job_id}"
+                    async with _httpx.AsyncClient(timeout=10.0) as _c:
+                        await _c.post(
+                            f"{_cfg_ns.ALERT_SERVICE_URL}/api/v1/alerts/notify/export-completed",
+                            json={
+                                "user_email": user_email,
+                                "user_display_name": user_display_name,
+                                "job_id": job_id,
+                                "status": result.get("status", "COMPLETED"),
+                                "download_url": download_url,
+                                "exported_count": result.get("exported_count", 0),
+                                "failed_count": result.get("failed_count", 0),
+                                "duration_seconds": _duration,
+                                "size_bytes": 0,
+                            },
+                        )
+                except Exception as _notify_err:
+                    print(f"[restore-worker] export-completed notify failed (non-fatal): {_notify_err}")
+
             return {
                 "exported_count": result["exported_count"],
                 "failed_count": result["failed_count"],

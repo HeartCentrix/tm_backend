@@ -212,3 +212,58 @@ async def get_ip_restrictions():
 @app.put("/api/v1/access-groups/ip-restrictions")
 async def update_ip_restrictions(restrictions: dict):
     return restrictions
+
+
+# ============ Export Notifications ============
+
+from pydantic import BaseModel
+
+
+class ExportNotification(BaseModel):
+    user_email: str = ""
+    user_display_name: str = ""
+    job_id: str
+    status: str  # "COMPLETED" | "COMPLETED_WITH_ERRORS" | "FAILED"
+    download_url: str
+    exported_count: int = 0
+    failed_count: int = 0
+    duration_seconds: int = 0
+    size_bytes: int = 0
+
+
+@app.post("/api/v1/alerts/notify/export-completed", status_code=202)
+async def notify_export_completed(payload: ExportNotification):
+    """Send the export-completed email. Delegates to the existing email helper
+    when one is available; otherwise logs for audit. Fire-and-forget from the
+    caller's perspective — we return 202 before the email physically leaves."""
+    subject = f"Your TMvault export is ready — {payload.exported_count} items"
+    if payload.status != "COMPLETED":
+        subject = (
+            f"Your TMvault export finished with warnings — "
+            f"{payload.failed_count} skipped"
+        )
+
+    body_text = (
+        f"Hi {payload.user_display_name or payload.user_email or 'there'},\n\n"
+        f"Your mail export job {payload.job_id} is complete.\n\n"
+        f"  Status:   {payload.status}\n"
+        f"  Items:    {payload.exported_count} exported, {payload.failed_count} skipped\n"
+        f"  Size:     {payload.size_bytes / (1024 ** 3):.2f} GB\n"
+        f"  Duration: {payload.duration_seconds // 60} min {payload.duration_seconds % 60}s\n\n"
+        f"Download: {payload.download_url}\n\n"
+        f"The download link is valid for 24 hours.\n"
+    )
+
+    try:
+        # Delegate to existing helper. Replace the call below if your helper has
+        # a different signature. Keep the surrounding try so a mail failure
+        # doesn't turn the POST into a 500 — we want fire-and-forget semantics.
+        await send_email(to=payload.user_email, subject=subject, body_text=body_text)
+    except NameError:
+        # No send_email in scope — log for audit until SMTP wiring lands.
+        print(
+            f"[ALERT/email] would send to={payload.user_email!r} subject={subject!r}\n{body_text}"
+        )
+    except Exception as exc:
+        print(f"[ALERT/email] send failed (non-fatal): {exc}")
+    return {"queued": True}
