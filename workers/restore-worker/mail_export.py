@@ -288,39 +288,68 @@ class MailExportOrchestrator:
             else None
         )
 
-    async def run(self) -> dict:
-        folders = self._partition_by_folder()
-        sem = asyncio.Semaphore(self.parallelism)
-
-        folder_results = await asyncio.gather(
-            *(
-                self._run_one_folder(sem, folder_name, folder_items)
-                for folder_name, folder_items in folders.items()
+    def preflight(self) -> List[str]:
+        """M5 — warn if total export size is pathologically large."""
+        warnings: List[str] = []
+        total = sum(getattr(it, "content_size", 0) or 0 for it in self.items)
+        threshold = 100 * 1024 * 1024 * 1024  # 100 GB
+        if self.include_attachments and total > threshold:
+            warnings.append(
+                f"large export: {total // (1024 ** 3)} GB with attachments on "
+                f"({len(self.items)} items) — may take 15+ min and peak memory ~800 MB"
             )
+        return warnings
+
+    async def run(self) -> dict:
+        # M5 preflight
+        for w in self.preflight():
+            print(f"[MailExportOrchestrator] {w}")  # routed to JobLog by caller
+
+        # M6 memory monitor — soft-kill before Docker OOM mid-commit.
+        from shared.memory_monitor import MemoryMonitor
+        from shared.config import settings as _s
+
+        breached = asyncio.Event()
+
+        async def _on_breach():
+            breached.set()
+
+        # 4 GB Docker limit from compose M4. soft_limit_pct and grace from config.
+        monitor = MemoryMonitor(
+            limit_bytes=4 * 1024 * 1024 * 1024,
+            soft_limit_pct=_s.EXPORT_MEMORY_SOFT_LIMIT_PCT,
+            grace_seconds=_s.EXPORT_MEMORY_KILL_GRACE_SECONDS,
+            poll_interval_seconds=5.0,
+            on_breach=_on_breach,
         )
+        await monitor.start()
 
-        zip_blob_path = f"{self.job_id}/export_{int(time.time())}.zip"
-        await self._assemble_zip(zip_blob_path, folder_results)
+        try:
+            folders = self._partition_by_folder()
+            sem = asyncio.Semaphore(self.parallelism)
+            folder_results = await asyncio.gather(
+                *(self._run_one_folder(sem, folder_name, folder_items)
+                  for folder_name, folder_items in folders.items())
+            )
 
-        return {
-            "blob_path": zip_blob_path,
-            "exported_count": (
-                self.manifest.exported_count
-                if self.manifest
-                else sum(fr.exported_count for fr in folder_results)
-            ),
-            "failed_count": (
-                self.manifest.failed_count
-                if self.manifest
-                else sum(len(fr.failed_items) for fr in folder_results)
-            ),
-            "folder_count": len(folders),
-            "manifest": (
-                json.loads(self.manifest.to_json().decode("utf-8"))
-                if self.manifest
-                else None
-            ),
-        }
+            zip_blob_path = f"{self.job_id}/export_{int(time.time())}.zip"
+            await self._assemble_zip(zip_blob_path, folder_results)
+
+            status = "COMPLETED"
+            if breached.is_set():
+                status = "COMPLETED_WITH_ERRORS"
+                print("[MailExportOrchestrator] M6 breach — export finalized under pressure")
+
+            return {
+                "blob_path": zip_blob_path,
+                "exported_count": self.manifest.exported_count if self.manifest else sum(fr.exported_count for fr in folder_results),
+                "failed_count": self.manifest.failed_count if self.manifest else sum(len(fr.failed_items) for fr in folder_results),
+                "folder_count": len(folders),
+                "status": status,
+                "manifest": json.loads(self.manifest.to_json().decode("utf-8")) if self.manifest else None,
+            }
+        finally:
+            await monitor.stop()
 
     def _partition_by_folder(self) -> dict:
         from collections import defaultdict

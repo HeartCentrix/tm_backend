@@ -99,3 +99,32 @@ async def test_orchestrator_emits_zip_with_per_folder_mbox():
     assert any(n.startswith("Inbox") and n.endswith(".mbox") for n in names)
     assert any(n.startswith("Sent") and n.endswith(".mbox") for n in names)
     assert "_MANIFEST.json" in names
+
+
+async def test_preflight_logs_warning_for_huge_export():
+    shard = FakeShard()
+    items = []
+    for i in range(10):
+        msg = {
+            "id": f"m{i}",
+            "subject": "x",
+            "from": {"emailAddress": {"address": "a@x.com"}},
+            "toRecipients": [{"emailAddress": {"address": "b@x.com"}}],
+            "body": {"contentType": "text", "content": "x"},
+            "sentDateTime": "2026-04-10T12:00:00Z",
+        }
+        await shard.upload_blob("mailbox", f"m{i}.json", json.dumps(msg).encode())
+        it = _Item(f"m{i}", f"msg {i}", "Inbox", f"m{i}.json")
+        it.content_size = 15 * 1024 * 1024 * 1024  # 15 GB each → 150 GB total
+        items.append(it)
+
+    from shared.export_manifest import ExportManifestBuilder
+    manifest = ExportManifestBuilder(job_id="job-huge", snapshot_ids=["s"])
+    orch = MailExportOrchestrator(
+        job_id="job-huge", snapshot_ids=["s"], items=items, shard=shard,
+        source_container="mailbox", dest_container="exports", parallelism=1,
+        split_bytes=10**9, block_size=1024, fetch_batch_size=5, queue_maxsize=5,
+        format="MBOX", include_attachments=True, manifest=manifest,
+    )
+    warnings = orch.preflight()
+    assert any("large export" in w for w in warnings)
