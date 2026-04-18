@@ -715,46 +715,82 @@ class BackupWorker:
                     # chat for the first slice; full history can come from
                     # a follow-up "deep" backup if/when we add one.
                     import httpx as _httpx
+                    # Switch to the tenant-wide getAllMessages endpoint:
+                    # `/chats/{id}/messages` only returns the first page
+                    # under app-only auth in most tenants (no nextLink), so
+                    # per-chat pagination caps at ~50 messages per chat.
+                    # `/users/{id}/chats/getAllMessages` returns messages
+                    # across ALL the user's chats with real pagination —
+                    # we bucket by chatId client-side using chat_meta.
                     chat_token = await graph_client._get_token()
-                    for chat_id in chat_ids:
-                        info = chat_meta[chat_id]
-                        display = info["displayName"]
-                        try:
-                            async with _httpx.AsyncClient(timeout=30.0) as _c:
+                    PAGE_SIZE = 50
+                    MAX_PAGES = 100       # safety cap: 100 × 50 = 5000 msgs / run
+                    all_msgs: List[Dict[str, Any]] = []
+                    next_url: Optional[str] = (
+                        f"{graph_client.GRAPH_URL}/users/{user_id}/chats/getAllMessages"
+                    )
+                    first_page = True
+                    pages_done = 0
+                    async with _httpx.AsyncClient(timeout=60.0) as _c:
+                        while next_url and pages_done < MAX_PAGES:
+                            try:
                                 _resp = await _c.get(
-                                    f"{graph_client.GRAPH_URL}/chats/{chat_id}/messages",
+                                    next_url,
                                     headers={"Authorization": f"Bearer {chat_token}"},
-                                    params={"$top": "50"},
+                                    params={"$top": str(PAGE_SIZE)} if first_page else None,
                                 )
-                                if _resp.status_code != 200:
-                                    print(f"[{self.worker_id}] [USER_CHATS] chat {chat_id} HTTP {_resp.status_code}")
-                                    continue
-                                page = _resp.json() or {}
-                            for m in page.get("value", []):
-                                body = (m.get("body") or {}).get("content") or ""
-                                # Top-level extra_data fields mirror the
-                                # legacy chat backup so ChatPreview's
-                                # context label (item.metadata.chatTopic),
-                                # /messages chatId filter, and any future
-                                # group-chat UI all read the same shape.
-                                ext = {
-                                    "raw": m,
-                                    "chatId": chat_id,
-                                    "chatTopic": display,
-                                    "chatType": info["chatType"],
-                                    "memberNames": info["memberNames"],
-                                    "memberCount": info["memberCount"],
-                                    "exportedVia": user_id,
-                                }
-                                out.append((
-                                    "TEAMS_CHAT_MESSAGE",
-                                    body[:120] or "(empty)",
-                                    m.get("id"),
-                                    ext,
-                                    f"chats/{display}",
-                                ))
-                        except Exception as e:
-                            print(f"[{self.worker_id}] [USER_CHATS] chat {chat_id} fetch failed: {e}")
+                            except Exception as e:
+                                print(f"[{self.worker_id}] [USER_CHATS] getAllMessages page {pages_done} fetch error: {type(e).__name__}: {e} — stopping (kept {len(all_msgs)})")
+                                break
+                            if _resp.status_code != 200:
+                                print(f"[{self.worker_id}] [USER_CHATS] getAllMessages page {pages_done} HTTP {_resp.status_code} — stopping (kept {len(all_msgs)})")
+                                break
+                            data = _resp.json() or {}
+                            batch = data.get("value", []) or []
+                            all_msgs.extend(batch)
+                            next_url = data.get("@odata.nextLink")
+                            first_page = False
+                            pages_done += 1
+                    print(f"[{self.worker_id}] [USER_CHATS] fetched {len(all_msgs)} messages across {pages_done} page(s)")
+
+                    # Bucket the flat message list into per-chat rows using
+                    # the pre-computed chat_meta for display name / type.
+                    # Messages whose chatId isn't in chat_meta (auth drift,
+                    # chat created mid-backup) get a synthetic fallback so
+                    # they still show up in Recovery.
+                    for m in all_msgs:
+                        chat_id = m.get("chatId") or (m.get("channelIdentity") or {}).get("channelId")
+                        if not chat_id:
+                            continue
+                        info = chat_meta.get(chat_id) or {
+                            "displayName": f"Chat {chat_id[:8]}",
+                            "chatType": "unknown",
+                            "topic": None,
+                            "memberCount": 0,
+                            "memberNames": [],
+                            "memberEmails": [],
+                        }
+                        display = info["displayName"]
+                        folder = f"chats/{display}"
+                        m["_chat_folder_path"] = folder
+                        m["chatId"] = chat_id
+                        body = (m.get("body") or {}).get("content") or ""
+                        ext = {
+                            "raw": m,
+                            "chatId": chat_id,
+                            "chatTopic": display,
+                            "chatType": info["chatType"],
+                            "memberNames": info["memberNames"],
+                            "memberCount": info["memberCount"],
+                            "exportedVia": user_id,
+                        }
+                        out.append((
+                            "TEAMS_CHAT_MESSAGE",
+                            body[:120] or "(empty)",
+                            m.get("id"),
+                            ext,
+                            folder,
+                        ))
                     return out
 
             except Exception as e:
@@ -802,10 +838,13 @@ class BackupWorker:
                         session.add_all(db_items)
                         await session.commit()
 
-                # For USER_MAIL: second pass captures attachments for each
-                # message with hasAttachments=true. Done AFTER the main email
-                # rows are committed so attachment rows can reference the
-                # email's external_id in extra_data.parent_item_id.
+                # Second pass: per-message attachment capture. The main
+                # snapshot items hold the raw Graph objects; attachments are
+                # separate SnapshotItem rows (one per attachment) tied to
+                # the parent message via extra_data.parent_item_id.
+                #
+                #   USER_MAIL  → EMAIL_ATTACHMENT rows (file/item/reference)
+                #   USER_CHATS → CHAT_ATTACHMENT rows (reference + cards)
                 att_items, att_bytes = [], 0
                 if resource.type.value == "USER_MAIL":
                     user_id = (resource.extra_data or {}).get("user_id")
@@ -819,6 +858,16 @@ class BackupWorker:
                             att_items, att_bytes = await self._usermail_backup_attachments(
                                 graph_client, resource, snapshot, tenant, user_id, emails_with_att,
                             )
+                elif resource.type.value == "USER_CHATS":
+                    chats_with_att = [
+                        extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
+                        if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
+                        and extra["raw"].get("attachments")
+                    ]
+                    if chats_with_att:
+                        att_items, att_bytes = await self._userchats_backup_attachments(
+                            graph_client, resource, snapshot, tenant, chats_with_att,
+                        )
 
                 if att_items:
                     async with async_session_factory() as session:
@@ -990,6 +1039,158 @@ class BackupWorker:
                         "is_inline": att.get("isInline", False),
                         "source_url": att.get("sourceUrl"),
                         "resolved": blob_path is not None,
+                    },
+                ))
+            return local_items, local_bytes
+
+        results = await asyncio.gather(
+            *[_one_message(m) for m in messages_with_attachments],
+            return_exceptions=True,
+        )
+        all_items: List[SnapshotItem] = []
+        total_bytes = 0
+        for r in results:
+            if isinstance(r, tuple):
+                items, b = r
+                all_items.extend(items)
+                total_bytes += b
+        return all_items, total_bytes
+
+    # ==================== Tier 2 USER_CHATS attachment capture ====================
+
+    async def _userchats_backup_attachments(
+        self,
+        graph_client: GraphClient,
+        resource: Resource,
+        snapshot: Snapshot,
+        tenant: Tenant,
+        messages_with_attachments: List[Dict[str, Any]],
+    ) -> Tuple[List[SnapshotItem], int]:
+        """Capture chat-message attachments as separate `CHAT_ATTACHMENT`
+        SnapshotItems, mirroring the email path.
+
+        Microsoft Graph attachment contentTypes we see in the wild
+        (confirmed against real data in `snapshot_items`):
+
+          - `reference` — a file in SharePoint / OneDrive / Teams. Has a
+            `contentUrl` pointing at the source. Resolvable via
+            /shares/{u!base64}/driveItem → downloadUrl. Store bytes in blob.
+
+          - `messageReference`, `forwardedMessageReference`,
+            `meetingReference` — UI pointers (reply context, meeting card).
+            No bytes to store; `content` carries JSON that describes the
+            target. Keep as metadata-only.
+
+          - `application/vnd.microsoft.card.*` — adaptive cards / audio /
+            richer embedded content. `content` holds the card JSON. Store
+            as metadata-only (the card body is already in extra_data.raw
+            on the parent message).
+
+          - `fileAttachment` / other binary types — rare in chat. Treat
+            the same as a reference if a contentUrl is present; otherwise
+            metadata-only."""
+        sem = asyncio.Semaphore(6)
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
+
+        REFERENCE_TYPES = {"reference", "fileAttachment"}
+        POINTER_TYPES = {"messageReference", "forwardedMessageReference", "meetingReference"}
+
+        async def _one_message(msg: Dict[str, Any]) -> Tuple[List[SnapshotItem], int]:
+            msg_id = msg.get("id")
+            if not msg_id:
+                return [], 0
+            attachments = msg.get("attachments") or []
+            if not isinstance(attachments, list) or not attachments:
+                return [], 0
+            chat_id = msg.get("chatId") or (msg.get("channelIdentity") or {}).get("channelId")
+            folder_path = msg.get("_chat_folder_path")  # set at fetch time for chats
+
+            local_items: List[SnapshotItem] = []
+            local_bytes = 0
+
+            for att in attachments:
+                att_id = att.get("id") or str(uuid.uuid4())
+                ct = (att.get("contentType") or "").strip()
+                name = att.get("name") or att.get("id") or "attachment"
+                content_url = att.get("contentUrl")
+                raw_content = att.get("content")  # JSON for pointers / cards
+
+                content_bytes: Optional[bytes] = None
+                resolved = False
+
+                if ct in REFERENCE_TYPES and content_url:
+                    async with sem:
+                        try:
+                            content_bytes = await graph_client.fetch_shared_url_content(content_url)
+                        except Exception as e:
+                            print(f"[{self.worker_id}] [CHAT-ATT] resolve fail {name} on {msg_id}: {type(e).__name__}: {e}")
+                            content_bytes = None
+                elif ct in POINTER_TYPES or ct.startswith("application/vnd.microsoft.card"):
+                    # Metadata-only: UI pointer or card. `content` is JSON
+                    # describing the thing being referenced; preserve it so
+                    # the UI can render the citation / card without Graph.
+                    content_bytes = None
+                else:
+                    # Unknown contentType — try the URL if provided, else
+                    # leave as metadata.
+                    if content_url:
+                        async with sem:
+                            try:
+                                content_bytes = await graph_client.fetch_shared_url_content(content_url)
+                            except Exception:
+                                content_bytes = None
+
+                blob_path: Optional[str] = None
+                content_hash: Optional[str] = None
+                size = 0
+
+                if content_bytes is not None:
+                    content_hash = hashlib.sha256(content_bytes).hexdigest()
+                    size = len(content_bytes)
+                    blob_path = azure_storage_manager.build_blob_path(
+                        str(tenant.id), str(resource.id), str(snapshot.id),
+                        f"catt_{msg_id}_{att_id}",
+                    )
+                    try:
+                        result = await upload_blob_with_retry(
+                            container, blob_path, content_bytes, shard, max_retries=3,
+                        )
+                        if isinstance(result, dict) and result.get("success"):
+                            resolved = True
+                            local_bytes += size
+                        else:
+                            blob_path = None
+                            content_hash = None
+                    except Exception as e:
+                        print(f"[{self.worker_id}] [CHAT-ATT UPLOAD] {name} on {msg_id}: {type(e).__name__}: {e}")
+                        blob_path = None
+                        content_hash = None
+
+                local_items.append(SnapshotItem(
+                    id=uuid.uuid4(),
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    external_id=f"{msg_id}::{att_id}",
+                    item_type="CHAT_ATTACHMENT",
+                    name=(name or "")[:255],
+                    folder_path=folder_path,
+                    content_hash=content_hash,
+                    content_size=size,
+                    blob_path=blob_path,
+                    content_checksum=content_hash,
+                    extra_data={
+                        "parent_item_id": msg_id,
+                        "chat_id": chat_id,
+                        "attachment_kind": ct,
+                        "content_type": ct,
+                        "content_url": content_url,
+                        "thumbnail_url": att.get("thumbnailUrl"),
+                        "teams_app_id": att.get("teamsAppId"),
+                        # Preserve the pointer/card JSON so the UI can
+                        # render it without a Graph round-trip.
+                        "content": raw_content,
+                        "resolved": resolved,
                     },
                 ))
             return local_items, local_bytes

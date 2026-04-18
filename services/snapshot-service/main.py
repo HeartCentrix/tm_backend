@@ -207,6 +207,18 @@ async def get_snapshot_folders(
     filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
     if item_type:
         filters.append(SnapshotItem.item_type == item_type)
+    else:
+        # Exclude child/attachment rows from folder counts. They share
+        # their parent's folder_path (so the mailbox message and its
+        # attachment both live under "/Inbox", and a chat message and
+        # its attachment both live under "chats/<chat name>"), but the
+        # middle-panel list endpoints only show primary items. If we
+        # include attachments in the folder count, the user sees "62" in
+        # the left panel and "50 of 50" in the middle and thinks the
+        # middle is wrong — it's the folder count that was over-counting.
+        filters.append(SnapshotItem.item_type.notin_(
+            ["EMAIL_ATTACHMENT", "CHAT_ATTACHMENT"]
+        ))
 
     items = (await db.execute(select(SnapshotItem).where(*filters))).scalars().all()
 
@@ -807,7 +819,14 @@ async def list_snapshot_messages(
             func.json_extract_path_text(SnapshotItem.extra_data, "raw", "chatId") == chatId,
         ))
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
-    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
+    # Sort by the message's actual send time, newest first. Without this
+    # the rows come back in insertion order (whatever the backup worker's
+    # parallel gather happened to return), so paging "to see older
+    # messages" doesn't map to chronological paging.
+    order_col = func.json_extract_path_text(SnapshotItem.extra_data, "raw", "createdDateTime").desc()
+    items = (await db.execute(
+        select(SnapshotItem).where(*filters).order_by(order_col).offset((page-1)*size).limit(size)
+    )).scalars().all()
 
     shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
     sem = asyncio.Semaphore(20)
@@ -1187,12 +1206,13 @@ async def get_item_attachments(
     if not parent:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    # Email external_id IS the Graph message id — what the backup handler
-    # stored as parent_item_id on each attachment.
+    # Email and chat message external_id IS the Graph id — both attachment
+    # kinds store that as parent_item_id. One endpoint serves both so the
+    # UI can look up attachments without caring which content tab it's on.
     parent_msg_id = parent.external_id
     filters = [
         SnapshotItem.snapshot_id == UUID(snapshot_id),
-        SnapshotItem.item_type == "EMAIL_ATTACHMENT",
+        SnapshotItem.item_type.in_(["EMAIL_ATTACHMENT", "CHAT_ATTACHMENT"]),
         func.json_extract_path_text(SnapshotItem.extra_data, "parent_item_id") == parent_msg_id,
     ]
     rows = (await db.execute(
@@ -1201,6 +1221,9 @@ async def get_item_attachments(
 
     def fmt(r):
         meta = r.extra_data or {}
+        # Email attachments store the original URL as `source_url`;
+        # chat attachments as `content_url`. Surface one normalized field
+        # so the UI doesn't need to know the difference.
         return {
             "id": str(r.id),
             "name": r.name,
@@ -1209,7 +1232,7 @@ async def get_item_attachments(
             "contentType": meta.get("content_type"),
             "isInline": bool(meta.get("is_inline")),
             "resolved": bool(meta.get("resolved")) and bool(r.blob_path),
-            "sourceUrl": meta.get("source_url"),
+            "sourceUrl": meta.get("source_url") or meta.get("content_url"),
         }
 
     return [fmt(r) for r in rows]
