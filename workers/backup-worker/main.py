@@ -209,10 +209,17 @@ class BackupWorker:
 
         async def handle(msg):
             async with sem:
+                # Process + ack split so a stale-channel ack failure (long-running
+                # job outlived the AMQP heartbeat) doesn't cascade into a wrongful
+                # reject of an already-successful job. If ack truly fails, the
+                # message will be redelivered after the consumer disconnects;
+                # for chat exports the saved delta token makes the redelivery
+                # a no-op (1s, 0 new msgs).
+                processed = False
                 try:
                     body = json.loads(msg.body.decode())
                     await self.process_backup_message(body)
-                    await msg.ack()
+                    processed = True
                 except Exception as e:
                     print(f"[{self.worker_id}] Error: {e}")
                     import traceback
@@ -227,6 +234,17 @@ class BackupWorker:
                             await msg.reject(requeue=False)
                     except Exception:
                         pass
+
+                if processed:
+                    try:
+                        await msg.ack()
+                    except Exception as ack_exc:
+                        print(
+                            f"[{self.worker_id}] Job succeeded but ack failed "
+                            f"(stale channel?): {type(ack_exc).__name__}: {ack_exc}. "
+                            f"Message will be redelivered; dedup/delta-token will "
+                            f"make the retry a no-op."
+                        )
 
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:

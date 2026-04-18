@@ -25,8 +25,16 @@ class MessageBus:
         # Retry with exponential backoff
         for attempt in range(1, max_retries + 1):
             try:
+                # heartbeat=600s and 30-min blocked-connection timeout keep the
+                # AMQP channel alive across long-running consumers (e.g. a single
+                # Teams chat export can take 30+ min on Graph's $top=50 cap).
+                # Without this, the channel goes stale mid-job and the post-job
+                # ack raises ChannelInvalidStateError — work succeeds but the
+                # message gets redelivered to another worker.
                 self.connection = await aio_pika.connect_robust(
                     settings.RABBITMQ_URL,
+                    heartbeat=600,
+                    blocked_connection_timeout=1800,
                 )
                 self.channel = await self.connection.channel()
                 self.exchange = await self.channel.declare_exchange(
