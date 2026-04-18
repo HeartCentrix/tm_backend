@@ -17,14 +17,29 @@ class MessageBus:
         self.channel: Optional[aio_pika.Channel] = None
         self.exchange: Optional[aio_pika.Exchange] = None
     
-    async def connect(self, max_retries: int = 10, retry_delay: int = 5):
+    async def connect(self, max_retries: int = 0, retry_delay: int = 5):
+        """Connect to RabbitMQ with retry.
+
+        Default (``max_retries=0``) retries FOREVER with capped exponential
+        backoff (5s → 10s → 15s → … capped at 30s). This replaces the old
+        behavior of giving up after 10 attempts, which left services
+        permanently dead if RabbitMQ had even a brief startup hiccup and
+        required a container restart to recover.
+
+        Pass ``max_retries > 0`` for a bounded retry that raises on exhaustion
+        — only callers who genuinely want to fail-fast should use that."""
         if not settings.RABBITMQ_ENABLED:
-            print("[MESSAGE_BUS] RabbitMQ disabled by config")
+            print("[MESSAGE_BUS] RabbitMQ disabled by config", flush=True)
             return
 
-        # Retry with exponential backoff
-        for attempt in range(1, max_retries + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
+                # aio_pika.connect_robust has its own auto-reconnect logic
+                # once the INITIAL connection is established, so this outer
+                # loop only needs to cover the cold-boot window before the
+                # first connect succeeds.
                 self.connection = await aio_pika.connect_robust(
                     settings.RABBITMQ_URL,
                 )
@@ -63,18 +78,29 @@ class MessageBus:
                 # Set channel QoS (per-consumer prefetch)
                 await self.channel.set_qos(prefetch_count=50)
 
-                print("[MESSAGE_BUS] Connected to RabbitMQ successfully")
+                print(f"[MESSAGE_BUS] Connected to RabbitMQ successfully (attempt {attempt})", flush=True)
                 return  # Success!
 
             except Exception as e:
-                if attempt < max_retries:
-                    print(f"[MESSAGE_BUS] Connection attempt {attempt}/{max_retries} failed: {e}")
-                    print(f"[MESSAGE_BUS] Retrying in {retry_delay}s...")
-                    await asyncio.sleep(retry_delay)
-                else:
-                    print(f"[MESSAGE_BUS] Failed to connect after {max_retries} attempts: {e}")
-                    print(f"[MESSAGE_BUS] Services requiring RabbitMQ will not function properly")
+                # Bounded retry hit its limit → bubble up the last error.
+                if max_retries and attempt >= max_retries:
+                    print(
+                        f"[MESSAGE_BUS] Failed to connect after {max_retries} attempts: "
+                        f"{type(e).__name__}: {e}",
+                        flush=True,
+                    )
                     raise
+
+                # Capped exponential backoff: delay grows every 5 attempts,
+                # maxing out at 30s so a long-down broker doesn't stretch
+                # into multi-minute gaps between retries.
+                delay = min(30, retry_delay * (1 + attempt // 5))
+                print(
+                    f"[MESSAGE_BUS] Connection attempt {attempt} failed "
+                    f"({type(e).__name__}: {e}); retrying in {delay}s",
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
     
     async def disconnect(self):
         if self.connection:

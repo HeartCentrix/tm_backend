@@ -301,6 +301,12 @@ class SnapshotItemResponse(BaseModel):
     metadata: dict
     isDeleted: bool
     createdAt: str
+    # Blob storage path for items whose real bytes were uploaded (populated
+    # for ONEDRIVE_FILE rows the backup worker successfully blobbed, for
+    # EMAIL/CHAT_ATTACHMENT rows, etc.). Null for metadata-only rows.
+    # Frontend uses `.blobPath` presence to decide whether to render a
+    # download link on the item row.
+    blobPath: Optional[str] = None
 
 
 class SnapshotListResponse(BaseModel):

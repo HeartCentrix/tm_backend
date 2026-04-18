@@ -110,6 +110,7 @@ ACTIONS = {
     "EXPORT_TRIGGERED": "Export job triggered",
     "EXPORT_COMPLETED": "Export completed",
     "EXPORT_DOWNLOADED": "Export file downloaded",
+    "FILE_DOWNLOADED": "Single file downloaded from a snapshot",
     "DISCOVERY_RUN": "Resource discovery executed",
     "SLA_CREATED": "SLA policy created",
     "SLA_UPDATED": "SLA policy updated",
