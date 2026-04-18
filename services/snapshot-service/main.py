@@ -1063,9 +1063,16 @@ async def list_snapshot_onedrive(
     size: int = Query(500, ge=1),
     folder: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
+    sort: Optional[str] = Query(None, description="name_asc|created_desc|modified_desc"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return OneDrive files in a snapshot."""
+    """Return OneDrive files in a snapshot.
+
+    `sort`:
+      - `created_desc`  → newest file first (Graph createdDateTime)
+      - `modified_desc` → most-recently-edited first (Graph lastModifiedDateTime)
+      - default / anything else → name A→Z (case-insensitive)
+    """
     filters = [
         SnapshotItem.snapshot_id == UUID(snapshot_id),
         SnapshotItem.item_type.in_(ONEDRIVE_ITEM_TYPES),
@@ -1074,8 +1081,22 @@ async def list_snapshot_onedrive(
         filters.append(SnapshotItem.folder_path == folder)
     if search:
         filters.append(SnapshotItem.name.ilike(f"%{search}%"))
+
+    stmt = select(SnapshotItem).where(*filters)
+    if sort == "created_desc":
+        # SQLAlchemy JSON (not JSONB) — use json_extract_path_text.
+        stmt = stmt.order_by(
+            func.json_extract_path_text(SnapshotItem.extra_data, "raw", "createdDateTime").desc()
+        )
+    elif sort == "modified_desc":
+        stmt = stmt.order_by(
+            func.json_extract_path_text(SnapshotItem.extra_data, "raw", "lastModifiedDateTime").desc()
+        )
+    else:
+        stmt = stmt.order_by(func.lower(SnapshotItem.name).asc())
+
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
-    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
+    items = (await db.execute(stmt.offset((page-1)*size).limit(size))).scalars().all()
     return {
         "content": [_item_to_response(i) for i in items],
         "totalElements": total,
@@ -1083,6 +1104,42 @@ async def list_snapshot_onedrive(
         "size": size,
         "number": page,
     }
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/onedrive/ids")
+async def list_onedrive_ids_by_prefix(
+    snapshot_id: str,
+    folder_prefix: str = Query(..., description="Folder path prefix; '/' means all files"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the ids of every ONEDRIVE_FILE in the snapshot whose
+    folder_path starts with `folder_prefix`. Used by the Recovery UI's
+    folder-row checkbox to bulk-select every file under a folder — works
+    recursively (selecting `/Documents` also picks up files in
+    `/Documents/Sub/` etc.).
+
+    Kept as a separate lightweight endpoint so the bulk-select doesn't
+    have to page through the main /onedrive response and re-assemble it
+    on the client."""
+    prefix = folder_prefix
+    if prefix == "/" or prefix == "":
+        # Root select → every file in the drive.
+        filters = [
+            SnapshotItem.snapshot_id == UUID(snapshot_id),
+            SnapshotItem.item_type.in_(ONEDRIVE_ITEM_TYPES),
+        ]
+    else:
+        # Match the folder itself AND any nested child (LIKE 'prefix%').
+        # Escape SQL LIKE wildcards in the prefix so a folder named with
+        # a literal `_` doesn't accidentally match sibling paths.
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        filters = [
+            SnapshotItem.snapshot_id == UUID(snapshot_id),
+            SnapshotItem.item_type.in_(ONEDRIVE_ITEM_TYPES),
+            (SnapshotItem.folder_path == prefix) | (SnapshotItem.folder_path.like(f"{escaped}/%", escape="\\")),
+        ]
+    rows = (await db.execute(select(SnapshotItem.id).where(*filters))).all()
+    return {"ids": [str(r[0]) for r in rows], "count": len(rows)}
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/contacts")

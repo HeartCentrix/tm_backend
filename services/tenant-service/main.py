@@ -371,7 +371,14 @@ async def discover_user_content(
         if existing:
             existing.display_name = c["display_name"]
             existing.email = c.get("email")
-            existing.extra_data = c.get("metadata", {})
+            # Merge discovery-provided metadata over existing extra_data
+            # instead of replacing it outright. This preserves keys written
+            # by the backup-worker (delta_token, mail_delta_token, calendar_
+            # delta_token, channel_delta_tokens, etc.) so incremental
+            # continuation keeps working across re-triggers. Graph discovery
+            # fields (drive_id, user_id, …) are stable keys that won't
+            # collide with backup-written state.
+            existing.extra_data = {**(existing.extra_data or {}), **c.get("metadata", {})}
             existing.external_id = c["external_id"]
             # Re-inherit parent SLA each time (covers parent SLA changes since last discovery).
             existing.sla_policy_id = user.sla_policy_id
@@ -477,7 +484,10 @@ async def backup_user_with_discovery(
                 if existing:
                     existing.display_name = c["display_name"]
                     existing.email = c.get("email")
-                    existing.extra_data = c.get("metadata", {})
+                    # Merge, don't overwrite — preserves delta tokens and
+                    # any other backup-written state between re-triggers.
+                    # See matching comment in discover_user_content().
+                    existing.extra_data = {**(existing.extra_data or {}), **c.get("metadata", {})}
                     existing.external_id = c["external_id"]
                     existing.sla_policy_id = user_sla_policy_id
                     child_ids.append(str(existing.id))
