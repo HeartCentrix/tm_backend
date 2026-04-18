@@ -722,6 +722,7 @@ async def list_snapshot_emails(
     page: int = Query(1, ge=1),
     size: int = Query(500, ge=1),
     folder: Optional[str] = Query(None, description="Filter to a specific mail folder path"),
+    search: Optional[str] = Query(None, description="Case-insensitive substring match on name/subject"),
     db: AsyncSession = Depends(get_db),
 ):
     """Return emails with from/to/cc/subject/body/date extracted from metadata."""
@@ -731,6 +732,8 @@ async def list_snapshot_emails(
     ]
     if folder is not None:
         filters.append(SnapshotItem.folder_path == folder)
+    if search:
+        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
 
@@ -773,6 +776,7 @@ async def list_snapshot_messages(
     size: int = Query(500, ge=1),
     chatId: Optional[str] = Query(None),
     folder: Optional[str] = Query(None, description="Filter to one chat by folder_path (e.g. 'chats/Vinay Chauhan')"),
+    search: Optional[str] = Query(None, description="Case-insensitive substring match on name (= body preview)"),
     db: AsyncSession = Depends(get_db),
 ):
     """Return Teams messages with sender/body/date extracted from metadata.
@@ -790,6 +794,8 @@ async def list_snapshot_messages(
     ]
     if folder is not None:
         filters.append(SnapshotItem.folder_path == folder)
+    if search:
+        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
     if chatId:
         # `extra_data` is a plain JSON column (not JSONB) so the `[].astext`
         # accessor is unavailable. Use json_extract_path_text and check
@@ -892,6 +898,7 @@ async def list_snapshot_calendar(
     snapshot_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(500, ge=1),
+    search: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     """Return calendar events with start/end/location/attendees extracted from metadata."""
@@ -899,6 +906,8 @@ async def list_snapshot_calendar(
         SnapshotItem.snapshot_id == UUID(snapshot_id),
         SnapshotItem.item_type == "CALENDAR_EVENT",
     ]
+    if search:
+        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
 
@@ -1014,6 +1023,7 @@ async def list_snapshot_onedrive(
     page: int = Query(1, ge=1),
     size: int = Query(500, ge=1),
     folder: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     """Return OneDrive files in a snapshot."""
@@ -1023,6 +1033,8 @@ async def list_snapshot_onedrive(
     ]
     if folder is not None:
         filters.append(SnapshotItem.folder_path == folder)
+    if search:
+        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
     return {
@@ -1040,6 +1052,7 @@ async def list_snapshot_contacts(
     page: int = Query(1, ge=1),
     size: int = Query(500, ge=1),
     folder: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     """Return contacts in a snapshot."""
@@ -1049,6 +1062,8 @@ async def list_snapshot_contacts(
     ]
     if folder is not None:
         filters.append(SnapshotItem.folder_path == folder)
+    if search:
+        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
 

@@ -712,6 +712,19 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_group_policy_assignments_policy ON group_policy_assignments(policy_id)",
         # Two-tier discovery — fast lookup of all child rows under a parent user.
         "CREATE INDEX IF NOT EXISTS ix_resources_parent_id ON resources(parent_resource_id)",
+        # Teams-chat packed-blob content-hash dedup. When two users share a
+        # chat, their backups hit the same message bytes — this tenant-scoped
+        # checksum index lets the writer reuse an existing blob_path instead
+        # of re-uploading. Also speeds up the ZIP export dedup pass.
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_items_tenant_checksum ON snapshot_items(tenant_id, content_checksum)",
+        # Partial BTREE on the JSON `metadata->>'chatId'` projection, scoped
+        # to chat messages. Powers the UI's "scope to one chat" filter on a
+        # per-user TEAMS_CHAT_EXPORT snapshot (which holds messages from
+        # many chats). When the metadata column migrates to JSONB we can add
+        # a GIN companion for containment queries.
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_items_metadata_chat_id "
+        "ON snapshot_items ((metadata->>'chatId')) "
+        "WHERE item_type = 'TEAMS_CHAT_MESSAGE'",
     ]
 
     add_column_statements = [
