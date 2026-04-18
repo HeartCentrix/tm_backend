@@ -237,6 +237,144 @@ def _sanitize_metadata(val: str) -> str:
     return val.encode("ascii", errors="replace").decode("ascii")
 
 
-# Placeholder for Task 13.
+try:
+    from shared.export_manifest import ExportManifestBuilder  # type: ignore
+except ImportError:  # pragma: no cover
+    ExportManifestBuilder = None  # type: ignore
+
+
 class MailExportOrchestrator:
-    pass
+    """Entry point for the mail-export pipeline. Partitions items by folder,
+    spawns one FolderExportTask per folder under asyncio.Semaphore(parallelism),
+    assembles the final ZIP + manifest.
+
+    Final ZIP is built in memory for this task; Task 28 upgrades to streaming
+    into stage_block calls via zipstream-ng."""
+
+    def __init__(
+        self,
+        *,
+        job_id: str,
+        snapshot_ids: List[str],
+        items: List[Any],
+        shard,
+        source_container: str,
+        dest_container: str,
+        parallelism: int,
+        split_bytes: int,
+        block_size: int,
+        fetch_batch_size: int,
+        queue_maxsize: int,
+        format: str,
+        include_attachments: bool,
+        manifest: Optional["ExportManifestBuilder"] = None,
+    ):
+        self.job_id = job_id
+        self.snapshot_ids = snapshot_ids
+        self.items = items
+        self.shard = shard
+        self.source_container = source_container
+        self.dest_container = dest_container
+        self.parallelism = max(1, parallelism)
+        self.split_bytes = split_bytes
+        self.block_size = block_size
+        self.fetch_batch_size = fetch_batch_size
+        self.queue_maxsize = queue_maxsize
+        self.format = format.upper()
+        self.include_attachments = include_attachments
+        self.manifest = manifest or (
+            ExportManifestBuilder(job_id=job_id, snapshot_ids=snapshot_ids)
+            if ExportManifestBuilder
+            else None
+        )
+
+    async def run(self) -> dict:
+        folders = self._partition_by_folder()
+        sem = asyncio.Semaphore(self.parallelism)
+
+        folder_results = await asyncio.gather(
+            *(
+                self._run_one_folder(sem, folder_name, folder_items)
+                for folder_name, folder_items in folders.items()
+            )
+        )
+
+        zip_blob_path = f"{self.job_id}/export_{int(time.time())}.zip"
+        await self._assemble_zip(zip_blob_path, folder_results)
+
+        return {
+            "blob_path": zip_blob_path,
+            "exported_count": (
+                self.manifest.exported_count
+                if self.manifest
+                else sum(fr.exported_count for fr in folder_results)
+            ),
+            "failed_count": (
+                self.manifest.failed_count
+                if self.manifest
+                else sum(len(fr.failed_items) for fr in folder_results)
+            ),
+            "folder_count": len(folders),
+            "manifest": (
+                json.loads(self.manifest.to_json().decode("utf-8"))
+                if self.manifest
+                else None
+            ),
+        }
+
+    def _partition_by_folder(self) -> dict:
+        from collections import defaultdict
+
+        out: dict = defaultdict(list)
+        for it in self.items:
+            folder = (getattr(it, "folder_path", None) or "Inbox").strip("/")
+            out[folder].append(it)
+        return dict(out)
+
+    async def _run_one_folder(
+        self,
+        sem: asyncio.Semaphore,
+        folder_name: str,
+        folder_items: List[Any],
+    ) -> FolderExportResult:
+        async with sem:
+            task = FolderExportTask(
+                folder_name=folder_name,
+                items=folder_items,
+                shard=self.shard,
+                source_container=self.source_container,
+                dest_container=self.dest_container,
+                dest_blob_prefix=f"{self.job_id}/{folder_name}",
+                split_bytes=self.split_bytes,
+                block_size=self.block_size,
+                fetch_batch_size=self.fetch_batch_size,
+                queue_maxsize=self.queue_maxsize,
+                format=self.format,
+                include_attachments=self.include_attachments,
+                manifest=self.manifest,
+            )
+            return await task.run()
+
+    async def _assemble_zip(
+        self, zip_blob_path: str, folder_results: List[FolderExportResult]
+    ):
+        """Build the final ZIP. Task 28 replaces this with a streaming impl
+        backed by zipstream-ng + stage_block."""
+        import io as _io
+        import zipfile as _zipfile
+
+        zip_buf = _io.BytesIO()
+        with _zipfile.ZipFile(zip_buf, "w", _zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for fr in folder_results:
+                for blob_path in fr.produced_blobs:
+                    content = await self.shard.download_blob(
+                        self.dest_container, blob_path
+                    )
+                    arcname = blob_path.split(f"{self.job_id}/", 1)[-1]
+                    zf.writestr(arcname, content or b"")
+            if self.manifest:
+                zf.writestr("_MANIFEST.json", self.manifest.to_json())
+
+        await self.shard.upload_blob(
+            self.dest_container, zip_blob_path, zip_buf.getvalue()
+        )
