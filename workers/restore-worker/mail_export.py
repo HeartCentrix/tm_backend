@@ -30,7 +30,13 @@ from shared.mbox_writer import MboxWriter  # noqa: E402
 @dataclass
 class FolderExportResult:
     folder_name: str
+    # MBOX path: per-folder MBOX blobs already uploaded to the destination
+    # container. ZIP assembly pulls these via server-side copy / download.
     produced_blobs: List[str] = field(default_factory=list)
+    # EML path: inline (arcname, bytes) pairs. For scale, EML format skips the
+    # intermediate per-message blob upload and feeds bytes straight into the
+    # ZIP streamer. Memory is the currently-being-zipped member only.
+    produced_inline_members: List[tuple] = field(default_factory=list)
     exported_count: int = 0
     failed_items: List[dict] = field(default_factory=list)
 
@@ -56,6 +62,7 @@ class FolderExportTask:
         format: str,
         include_attachments: bool,
         manifest,
+        mbox_inline_limit_bytes: int = 100 * 1024 * 1024,
     ):
         self.folder_name = folder_name
         self.items = items
@@ -70,6 +77,10 @@ class FolderExportTask:
         self.format = format.upper()
         self.include_attachments = include_attachments
         self.manifest = manifest
+        # MBOX tiering — folders under this byte size accumulate in memory and
+        # go inline into the final ZIP; larger folders fall back to staging an
+        # intermediate folder-MBOX blob so memory stays bounded.
+        self.mbox_inline_limit_bytes = mbox_inline_limit_bytes
 
     async def run(self) -> FolderExportResult:
         result = FolderExportResult(folder_name=self.folder_name)
@@ -82,9 +93,67 @@ class FolderExportTask:
         return result
 
     async def _fetch_message(self, item) -> Optional[dict]:
-        raw = await self.shard.download_blob(self.source_container, item.blob_path)
-        if raw is None:
+        # Fast path — Tier 2 USER_MAIL backup stores the Graph message JSON
+        # directly on the SnapshotItem row in extra_data.raw; no Azure blob is
+        # written for the message body (only attachments go to Azure). Use the
+        # inline payload when it's present to skip Azure entirely.
+        meta = getattr(item, "extra_data", None) or getattr(item, "metadata", None) or {}
+        raw_inline = meta.get("raw") if isinstance(meta, dict) else None
+        if raw_inline:
+            print(f"[FolderExportTask/{self.folder_name}] using inline extra_data.raw ext_id={getattr(item, 'external_id', '')[:40]} fields={list(raw_inline.keys())[:8]}", flush=True)
+            return raw_inline
+
+        blob_path = getattr(item, "blob_path", None)
+
+        # Legacy fallback — some SnapshotItem rows were created before blob_path
+        # was persisted. Reconstruct by listing blobs under the snapshot's prefix
+        # and matching on external_id (the last path segment of the canonical
+        # backup path: tenant/resource/snapshot/timestamp/external_id).
+        resolved_container = self.source_container
+        if not blob_path:
+            ext_id = getattr(item, "external_id", "") or ""
+            snap_id = str(getattr(item, "snapshot_id", "") or "")
+            print(f"[FolderExportTask/{self.folder_name}] blob_path=NULL, attempting list-and-match ext_id={ext_id[:40]}...", flush=True)
+
+            candidates = [self.source_container]
+            fb = getattr(item, "_mailbox_fallback_container", None)
+            if fb and fb not in candidates:
+                candidates.append(fb)
+
+            matched = None
+            matched_container = None
+            for cand in candidates:
+                try:
+                    async for name in self.shard.list_blobs(cand):
+                        if snap_id and snap_id not in name:
+                            continue
+                        if name.endswith(f"/{ext_id}"):
+                            matched = name
+                            matched_container = cand
+                            break
+                    if matched:
+                        break
+                    print(f"[FolderExportTask/{self.folder_name}] no match in container={cand}", flush=True)
+                except Exception as exc:
+                    print(f"[FolderExportTask/{self.folder_name}] list container={cand} failed: {type(exc).__name__}: {exc}", flush=True)
+
+            if matched:
+                blob_path = matched
+                resolved_container = matched_container
+                print(f"[FolderExportTask/{self.folder_name}] recovered blob_path={blob_path} container={resolved_container}", flush=True)
+            else:
+                print(f"[FolderExportTask/{self.folder_name}] no blob matched ext_id={ext_id[:40]}... under snapshot={snap_id}", flush=True)
+
+        if not blob_path:
+            print(f"[FolderExportTask/{self.folder_name}] blob_path resolution FAILED ext_id={getattr(item, 'external_id', '')[:40]}", flush=True)
             return None
+
+        print(f"[FolderExportTask/{self.folder_name}] _fetch_message container={resolved_container} path={blob_path}", flush=True)
+        raw = await self.shard.download_blob(resolved_container, blob_path)
+        if raw is None:
+            print(f"[FolderExportTask/{self.folder_name}] blob MISSING path={blob_path}", flush=True)
+            return None
+        print(f"[FolderExportTask/{self.folder_name}] blob fetched size={len(raw)} path={blob_path}", flush=True)
         return json.loads(raw.decode("utf-8"))
 
     async def _gather_attachments(self, att_paths) -> List[AttachmentRef]:
@@ -103,12 +172,14 @@ class FolderExportTask:
         return out
 
     async def _build_eml_for_item(self, item):
+        print(f"[FolderExportTask/{self.folder_name}] _build_eml_for_item START ext_id={item.external_id}", flush=True)
         msg_json = await self._fetch_message(item)
         if msg_json is None:
             raise FileNotFoundError(f"blob missing: {item.blob_path}")
         attachments = await self._gather_attachments(
             getattr(item, "attachment_blob_paths", []) or []
         )
+        print(f"[FolderExportTask/{self.folder_name}] building EML ext_id={item.external_id} atts={len(attachments)}", flush=True)
         if attachments:
             pieces = []
             async for chunk in build_eml_streaming(msg_json, attachments):
@@ -116,43 +187,102 @@ class FolderExportTask:
             eml_bytes = b"".join(pieces)
         else:
             eml_bytes = build_eml(msg_json, attachments=[])
+        print(f"[FolderExportTask/{self.folder_name}] EML built size={len(eml_bytes)} ext_id={item.external_id}", flush=True)
         return msg_json, eml_bytes
 
     async def _run_mbox(self, result: FolderExportResult):
+        """Build a folder's MBOX bytes with a two-tier storage strategy:
+
+        Phase A — inline accumulation (default).
+            All bytes go into an in-memory bytearray. No Azure I/O. At folder
+            close, emits as an inline ZIP member. Avoids the double I/O cost
+            (write intermediate blob + read during ZIP assembly).
+
+        Phase B — blob spillover (only if folder exceeds mbox_inline_limit_bytes).
+            When the in-memory buffer crosses the threshold, flushes everything
+            accumulated so far to an Azure intermediate blob via stage_block,
+            and every subsequent message streams to the same blob. At close,
+            commits the blob and emits as a blob-path ZIP member. Memory stays
+            bounded regardless of folder size.
+
+        Size-splits (split_bytes) still fire inside the MboxWriter; each part
+        is evaluated independently under the same inline/blob rule.
+        """
+        print(f"[FolderExportTask/{self.folder_name}] _run_mbox START items={len(self.items)} prefix={self.dest_blob_prefix} inline_limit={self.mbox_inline_limit_bytes}", flush=True)
+
         part_index = 1
         current_path = f"{self.dest_blob_prefix}.01.mbox"
-        block_ids: List[str] = []
-        buf = bytearray()
+
+        # Per-part state. Reset at each size-split rollover.
+        state = {
+            "buf": bytearray(),          # accumulating bytes (Phase A and pre-flush Phase B)
+            "mode": "inline",            # "inline" or "blob"
+            "block_ids": [],             # blob mode: staged block ids so far
+            "total_bytes": 0,            # running count for this part (both modes)
+        }
+
+        async def _spillover_to_blob():
+            """Transition current part from inline → blob: stage all buffered
+            bytes to Azure, switch mode."""
+            print(f"[FolderExportTask/{self.folder_name}] part={part_index} spill to blob at {state['total_bytes']} bytes", flush=True)
+            # Drain buf in block-sized chunks.
+            while state["buf"]:
+                take = min(self.block_size, len(state["buf"]))
+                chunk = bytes(state["buf"][:take])
+                del state["buf"][:take]
+                bid = f"blk-{len(state['block_ids']):05d}"
+                await self.shard.stage_block(self.dest_container, current_path, bid, chunk)
+                state["block_ids"].append(bid)
+            state["mode"] = "blob"
 
         async def flush_block(final: bool = False):
-            nonlocal buf
+            """In blob mode: drain buf into stage_block calls."""
+            if state["mode"] != "blob":
+                return
+            buf = state["buf"]
             while len(buf) >= self.block_size or (final and buf):
                 take = min(self.block_size, len(buf))
                 chunk = bytes(buf[:take])
                 del buf[:take]
-                bid = f"blk-{len(block_ids):05d}"
+                bid = f"blk-{len(state['block_ids']):05d}"
                 await self.shard.stage_block(self.dest_container, current_path, bid, chunk)
-                block_ids.append(bid)
+                state["block_ids"].append(bid)
 
         def emit(data: bytes):
-            buf.extend(data)
+            state["buf"].extend(data)
+            state["total_bytes"] += len(data)
 
         def _on_rollover(idx: int):
+            # MboxWriter fires this AFTER append_message crosses split_bytes.
+            # The folder-level loop below notices part_index changed and
+            # finalizes current before continuing.
             nonlocal part_index
             part_index = idx + 1
 
         writer = MboxWriter(emit=emit, split_bytes=self.split_bytes, on_rollover=_on_rollover)
 
         async def finalize_current():
-            nonlocal current_path, block_ids
-            await flush_block(final=True)
-            if block_ids:
-                await self.shard.commit_block_list_manual(
-                    self.dest_container, current_path, block_ids,
-                    metadata={"folder": _sanitize_metadata(self.folder_name), "part": str(part_index)},
-                )
-                result.produced_blobs.append(current_path)
-            block_ids = []
+            """Close out the current part: emit as inline or commit blob."""
+            nonlocal current_path
+            if state["mode"] == "inline":
+                if state["buf"]:
+                    arc = f"{self.folder_name}.{part_index:02d}.mbox" if part_index > 1 else f"{self.folder_name}.mbox"
+                    result.produced_inline_members.append((arc, bytes(state["buf"])))
+                    print(f"[FolderExportTask/{self.folder_name}] part={part_index} finalized INLINE size={state['total_bytes']}", flush=True)
+            else:  # blob mode
+                await flush_block(final=True)
+                if state["block_ids"]:
+                    await self.shard.commit_block_list_manual(
+                        self.dest_container, current_path, state["block_ids"],
+                        metadata={"folder": _sanitize_metadata(self.folder_name), "part": str(part_index)},
+                    )
+                    result.produced_blobs.append(current_path)
+                    print(f"[FolderExportTask/{self.folder_name}] part={part_index} finalized BLOB path={current_path} size={state['total_bytes']}", flush=True)
+            # Reset for next part.
+            state["buf"] = bytearray()
+            state["mode"] = "inline"
+            state["block_ids"] = []
+            state["total_bytes"] = 0
 
         idx = 0
         while idx < len(self.items):
@@ -170,6 +300,7 @@ class FolderExportTask:
 
             for it, data, err in prepared:
                 if err:
+                    print(f"[FolderExportTask/{self.folder_name}] ITEM FAILED ext_id={it.external_id} error={err}", flush=True)
                     result.failed_items.append({"id": it.external_id, "name": getattr(it, "name", ""), "error": err})
                     if self.manifest:
                         self.manifest.record_failure(
@@ -198,38 +329,70 @@ class FolderExportTask:
                 if part_index != prior_part:
                     await finalize_current()
                     current_path = f"{self.dest_blob_prefix}.{part_index:02d}.mbox"
-                    buf[:] = b""
 
-                if len(buf) >= self.block_size:
+                # Tier transition: inline → blob when folder grows past limit.
+                if state["mode"] == "inline" and state["total_bytes"] > self.mbox_inline_limit_bytes:
+                    await _spillover_to_blob()
+
+                # In blob mode, flush whenever buf exceeds block_size.
+                if state["mode"] == "blob" and len(state["buf"]) >= self.block_size:
                     await flush_block()
 
         writer.close()
         await finalize_current()
+        print(f"[FolderExportTask/{self.folder_name}] _run_mbox DONE produced_blobs={len(result.produced_blobs)} produced_inline={len(result.produced_inline_members)} failed={len(result.failed_items)}", flush=True)
 
     async def _run_eml(self, result: FolderExportResult):
-        for item in self.items:
-            try:
-                _, eml_bytes = await self._build_eml_for_item(item)
-                safe_name = "".join(c if c.isalnum() or c in "-._" else "_" for c in (item.name or item.external_id))
-                blob_path = f"{self.dest_blob_prefix}/{safe_name}-{item.external_id}.eml"
-                await self.shard.upload_blob(self.dest_container, blob_path, eml_bytes)
-                result.produced_blobs.append(blob_path)
+        """Build EMLs in-memory and stage them for ZIP assembly. No per-message
+        Azure upload — that was an I/O bottleneck that scaled linearly with
+        mailbox size and blew past the 60s frontend-poll budget for full
+        mailboxes.
+
+        Messages are fetched + EMLs built in parallel batches so a thousand-
+        message folder completes in ~seconds instead of ~minutes. Inline
+        (arcname, bytes) pairs land on result.produced_inline_members; the
+        orchestrator feeds them directly into the streaming ZIP writer.
+        """
+        print(f"[FolderExportTask/{self.folder_name}] _run_eml START items={len(self.items)} prefix={self.dest_blob_prefix}", flush=True)
+
+        idx = 0
+        while idx < len(self.items):
+            batch = self.items[idx : idx + self.fetch_batch_size]
+            idx += len(batch)
+
+            async def _prep(it):
+                try:
+                    _, eml_bytes = await self._build_eml_for_item(it)
+                    return it, eml_bytes, None
+                except Exception as exc:
+                    return it, None, f"{type(exc).__name__}: {exc}"
+
+            prepared = await asyncio.gather(*(_prep(i) for i in batch))
+
+            for it, eml_bytes, err in prepared:
+                if err:
+                    print(f"[FolderExportTask/{self.folder_name}] ITEM FAILED (EML path) ext_id={it.external_id} error={err}", flush=True)
+                    result.failed_items.append({
+                        "id": it.external_id, "name": getattr(it, "name", ""),
+                        "error": err,
+                    })
+                    if self.manifest:
+                        self.manifest.record_failure(
+                            item_id=it.external_id, name=getattr(it, "name", ""),
+                            folder=self.folder_name, error=err,
+                        )
+                    continue
+                safe_name = "".join(c if c.isalnum() or c in "-._" else "_" for c in (it.name or it.external_id))
+                arcname = f"{self.folder_name}/{safe_name}-{it.external_id}.eml"
+                result.produced_inline_members.append((arcname, eml_bytes))
                 result.exported_count += 1
                 if self.manifest:
                     self.manifest.record_success(
-                        item_id=item.external_id, name=getattr(item, "name", ""),
+                        item_id=it.external_id, name=getattr(it, "name", ""),
                         folder=self.folder_name, size_bytes=len(eml_bytes),
                     )
-            except Exception as exc:
-                result.failed_items.append({
-                    "id": item.external_id, "name": getattr(item, "name", ""),
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
-                if self.manifest:
-                    self.manifest.record_failure(
-                        item_id=item.external_id, name=getattr(item, "name", ""),
-                        folder=self.folder_name, error=str(exc), error_class=type(exc).__name__,
-                    )
+
+        print(f"[FolderExportTask/{self.folder_name}] _run_eml DONE produced_inline={len(result.produced_inline_members)} failed={len(result.failed_items)}", flush=True)
 
 
 def _sanitize_metadata(val: str) -> str:
@@ -267,6 +430,7 @@ async def stream_zip_to_block_blob(
     """
     import zipstream  # package: zipstream-ng
 
+    print(f"[stream_zip] START dest={dest_blob_path} members={len(members)} block_size={block_size}", flush=True)
     zs = zipstream.ZipStream(compress_type=zipstream.ZIP_STORED)
 
     block_ids: list = []
@@ -284,22 +448,30 @@ async def stream_zip_to_block_blob(
             block_ids.append(bid)
             block_index += 1
 
-    for arcname, container, path in members:
-        # Pre-buffer this member's chunks (bounded by download_blob_stream's
-        # chunk_size = block_size each). We hold at most one member's worth
-        # of chunks in RAM at a time — the list is deleted before the next
-        # member is loaded.
-        chunks: list = []
-        async for chunk in member_source_shard.download_blob_stream(
-            container, path, chunk_size=block_size
-        ):
-            chunks.append(chunk)
+    print(f"[stream_zip] adding {len(members)} members to zipstream", flush=True)
+    # Member tuple is either:
+    #   (arcname, container, blob_path)        — pull bytes from Azure
+    #   (arcname, bytes_or_bytearray)          — inline bytes (EML path)
+    #   (arcname, "inline", bytes)             — tagged inline form
+    for m in members:
+        if len(m) == 2:
+            arcname, content = m
+            chunks = [bytes(content)]
+        elif len(m) == 3 and m[1] == "inline":
+            arcname, _tag, content = m
+            chunks = [bytes(content)]
+        else:
+            arcname, container, path = m
+            chunks = []
+            async for chunk in member_source_shard.download_blob_stream(
+                container, path, chunk_size=block_size
+            ):
+                chunks.append(chunk)
         zs.add(iter(chunks), arcname=arcname)
-        del chunks  # release list reference; zs holds the iterator
+        del chunks
 
-        # Drain only this member's bytes from zs using file(). This keeps
-        # memory bounded to one member's data at a time rather than
-        # accumulating all members before draining.
+        # Drain only this member's bytes from zs using file(). Keeps memory
+        # bounded to one member at a time.
         for zchunk in zs.file():
             staged.extend(zchunk)
             await _flush_to_block()
@@ -312,10 +484,12 @@ async def stream_zip_to_block_blob(
         await _flush_to_block()
 
     await _flush_to_block(final=True)
+    print(f"[stream_zip] committing {len(block_ids)} blocks to {dest_blob_path}", flush=True)
     await dest_shard.commit_block_list_manual(
         dest_container, dest_blob_path, block_ids,
         metadata={"streamed": "true"},
     )
+    print(f"[stream_zip] DONE dest={dest_blob_path}", flush=True)
 
 
 class MailExportOrchestrator:
@@ -352,6 +526,7 @@ class MailExportOrchestrator:
         manifest: Optional["ExportManifestBuilder"] = None,
         checkpoint: Optional[dict] = None,
         persist_checkpoint=None,  # async callable(dict) — e.g. update Job.result in DB
+        mbox_inline_limit_bytes: int = 100 * 1024 * 1024,
     ):
         if shard_manager is None and shard is None:
             raise ValueError("pass either shard_manager (preferred) or shard (legacy)")
@@ -369,6 +544,7 @@ class MailExportOrchestrator:
         self.queue_maxsize = queue_maxsize
         self.format = format.upper()
         self.include_attachments = include_attachments
+        self.mbox_inline_limit_bytes = mbox_inline_limit_bytes
         self.manifest = manifest or (
             ExportManifestBuilder(job_id=job_id, snapshot_ids=snapshot_ids)
             if ExportManifestBuilder
@@ -376,6 +552,14 @@ class MailExportOrchestrator:
         )
         self.checkpoint = dict(checkpoint or {"completed_folders": [], "produced_blobs": {}})
         self.persist_checkpoint = persist_checkpoint
+
+    async def _safe_persist_checkpoint(self, cp_dict: dict, folder_name: str) -> None:
+        """Best-effort background checkpoint write. Errors logged, never raised."""
+        try:
+            await self.persist_checkpoint(cp_dict)
+            print(f"[MailExportOrchestrator] checkpoint persisted folder={folder_name}", flush=True)
+        except Exception as exc:
+            print(f"[MailExportOrchestrator] checkpoint persist failed folder={folder_name} (non-fatal): {type(exc).__name__}: {exc}", flush=True)
 
     def preflight(self) -> List[str]:
         """M5 — warn if total export size is pathologically large."""
@@ -390,9 +574,10 @@ class MailExportOrchestrator:
         return warnings
 
     async def run(self) -> dict:
+        print(f"[MailExportOrchestrator] ENTER job={self.job_id} items={len(self.items)} fmt={self.format}", flush=True)
         # M5 preflight
         for w in self.preflight():
-            print(f"[MailExportOrchestrator] {w}")  # routed to JobLog by caller
+            print(f"[MailExportOrchestrator] {w}", flush=True)
 
         # M6 memory monitor — soft-kill before Docker OOM mid-commit.
         from shared.memory_monitor import MemoryMonitor
@@ -412,19 +597,23 @@ class MailExportOrchestrator:
             on_breach=_on_breach,
         )
         await monitor.start()
+        print(f"[MailExportOrchestrator] monitor started job={self.job_id}", flush=True)
 
         try:
             if self.shard_manager:
                 groups = self._partition_by_folder_and_shard()
             else:
                 groups = {(fn, 0): items for fn, items in self._partition_by_folder().items()}
+            print(f"[MailExportOrchestrator] partitioned into {len(groups)} (folder,shard) groups: {list(groups.keys())}", flush=True)
 
             completed = set(self.checkpoint.get("completed_folders", []))
             sem = asyncio.Semaphore(self.parallelism)
 
             async def _run_and_persist(folder_name, shard_index, folder_items):
+                print(f"[MailExportOrchestrator] _run_and_persist START folder={folder_name} shard={shard_index} items={len(folder_items)}", flush=True)
                 shard = self.shard_manager.get_shard_by_index(shard_index) if self.shard_manager else self.shard
                 async with sem:
+                    print(f"[MailExportOrchestrator] folder sem acquired folder={folder_name}", flush=True)
                     task = FolderExportTask(
                         folder_name=folder_name,
                         items=folder_items,
@@ -441,9 +630,11 @@ class MailExportOrchestrator:
                         queue_maxsize=self.queue_maxsize,
                         format=self.format,
                         include_attachments=self.include_attachments,
+                        mbox_inline_limit_bytes=self.mbox_inline_limit_bytes,
                         manifest=self.manifest,
                     )
                     result = await task.run()
+                    print(f"[MailExportOrchestrator] folder={folder_name} produced={len(result.produced_blobs)} failures={len(result.failed_items)}", flush=True)
 
                 cp_folders = list(self.checkpoint.get("completed_folders", []))
                 cp_blobs = dict(self.checkpoint.get("produced_blobs", {}))
@@ -452,20 +643,24 @@ class MailExportOrchestrator:
                 cp_blobs[folder_name] = list(result.produced_blobs)
                 self.checkpoint["completed_folders"] = cp_folders
                 self.checkpoint["produced_blobs"] = cp_blobs
-                if self.persist_checkpoint:
-                    try:
-                        await self.persist_checkpoint(dict(self.checkpoint))
-                    except Exception as exc:
-                        print(f"[MailExportOrchestrator] checkpoint persist failed (non-fatal): {exc}")
+                # Mid-run checkpoint persist disabled — it opened a second DB
+                # session that raced with the main session's final commit and
+                # clobbered result.blob_path. Checkpoint is carried in the
+                # final returned dict (see run() below) and persisted as part
+                # of the main job update, so resumability still works across
+                # redeliveries.
+                print(f"[MailExportOrchestrator] _run_and_persist RETURN folder={folder_name}", flush=True)
                 return shard_index, shard, result
 
             remaining_groups = {
                 k: v for k, v in groups.items() if k[0] not in completed
             }
+            print(f"[MailExportOrchestrator] gathering {len(remaining_groups)} folder tasks", flush=True)
             per_group = await asyncio.gather(
                 *(_run_and_persist(fn, si, items)
                   for (fn, si), items in remaining_groups.items())
             )
+            print(f"[MailExportOrchestrator] all folder tasks done ({len(per_group)} results)", flush=True)
 
             # For legacy single-shard path: also recover prior checkpoint blobs
             # into folder_results so ZIP assembly includes them.
@@ -498,6 +693,7 @@ class MailExportOrchestrator:
             )
 
             zip_blob_path = f"{self.job_id}/export_{int(time.time())}.zip"
+            print(f"[MailExportOrchestrator] assembling ZIP dest_shard={dest_shard_index} path={zip_blob_path}", flush=True)
             await self._assemble_zip_multi_shard(
                 dest_shard=dest_shard,
                 zip_blob_path=zip_blob_path,
@@ -546,11 +742,22 @@ class MailExportOrchestrator:
 
     async def _assemble_zip_multi_shard(self, *, dest_shard, zip_blob_path, per_group, dest_shard_index):
         """Stream the final ZIP into block staging on dest_shard.
-        Cross-shard members are copied to dest_shard first via put_block_from_url."""
-        same_shard_members = []
-        cross_shard_tmp_copies = []
+        Three member sources:
+          - same-shard blob (MBOX folder files on same shard as dest) — direct
+          - cross-shard blob (MBOX from another shard) — server-side-copy first
+          - inline bytes (EML messages built in memory) — no Azure round-trip
+        """
+        inline_members = []           # (arcname, bytes) — EML path
+        same_shard_members = []       # (arcname, container, blob_path) — same-shard MBOX
+        cross_shard_tmp_copies = []   # (arcname, container, tmp_path) — cross-shard MBOX copied locally
 
         for shard_index, shard, fr in per_group:
+            # EML inline members: no Azure round-trip needed. Arcname already
+            # set by FolderExportTask._run_eml (e.g. "Inbox/subject-id.eml").
+            for arc, eml_bytes in getattr(fr, "produced_inline_members", []) or []:
+                inline_members.append((arc, "inline", eml_bytes))
+
+            # MBOX per-folder blobs (legacy + MBOX format).
             for blob_path in fr.produced_blobs:
                 arc = blob_path.split(f"{self.job_id}/shard-{shard_index}/", 1)[-1]
                 if "/shard-" not in blob_path:
@@ -558,7 +765,6 @@ class MailExportOrchestrator:
                 if shard_index == dest_shard_index:
                     same_shard_members.append((arc, self.dest_container, blob_path))
                 else:
-                    # Server-side copy into dest shard's exports container.
                     try:
                         sas_src = await shard.get_blob_sas_url(self.dest_container, blob_path)
                     except Exception:
@@ -575,8 +781,10 @@ class MailExportOrchestrator:
                     except Exception as exc:
                         print(f"[MailExportOrchestrator] cross-shard copy failed for {blob_path}: {exc}")
 
-        all_members = same_shard_members + cross_shard_tmp_copies
+        all_members = inline_members + same_shard_members + cross_shard_tmp_copies
         manifest_bytes = self.manifest.to_json() if self.manifest else b"{}"
+
+        print(f"[MailExportOrchestrator] ZIP member breakdown: inline={len(inline_members)} same_shard={len(same_shard_members)} cross_shard={len(cross_shard_tmp_copies)}", flush=True)
 
         await stream_zip_to_block_blob(
             dest_shard=dest_shard,
@@ -589,7 +797,8 @@ class MailExportOrchestrator:
         )
 
         # Cleanup intermediate per-folder MBOX blobs + cross-shard temp copies.
-        # Failures here are non-fatal — the final ZIP already committed.
+        # Inline members have no Azure footprint to clean up. Failures here
+        # are non-fatal — the final ZIP already committed.
         for _, container, path in same_shard_members + cross_shard_tmp_copies:
             try:
                 await dest_shard.delete_blob(container, path)

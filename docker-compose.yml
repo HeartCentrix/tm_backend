@@ -376,6 +376,7 @@ services:
       dockerfile: workers/restore-worker/Dockerfile
     env_file: .env
     environment:
+      PYTHONUNBUFFERED: "1"
       DB_HOST: postgres
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq

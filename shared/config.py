@@ -131,6 +131,11 @@ class Settings:
         self.EXPORT_MEMORY_SOFT_LIMIT_PCT = int(os.getenv("EXPORT_MEMORY_SOFT_LIMIT_PCT", "80"))
         self.EXPORT_MEMORY_KILL_GRACE_SECONDS = int(os.getenv("EXPORT_MEMORY_KILL_GRACE_SECONDS", "60"))
         self.EXPORT_MAIL_V2_ENABLED = os.getenv("EXPORT_MAIL_V2_ENABLED", "false").lower() in ("true", "1", "yes")
+        # MBOX tiering: folders under this byte size accumulate in memory and go
+        # straight into the final ZIP without an intermediate Azure blob.
+        # Folders over the limit stream via intermediate blob (bounded memory,
+        # ZIP assembly re-reads). Default 100 MiB.
+        self.EXPORT_MBOX_INLINE_LIMIT_BYTES = int(os.getenv("EXPORT_MBOX_INLINE_LIMIT_BYTES", str(100 * 1024 * 1024)))
 
         # Heavy export pool — routes >100 GB-with-attachments exports to a dedicated
         # worker set with a larger memory budget. See spec §13 promoted scope.

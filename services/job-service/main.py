@@ -919,15 +919,39 @@ async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Job completed but no blob_path recorded")
 
     # Reuse the same shard the workers use so credentials line up.
-    try:
-        from shared.azure_storage import azure_storage_manager
-        shard = azure_storage_manager.get_default_shard()
-        content = await shard.download_blob("exports", blob_path)
-    except Exception as exc:
-        print(f"[JOB_SERVICE] export download failed for job {job_id}: {exc}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch export blob: {exc}")
+    # Container naming mirrors backup-worker / restore-worker:
+    # `backup-exports-{tenant_hash}`. Fallbacks: literal "exports" (legacy) and
+    # Job.result.container (if the worker recorded it explicitly).
+    from shared.azure_storage import azure_storage_manager
+    shard = azure_storage_manager.get_default_shard()
+    candidate_containers: list = []
+    if result.get("container"):
+        candidate_containers.append(str(result["container"]))
+    if job.tenant_id:
+        candidate_containers.append(azure_storage_manager.get_container_name(str(job.tenant_id), "exports"))
+    candidate_containers.append("exports")
+    # dedupe preserving order
+    seen = set(); _uniq = []
+    for c in candidate_containers:
+        if c and c not in seen:
+            seen.add(c); _uniq.append(c)
+    candidate_containers = _uniq
+
+    content = None
+    last_err: Exception | None = None
+    for cand in candidate_containers:
+        try:
+            content = await shard.download_blob(cand, blob_path)
+            if content is not None:
+                print(f"[JOB_SERVICE] export download: found in container={cand}")
+                break
+        except Exception as exc:
+            last_err = exc
+            print(f"[JOB_SERVICE] container={cand} download failed: {exc}")
     if content is None:
-        raise HTTPException(status_code=404, detail="Export blob not found in storage")
+        if last_err:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch export blob: {last_err}")
+        raise HTTPException(status_code=404, detail=f"Export blob not found in any of: {candidate_containers}")
 
     fname = blob_path.rsplit("/", 1)[-1] or f"export_{job_id}.zip"
 
