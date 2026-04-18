@@ -92,9 +92,11 @@ class RestoreWorker:
                     print(f"[{self.worker_id}] Failed to connect to RabbitMQ after {max_retries} attempts")
                     raise
 
+        from shared.config import settings as _s
+        queue_name = _s.RESTORE_WORKER_QUEUE
         queues = [
             ("restore.urgent", 10),
-            ("restore.normal", 30),
+            (queue_name, 30),
             ("restore.low", 50),
         ]
 

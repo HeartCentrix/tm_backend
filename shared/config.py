@@ -132,6 +132,15 @@ class Settings:
         self.EXPORT_MEMORY_KILL_GRACE_SECONDS = int(os.getenv("EXPORT_MEMORY_KILL_GRACE_SECONDS", "60"))
         self.EXPORT_MAIL_V2_ENABLED = os.getenv("EXPORT_MAIL_V2_ENABLED", "false").lower() in ("true", "1", "yes")
 
+        # Heavy export pool — routes >100 GB-with-attachments exports to a dedicated
+        # worker set with a larger memory budget. See spec §13 promoted scope.
+        self.HEAVY_EXPORT_THRESHOLD_BYTES = int(os.getenv(
+            "HEAVY_EXPORT_THRESHOLD_BYTES", str(100 * 1024 * 1024 * 1024)
+        ))
+        self.HEAVY_EXPORT_QUEUE = os.getenv("HEAVY_EXPORT_QUEUE", "restore.heavy")
+        self.HEAVY_EXPORT_ENABLED = os.getenv("HEAVY_EXPORT_ENABLED", "false").lower() in ("true", "1", "yes")
+        self.RESTORE_WORKER_QUEUE = os.getenv("RESTORE_WORKER_QUEUE", "restore.normal")
+
         self.ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
         self.ELASTICSEARCH_ENABLED = False
         origins = os.getenv("CORS_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:4200,http://localhost:3000,http://localhost:5173")

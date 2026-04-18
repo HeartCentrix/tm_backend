@@ -413,6 +413,54 @@ services:
         reservations:
           memory: 1G
 
+  restore-worker-heavy:
+    build:
+      context: .
+      dockerfile: workers/restore-worker/Dockerfile
+    container_name: tm_vault_restore_worker_heavy
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      RABBITMQ_ENABLED: "true"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
+      AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
+      # Multi-app registration
+      APP_1_CLIENT_ID: ${APP_1_CLIENT_ID}
+      APP_1_CLIENT_SECRET: ${APP_1_CLIENT_SECRET}
+      APP_1_TENANT_ID: ${APP_1_TENANT_ID}
+      APP_2_CLIENT_ID: ${APP_2_CLIENT_ID:-}
+      APP_2_CLIENT_SECRET: ${APP_2_CLIENT_SECRET:-}
+      APP_2_TENANT_ID: ${APP_2_TENANT_ID:-}
+      APP_3_CLIENT_ID: ${APP_3_CLIENT_ID:-}
+      APP_3_CLIENT_SECRET: ${APP_3_CLIENT_SECRET:-}
+      APP_3_TENANT_ID: ${APP_3_TENANT_ID:-}
+      AZURE_AD_CLIENT_ID: ${AZURE_AD_CLIENT_ID}
+      AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
+      RESTORE_WORKER_QUEUE: restore.heavy
+      MAX_CONCURRENT_EXPORTS_PER_WORKER: 1
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 16G
+        reservations:
+          memory: 4G
+    mem_limit: 16g
+    profiles:
+      - heavy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
   # search-service removed — see note above graph-proxy/delta-token. Gateway
   # routes /resources/search to resource-service; this service had no callers.
 

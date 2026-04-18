@@ -825,7 +825,29 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
             spec=request,
             resource_type=resource_type,
         )
-        queue = restore_message.get("queue", "restore.normal")
+
+        # Total bytes for M5 preflight + Task 23 heavy pool routing.
+        from sqlalchemy import func as sa_func, select as sa_select
+        total_bytes = 0
+        try:
+            if item_ids:
+                q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
+                    SnapshotItem.id.in_([uuid.UUID(x) for x in item_ids])
+                )
+                total_bytes = int((await db.execute(q)).scalar() or 0)
+            elif snapshot_ids:
+                q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
+                    SnapshotItem.snapshot_id.in_([uuid.UUID(x) for x in snapshot_ids])
+                )
+                total_bytes = int((await db.execute(q)).scalar() or 0)
+        except Exception:
+            total_bytes = 0
+
+        from services.job_service_utils import pick_export_queue
+        queue = pick_export_queue(
+            total_bytes=total_bytes,
+            include_attachments=bool(request.get("includeAttachments", True)),
+        )
         await message_bus.publish(queue, restore_message, priority=restore_message.get("priority", 5))
     else:
         print(f"[JOB_SERVICE] RabbitMQ not enabled, export job {job.id} will stay QUEUED")
