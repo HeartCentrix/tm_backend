@@ -502,24 +502,60 @@ class BackupWorker:
                         print(f"[{self.worker_id}] [USER_MAIL] folder tree fetch failed for {user_id}: {e}")
                         folder_tree = {}
 
-                    page = await graph_client._get(
-                        f"{graph_client.GRAPH_URL}/users/{user_id}/messages",
-                        params={"$top": str(ITEM_LIMIT), "$select": "id,subject,from,toRecipients,ccRecipients,sentDateTime,receivedDateTime,bodyPreview,body,hasAttachments,parentFolderId,parentFolderName"},
-                    )
+                    # Direct httpx — do NOT use graph_client._get, which
+                    # follows @odata.nextLink internally. If any one page
+                    # raises (504 timeouts on `$skip=N` are common on large
+                    # mailboxes), the entire fetch bails and we drop all
+                    # messages already retrieved. Here we page manually,
+                    # break on the first failure, and return whatever was
+                    # fetched successfully — a partial capture beats zero.
+                    import httpx as _httpx
+                    mail_token = await graph_client._get_token()
+                    PAGE_SIZE = 50
+                    MAX_PAGES = 20  # ~1000 messages hard cap per run
                     out = []
-                    for m in page.get("value", []):
-                        path = (
-                            folder_tree.get(m.get("parentFolderId"))
-                            or m.get("parentFolderName")
-                            or ""
-                        )
-                        out.append((
-                            "EMAIL",
-                            m.get("subject") or "(no subject)",
-                            m.get("id"),
-                            {"raw": m},
-                            path,
-                        ))
+                    next_url = f"{graph_client.GRAPH_URL}/users/{user_id}/messages"
+                    params = {
+                        "$top": str(PAGE_SIZE),
+                        # NOTE: `parentFolderName` is NOT a Graph message
+                        # property — requesting it returns HTTP 400. Folder
+                        # NAMES come from the folder_tree lookup via
+                        # parentFolderId below.
+                        "$select": "id,subject,from,toRecipients,ccRecipients,sentDateTime,receivedDateTime,bodyPreview,body,hasAttachments,parentFolderId",
+                    }
+                    pages_done = 0
+                    async with _httpx.AsyncClient(timeout=60.0) as _c:
+                        while next_url and pages_done < MAX_PAGES:
+                            try:
+                                r = await _c.get(
+                                    next_url,
+                                    headers={"Authorization": f"Bearer {mail_token}"},
+                                    params=params if pages_done == 0 else None,
+                                )
+                                if r.status_code != 200:
+                                    print(f"[{self.worker_id}] [USER_MAIL] page {pages_done} HTTP {r.status_code} — stopping (kept {len(out)} messages)")
+                                    break
+                                page = r.json() or {}
+                            except Exception as e:
+                                print(f"[{self.worker_id}] [USER_MAIL] page {pages_done} fetch failed: {type(e).__name__}: {e} — stopping (kept {len(out)} messages)")
+                                break
+                            for m in page.get("value", []):
+                                path = (
+                                    folder_tree.get(m.get("parentFolderId"))
+                                    or m.get("parentFolderName")
+                                    or ""
+                                )
+                                out.append((
+                                    "EMAIL",
+                                    m.get("subject") or "(no subject)",
+                                    m.get("id"),
+                                    {"raw": m},
+                                    path,
+                                ))
+                            next_url = page.get("@odata.nextLink")
+                            pages_done += 1
+                            if len(out) >= ITEM_LIMIT * 5:
+                                break  # safety cap
                     return out
 
                 if kind == "USER_ONEDRIVE":
@@ -766,9 +802,36 @@ class BackupWorker:
                         session.add_all(db_items)
                         await session.commit()
 
+                # For USER_MAIL: second pass captures attachments for each
+                # message with hasAttachments=true. Done AFTER the main email
+                # rows are committed so attachment rows can reference the
+                # email's external_id in extra_data.parent_item_id.
+                att_items, att_bytes = [], 0
+                if resource.type.value == "USER_MAIL":
+                    user_id = (resource.extra_data or {}).get("user_id")
+                    if user_id:
+                        emails_with_att = [
+                            extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
+                            if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
+                            and extra["raw"].get("hasAttachments")
+                        ]
+                        if emails_with_att:
+                            att_items, att_bytes = await self._usermail_backup_attachments(
+                                graph_client, resource, snapshot, tenant, user_id, emails_with_att,
+                            )
+
+                if att_items:
+                    async with async_session_factory() as session:
+                        session.add_all(att_items)
+                        await session.commit()
+
+                total_items = len(items_data) + len(att_items)
+                bytes_total += att_bytes
+
+                async with async_session_factory() as session:
                     snap = await session.get(Snapshot, snapshot.id)
-                    snap.item_count = len(items_data)
-                    snap.new_item_count = len(items_data)
+                    snap.item_count = total_items
+                    snap.new_item_count = total_items
                     snap.bytes_total = bytes_total
                     snap.bytes_added = bytes_total
                     snap.status = SnapshotStatus.COMPLETED
@@ -778,17 +841,171 @@ class BackupWorker:
                     await session.commit()
 
                     await self.update_resource_backup_info(session, resource, job_id, snapshot.id, {
-                        "item_count": len(items_data),
+                        "item_count": total_items,
                         "bytes_added": bytes_total,
                     })
 
-                print(f"[{self.worker_id}] [{resource.type.value}] {resource.display_name} — {len(items_data)} items, {bytes_total} bytes")
-                return {"item_count": len(items_data), "bytes_added": bytes_total}
+                suffix = f" + {len(att_items)} attachments" if att_items else ""
+                print(f"[{self.worker_id}] [{resource.type.value}] {resource.display_name} — {len(items_data)} items{suffix}, {bytes_total} bytes")
+                return {"item_count": total_items, "bytes_added": bytes_total}
 
         results = await asyncio.gather(*[_backup_one(r) for r in resources], return_exceptions=True)
         item_count = sum(r.get("item_count", 0) for r in results if isinstance(r, dict))
         bytes_added = sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict))
         return {"item_count": item_count, "bytes_added": bytes_added}
+
+    # ==================== Tier 2 USER_MAIL attachment capture ====================
+
+    async def _usermail_backup_attachments(
+        self,
+        graph_client: GraphClient,
+        resource: Resource,
+        snapshot: Snapshot,
+        tenant: Tenant,
+        user_id: str,
+        messages_with_attachments: List[Dict[str, Any]],
+    ) -> Tuple[List[SnapshotItem], int]:
+        """Capture every attachment from a list of messages as separate
+        `EMAIL_ATTACHMENT` SnapshotItems backed by Azure Blob.
+
+        Three Graph attachment kinds, each handled:
+          - fileAttachment (binary): read `contentBytes` if inline, else
+            fetch via /$value — upload bytes to blob.
+          - itemAttachment (nested Outlook item): serialize the payload's
+            `.item` field to JSON — upload to blob. Lets us restore the
+            nested email/event even though Graph doesn't ship raw MIME.
+          - referenceAttachment (OneDrive/SharePoint link): resolve the
+            `sourceUrl` via /shares/{id}/driveItem and download the file.
+            Falls back to metadata-only if the link isn't resolvable
+            (external / missing grant / revoked).
+
+        Each attachment gets `extra_data.parent_item_id = <message id>` so
+        the Recovery page's EmailPreview can list them under the parent
+        email. Bounded concurrency keeps us under Graph throttling."""
+        sem = asyncio.Semaphore(8)
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "email")
+
+        async def _one_message(msg: Dict[str, Any]) -> Tuple[List[SnapshotItem], int]:
+            msg_id = msg.get("id")
+            if not msg_id:
+                return [], 0
+            async with sem:
+                try:
+                    attachments = await graph_client.list_message_attachments(user_id, msg_id)
+                except Exception as e:
+                    print(f"[{self.worker_id}] [ATT-LIST FAIL] msg {msg_id}: {type(e).__name__}: {e}")
+                    return [], 0
+
+            local_items: List[SnapshotItem] = []
+            local_bytes = 0
+            folder_path = msg.get("_full_folder_path") or msg.get("parentFolderName") or None
+
+            for att in attachments:
+                att_id = att.get("id")
+                if not att_id:
+                    continue
+                att_kind = att.get("@odata.type", "")
+                att_name = att.get("name") or att_id
+                content_type = att.get("contentType")
+                declared_size = att.get("size") or 0
+
+                content_bytes: Optional[bytes] = None
+
+                if att_kind.endswith("fileAttachment"):
+                    raw_b64 = att.get("contentBytes")
+                    if raw_b64:
+                        import base64 as _b64
+                        try:
+                            content_bytes = _b64.b64decode(raw_b64)
+                        except Exception:
+                            content_bytes = None
+                    if content_bytes is None:
+                        try:
+                            async with sem:
+                                content_bytes = await graph_client.get_message_attachment_content(user_id, msg_id, att_id)
+                        except Exception as e:
+                            print(f"[{self.worker_id}] [ATT-FAIL] {att_name} (file) on {msg_id}: {type(e).__name__}: {e}")
+                            continue
+                elif att_kind.endswith("itemAttachment"):
+                    # Nested Outlook item — serialize to JSON so it's
+                    # downloadable as a .json file and restorable later.
+                    nested = att.get("item") or {}
+                    try:
+                        content_bytes = json.dumps(nested, default=str).encode("utf-8")
+                    except Exception:
+                        content_bytes = None
+                    if not att_name.lower().endswith(".json"):
+                        att_name = f"{att_name}.json"
+                    content_type = content_type or "application/json"
+                elif att_kind.endswith("referenceAttachment"):
+                    # Try to resolve the sharing URL into actual bytes.
+                    source_url = att.get("sourceUrl")
+                    content_bytes = await graph_client.fetch_shared_url_content(source_url) if source_url else None
+                    # If resolution fails, fall through with content_bytes=None
+                    # and we persist a metadata-only row below.
+
+                blob_path: Optional[str] = None
+                content_hash: Optional[str] = None
+                size = declared_size
+
+                if content_bytes is not None:
+                    content_hash = hashlib.sha256(content_bytes).hexdigest()
+                    size = len(content_bytes)
+                    blob_path = azure_storage_manager.build_blob_path(
+                        str(tenant.id), str(resource.id), str(snapshot.id),
+                        f"att_{msg_id}_{att_id}",
+                    )
+                    try:
+                        result = await upload_blob_with_retry(
+                            container, blob_path, content_bytes, shard, max_retries=3,
+                        )
+                        if not (isinstance(result, dict) and result.get("success")):
+                            # Upload failed — keep the row as metadata-only.
+                            blob_path = None
+                            content_hash = None
+                        else:
+                            local_bytes += size
+                    except Exception as e:
+                        print(f"[{self.worker_id}] [ATT-UPLOAD] {att_name} on {msg_id}: {type(e).__name__}: {e}")
+                        blob_path = None
+                        content_hash = None
+
+                local_items.append(SnapshotItem(
+                    id=uuid.uuid4(),
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    external_id=f"{msg_id}::{att_id}",
+                    item_type="EMAIL_ATTACHMENT",
+                    name=(att_name or "")[:255],
+                    folder_path=folder_path,
+                    content_hash=content_hash,
+                    content_size=size,
+                    blob_path=blob_path,
+                    content_checksum=content_hash,
+                    extra_data={
+                        "parent_item_id": msg_id,
+                        "attachment_kind": att_kind,
+                        "content_type": content_type,
+                        "is_inline": att.get("isInline", False),
+                        "source_url": att.get("sourceUrl"),
+                        "resolved": blob_path is not None,
+                    },
+                ))
+            return local_items, local_bytes
+
+        results = await asyncio.gather(
+            *[_one_message(m) for m in messages_with_attachments],
+            return_exceptions=True,
+        )
+        all_items: List[SnapshotItem] = []
+        total_bytes = 0
+        for r in results:
+            if isinstance(r, tuple):
+                items, b = r
+                all_items.extend(items)
+                total_bytes += b
+        return all_items, total_bytes
 
     # ==================== Server-Side Copy for Files ====================
 
