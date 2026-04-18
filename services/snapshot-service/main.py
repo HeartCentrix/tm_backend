@@ -987,15 +987,35 @@ async def list_snapshot_calendar(
         else:
             event_type = "Appointment"
 
+        # Graph returns `start.dateTime` without a timezone suffix (e.g.
+        # "2024-01-15T09:00:00.0000000") and the zone in the sibling
+        # `timeZone` field. When timeZone is "UTC", we append Z so the
+        # frontend's `new Date(s).toLocaleString()` converts to the
+        # viewer's local timezone instead of treating the string as
+        # local (which would hide the timezone shift).
+        def _iso_with_tz(dt_str: Optional[str], tz_name: Optional[str]) -> Optional[str]:
+            if not dt_str:
+                return dt_str
+            # Already has a tz marker (Z or ±HH:MM) — leave alone.
+            if dt_str.endswith("Z") or "+" in dt_str[10:] or "-" in dt_str[10:]:
+                return dt_str
+            if (tz_name or "").upper() == "UTC":
+                return dt_str + "Z"
+            # Non-UTC named tz (e.g. "India Standard Time"): we don't have
+            # a Windows→IANA map here, so pass through as local-style ISO
+            # and let the frontend interpret. Better than fabricating the
+            # wrong offset.
+            return dt_str
+        _tz = start_obj.get("timeZone") or "UTC"
         return {
             "id": str(i.id),
             "snapshotId": str(i.snapshot_id),
             "externalId": i.external_id,
             "itemType": i.item_type,
             "subject": subject or i.name or "",
-            "start": start_obj.get("dateTime") or start_obj.get("date"),
-            "end": end_obj.get("dateTime") or end_obj.get("date"),
-            "timeZone": start_obj.get("timeZone") or "UTC",
+            "start": _iso_with_tz(start_obj.get("dateTime") or start_obj.get("date"), _tz),
+            "end": _iso_with_tz(end_obj.get("dateTime") or end_obj.get("date"), start_obj.get("timeZone") or _tz),
+            "timeZone": _tz,
             "isAllDay": is_all_day,
             "isCancelled": is_cancelled,
             "location": (raw.get("location") or {}).get("displayName") or "",
@@ -1162,12 +1182,34 @@ async def get_item_content(
                 except Exception:
                     pass
 
-            content_type = (meta.get("content_type")
-                            or ("application/json" if item.item_type in ("EMAIL", "CALENDAR_EVENT", "TEAMS_CHAT_MESSAGE") else "application/octet-stream"))
+            # Content-Type priority:
+            #   1. `extra_data.content_type` — Graph's declared MIME (most
+            #      accurate for fileAttachments: "application/pdf" etc.).
+            #      But skip it if it's a non-MIME string like "reference"
+            #      that Graph hands back for chat attachments.
+            #   2. Infer from the filename extension via mimetypes —
+            #      covers chat referenceAttachments (we have the filename
+            #      but Graph gave us "reference", not the actual MIME).
+            #   3. Type-based default (EMAIL/CALENDAR_EVENT/TEAMS_CHAT_MESSAGE
+            #      are JSON) or application/octet-stream.
+            import mimetypes as _mt
+            declared_ct = (meta.get("content_type") or "").strip()
+            looks_like_mime = "/" in declared_ct  # filters out bare words like "reference"
+            guessed_ct, _ = _mt.guess_type(item.name or "")
+            content_type = (
+                declared_ct if looks_like_mime else
+                guessed_ct or (
+                    "application/json" if item.item_type in ("EMAIL", "CALENDAR_EVENT", "TEAMS_CHAT_MESSAGE")
+                    else "application/octet-stream"
+                )
+            )
             headers = {}
             if download:
                 # RFC 5987 filename* for non-ASCII safety; plain filename
-                # kept as a fallback for older browsers.
+                # kept as a fallback for older browsers. The filename
+                # retains the extension from item.name (we set it at
+                # backup time from Graph's `name` field, which already
+                # includes the extension).
                 import urllib.parse as _urlp
                 fname = (item.name or f"item-{item.id}").strip()
                 safe = _urlp.quote(fname)
