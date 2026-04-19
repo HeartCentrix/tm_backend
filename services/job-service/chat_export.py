@@ -205,6 +205,13 @@ async def trigger(
     await _ensure_ownership(sess, user, req.resourceId)
     user_tenant = _user_tenant_id(user)
 
+    # Feature flag gate — tenant must be opted in via extra_data.limits.
+    tenant = (await sess.execute(select(Tenant).where(Tenant.id == user_tenant))).scalar_one()
+    limits = (tenant.extra_data or {}).get("limits", {}) if hasattr(tenant, "extra_data") else {}
+    if not limits.get("chat_export_enabled"):
+        raise HTTPException(503, detail={"error": "FEATURE_NOT_ENABLED",
+                                         "hint": "Chat export is in rollout; contact support to enable."})
+
     # Idempotency: if the same tenant sends the same Idempotency-Key, return
     # the prior job rather than queuing a duplicate export.
     if idempotency_key:
@@ -266,8 +273,6 @@ async def trigger(
         .where(Job.status.in_([JobStatus.QUEUED, JobStatus.PENDING, JobStatus.RUNNING]))
     )
     running = (await sess.execute(running_q)).scalar_one() or 0
-    tenant = (await sess.execute(select(Tenant).where(Tenant.id == user_tenant))).scalar_one_or_none()
-    limits = ((tenant.extra_data if tenant else None) or {}).get("limits", {})
     cap = limits.get("chat_export_concurrent") or settings.chat_export_tenant_concurrent_min
     if running >= cap:
         return JSONResponse(
