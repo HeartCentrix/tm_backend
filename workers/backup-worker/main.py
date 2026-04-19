@@ -514,47 +514,27 @@ class BackupWorker:
                         print(f"[{self.worker_id}] [USER_MAIL] folder tree fetch failed for {user_id}: {e}")
                         folder_tree = {}
 
-                    # Direct httpx — do NOT use graph_client._get, which
-                    # follows @odata.nextLink internally. If any one page
-                    # raises (504 timeouts on `$skip=N` are common on large
-                    # mailboxes), the entire fetch bails and we drop all
-                    # messages already retrieved. Here we page manually,
-                    # break on the first failure, and return whatever was
-                    # fetched successfully — a partial capture beats zero.
-                    import httpx as _httpx
-                    mail_token = await graph_client._get_token()
-                    PAGE_SIZE = 50
-                    # Unbounded pagination — follow @odata.nextLink until
-                    # Graph returns no more. Huge-but-finite `MAX_PAGES`
-                    # is an emergency-brake against a Graph bug that
-                    # might keep handing out nextLinks indefinitely.
-                    MAX_PAGES = 10000
-                    out = []
-                    next_url = f"{graph_client.GRAPH_URL}/users/{user_id}/messages"
-                    params = {
-                        "$top": str(PAGE_SIZE),
+                    # Route through GraphClient._iter_pages so pacing,
+                    # multi-app rotation, Retry-After, cumulative-cap, and
+                    # sticky failover all apply automatically (behind
+                    # GRAPH_HARDENING_ENABLED — legacy path unchanged when
+                    # the flag is off). Partial captures still land in out[]
+                    # so cap-exhaustion surfaces as partial snapshot, not
+                    # failed job.
+                    out: List = []
+                    mail_url = f"{graph_client.GRAPH_URL}/users/{user_id}/messages"
+                    mail_params = {
+                        "$top": "50",
                         # NOTE: `parentFolderName` is NOT a Graph message
                         # property — requesting it returns HTTP 400. Folder
                         # NAMES come from the folder_tree lookup via
                         # parentFolderId below.
                         "$select": "id,subject,from,toRecipients,ccRecipients,sentDateTime,receivedDateTime,bodyPreview,body,hasAttachments,parentFolderId",
                     }
-                    pages_done = 0
-                    async with _httpx.AsyncClient(timeout=60.0) as _c:
-                        while next_url and pages_done < MAX_PAGES:
-                            try:
-                                r = await _c.get(
-                                    next_url,
-                                    headers={"Authorization": f"Bearer {mail_token}"},
-                                    params=params if pages_done == 0 else None,
-                                )
-                                if r.status_code != 200:
-                                    print(f"[{self.worker_id}] [USER_MAIL] page {pages_done} HTTP {r.status_code} — stopping (kept {len(out)} messages)")
-                                    break
-                                page = r.json() or {}
-                            except Exception as e:
-                                print(f"[{self.worker_id}] [USER_MAIL] page {pages_done} fetch failed: {type(e).__name__}: {e} — stopping (kept {len(out)} messages)")
-                                break
+                    try:
+                        async for page in graph_client._iter_pages(
+                            mail_url, params=mail_params,
+                        ):
                             for m in page.get("value", []):
                                 path = (
                                     folder_tree.get(m.get("parentFolderId"))
@@ -568,8 +548,12 @@ class BackupWorker:
                                     {"raw": m},
                                     path,
                                 ))
-                            next_url = page.get("@odata.nextLink")
-                            pages_done += 1
+                    except Exception as e:
+                        print(
+                            f"[{self.worker_id}] [USER_MAIL] stream aborted "
+                            f"for {user_id}: {type(e).__name__}: {e} "
+                            f"(kept {len(out)} messages)"
+                        )
                     return out
 
                 if kind == "USER_ONEDRIVE":
