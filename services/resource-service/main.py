@@ -438,6 +438,29 @@ async def get_resources_by_type(
     if not includeHidden and type in UI_HIDDEN_TYPES:
         return {"items": [], "item_number": 0, "page_number": page, "next_page_token": None}
 
+    # SharePoint sub-section filter: exclude sites whose name+email
+    # collides with a Microsoft 365 group / Entra group / Teams channel.
+    # Those appear under the Groups & Teams tab instead, so showing them
+    # here duplicates the row. Match is case-insensitive on display_name
+    # AND identical on email (NULL treated equal).
+    sp_exclude_clause = ""
+    if type == "SHAREPOINT_SITE":
+        # A SP site backed by an M365 group / Entra group / Teams channel
+        # shares the group's display name (the admin API surfaces the
+        # group's name as the site title). When both the SP site and the
+        # group also have a mail address, require it to match; when the
+        # SP site has no email (the common case), match on name alone.
+        sp_exclude_clause = """AND NOT EXISTS (
+            SELECT 1 FROM resources g
+            WHERE g.tenant_id = r.tenant_id
+              AND g.type IN ('M365_GROUP', 'ENTRA_GROUP', 'TEAMS_CHANNEL')
+              AND LOWER(g.display_name) = LOWER(r.display_name)
+              AND (
+                    COALESCE(r.email, '') = ''
+                 OR LOWER(COALESCE(g.email, '')) = LOWER(COALESCE(r.email, ''))
+              )
+        )"""
+
     # Same lateral join as the main list — derive last_backup_status from
     # the latest BACKUP job touching this resource so Protection mirrors
     # Activity.
@@ -456,6 +479,7 @@ async def get_resources_by_type(
         ) latest_job ON TRUE
         WHERE r.type = :rtype
         {'AND r.tenant_id = :rtenant' if tenantId else ''}
+        {sp_exclude_clause}
         ORDER BY r.created_at DESC
         LIMIT :rlimit OFFSET :roffset
     """)
@@ -469,6 +493,7 @@ async def get_resources_by_type(
     count_query = text(f"""
         SELECT count(*) FROM resources r WHERE r.type = :rtype
         {'AND r.tenant_id = :rtenant' if tenantId else ''}
+        {sp_exclude_clause}
     """)
     count_result = await db.execute(count_query, params)
     total = count_result.scalar() or 0

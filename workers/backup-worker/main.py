@@ -2213,20 +2213,34 @@ class BackupWorker:
                 for o in owners.get("value", []):
                     items_to_backup.append(("GROUP_OWNER", o))
 
-            group_mail_enabled = bool((resource.extra_data or {}).get("mail_enabled"))
-            if backup_group_mailbox and group_mail_enabled:
-                group_mailbox_items, mailbox_bytes = await self.backup_group_mailbox_content(
-                    resource,
-                    tenant,
-                    snapshot,
-                    graph_client,
-                )
-                bytes_added += mailbox_bytes
-                item_count += len(group_mailbox_items)
-                if group_mailbox_items:
-                    async with async_session_factory() as session:
-                        session.add_all(group_mailbox_items)
-                        await session.commit()
+            # Only Unified (Microsoft 365) groups expose /groups/{id}/threads.
+            # Mail-enabled security groups and distribution lists have
+            # mail_enabled=true but groupTypes=[] and /threads returns 403.
+            meta = resource.extra_data or {}
+            group_types = [gt for gt in (meta.get("group_types") or []) if isinstance(gt, str)]
+            is_unified = any(gt.lower() == "unified" for gt in group_types)
+            group_mail_enabled = bool(meta.get("mail_enabled"))
+            if backup_group_mailbox and group_mail_enabled and is_unified:
+                try:
+                    group_mailbox_items, mailbox_bytes = await self.backup_group_mailbox_content(
+                        resource,
+                        tenant,
+                        snapshot,
+                        graph_client,
+                    )
+                    bytes_added += mailbox_bytes
+                    item_count += len(group_mailbox_items)
+                    if group_mailbox_items:
+                        async with async_session_factory() as session:
+                            session.add_all(group_mailbox_items)
+                            await session.commit()
+                except Exception as mbx_exc:
+                    logger.warning(
+                        "[%s] Group mailbox backup skipped for %s: %s",
+                        self.worker_id, resource.display_name, mbx_exc,
+                    )
+            elif backup_group_mailbox and group_mail_enabled and not is_unified:
+                print(f"[{self.worker_id}]   [GROUP_MAILBOX] Skipping {resource.display_name}: mail-enabled but not Unified (classification={meta.get('group_classification')})")
 
         elif resource_type == "ENTRA_APP":
             # Application registration — fetch via /applications?$filter=id eq '{id}'
