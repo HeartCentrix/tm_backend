@@ -159,6 +159,18 @@ class Settings:
         self.BACKUP_HEAVY_QUEUE = os.getenv("BACKUP_HEAVY_QUEUE", "backup.heavy")
         self.BACKUP_WORKER_QUEUE = os.getenv("BACKUP_WORKER_QUEUE", "backup.normal")
 
+        # ── Contact backup expansion ──
+        # Capture IPM.Contact items from Deleted Items + Recoverable Items
+        # mail folders in addition to /contactFolders. Default on so backups
+        # cover the full mailbox-side contact estate. Disable per tenant if
+        # Graph perms are restricted.
+        self.BACKUP_CONTACTS_INCLUDE_DELETED = os.getenv(
+            "BACKUP_CONTACTS_INCLUDE_DELETED", "true"
+        ).lower() in ("true", "1", "yes")
+        self.BACKUP_CONTACTS_INCLUDE_RECOVERABLE = os.getenv(
+            "BACKUP_CONTACTS_INCLUDE_RECOVERABLE", "true"
+        ).lower() in ("true", "1", "yes")
+
         # ── RabbitMQ long-run safety ──
         self.RABBITMQ_CONSUMER_HEARTBEAT_SECONDS = int(os.getenv("RABBITMQ_CONSUMER_HEARTBEAT_SECONDS", str(7 * 24 * 3600)))
         self.RABBITMQ_CONSUMER_TIMEOUT_MS = int(os.getenv("RABBITMQ_CONSUMER_TIMEOUT_MS", str(7 * 24 * 3600 * 1000)))
