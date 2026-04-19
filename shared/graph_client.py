@@ -446,6 +446,15 @@ class GraphClient:
                         else:
                             pages_on_failover = 0
 
+    async def batch(self, requests):
+        """Convenience: run a Graph $batch through the hardened policy.
+
+        See shared.graph_batch.BatchClient for semantics. Paginated
+        endpoints (delta, skiptoken, top) are rejected at submission.
+        """
+        from shared.graph_batch import BatchClient
+        return await BatchClient(self).batch(requests)
+
     async def _post(self, url: str, payload: Dict[str, Any], headers: Optional[Dict] = None) -> Dict[str, Any]:
         """Make authenticated POST request"""
         token = await self._get_token()

@@ -110,3 +110,39 @@ def test_batch_rejects_paginated_endpoint():
         BatchClient.validate_requests([
             BatchRequest(id="r1", method="GET", url="/users/delta"),
         ])
+
+
+@pytest.mark.asyncio
+async def test_graph_client_batch_convenience(monkeypatch):
+    monkeypatch.setenv("GRAPH_HARDENING_ENABLED", "true")
+    monkeypatch.setenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "0")
+    monkeypatch.setenv("GRAPH_APP_PACE_REQS_PER_SEC", "0")
+    from shared import config
+    importlib.reload(config)
+    from shared import graph_client
+    importlib.reload(graph_client)
+
+    gc = graph_client.GraphClient(
+        client_id="cid", client_secret="sec", tenant_id="tid",
+    )
+    gc._get_token = AsyncMock(return_value="tok")
+
+    async def fake_post(url, json, **kw):
+        responses = [
+            {"id": r["id"], "status": 200, "body": {"echo": r["id"]}}
+            for r in json["requests"]
+        ]
+        return MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"responses": responses}),
+        )
+
+    from shared.graph_batch import BatchRequest
+    with patch("shared.graph_batch.httpx.AsyncClient") as M:
+        cli = M.return_value.__aenter__.return_value
+        cli.post = AsyncMock(side_effect=fake_post)
+        requests = [BatchRequest(id=f"r{i}", method="GET", url=f"/users/{i}")
+                    for i in range(5)]
+        out = await gc.batch(requests)
+    assert len(out) == 5
+    assert all(r.status == 200 for r in out.values())
