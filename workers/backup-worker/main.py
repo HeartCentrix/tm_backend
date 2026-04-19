@@ -2198,7 +2198,7 @@ class BackupWorker:
 
             print(f"[{self.worker_id}]   [ENTRA_USER] Total items to backup: {len(items_to_backup)}")
 
-        elif resource_type in ("ENTRA_GROUP", "DYNAMIC_GROUP"):
+        elif resource_type in ("ENTRA_GROUP", "DYNAMIC_GROUP", "M365_GROUP"):
             group_mailbox_items: List[SnapshotItem] = []
 
             if backup_entra_core:
@@ -2218,8 +2218,10 @@ class BackupWorker:
             # mail_enabled=true but groupTypes=[] and /threads returns 403.
             meta = resource.extra_data or {}
             group_types = [gt for gt in (meta.get("group_types") or []) if isinstance(gt, str)]
-            is_unified = any(gt.lower() == "unified" for gt in group_types)
+            is_unified = any(gt.lower() == "unified" for gt in group_types) or resource_type == "M365_GROUP"
             group_mail_enabled = bool(meta.get("mail_enabled"))
+            has_team = bool(meta.get("has_team"))
+
             if backup_group_mailbox and group_mail_enabled and is_unified:
                 try:
                     group_mailbox_items, mailbox_bytes = await self.backup_group_mailbox_content(
@@ -2241,6 +2243,26 @@ class BackupWorker:
                     )
             elif backup_group_mailbox and group_mail_enabled and not is_unified:
                 print(f"[{self.worker_id}]   [GROUP_MAILBOX] Skipping {resource.display_name}: mail-enabled but not Unified (classification={meta.get('group_classification')})")
+
+            # Unified M365 groups may be team-backed. When so, capture every
+            # channel's messages + replies — same path the standalone
+            # TEAMS_CHANNEL handler uses — so the Group's Recovery view
+            # ("Team Channels" tab) has data without needing a separate
+            # TEAMS_CHANNEL resource backup.
+            if is_unified and has_team:
+                try:
+                    channel_items, channel_bytes = await self._backup_team_channels(
+                        resource, tenant, snapshot, graph_client, obj_id,
+                    )
+                    # _backup_team_channels returns (count, bytes) — already
+                    # an integer count, NOT a list, so use it directly.
+                    bytes_added += channel_bytes
+                    item_count += channel_items
+                except Exception as ch_exc:
+                    logger.warning(
+                        "[%s] Team channels backup skipped for %s: %s",
+                        self.worker_id, resource.display_name, ch_exc,
+                    )
 
         elif resource_type == "ENTRA_APP":
             # Application registration — fetch via /applications?$filter=id eq '{id}'
@@ -2446,7 +2468,17 @@ class BackupWorker:
 
         if resource.type.value == "TEAMS_CHANNEL":
             print(f"[{self.worker_id}]   [CHANNELS] Fetching channels...")
-            channels = await graph_client.get_teams_channels(team_id)
+            # Some TEAMS_CHANNEL resources are actually distribution lists or
+            # unified groups without a Team backing them — /teams/{id}/channels
+            # returns 404 for these. Treat it as "nothing to back up" rather
+            # than failing the whole job.
+            try:
+                channels = await graph_client.get_teams_channels(team_id)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    print(f"[{self.worker_id}]   [CHANNELS] No Team backing {resource.display_name} (404) — completing empty")
+                    return {"item_count": 0, "bytes_added": 0}
+                raise
             ch_list = channels.get("value", [])
             print(f"[{self.worker_id}]   [CHANNELS] Found {len(ch_list)} channels — backing up ALL in parallel")
 
@@ -2552,6 +2584,123 @@ class BackupWorker:
             })
         
         return {"item_count": item_count, "bytes_added": bytes_added}
+
+    async def _backup_team_channels(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
+                                    graph_client: GraphClient, team_id: str) -> tuple[int, int]:
+        """Capture every channel's messages + replies for a team-backed
+        M365 group. Mirrors the TEAMS_CHANNEL branch in _backup_teams_resource
+        but is callable from any handler given a team_id. Returns
+        (item_count, bytes_added).
+        """
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
+        total_items = 0
+        total_bytes = 0
+
+        try:
+            channels = await graph_client.get_teams_channels(team_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                print(f"[{self.worker_id}]   [CHANNELS] No Team backing {resource.display_name} (404) — skipping channels")
+                return 0, 0
+            raise
+        ch_list = channels.get("value", [])
+        print(f"[{self.worker_id}]   [CHANNELS] {resource.display_name}: {len(ch_list)} channels")
+
+        # Persist a row per channel up front so the Recovery view can show
+        # the channel list even when /messages/delta returns 403 (protected
+        # API). Without this, a group with blocked message access renders
+        # "No channels captured".
+        channel_info_rows: List[SnapshotItem] = []
+        for ch in ch_list:
+            ch_id = ch.get("id") or ""
+            ch_name = ch.get("displayName") or ch_id
+            channel_info_rows.append(SnapshotItem(
+                snapshot_id=snapshot.id,
+                tenant_id=tenant.id,
+                external_id=ch_id,
+                item_type="TEAMS_CHANNEL_INFO",
+                name=ch_name[:255],
+                folder_path=f"channels/{ch_name}",
+                content_size=0,
+                content_hash=None,
+                content_checksum=None,
+                extra_data={"raw": ch, "channelId": ch_id, "channelName": ch_name},
+            ))
+        if channel_info_rows:
+            async with async_session_factory() as sess:
+                sess.add_all(channel_info_rows)
+                await sess.commit()
+            total_items += len(channel_info_rows)
+
+        for ch in ch_list:
+            ch_id = ch.get("id")
+            ch_name = ch.get("displayName", ch_id)
+            try:
+                msgs = await graph_client.get_channel_messages(team_id, ch_id)
+            except Exception as exc:
+                logger.warning("[%s] Channel messages fetch failed for %s/%s: %s",
+                               self.worker_id, resource.display_name, ch_name, exc)
+                continue
+            msg_list = msgs.get("value", [])
+
+            upload_tasks = []
+            item_metas = []
+            reply_ids: set = set()
+            for msg in msg_list:
+                msg_id = msg.get("id", str(uuid.uuid4()))
+                cb = json.dumps(msg).encode()
+                ch_content_hash = hashlib.sha256(cb).hexdigest()
+                bp = azure_storage_manager.build_blob_path(
+                    str(tenant.id), str(resource.id), str(snapshot.id), f"ch_{ch_id}_msg_{msg_id}"
+                )
+                upload_tasks.append(upload_blob_with_retry(container, bp, cb, shard))
+                item_metas.append((msg_id, msg, cb, ch_content_hash, bp, ch_id, ch_name))
+
+                if (msg.get("replyCount") or 0) > 0:
+                    try:
+                        replies = await graph_client.get_channel_messages_replies(team_id, ch_id, msg_id)
+                        for r in (replies.get("value") or []):
+                            rid = r.get("id", str(uuid.uuid4()))
+                            rb = json.dumps(r).encode()
+                            rh = hashlib.sha256(rb).hexdigest()
+                            rbp = azure_storage_manager.build_blob_path(
+                                str(tenant.id), str(resource.id), str(snapshot.id),
+                                f"ch_{ch_id}_msg_{msg_id}_reply_{rid}"
+                            )
+                            upload_tasks.append(upload_blob_with_retry(container, rbp, rb, shard))
+                            item_metas.append((rid, r, rb, rh, rbp, ch_id, ch_name))
+                            reply_ids.add(rid)
+                    except Exception as exc:
+                        print(f"[{self.worker_id}]   [CHANNEL_REPLY FAIL] {ch_name}/{msg_id}: {exc}")
+
+            upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+            db_items: List[SnapshotItem] = []
+            for (mid, mdata, mbytes, mhash, mbp, cid, cname), res in zip(item_metas, upload_results):
+                if isinstance(res, dict) and res.get("success"):
+                    is_reply = mid in reply_ids
+                    db_items.append(SnapshotItem(
+                        snapshot_id=snapshot.id,
+                        tenant_id=tenant.id,
+                        external_id=mid,
+                        item_type="TEAMS_MESSAGE_REPLY" if is_reply else "TEAMS_MESSAGE",
+                        name=mdata.get("subject") or (mdata.get("body", {}).get("content", "")[:100]) or mid,
+                        folder_path=f"channels/{cname}",
+                        content_hash=mhash,
+                        content_size=len(mbytes),
+                        blob_path=mbp,
+                        extra_data={"raw": mdata, "channelId": cid, "channelName": cname, "isReply": is_reply},
+                        content_checksum=mhash,
+                    ))
+                    total_bytes += len(mbytes)
+            if db_items:
+                async with async_session_factory() as sess:
+                    sess.add_all(db_items)
+                    await sess.commit()
+                total_items += len(db_items)
+
+        print(f"[{self.worker_id}]   [CHANNELS] {resource.display_name}: persisted {total_items} messages, {total_bytes} bytes")
+        return total_items, total_bytes
 
     async def _backup_teams_chat_resource(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
                                           graph_client: GraphClient, job_id: uuid.UUID) -> Dict:
@@ -5598,8 +5747,26 @@ class BackupWorker:
                     return local_items, local_bytes
                 raise
 
+            # Posts carry body + from + receivedDateTime but NOT the subject —
+            # the subject lives on the parent thread as `topic`. Enrich each
+            # post so the frontend (EmailItemRow / EmailPreview) gets the
+            # same shape as a user's EMAIL item: raw.subject + raw.bodyPreview.
+            thread_topic = thread.get("topic") or ""
             for post in posts.get("value", []):
                 post_id = post.get("id", str(uuid.uuid4()))
+                # Inject subject + a short bodyPreview if missing so the UI
+                # mirrors user-mail rendering without frontend special-casing.
+                if not post.get("subject") and thread_topic:
+                    post["subject"] = thread_topic
+                if not post.get("bodyPreview"):
+                    raw_body = (post.get("body") or {}).get("content") or ""
+                    # Strip HTML tags for a plain-text preview.
+                    import re as _re
+                    post["bodyPreview"] = _re.sub(r"<[^>]+>", " ", raw_body).strip()[:180]
+                # Normalise sentDateTime for EmailItemRow which prefers it.
+                if not post.get("sentDateTime"):
+                    post["sentDateTime"] = post.get("receivedDateTime")
+
                 post_bytes = json.dumps(post).encode()
                 post_hash = hashlib.sha256(post_bytes).hexdigest()
                 post_blob_path = azure_storage_manager.build_blob_path(
@@ -5615,12 +5782,12 @@ class BackupWorker:
                         tenant_id=tenant.id,
                         external_id=post_id,
                         item_type="GROUP_MAILBOX_POST",
-                        name=post.get("subject") or post.get("id", post_id),
-                        folder_path=f"group-mailbox/threads/{thread.get('topic') or thread_id}",
+                        name=post.get("subject") or thread_topic or post_id,
+                        folder_path=f"group-mailbox/threads/{thread_topic or thread_id}",
                         content_hash=post_hash,
                         content_size=len(post_bytes),
                         blob_path=post_blob_path,
-                        extra_data={"raw": post, "threadId": thread_id, "conversationId": conversation_id},
+                        extra_data={"raw": post, "threadId": thread_id, "conversationId": conversation_id, "threadTopic": thread_topic},
                         content_checksum=post_hash,
                     ))
                     local_bytes += len(post_bytes)
