@@ -239,7 +239,7 @@ async def trigger(
         dup_q = (
             select(Job)
             .where(Job.tenant_id == user_tenant)
-            .where(Job.spec["idempotency_key"].astext == idempotency_key)
+            .where(Job.spec.op("->>")("idempotency_key") == idempotency_key)
             .order_by(Job.created_at.desc())
             .limit(1)
         )
@@ -290,7 +290,7 @@ async def trigger(
         .select_from(Job)
         .where(Job.tenant_id == user_tenant)
         .where(Job.type == JobType.EXPORT)
-        .where(Job.spec["kind"].astext == KIND)
+        .where(Job.spec.op("->>")("kind") == KIND)
         .where(Job.status.in_([JobStatus.QUEUED, JobStatus.PENDING, JobStatus.RUNNING]))
     )
     running = (await sess.execute(running_q)).scalar_one() or 0
