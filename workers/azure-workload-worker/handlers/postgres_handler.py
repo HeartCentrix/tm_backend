@@ -479,24 +479,44 @@ class PostgresBackupHandler:
 
     async def _capture_schema(self, conn, server_name: str, db_name: str,
                                snapshot: Snapshot, resource: Resource) -> Dict:
-        """Capture CREATE TABLE statements for all tables.
+        """Capture schema artifacts as a multi-level folder tree (AFI-parity).
 
-        Emits multiple artifacts per database so the Schema tab can show
-        a folder tree (matching AFI's layout):
+        Produces (relative to <db_name>):
 
-          <db>/sql_schema.sql      — consolidated CREATE TABLE statements
-          <db>/sql_schema.dump     — same content (placeholder for pg_dump
-                                      custom format)
-          <db>/sql/<schema>__<table>.sql — per-table CREATE TABLE
+          sql/Other/grants          — GRANT / role assignments text
+          sql/Other/schemas         — CREATE SCHEMA statements
+          sql/<schema>/Tables/<t>   — CREATE TABLE per table (one file each)
+          sql/<schema>/Sequences/<s>— CREATE SEQUENCE per sequence
+          sql/<schema>/Views/<v>    — CREATE VIEW per view (when present)
 
-        Returns {"files": [...], "size_bytes": total} where each file has
-        name, folder_path (relative to db), blob_path, size_bytes.
+        Returns {"files": [...], "size_bytes": total}. Each file has
+        name, folder_path (relative to db, using forward slashes),
+        blob_path, size_bytes. The frontend renders this verbatim as a
+        tree.
         """
         shard = azure_storage_manager.get_default_shard()
         container = azure_storage_manager.get_container_name(str(resource.tenant_id), "azure-postgresql")
         await shard._ensure_container(container)
 
-        tables = await conn.fetch("""
+        snap_dir = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/schema"
+        files: list = []
+        total_bytes = 0
+
+        async def _upload(rel_path: str, content: str) -> tuple:
+            blob_path = f"{snap_dir}/{rel_path}"
+            data = content.encode("utf-8") if isinstance(content, str) else content
+            client = shard.get_async_client().get_blob_client(container, blob_path)
+            await client.upload_blob(data, overwrite=True)
+            return blob_path, len(data)
+
+        def _add(name: str, folder_path: str, blob_path: str, size: int):
+            files.append({
+                "name": name, "folder_path": folder_path,
+                "blob_path": blob_path, "size_bytes": size,
+            })
+
+        # ── Tables / columns / sequences / views — one pg query each.
+        table_rows = await conn.fetch("""
             SELECT table_schema, table_name
             FROM information_schema.tables
             WHERE table_type = 'BASE TABLE'
@@ -513,7 +533,6 @@ class PostgresBackupHandler:
                 WHERE table_schema = $1 AND table_name = $2
                 ORDER BY ordinal_position
             """, schema, table)
-
             lines = [f"-- Table: {schema}.{table}",
                      f"CREATE TABLE IF NOT EXISTS \"{schema}\".\"{table}\" ("]
             col_defs = []
@@ -526,73 +545,114 @@ class PostgresBackupHandler:
                         dtype += f"({col['numeric_precision']},{col['numeric_scale']})"
                     else:
                         dtype += f"({col['numeric_precision']})"
-
                 nullable = "" if col["is_nullable"] == "NO" else " NULL"
                 default = f" DEFAULT {col['column_default']}" if col["column_default"] else ""
                 col_defs.append(f'    "{col["column_name"]}" {dtype}{nullable}{default}')
-
             lines.append(",\n".join(col_defs))
             lines.append(");\n")
             return "\n".join(lines)
 
-        per_table_sql: dict = {}
-        consolidated_lines = [
-            f"-- Schema export for database: {db_name}",
+        for r in table_rows:
+            schema, table = r["table_schema"], r["table_name"]
+            content = await _build_create_table(schema, table)
+            bp, sz = await _upload(f"sql/{schema}/Tables/{table}", content)
+            _add(table, f"sql/{schema}/Tables", bp, sz)
+            total_bytes += sz
+
+        # Sequences — excluding pg_catalog.
+        seq_rows = await conn.fetch("""
+            SELECT sequence_schema, sequence_name, data_type,
+                   start_value, minimum_value, maximum_value, increment
+            FROM information_schema.sequences
+            WHERE sequence_schema NOT IN ('pg_catalog', 'information_schema')
+            ORDER BY sequence_schema, sequence_name
+        """)
+        for r in seq_rows:
+            schema, seq = r["sequence_schema"], r["sequence_name"]
+            content = (
+                f"-- Sequence: {schema}.{seq}\n"
+                f"CREATE SEQUENCE IF NOT EXISTS \"{schema}\".\"{seq}\"\n"
+                f"    AS {r['data_type']}\n"
+                f"    INCREMENT {r['increment']}\n"
+                f"    MINVALUE {r['minimum_value']}\n"
+                f"    MAXVALUE {r['maximum_value']}\n"
+                f"    START {r['start_value']};\n"
+            )
+            bp, sz = await _upload(f"sql/{schema}/Sequences/{seq}", content)
+            _add(seq, f"sql/{schema}/Sequences", bp, sz)
+            total_bytes += sz
+
+        # Views — CREATE VIEW statements.
+        view_rows = await conn.fetch("""
+            SELECT table_schema, table_name, view_definition
+            FROM information_schema.views
+            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+            ORDER BY table_schema, table_name
+        """)
+        for r in view_rows:
+            schema, view = r["table_schema"], r["table_name"]
+            content = (
+                f"-- View: {schema}.{view}\n"
+                f"CREATE OR REPLACE VIEW \"{schema}\".\"{view}\" AS\n"
+                f"{r['view_definition']}\n"
+            )
+            bp, sz = await _upload(f"sql/{schema}/Views/{view}", content)
+            _add(view, f"sql/{schema}/Views", bp, sz)
+            total_bytes += sz
+
+        # ── Other/ — database-wide metadata: schemas + role grants.
+        schemas_rows = await conn.fetch("""
+            SELECT schema_name
+            FROM information_schema.schemata
+            WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+              AND schema_name NOT LIKE 'pg_temp_%'
+              AND schema_name NOT LIKE 'pg_toast_temp_%'
+            ORDER BY schema_name
+        """)
+        schemas_content_lines = [
+            f"-- Schemas in database: {db_name}",
             f"-- Exported at: {datetime.now(timezone.utc).isoformat()}",
             "",
         ]
-        for table_row in tables:
-            schema = table_row["table_schema"]
-            table = table_row["table_name"]
-            create_sql = await _build_create_table(schema, table)
-            per_table_sql[(schema, table)] = create_sql
-            consolidated_lines.append(create_sql)
+        for r in schemas_rows:
+            schemas_content_lines.append(f"CREATE SCHEMA IF NOT EXISTS \"{r['schema_name']}\";")
+        schemas_content = "\n".join(schemas_content_lines) + "\n"
+        bp, sz = await _upload("sql/Other/schemas", schemas_content)
+        _add("schemas", "sql/Other", bp, sz)
+        total_bytes += sz
 
-        consolidated = "\n".join(consolidated_lines) + "\n"
-
-        snap_dir = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/schema"
-        files: list = []
-        total_bytes = 0
-
-        async def _upload(rel_path: str, content: str) -> tuple:
-            blob_path = f"{snap_dir}/{rel_path}"
-            data = content.encode("utf-8")
-            client = shard.get_async_client().get_blob_client(container, blob_path)
-            await client.upload_blob(data, overwrite=True)
-            return blob_path, len(data)
-
-        # Root-level files — sql_schema.sql + sql_schema.dump.
-        sql_path, sql_size = await _upload("sql_schema.sql", consolidated)
-        files.append({"name": "sql_schema.sql", "folder_path": "",
-                      "blob_path": sql_path, "size_bytes": sql_size})
-        total_bytes += sql_size
-
-        dump_path, dump_size = await _upload("sql_schema.dump", consolidated)
-        files.append({"name": "sql_schema.dump", "folder_path": "",
-                      "blob_path": dump_path, "size_bytes": dump_size})
-        total_bytes += dump_size
-
-        # Per-table files under sql/. File name combines schema and
-        # table so different schemas with same table name don't collide.
-        for (schema, table), create_sql in per_table_sql.items():
-            fname = f"{schema}__{table}.sql"
-            rel = f"sql/{fname}"
-            blob_path, bsize = await _upload(rel, create_sql)
-            files.append({
-                "name": fname, "folder_path": "sql",
-                "blob_path": blob_path, "size_bytes": bsize,
-            })
-            total_bytes += bsize
+        grants_rows = await conn.fetch("""
+            SELECT grantee, table_schema, table_name, privilege_type
+            FROM information_schema.table_privileges
+            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+              AND grantee NOT IN ('PUBLIC')
+            ORDER BY table_schema, table_name, grantee, privilege_type
+        """)
+        grants_content_lines = [
+            f"-- Grants in database: {db_name}",
+            f"-- Exported at: {datetime.now(timezone.utc).isoformat()}",
+            "",
+        ]
+        for r in grants_rows:
+            grants_content_lines.append(
+                f'GRANT {r["privilege_type"]} ON "{r["table_schema"]}"."{r["table_name"]}" '
+                f'TO "{r["grantee"]}";'
+            )
+        grants_content = "\n".join(grants_content_lines) + "\n"
+        bp, sz = await _upload("sql/Other/grants", grants_content)
+        _add("grants", "sql/Other", bp, sz)
+        total_bytes += sz
 
         self._log(
-            f"  Phase 2: Schema captured: {len(tables)} tables, "
+            f"  Phase 2: Schema captured: {len(table_rows)} tables, "
+            f"{len(seq_rows)} sequences, {len(view_rows)} views, "
             f"{len(files)} files, {self._format_size(total_bytes)}"
         )
 
         return {
             "files": files,
             "size_bytes": total_bytes,
-            "blob_path": sql_path,
+            "blob_path": files[0]["blob_path"] if files else "",
         }
 
     async def _capture_configuration(self, server_name: str, sub_id: str,
