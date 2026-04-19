@@ -643,27 +643,35 @@ class BackupWorker:
                         print(f"[{self.worker_id}] [USER_CHATS] chats list failed for {user_id}: {e}")
                         chats_raw = []
 
-                    member_sem = asyncio.Semaphore(8)
-
-                    async def _fetch_members(cid: str):
-                        async with member_sem:
-                            try:
-                                m_page = await graph_client._get(
-                                    f"{graph_client.GRAPH_URL}/chats/{cid}/members"
-                                )
-                                emails = []
-                                names = []
-                                for m in (m_page or {}).get("value", []) or []:
-                                    if m.get("email"):
-                                        emails.append(m["email"])
-                                    if m.get("displayName"):
-                                        names.append(m["displayName"])
-                                return cid, emails, names
-                            except Exception:
-                                return cid, [], []
-
-                    member_results = await asyncio.gather(*[_fetch_members(c.get("id")) for c in chats_raw if c.get("id")])
-                    member_lookup = {cid: (emails, names) for cid, emails, names in member_results}
+                    # Batch /chats/{id}/members via /v1.0/$batch — one HTTP
+                    # call per 20 chats instead of 200 individual _get's.
+                    # Cuts throttle cost ~20× vs the old 8-way gather.
+                    from shared.graph_batch import BatchRequest
+                    batch_reqs = [
+                        BatchRequest(
+                            id=c["id"], method="GET",
+                            url=f"/chats/{c['id']}/members",
+                        )
+                        for c in chats_raw if c.get("id")
+                    ]
+                    member_lookup: Dict[str, Tuple[List[str], List[str]]] = {}
+                    if batch_reqs:
+                        try:
+                            batch_result = await graph_client.batch(batch_reqs)
+                        except Exception as e:
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] members "
+                                f"batch failed: {type(e).__name__}: {e}"
+                            )
+                            batch_result = {}
+                        for cid, resp in batch_result.items():
+                            if resp.status == 200:
+                                value = (resp.body or {}).get("value", []) or []
+                                emails = [m.get("email") for m in value if m.get("email")]
+                                names = [m.get("displayName") for m in value if m.get("displayName")]
+                                member_lookup[cid] = (emails, names)
+                            else:
+                                member_lookup[cid] = ([], [])
 
                     for ch in chats_raw:
                         cid = ch.get("id")
