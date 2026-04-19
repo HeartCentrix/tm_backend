@@ -1239,12 +1239,13 @@ class BackupWorker:
         return all_items, total_bytes
 
     # ==================== Tier 2 USER_ONEDRIVE file-bytes capture ====================
-
-    # Initial-slice cap for USER_ONEDRIVE. Keeps a single backup run bounded
-    # so a 500k-file drive doesn't block the queue forever — remaining files
-    # pick up on the next run via the delta token. Either bound trips first.
-    USER_ONEDRIVE_MAX_FILES = 50
-    USER_ONEDRIVE_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
+    #
+    # v2: uncapped. The legacy MAX_FILES / MAX_BYTES knobs are off by default —
+    # a user's full drive captures in one run. Concurrency + checkpoint +
+    # heavy-pool routing keep it bounded. Legacy caps stay active when
+    # ONEDRIVE_BACKUP_V2_ENABLED is false (rollback safety).
+    LEGACY_USER_ONEDRIVE_MAX_FILES = 50
+    LEGACY_USER_ONEDRIVE_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
 
     async def _useronedrive_backup_files(
         self,
@@ -1255,20 +1256,31 @@ class BackupWorker:
         drive_id: str,
         file_items: List[Dict[str, Any]],
     ) -> Tuple[int, int]:
-        """Download a capped slice of OneDrive files to blob and update the
-        already-persisted ONEDRIVE_FILE snapshot-item rows with blob_path +
-        real content_size + sha256.
+        """Download OneDrive files to blob and update the already-persisted
+        ONEDRIVE_FILE snapshot-item rows with blob_path + real content_size
+        + sha256.
 
-        Returns (uploaded_count, bytes_uploaded). Files skipped by the cap
-        still have their metadata row; their blob_path stays NULL so the
-        Recovery UI can show "not yet downloaded" while future runs catch
-        up via the delta token.
+        v2 path (ONEDRIVE_BACKUP_V2_ENABLED=true): no per-run cap. Downloads
+        run under a semaphore of ONEDRIVE_BACKUP_FILE_CONCURRENCY. A
+        BackupCheckpoint commits to Job.result.backup_checkpoint every N
+        files / M bytes so a worker crash resumes from the last commit.
+
+        Legacy path: retains the 50-file / 500-MB slice from the v1
+        implementation — partial-backup semantics pick remaining files up
+        on the next run via the delta token.
         """
         from sqlalchemy import update as sa_update
+        from shared.backup_checkpoint import BackupCheckpoint
+        from shared.models import Job as _Job
 
-        # Sort smallest-first so the cap captures the most files per run —
-        # a single 400 MB blob would otherwise exhaust the byte budget on
-        # one item. Graph's 'size' is authoritative; missing → treat as 0.
+        v2_enabled = settings.ONEDRIVE_BACKUP_V2_ENABLED
+        max_files = None if v2_enabled else self.LEGACY_USER_ONEDRIVE_MAX_FILES
+        max_bytes = None if v2_enabled else self.LEGACY_USER_ONEDRIVE_MAX_BYTES
+        per_file_timeout = settings.ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS
+        file_concurrency = settings.ONEDRIVE_BACKUP_FILE_CONCURRENCY if v2_enabled else 1
+
+        # Sort smallest-first so the legacy cap captures the most files per
+        # run; in v2 ordering is cosmetic (everything downloads).
         ordered = sorted(
             (f for f in file_items if f.get("id")),
             key=lambda f: int(f.get("size") or 0),
@@ -1277,92 +1289,128 @@ class BackupWorker:
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "files")
 
-        uploaded_count = 0
-        bytes_uploaded = 0
-        # Per-file updates we'll apply in a single transaction at the end,
-        # keyed by external_id so the UPDATE targets exactly one row.
+        # Load existing checkpoint (resume path).
+        cp_payload = None
+        if snapshot.job_id:
+            async with async_session_factory() as _s0:
+                snap_job = await _s0.get(_Job, snapshot.job_id)
+                if snap_job and isinstance(snap_job.result, dict):
+                    cp_payload = snap_job.result.get("backup_checkpoint")
+        checkpoint = (
+            BackupCheckpoint.from_dict(cp_payload)
+            if cp_payload
+            else BackupCheckpoint.empty(resource_id=str(resource.id), drive_id=drive_id)
+        )
+
+        file_sem = asyncio.Semaphore(file_concurrency)
+        state = {"uploaded_count": 0, "bytes_uploaded": 0}
         updates: List[Tuple[str, str, int, str, Dict[str, Any]]] = []
+        state_lock = asyncio.Lock()
 
-        for f in ordered:
-            if uploaded_count >= self.USER_ONEDRIVE_MAX_FILES:
-                break
-            if bytes_uploaded >= self.USER_ONEDRIVE_MAX_BYTES:
-                break
-
+        async def _process_one(f: Dict[str, Any]):
             file_id = f.get("id")
+            if not file_id or checkpoint.is_done(file_id):
+                return
             file_name = f.get("name") or "(unnamed)"
             size_hint = int(f.get("size") or 0)
-
-            # Skip zero-byte files — nothing to download, but leave the
-            # metadata row so it still shows up in the file listing.
             if size_hint == 0:
-                continue
+                return
 
-            # Would-overflow check: don't start a file that alone blows
-            # the byte budget (unless it's the first one, so we make at
-            # least some forward progress on huge-file drives).
-            if uploaded_count > 0 and (bytes_uploaded + size_hint) > self.USER_ONEDRIVE_MAX_BYTES:
-                continue
+            # Enforce legacy caps pre-flight; v2 skips this entirely.
+            if max_files is not None or max_bytes is not None:
+                async with state_lock:
+                    if max_files is not None and state["uploaded_count"] >= max_files:
+                        return
+                    if max_bytes is not None and state["bytes_uploaded"] >= max_bytes:
+                        return
+                    if (
+                        max_bytes is not None
+                        and state["uploaded_count"] > 0
+                        and (state["bytes_uploaded"] + size_hint) > max_bytes
+                    ):
+                        return
 
             blob_path = azure_storage_manager.build_blob_path(
                 str(tenant.id), str(resource.id), str(snapshot.id), file_id,
             )
 
-            try:
-                download_url, real_size, qxh = await graph_client.get_download_url(drive_id, file_id)
-            except RuntimeError as e:
-                # Whiteboards, OneNote pages, cloud-native objects etc.
-                # have a 'file' facet but aren't downloadable. Skip
-                # silently — the metadata row is already persisted.
-                if "downloadurl" in str(e).lower() or "download url" in str(e).lower():
-                    continue
-                print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {e}")
-                continue
-            except Exception as e:
-                print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {type(e).__name__}: {e}")
-                continue
+            async with file_sem:
+                try:
+                    download_url, real_size, qxh = await graph_client.get_download_url(drive_id, file_id)
+                except RuntimeError as e:
+                    # Whiteboards, OneNote pages, cloud-native objects have a
+                    # 'file' facet but aren't downloadable — skip silently.
+                    if "downloadurl" in str(e).lower() or "download url" in str(e).lower():
+                        return
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {e}")
+                    return
+                except Exception as e:
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {type(e).__name__}: {e}")
+                    return
 
-            tmp_path = None
-            try:
-                async with self.backup_semaphore:
-                    tmp_path, sha256 = await self._download_to_temp_resumable(
-                        download_url=download_url, expected_size=real_size, file_name=file_name,
-                    )
-                    upload_result = await upload_blob_with_retry_from_file(
-                        container_name=container, blob_path=blob_path,
-                        file_path=tmp_path, shard=shard, file_size=real_size,
-                        metadata={
-                            "source_item_id": file_id,
-                            "source_drive_id": drive_id,
-                            "original-name": file_name,
-                            "sha256": sha256,
-                        },
-                    )
-            except Exception as e:
-                print(f"[{self.worker_id}] [USER_ONEDRIVE] download/upload failed for {file_name}: {type(e).__name__}: {e}")
-                continue
-            finally:
-                if tmp_path:
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
+                tmp_path = None
+                try:
+                    async def _download_and_upload():
+                        nonlocal tmp_path
+                        tmp_path, sha256 = await self._download_to_temp_resumable(
+                            download_url=download_url, expected_size=real_size, file_name=file_name,
+                        )
+                        upload_result = await upload_blob_with_retry_from_file(
+                            container_name=container, blob_path=blob_path,
+                            file_path=tmp_path, shard=shard, file_size=real_size,
+                            metadata={
+                                "source_item_id": file_id,
+                                "source_drive_id": drive_id,
+                                "original-name": file_name,
+                                "sha256": sha256,
+                            },
+                        )
+                        return upload_result, sha256
 
-            if not upload_result.get("success"):
-                print(f"[{self.worker_id}] [USER_ONEDRIVE] blob upload failed for {file_name}: {upload_result.get('error')}")
-                continue
+                    if per_file_timeout > 0:
+                        upload_result, sha256 = await asyncio.wait_for(
+                            _download_and_upload(), timeout=per_file_timeout
+                        )
+                    else:
+                        upload_result, sha256 = await _download_and_upload()
+                except asyncio.TimeoutError:
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] timeout for {file_name} (>{per_file_timeout}s); skipping")
+                    return
+                except Exception as e:
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] download/upload failed for {file_name}: {type(e).__name__}: {e}")
+                    return
+                finally:
+                    if tmp_path:
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
 
-            # Enrich the existing row's extra_data with dedup + provenance
-            # hints without clobbering the raw Graph object already there.
-            extra_patch = {
-                "raw": f,
-                "sha256": sha256,
-                "quickxor": qxh,
-                "blobbed_at": datetime.utcnow().isoformat() + "Z",
-            }
-            updates.append((file_id, blob_path, real_size, sha256, extra_patch))
-            uploaded_count += 1
-            bytes_uploaded += real_size
+                if not upload_result.get("success"):
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] blob upload failed for {file_name}: {upload_result.get('error')}")
+                    return
+
+                extra_patch = {
+                    "raw": f,
+                    "sha256": sha256,
+                    "quickxor": qxh,
+                    "blobbed_at": datetime.utcnow().isoformat() + "Z",
+                }
+                async with state_lock:
+                    state["uploaded_count"] += 1
+                    state["bytes_uploaded"] += real_size
+                    updates.append((file_id, blob_path, real_size, sha256, extra_patch))
+                    checkpoint.record_file_done(external_id=file_id, size=real_size)
+
+                    if v2_enabled and checkpoint.should_commit(
+                        every_files=settings.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES,
+                        every_bytes=settings.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES,
+                    ):
+                        # Commit outside the lock would need a copy; keep it
+                        # inline — commit only needs one DB round-trip.
+                        await self._commit_backup_checkpoint(snapshot.job_id, checkpoint)
+
+        await asyncio.gather(*(_process_one(f) for f in ordered))
 
         if updates:
             async with async_session_factory() as session:
@@ -1383,8 +1431,28 @@ class BackupWorker:
                     )
                 await session.commit()
 
-        print(f"[{self.worker_id}] [USER_ONEDRIVE] blobbed {uploaded_count}/{len(ordered)} files ({bytes_uploaded} bytes)")
-        return uploaded_count, bytes_uploaded
+        if v2_enabled:
+            await self._commit_backup_checkpoint(snapshot.job_id, checkpoint)
+
+        print(
+            f"[{self.worker_id}] [USER_ONEDRIVE] blobbed {state['uploaded_count']}/{len(ordered)} files "
+            f"({state['bytes_uploaded']} bytes, v2={v2_enabled}, concurrency={file_concurrency})"
+        )
+        return state["uploaded_count"], state["bytes_uploaded"]
+
+    async def _commit_backup_checkpoint(self, job_id, checkpoint) -> None:
+        """Merge the current BackupCheckpoint into Job.result.backup_checkpoint."""
+        if not job_id:
+            return
+        from shared.models import Job as _Job
+        async with async_session_factory() as s:
+            j = await s.get(_Job, job_id)
+            if j is not None:
+                r = dict(j.result or {})
+                r["backup_checkpoint"] = checkpoint.to_dict()
+                j.result = r
+                await s.commit()
+                checkpoint.mark_committed()
 
     # ==================== Server-Side Copy for Files ====================
 
