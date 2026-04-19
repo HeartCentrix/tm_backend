@@ -219,6 +219,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Job Service", version="1.0.0", lifespan=lifespan)
 
+# Chat-export router — /api/v1/exports/chat/* (trigger, estimate, SSE, cancel, delete).
+# Imported after app creation so the module's router instance is registered.
+from chat_export import router as chat_export_router  # noqa: E402
+app.include_router(chat_export_router)
+
 
 @app.get("/health")
 async def health():

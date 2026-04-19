@@ -413,6 +413,47 @@ services:
     networks:
       - tm-network
 
+  chat-export-worker:
+    build:
+      context: .
+      dockerfile: workers/chat-export-worker/Dockerfile
+    container_name: tm_vault_chat_export_worker
+    env_file: .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: postgres
+      RABBITMQ_ENABLED: "true"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      REDIS_ENABLED: "true"
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
+      AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+    ports:
+      - "9102:9102"
+      - "8081:8081"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
   # graph-proxy, delta-token, search-service: retired as of the services audit.
   # - graph-proxy: zero callers; GraphClient talks to Microsoft Graph directly
   # - delta-token: zero callers; delta tokens live on snapshots.delta_token column

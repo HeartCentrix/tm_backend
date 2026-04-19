@@ -1,0 +1,18 @@
+{% import '_macros.html.j2' as m %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ thread_name }} — single message — TMvault</title>
+<link rel="stylesheet" href="../../styles.css">
+</head>
+<body>
+<div class="container">
+  <header class="thread-header">
+    <h1>{{ thread_name }}</h1>
+    <div class="meta">single message · exported {{ exported_at }}</div>
+  </header>
+  {{ m.bubble(msg) }}
+</div>
+</body>
+</html>

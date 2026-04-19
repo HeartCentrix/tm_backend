@@ -113,10 +113,12 @@ class JobType(str, enum.Enum):
 
 class JobStatus(str, enum.Enum):
     QUEUED = "QUEUED"
+    PENDING = "PENDING"  # T0 migration: chat-export PENDING (queued-but-idempotency-safe)
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    CANCELLING = "CANCELLING"  # T0 migration: transient state while worker wraps up
     RETRYING = "RETRYING"
 
 
@@ -435,6 +437,7 @@ class SnapshotItem(Base):
     snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id"), nullable=False, index=True)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
     external_id = Column(String, nullable=False)
+    parent_external_id = Column(String, index=True)
     item_type = Column(String, nullable=False)
     name = Column(String, nullable=False)
     folder_path = Column(String)

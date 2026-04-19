@@ -97,6 +97,8 @@ tags:
     description: Audit logging and event tracking
   - name: Activity
     description: Activity log and export
+  - name: Chat Export
+    description: Start, track, and download chat/Teams conversation exports
   - name: Search
     description: Search and discovery across all resources
   - name: DLQ
@@ -1493,6 +1495,78 @@ paths:
                 properties:
                   url:
                     type: string
+
+  # ==================== CHAT EXPORT ====================
+  /api/v1/exports/chat:
+    post:
+      tags: [Chat Export]
+      summary: Start a chat export job
+      operationId: startChatExport
+      security: [{BearerAuth: []}]
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChatExportRequest'}
+      responses:
+        '202':
+          description: Accepted
+          content: {application/json: {schema: {$ref: '#/components/schemas/ChatExportAccepted'}}}
+        '400': {description: Bad request}
+        '403': {description: Forbidden}
+        '409': {description: Size cap exceeded}
+        '429': {description: Rate limited}
+
+  /api/v1/exports/chat/estimate:
+    post:
+      tags: [Chat Export]
+      operationId: estimateChatExport
+      security: [{BearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChatExportRequest'}
+      responses:
+        '200':
+          description: Estimate
+          content: {application/json: {schema: {$ref: '#/components/schemas/ChatExportEstimate'}}}
+
+  /api/v1/exports/chat/{jobId}:
+    get:
+      tags: [Chat Export]
+      operationId: chatExportStatus
+      security: [{BearerAuth: []}]
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: JSON snapshot or SSE stream (by Accept header)
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ChatExportStatus'}}
+            text/event-stream: {}
+    delete:
+      tags: [Chat Export]
+      operationId: chatExportDelete
+      security: [{BearerAuth: []}]
+      parameters: [{in: path, name: jobId, required: true, schema: {type: string, format: uuid}}]
+      responses: {'204': {description: deleted}}
+
+  /api/v1/exports/chat/{jobId}/cancel:
+    post:
+      tags: [Chat Export]
+      operationId: chatExportCancel
+      security: [{BearerAuth: []}]
+      parameters: [{in: path, name: jobId, required: true, schema: {type: string, format: uuid}}]
+      responses: {'202': {description: cancelling}}
 
   # ==================== SNAPSHOT SERVICE ====================
   /api/v1/resources/{resource_id}/snapshots:
@@ -3603,6 +3677,59 @@ components:
           items:
             type: string
             format: uuid
+
+    # Chat Export Schemas
+    ChatExportRequest:
+      type: object
+      required: [resourceId, snapshotIds, exportFormat]
+      properties:
+        resourceId: {type: string, format: uuid}
+        snapshotIds: {type: array, items: {type: string, format: uuid}}
+        threadPath: {type: string, nullable: true}
+        itemIds: {type: array, items: {type: string, format: uuid}}
+        exportFormat: {type: string, enum: [HTML, JSON, PDF]}
+        includeAttachments: {type: boolean}
+        force: {type: boolean}
+    ChatExportAccepted:
+      type: object
+      properties:
+        jobId: {type: string, format: uuid}
+        status: {type: string}
+        estimatedMessages: {type: integer}
+        estimatedBytes: {type: integer, format: int64}
+        softCapWarning: {type: boolean}
+        hardCapExceeded: {type: boolean}
+    ChatExportEstimate:
+      type: object
+      properties:
+        messages: {type: integer}
+        attachmentBytes: {type: integer, format: int64}
+        estimatedZipBytes: {type: integer, format: int64}
+        layoutMode: {type: string, enum: [single_thread, per_message]}
+        softCapExceeded: {type: boolean}
+        hardCapExceeded: {type: boolean}
+    ChatExportStatus:
+      type: object
+      properties:
+        jobId: {type: string, format: uuid}
+        status: {type: string}
+        download:
+          type: object
+          nullable: true
+          properties:
+            url: {type: string}
+            sizeBytes: {type: integer, format: int64}
+            sha256: {type: string}
+            filename: {type: string}
+            supportsRange: {type: boolean}
+        summary:
+          type: object
+          nullable: true
+          properties:
+            messages: {type: integer}
+            format: {type: string}
+            layoutMode: {type: string}
+        error: {type: object, nullable: true}
 
     # Policy Schemas
     SlaPolicyResponse:

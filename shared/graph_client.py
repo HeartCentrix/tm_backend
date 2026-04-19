@@ -2733,6 +2733,55 @@ class GraphClient:
             resp.raise_for_status()
             return resp.content
 
+    async def get_hosted_content(
+        self, chat_id: str, message_id: str, hc_id: str, chunk_size: int = 1024 * 1024
+    ) -> Tuple[AsyncGenerator[bytes, None], str, int]:
+        """Stream the raw bytes of a chat message's hostedContent.
+
+        Graph API: GET /chats/{cid}/messages/{mid}/hostedContents/{hid}/$value
+
+        Opens an httpx streaming response, captures Content-Type and
+        Content-Length headers, then returns an async generator that yields
+        chunks of ``chunk_size`` bytes. The underlying httpx client + stream
+        contexts stay open until the returned generator is exhausted or closed
+        — callers MUST fully consume (or ``aclose()``) the stream to release
+        the connection. Used by the backup-worker hostedContents capture and
+        by the Teams-chat backfill script.
+
+        Returns: (async_iter_bytes, content_type, content_length).
+        """
+        url = f"{self.GRAPH_URL}/chats/{chat_id}/messages/{message_id}/hostedContents/{hc_id}/$value"
+        token = await self._get_token()
+        client_cm = httpx.AsyncClient(timeout=300.0, follow_redirects=True)
+        client = await client_cm.__aenter__()
+        try:
+            stream_cm = client.stream(
+                "GET", url, headers={"Authorization": f"Bearer {token}"}
+            )
+            resp = await stream_cm.__aenter__()
+        except BaseException:
+            await client_cm.__aexit__(None, None, None)
+            raise
+
+        try:
+            resp.raise_for_status()
+            ctype = resp.headers.get("Content-Type", "application/octet-stream")
+            size = int(resp.headers.get("Content-Length", "0") or 0)
+        except BaseException:
+            await stream_cm.__aexit__(None, None, None)
+            await client_cm.__aexit__(None, None, None)
+            raise
+
+        async def _iter() -> AsyncGenerator[bytes, None]:
+            try:
+                async for chunk in resp.aiter_bytes(chunk_size):
+                    yield chunk
+            finally:
+                await stream_cm.__aexit__(None, None, None)
+                await client_cm.__aexit__(None, None, None)
+
+        return _iter(), ctype, size
+
     async def fetch_shared_url_content(self, source_url: str) -> Optional[bytes]:
         """Resolve a OneDrive / SharePoint share URL to its actual file bytes.
 

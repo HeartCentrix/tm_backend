@@ -300,6 +300,16 @@ async def restore(request: Request):
     return await proxy_request("job", request.url.path, request)
 
 
+# Chat export routes (v1 — single-thread / per-message, routed to job-service)
+@app.post("/api/v1/exports/chat")
+@app.post("/api/v1/exports/chat/estimate")
+@app.get("/api/v1/exports/chat/{job_id}")
+@app.post("/api/v1/exports/chat/{job_id}/cancel")
+@app.delete("/api/v1/exports/chat/{job_id}")
+async def chat_export(request: Request):
+    return await proxy_request("job", request.url.path, request)
+
+
 # Alert routes
 @app.get("/api/v1/alerts")
 @app.get("/api/v1/alerts/{alert_id}")

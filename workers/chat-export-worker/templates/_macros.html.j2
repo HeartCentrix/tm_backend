@@ -1,0 +1,80 @@
+{% macro fmt_bytes(n) -%}
+{%- if n < 1024 -%}{{ n }} B
+{%- elif n < 1048576 -%}{{ "%.1f"|format(n / 1024.0) }} KB
+{%- elif n < 1073741824 -%}{{ "%.1f"|format(n / 1048576.0) }} MB
+{%- else -%}{{ "%.2f"|format(n / 1073741824.0) }} GB
+{%- endif -%}
+{% endmacro %}
+
+{% macro fmt_duration(secs) -%}
+{%- if secs is none -%}-
+{%- elif secs < 60 -%}{{ secs }} s
+{%- else -%}{{ secs // 60 }} min {{ secs % 60 }} s
+{%- endif -%}
+{% endmacro %}
+
+{% macro event_pill(m) -%}
+<div class="event-pill">
+{%- if m.event.kind == 'call_started' -%}
+📞 {{ m.event.initiator or 'Someone' }} started a call
+{%- elif m.event.kind == 'call_ended' -%}
+📞 Call ended · {{ fmt_duration(m.event.duration_seconds) }}{% if m.event.participants %} · {{ m.event.participants | join(', ') }}{% endif %}
+{%- elif m.event.kind == 'call_recording_ended' -%}
+⏹ Call recording ended
+{%- elif m.event.kind == 'members_added' -%}
+➕ {{ m.event.initiator or 'Someone' }} added {{ m.event.members | join(', ') }}
+{%- elif m.event.kind == 'members_removed' -%}
+➖ {{ m.event.initiator or 'Someone' }} removed {{ m.event.members | join(', ') }}
+{%- elif m.event.kind == 'chat_renamed' -%}
+✎ {{ m.event.initiator or 'Someone' }} renamed chat to "{{ m.event.new_chat_name }}"
+{%- elif m.event.kind == 'teams_app_installed' -%}
+🧩 {{ m.event.initiator or 'Someone' }} installed a Teams app
+{%- elif m.event.kind == 'teams_app_removed' -%}
+🧩 {{ m.event.initiator or 'Someone' }} removed a Teams app
+{%- else -%}
+⚙ system event ({{ m.event.raw_odata_type }})
+{%- endif -%}
+</div>
+{%- endmacro %}
+
+{% macro bubble(m) -%}
+{%- if m.event -%}
+  {{ event_pill(m) }}
+{%- elif m.deleted_at -%}
+  <div class="bubble"><div class="avatar" style="background:{{ m.sender_color }}">{{ m.sender_initials }}</div>
+  <div class="bubble-main"><div class="head"><span class="sender">{{ m.sender_name }}</span>
+  <span class="time">{{ m.created_at.strftime('%Y-%m-%d %H:%M UTC') }}</span></div>
+  <div class="body deleted">This message was deleted</div></div></div>
+{%- else -%}
+  <div class="bubble"><div class="avatar" style="background:{{ m.sender_color }}">{{ m.sender_initials }}</div>
+    <div class="bubble-main">
+      <div class="head">
+        <span class="sender">{{ m.sender_name }}</span>
+        <span class="time">{{ m.created_at.strftime('%Y-%m-%d %H:%M UTC') }}</span>
+        {%- if m.last_edited_at -%}<span class="edited">(edited)</span>{%- endif -%}
+      </div>
+      {%- if m.quoted_parent -%}
+      <div class="quote">
+        <div><span class="qsender">In reply to {{ m.quoted_parent.sender_name }}</span></div>
+        <div>{{ m.quoted_parent.snippet }}</div>
+      </div>
+      {%- endif -%}
+      <div class="body">{{ m.body_html | safe }}</div>
+      {%- if m.attachments -%}
+      <div class="attachments">
+        {% for a in m.attachments -%}
+        <a class="chip" href="{{ a.local_path }}"><span>📎 {{ a.name }}</span><span class="size">({{ fmt_bytes(a.size) }})</span></a>
+        {%- endfor %}
+      </div>
+      {%- endif -%}
+      {%- if m.reactions -%}
+      <div class="reactions">
+        {% for r in m.reactions -%}
+        <span class="r">{{ r.emoji }}</span>
+        {%- endfor %}
+      </div>
+      {%- endif -%}
+    </div>
+  </div>
+{%- endif -%}
+{%- endmacro %}

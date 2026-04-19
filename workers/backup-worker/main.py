@@ -1034,6 +1034,7 @@ class BackupWorker:
                 #   USER_MAIL  → EMAIL_ATTACHMENT rows (file/item/reference)
                 #   USER_CHATS → CHAT_ATTACHMENT rows (reference + cards)
                 att_items, att_bytes = [], 0
+                total_hosted_items = 0
                 if resource.type.value == "USER_MAIL":
                     user_id = (resource.extra_data or {}).get("user_id")
                     if user_id:
@@ -1047,6 +1048,9 @@ class BackupWorker:
                                 graph_client, resource, snapshot, tenant, user_id, emails_with_att,
                             )
                 elif resource.type.value == "USER_CHATS":
+                    user_id = (
+                        (resource.extra_data or {}).get("user_id") or resource.external_id
+                    )
                     chats_with_att = [
                         extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
                         if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
@@ -1056,6 +1060,54 @@ class BackupWorker:
                         att_items, att_bytes = await self._userchats_backup_attachments(
                             graph_client, resource, snapshot, tenant, chats_with_att,
                         )
+                    # Inline-image capture (hostedContents). Runs per message
+                    # so each (message, hosted_content) pair gets its own
+                    # CHAT_HOSTED_CONTENT SnapshotItem, streamed straight to
+                    # blob under users/<uid>/chats/<cid>/messages/<mid>/hosted/<hid>.
+                    msgs_with_hc = [
+                        extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
+                        if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
+                        and extra["raw"].get("hostedContents")
+                    ]
+                    if msgs_with_hc and user_id:
+                        # Bind self so _one_msg can reach the BackupWorker
+                        # without pulling the whole closure through gather.
+                        bw_self = self
+                        user_id_local = user_id
+                        snap_id_local = str(snapshot.id)
+                        # Expose the active graph client so
+                        # _userchats_backup_hosted_contents (which uses
+                        # self.graph) picks up the per-backup token + shard.
+                        self.graph = graph_client
+
+                        async def _one_msg(message: Dict[str, Any]) -> Tuple[int, int]:
+                            m_chat_id = (
+                                message.get("chatId")
+                                or (message.get("channelIdentity") or {}).get("channelId")
+                            )
+                            if not m_chat_id or not message.get("id"):
+                                return 0, 0
+                            return await bw_self._userchats_backup_hosted_contents(
+                                snapshot_id=snap_id_local,
+                                user_id=user_id_local,
+                                chat_id=m_chat_id,
+                                message_id=message["id"],
+                                hosted_contents=message["hostedContents"],
+                            )
+
+                        hc_results = await asyncio.gather(
+                            *[_one_msg(m) for m in msgs_with_hc], return_exceptions=True,
+                        )
+                        for r in hc_results:
+                            if isinstance(r, tuple):
+                                hc_items, hc_bytes = r
+                                # _userchats_backup_hosted_contents persists
+                                # its own SnapshotItem rows, so we only need
+                                # to accumulate the count + bytes into the
+                                # per-chat totals (not att_items, which is a
+                                # SnapshotItem list committed below).
+                                bytes_total += hc_bytes
+                                total_hosted_items += hc_items
                 elif resource.type.value == "USER_ONEDRIVE":
                     drive_id = (resource.extra_data or {}).get("drive_id")
                     file_items = [
@@ -1083,7 +1135,7 @@ class BackupWorker:
                         session.add_all(att_items)
                         await session.commit()
 
-                total_items = len(items_data) + len(att_items)
+                total_items = len(items_data) + len(att_items) + total_hosted_items
                 bytes_total += att_bytes
 
                 async with async_session_factory() as session:
@@ -1416,6 +1468,138 @@ class BackupWorker:
                 all_items.extend(items)
                 total_bytes += b
         return all_items, total_bytes
+
+    # ==================== Tier 2 USER_CHATS hostedContents capture ====================
+
+    async def _userchats_backup_hosted_contents(
+        self,
+        *,
+        snapshot_id: str,
+        user_id: str,
+        chat_id: str,
+        message_id: str,
+        hosted_contents: list,
+    ) -> Tuple[int, int]:
+        """Capture inline-image binaries as CHAT_HOSTED_CONTENT snapshot items.
+
+        Idempotent — skips any (message_id, hc_id) already present. Bounded
+        concurrency via settings.chat_hosted_content_concurrency, size-capped
+        at settings.chat_hosted_content_max_bytes.
+
+        Returns (items_created, bytes_captured).
+        """
+        sem = asyncio.Semaphore(settings.chat_hosted_content_concurrency)
+        items = 0
+        total_bytes = 0
+
+        async def _one(hc: dict) -> Tuple[int, int]:
+            hc_id = hc.get("id")
+            if not hc_id:
+                return 0, 0
+            if await self._exists_hosted_item(snapshot_id, message_id, hc_id):
+                return 0, 0
+            async with sem:
+                stream, ctype, size = await self.graph.get_hosted_content(
+                    chat_id, message_id, hc_id
+                )
+                if size and size > settings.chat_hosted_content_max_bytes:
+                    logger.warning(
+                        "hosted_content_skipped_size_cap",
+                        extra={"message_id": message_id, "hc_id": hc_id, "size": size},
+                    )
+                    return 0, 0
+                blob_path = f"users/{user_id}/chats/{chat_id}/messages/{message_id}/hosted/{hc_id}"
+                await self._upload_stream(blob_path, stream, content_type=ctype)
+                await self._insert_snapshot_item(
+                    snapshot_id=snapshot_id,
+                    item_type="CHAT_HOSTED_CONTENT",
+                    external_id=f"{message_id}:{hc_id}",
+                    parent_external_id=message_id,
+                    name=f"inline-{hc_id}",
+                    blob_path=blob_path,
+                    content_size=size,
+                    extra_data={"content_type": ctype, "source_message_id": message_id},
+                )
+                return 1, size
+
+        results = await asyncio.gather(*[_one(hc) for hc in hosted_contents])
+        for c, b in results:
+            items += c
+            total_bytes += b
+        return items, total_bytes
+
+    async def _exists_hosted_item(
+        self, snapshot_id: str, message_id: str, hc_id: str
+    ) -> bool:
+        """Check whether a CHAT_HOSTED_CONTENT row already exists for this
+        (snapshot, message, hc_id). Used by _userchats_backup_hosted_contents
+        for idempotency."""
+        external_id = f"{message_id}:{hc_id}"
+        async with async_session_factory() as session:
+            stmt = select(SnapshotItem.id).where(
+                and_(
+                    SnapshotItem.snapshot_id == snapshot_id,
+                    SnapshotItem.external_id == external_id,
+                    SnapshotItem.item_type == "CHAT_HOSTED_CONTENT",
+                )
+            ).limit(1)
+            res = await session.execute(stmt)
+            return res.scalar_one_or_none() is not None
+
+    async def _upload_stream(
+        self, blob_path: str, stream, *, content_type: str = "application/octet-stream",
+        tenant_id: Optional[str] = None, resource_id: Optional[str] = None,
+        container: str = "teams",
+    ) -> None:
+        """Drain an async byte iterator into an Azure blob. Thin wrapper that
+        concatenates chunks in memory (hostedContents are size-capped upstream,
+        so buffering is bounded) and forwards to upload_blob_with_retry."""
+        buf = bytearray()
+        try:
+            async for chunk in stream:
+                if chunk:
+                    buf.extend(chunk)
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:
+                    pass
+        if tenant_id is None or resource_id is None:
+            # Callers that don't want sharding can pass the raw blob_path
+            # through to the default shard.
+            shard = azure_storage_manager.get_shard_for_resource(
+                resource_id or blob_path, tenant_id or blob_path,
+            )
+            cname = azure_storage_manager.get_container_name(
+                tenant_id or "default", container,
+            )
+        else:
+            shard = azure_storage_manager.get_shard_for_resource(resource_id, tenant_id)
+            cname = azure_storage_manager.get_container_name(tenant_id, container)
+        await upload_blob_with_retry(cname, blob_path, bytes(buf), shard, max_retries=3)
+
+    async def _insert_snapshot_item(self, **kw) -> None:
+        """Insert a SnapshotItem row from kwargs. Thin wrapper so callers (like
+        _userchats_backup_hosted_contents) can stay focused on the business
+        logic. Fields that aren't declared on the SnapshotItem ORM mapping —
+        e.g. parent_external_id on older schemas — are folded into extra_data
+        so the insert still succeeds cross-schema."""
+        model_cols = {c.key for c in SnapshotItem.__table__.columns}
+        model_cols.update({k for k in SnapshotItem.__mapper__.attrs.keys()})
+        extra_data = dict(kw.pop("extra_data", {}) or {})
+        clean: Dict[str, Any] = {}
+        for k, v in kw.items():
+            if k in model_cols:
+                clean[k] = v
+            else:
+                extra_data[k] = v
+        clean["extra_data"] = extra_data
+        clean.setdefault("id", uuid.uuid4())
+        async with async_session_factory() as session:
+            session.add(SnapshotItem(**clean))
+            await session.commit()
 
     # ==================== Tier 2 USER_ONEDRIVE file-bytes capture ====================
     #
