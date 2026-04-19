@@ -727,6 +727,13 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_snapshot_items_metadata_chat_id "
         "ON snapshot_items ((metadata->>'chatId')) "
         "WHERE item_type = 'TEAMS_CHAT_MESSAGE'",
+        # Covers the cross-snapshot aggregation queries added for mail /
+        # chats / calendar / folders — filter on snapshot_id IN (...) and
+        # item_type IN (...), then dedupe by external_id. Makes the
+        # /folders endpoint + the left-panel count endpoints bounded by
+        # index scan instead of full table scan.
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_items_snap_type_ext "
+        "ON snapshot_items (snapshot_id, item_type, external_id)",
     ]
 
     add_column_statements = [
