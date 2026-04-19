@@ -113,10 +113,12 @@ class JobType(str, enum.Enum):
 
 class JobStatus(str, enum.Enum):
     QUEUED = "QUEUED"
+    PENDING = "PENDING"  # T0 migration: chat-export PENDING (queued-but-idempotency-safe)
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    CANCELLING = "CANCELLING"  # T0 migration: transient state while worker wraps up
     RETRYING = "RETRYING"
 
 
