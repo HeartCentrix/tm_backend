@@ -11,3 +11,8 @@ Run during low-traffic window. All indexes use `CONCURRENTLY` so no table lock.
 
 Verify:
     psql "$DATABASE_URL" -c "\di+ idx_snapshot_items_resource_type_folder"
+
+## 2026-04-20 — Chat export schema prerequisites
+Run BEFORE the chat-export indexes migration below. Adds `parent_external_id` column + `PENDING` / `CANCELLING` enum values.
+
+    psql "$DATABASE_URL" -f migrations/2026_04_20_chat_export_schema.sql
