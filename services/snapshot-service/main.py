@@ -1046,6 +1046,41 @@ async def list_snapshot_messages(
     return {"content": list(results), "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
 
 
+WELL_KNOWN_CONTACT_FOLDERS = [
+    "Contacts", "Recipient Cache", "Deleted Items", "Recoverable Items",
+]
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/contact-folders")
+async def list_snapshot_contact_folders(
+    snapshot_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Distinct folder_path values for USER_CONTACT items in a snapshot.
+    Powers the folder-grain checkbox subgroup in the Download modal.
+
+    Sort order: well-known folders (Contacts, Recipient Cache, Deleted
+    Items, Recoverable Items) first in canonical order, then any custom
+    folders alphabetically."""
+    try:
+        sid = UUID(snapshot_id)
+    except ValueError:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="invalid snapshot_id")
+
+    stmt = (
+        select(distinct(SnapshotItem.folder_path))
+        .where(SnapshotItem.snapshot_id == sid)
+        .where(SnapshotItem.item_type == "USER_CONTACT")
+        .where(SnapshotItem.folder_path.isnot(None))
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    seen = {f for f in rows if f}
+    well_known = [f for f in WELL_KNOWN_CONTACT_FOLDERS if f in seen]
+    others = sorted(seen - set(WELL_KNOWN_CONTACT_FOLDERS))
+    return {"folders": well_known + others}
+
+
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/chats/groups")
 async def list_snapshot_chat_groups(
     snapshot_id: str,
