@@ -1,0 +1,60 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: chat-export-worker
+  namespace: tmvault
+spec:
+  scaleTargetRef:
+    name: chat-export-worker
+  minReplicaCount: 2
+  maxReplicaCount: 64
+  cooldownPeriod: 300
+  pollingInterval: 15
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: amqp
+        queueName: q.export.chat.thread
+        mode: QueueLength
+        value: "50"
+      authenticationRef:
+        name: rabbitmq-trigger-auth
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        metricName: chat_export_avg_duration
+        query: |
+          avg(rate(chat_export_duration_seconds_sum[5m])
+            / rate(chat_export_duration_seconds_count[5m]))
+        threshold: "60"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-export-worker
+  namespace: tmvault
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: chat-export-worker}}
+  template:
+    metadata:
+      labels: {app: chat-export-worker}
+    spec:
+      containers:
+        - name: worker
+          image: registry.tmvault.internal/chat-export-worker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {containerPort: 9102, name: metrics}
+            - {containerPort: 8081, name: health}
+          resources:
+            requests: {cpu: "500m", memory: "1Gi"}
+            limits: {cpu: "2",     memory: "4Gi"}
+          readinessProbe:
+            httpGet: {path: /ready, port: 8081}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: 8081}
+            periodSeconds: 10
+          envFrom:
+            - secretRef: {name: tmvault-env}
