@@ -1,7 +1,43 @@
 """Shared pytest fixtures for tm_backend tests."""
 import asyncio
+import importlib.util
 import os
+import pathlib
+import sys
+import types
+
 import pytest
+
+
+def _register_hyphenated_worker_aliases() -> None:
+    """Expose hyphenated worker dirs (e.g. ``workers/chat-export-worker``)
+    under underscore-based Python import paths so tests can write
+    ``from workers.chat_export_worker.render.normalizer import ...``
+    without renaming the on-disk directory (which is tied to the
+    Dockerfile/docker-compose WORKDIR).
+    """
+    here = pathlib.Path(__file__).resolve().parent
+    root = here.parent
+
+    if "workers" not in sys.modules:
+        workers_pkg = types.ModuleType("workers")
+        workers_pkg.__path__ = [str(root / "workers")]
+        sys.modules["workers"] = workers_pkg
+
+    aliases = {
+        "workers.chat_export_worker": root / "workers" / "chat-export-worker",
+    }
+    for mod_name, disk_path in aliases.items():
+        if not disk_path.is_dir():
+            continue
+        if mod_name in sys.modules:
+            continue
+        pkg = types.ModuleType(mod_name)
+        pkg.__path__ = [str(disk_path)]
+        sys.modules[mod_name] = pkg
+
+
+_register_hyphenated_worker_aliases()
 
 
 @pytest.fixture(scope="session")
