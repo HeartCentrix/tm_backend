@@ -479,7 +479,19 @@ class PostgresBackupHandler:
 
     async def _capture_schema(self, conn, server_name: str, db_name: str,
                                snapshot: Snapshot, resource: Resource) -> Dict:
-        """Capture CREATE TABLE statements for all tables."""
+        """Capture CREATE TABLE statements for all tables.
+
+        Emits multiple artifacts per database so the Schema tab can show
+        a folder tree (matching AFI's layout):
+
+          <db>/sql_schema.sql      — consolidated CREATE TABLE statements
+          <db>/sql_schema.dump     — same content (placeholder for pg_dump
+                                      custom format)
+          <db>/sql/<schema>__<table>.sql — per-table CREATE TABLE
+
+        Returns {"files": [...], "size_bytes": total} where each file has
+        name, folder_path (relative to db), blob_path, size_bytes.
+        """
         shard = azure_storage_manager.get_default_shard()
         container = azure_storage_manager.get_container_name(str(resource.tenant_id), "azure-postgresql")
         await shard._ensure_container(container)
@@ -493,14 +505,7 @@ class PostgresBackupHandler:
             ORDER BY table_schema, table_name
         """)
 
-        schema_lines = [f"-- Schema export for database: {db_name}"]
-        schema_lines.append(f"-- Exported at: {datetime.now(timezone.utc).isoformat()}")
-        schema_lines.append("")
-
-        for table_row in tables:
-            schema = table_row["table_schema"]
-            table = table_row["table_name"]
-
+        async def _build_create_table(schema: str, table: str) -> str:
             columns = await conn.fetch("""
                 SELECT column_name, data_type, character_maximum_length,
                        is_nullable, column_default, numeric_precision, numeric_scale
@@ -509,9 +514,8 @@ class PostgresBackupHandler:
                 ORDER BY ordinal_position
             """, schema, table)
 
-            schema_lines.append(f"-- Table: {schema}.{table}")
-            schema_lines.append(f"CREATE TABLE IF NOT EXISTS \"{schema}\".\"{table}\" (")
-
+            lines = [f"-- Table: {schema}.{table}",
+                     f"CREATE TABLE IF NOT EXISTS \"{schema}\".\"{table}\" ("]
             col_defs = []
             for col in columns:
                 dtype = col["data_type"].upper()
@@ -525,24 +529,71 @@ class PostgresBackupHandler:
 
                 nullable = "" if col["is_nullable"] == "NO" else " NULL"
                 default = f" DEFAULT {col['column_default']}" if col["column_default"] else ""
-
                 col_defs.append(f'    "{col["column_name"]}" {dtype}{nullable}{default}')
 
-            schema_lines.append(",\n".join(col_defs))
-            schema_lines.append(");\n")
+            lines.append(",\n".join(col_defs))
+            lines.append(");\n")
+            return "\n".join(lines)
 
-        schema_content = "\n".join(schema_lines) + "\n"
-        schema_bytes = len(schema_content.encode("utf-8"))
+        per_table_sql: dict = {}
+        consolidated_lines = [
+            f"-- Schema export for database: {db_name}",
+            f"-- Exported at: {datetime.now(timezone.utc).isoformat()}",
+            "",
+        ]
+        for table_row in tables:
+            schema = table_row["table_schema"]
+            table = table_row["table_name"]
+            create_sql = await _build_create_table(schema, table)
+            per_table_sql[(schema, table)] = create_sql
+            consolidated_lines.append(create_sql)
 
-        schema_blob_name = f"{db_name}-schema.sql"
-        schema_blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/schema/{schema_blob_name}"
+        consolidated = "\n".join(consolidated_lines) + "\n"
 
-        blob_client = shard.get_async_client().get_blob_client(container, schema_blob_path)
-        await blob_client.upload_blob(schema_content.encode("utf-8"), overwrite=True)
+        snap_dir = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/schema"
+        files: list = []
+        total_bytes = 0
 
-        self._log(f"  Phase 2: Schema captured: {len(tables)} tables, {self._format_size(schema_bytes)}")
+        async def _upload(rel_path: str, content: str) -> tuple:
+            blob_path = f"{snap_dir}/{rel_path}"
+            data = content.encode("utf-8")
+            client = shard.get_async_client().get_blob_client(container, blob_path)
+            await client.upload_blob(data, overwrite=True)
+            return blob_path, len(data)
 
-        return {"blob_path": schema_blob_path, "size_bytes": schema_bytes}
+        # Root-level files — sql_schema.sql + sql_schema.dump.
+        sql_path, sql_size = await _upload("sql_schema.sql", consolidated)
+        files.append({"name": "sql_schema.sql", "folder_path": "",
+                      "blob_path": sql_path, "size_bytes": sql_size})
+        total_bytes += sql_size
+
+        dump_path, dump_size = await _upload("sql_schema.dump", consolidated)
+        files.append({"name": "sql_schema.dump", "folder_path": "",
+                      "blob_path": dump_path, "size_bytes": dump_size})
+        total_bytes += dump_size
+
+        # Per-table files under sql/. File name combines schema and
+        # table so different schemas with same table name don't collide.
+        for (schema, table), create_sql in per_table_sql.items():
+            fname = f"{schema}__{table}.sql"
+            rel = f"sql/{fname}"
+            blob_path, bsize = await _upload(rel, create_sql)
+            files.append({
+                "name": fname, "folder_path": "sql",
+                "blob_path": blob_path, "size_bytes": bsize,
+            })
+            total_bytes += bsize
+
+        self._log(
+            f"  Phase 2: Schema captured: {len(tables)} tables, "
+            f"{len(files)} files, {self._format_size(total_bytes)}"
+        )
+
+        return {
+            "files": files,
+            "size_bytes": total_bytes,
+            "blob_path": sql_path,
+        }
 
     async def _capture_configuration(self, server_name: str, sub_id: str,
                                       rg: str, snapshot: Snapshot,
@@ -941,20 +992,37 @@ class PostgresBackupHandler:
                 },
             ))
 
-            if schema_result.get("blob_path"):
-                schema_name = schema_result["blob_path"].rsplit("/", 1)[-1]
+            # Schema files — one row per captured schema artifact so the
+            # Schema tab can render a folder tree. folder_path is
+            # `<db_name>` for root-level files and `<db_name>/<sub>`
+            # (e.g. `<db_name>/sql`) for files inside a subfolder.
+            schema_files = schema_result.get("files") or []
+            if not schema_files and schema_result.get("blob_path"):
+                # Back-compat — old shape had a single blob_path.
+                fallback_name = schema_result["blob_path"].rsplit("/", 1)[-1]
+                schema_files = [{
+                    "name": fallback_name or f"{db_name}-schema.sql",
+                    "folder_path": "",
+                    "blob_path": schema_result.get("blob_path"),
+                    "size_bytes": schema_result.get("size_bytes") or 0,
+                }]
+
+            for sf in schema_files:
+                rel_folder = (sf.get("folder_path") or "").strip("/")
+                folder = f"{db_name}/{rel_folder}" if rel_folder else db_name
+                fname = sf.get("name") or "schema.sql"
                 rows.append(SnapshotItem(
                     id=_uuid.uuid4(),
                     snapshot_id=snapshot.id,
                     tenant_id=tenant.id,
-                    external_id=f"{server_name}:{db_name}:schema",
+                    external_id=f"{server_name}:{db_name}:schema:{folder}/{fname}",
                     item_type="AZURE_DB_SCHEMA_FILE",
-                    name=schema_name or f"{db_name}-schema.sql",
-                    folder_path=db_name,
-                    content_size=int(schema_result.get("size_bytes") or 0),
+                    name=fname,
+                    folder_path=folder,
+                    content_size=int(sf.get("size_bytes") or 0),
                     content_hash=None,
                     content_checksum=None,
-                    blob_path=schema_result.get("blob_path"),
+                    blob_path=sf.get("blob_path"),
                     extra_data={
                         "server_name": server_name,
                         "database_name": db_name,
