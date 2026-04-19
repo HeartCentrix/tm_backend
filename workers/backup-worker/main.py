@@ -2213,20 +2213,34 @@ class BackupWorker:
                 for o in owners.get("value", []):
                     items_to_backup.append(("GROUP_OWNER", o))
 
-            group_mail_enabled = bool((resource.extra_data or {}).get("mail_enabled"))
-            if backup_group_mailbox and group_mail_enabled:
-                group_mailbox_items, mailbox_bytes = await self.backup_group_mailbox_content(
-                    resource,
-                    tenant,
-                    snapshot,
-                    graph_client,
-                )
-                bytes_added += mailbox_bytes
-                item_count += len(group_mailbox_items)
-                if group_mailbox_items:
-                    async with async_session_factory() as session:
-                        session.add_all(group_mailbox_items)
-                        await session.commit()
+            # Only Unified (Microsoft 365) groups expose /groups/{id}/threads.
+            # Mail-enabled security groups and distribution lists have
+            # mail_enabled=true but groupTypes=[] and /threads returns 403.
+            meta = resource.extra_data or {}
+            group_types = [gt for gt in (meta.get("group_types") or []) if isinstance(gt, str)]
+            is_unified = any(gt.lower() == "unified" for gt in group_types)
+            group_mail_enabled = bool(meta.get("mail_enabled"))
+            if backup_group_mailbox and group_mail_enabled and is_unified:
+                try:
+                    group_mailbox_items, mailbox_bytes = await self.backup_group_mailbox_content(
+                        resource,
+                        tenant,
+                        snapshot,
+                        graph_client,
+                    )
+                    bytes_added += mailbox_bytes
+                    item_count += len(group_mailbox_items)
+                    if group_mailbox_items:
+                        async with async_session_factory() as session:
+                            session.add_all(group_mailbox_items)
+                            await session.commit()
+                except Exception as mbx_exc:
+                    logger.warning(
+                        "[%s] Group mailbox backup skipped for %s: %s",
+                        self.worker_id, resource.display_name, mbx_exc,
+                    )
+            elif backup_group_mailbox and group_mail_enabled and not is_unified:
+                print(f"[{self.worker_id}]   [GROUP_MAILBOX] Skipping {resource.display_name}: mail-enabled but not Unified (classification={meta.get('group_classification')})")
 
         elif resource_type == "ENTRA_APP":
             # Application registration — fetch via /applications?$filter=id eq '{id}'
@@ -4926,6 +4940,229 @@ class BackupWorker:
                       f"method={r.get('method','?')} reason={r.get('reason','no reason')}")
 
         print(f"[{self.worker_id}]   [SP_FILES] Done — {total_items} uploaded, {failed} failed, {total_bytes} bytes")
+
+        # -----------------------------------------------------------------
+        # SharePoint LISTS pass — libraries, system catalogs, and custom
+        # lists on the site. Drive-items above only cover files in the
+        # default document library; lists like Site Pages, Events,
+        # _catalogs/masterpage, User Information List, TaxonomyHiddenList,
+        # etc. live at /sites/{id}/lists and are invisible to the drive
+        # API. We capture each list as a metadata SnapshotItem so the
+        # Recovery UI can surface the full site inventory.
+        # -----------------------------------------------------------------
+        # Per-list caps to protect against pathological system lists
+        # (e.g. User Information List can hold tens of thousands of rows).
+        PER_LIST_ROW_CAP = 500
+        PER_ITEM_BYTE_CAP = 25 * 1024 * 1024  # 25 MB per single file
+        list_rows_persisted = 0
+        list_files_persisted = 0
+        list_files_bytes = 0
+        shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
+        container = azure_storage_manager.get_container_name(str(tenant.id), "sharepoint")
+        try:
+            for site_id, site_label, _tok in site_targets:
+                try:
+                    lists_resp = await graph_client.get_sharepoint_site_lists(site_id)
+                except Exception as exc:
+                    logger.warning("Failed to fetch lists for site %s: %s", site_id, exc)
+                    continue
+
+                # Derive hostname + root web URL once per site so SP REST
+                # calls can hit the right tenant (e.g. "qfion.sharepoint.com"
+                # + "https://qfion.sharepoint.com/sites/Foo"). We pick these
+                # up from any list's webUrl — they all share the same host
+                # and site path.
+                sp_hostname: Optional[str] = None
+                sp_site_web_url: Optional[str] = None
+                for _l in (lists_resp.get("value") or []):
+                    _wu = _l.get("webUrl") or ""
+                    if _wu:
+                        from urllib.parse import urlparse as _up
+                        _p = _up(_wu)
+                        sp_hostname = _p.netloc
+                        _parts = _p.path.strip("/").split("/")
+                        if len(_parts) >= 2 and _parts[0] == "sites":
+                            sp_site_web_url = f"{_p.scheme}://{_p.netloc}/sites/{_parts[1]}"
+                        else:
+                            sp_site_web_url = f"{_p.scheme}://{_p.netloc}"
+                        break
+
+                for lst in (lists_resp.get("value") or []):
+                  try:
+                    lst_id = lst.get("id") or ""
+                    if not lst_id:
+                        continue
+                    display = lst.get("displayName") or lst.get("name") or lst_id
+                    list_meta = lst.get("list") or {}
+                    list_folder_path = f"{site_label}/lists/{display}"
+                    is_library = str(list_meta.get("template") or "").lower() in ("documentlibrary", "masterpagecatalog", "webtemplatecatalog", "webpartcatalog", "themecatalog", "solutioncatalog")
+
+                    # 1) Persist the list itself as a folder row so the
+                    #    Recovery UI has a container to show items under.
+                    list_row = SnapshotItem(
+                        id=uuid.uuid4(),
+                        snapshot_id=snapshot.id,
+                        tenant_id=tenant.id,
+                        external_id=lst_id,
+                        item_type="SHAREPOINT_LIST",
+                        name=display[:255],
+                        folder_path=f"{site_label}/lists",
+                        content_size=0,
+                        content_hash=None,
+                        content_checksum=None,
+                        extra_data={
+                            "raw": lst,
+                            "site_id": site_id,
+                            "site_label": site_label,
+                            "template": list_meta.get("template"),
+                            "system": bool(lst.get("system")) or bool(list_meta.get("hidden")),
+                            "hidden": bool(list_meta.get("hidden")),
+                            "is_catalog": "_catalogs" in (lst.get("webUrl") or ""),
+                            "is_library": is_library,
+                            "web_url": lst.get("webUrl"),
+                            "last_modified": lst.get("lastModifiedDateTime"),
+                        },
+                    )
+                    async with async_session_factory() as sess:
+                        sess.add(list_row)
+                        await sess.commit()
+                    list_rows_persisted += 1
+
+                    # 2) Walk items inside the list via SP REST —
+                    #    gives us real File metadata (ServerRelativeUrl,
+                    #    Length, Name) for every catalog that Graph hides.
+                    if not (sp_hostname and sp_site_web_url):
+                        logger.warning("Cannot derive SP site URL for %s, skipping items", site_label)
+                        continue
+                    try:
+                        raw_items = await graph_client.get_sharepoint_list_items_via_rest(
+                            sp_hostname, sp_site_web_url, lst_id,
+                        )
+                    except Exception as exc:
+                        logger.warning("SP REST items failed for list %s/%s: %s", site_label, display, exc)
+                        continue
+
+                    if len(raw_items) > PER_LIST_ROW_CAP:
+                        print(f"[{self.worker_id}]   [SP_LIST_ITEMS] {site_label}/{display}: {len(raw_items)} rows, capping to {PER_LIST_ROW_CAP}")
+                        raw_items = raw_items[:PER_LIST_ROW_CAP]
+
+                    batch_rows: List[SnapshotItem] = []
+                    for it in raw_items:
+                        it_id = str(it.get("Id") or it.get("ID") or "")
+                        if not it_id:
+                            continue
+                        srv_rel = it.get("FileRef") or ""
+                        leaf = it.get("FileLeafRef") or ""
+                        obj_type = int(it.get("FileSystemObjectType") or 0)
+                        is_folder = (obj_type == 1)
+                        name = leaf or it.get("Title") or (srv_rel.rsplit("/", 1)[-1] if srv_rel else f"Item-{it_id}")
+
+                        # Nest the folder_path by the item's own server-relative
+                        # path so the Recovery tree mirrors the real site layout.
+                        # e.g. "Communication site/lists/Site Pages/Home.aspx"
+                        if srv_rel:
+                            trail = srv_rel.lstrip("/")
+                            # Strip the /sites/<Name>/ prefix if present — site_label
+                            # already covers that scope.
+                            parts = trail.split("/")
+                            if len(parts) >= 2 and parts[0] == "sites":
+                                parts = parts[2:]
+                            # Drop the leaf (file/folder itself) from the path.
+                            path_parts = parts[:-1] if len(parts) > 1 else []
+                            item_folder_path = f"{site_label}/lists/{display}"
+                            if path_parts:
+                                item_folder_path += "/" + "/".join(path_parts)
+                        else:
+                            item_folder_path = list_folder_path
+
+                        blob_path: Optional[str] = None
+                        content_hash: Optional[str] = None
+                        downloaded_bytes = 0
+                        size = 0
+                        file_info: Optional[Dict[str, Any]] = None
+
+                        # Decide if this row is a real file by probing
+                        # SharePoint's /GetFileByServerRelativeUrl endpoint
+                        # — returns 200 + Length for files, 404/400 for
+                        # plain list rows or folders.
+                        if srv_rel and not is_folder:
+                            file_info = await graph_client.get_sharepoint_file_metadata_via_rest(
+                                sp_hostname, sp_site_web_url, srv_rel,
+                            )
+                            if file_info:
+                                size = int(file_info.get("Length") or 0)
+
+                        if file_info and size > 0 and size <= PER_ITEM_BYTE_CAP:
+                            try:
+                                content_bytes = await graph_client.download_sharepoint_file_via_rest(
+                                    sp_hostname, sp_site_web_url, srv_rel,
+                                )
+                                if content_bytes:
+                                    content_hash = hashlib.sha256(content_bytes).hexdigest()
+                                    blob_path = azure_storage_manager.build_blob_path(
+                                        str(tenant.id), str(resource.id), str(snapshot.id),
+                                        f"splist_{lst_id}_{it_id}_{name}",
+                                    )
+                                    upload_result = await upload_blob_with_retry(
+                                        container, blob_path, content_bytes, shard, max_retries=3,
+                                    )
+                                    if not (isinstance(upload_result, dict) and upload_result.get("success")):
+                                        blob_path = None
+                                    else:
+                                        downloaded_bytes = len(content_bytes)
+                            except Exception as exc:
+                                print(f"[{self.worker_id}]   [SP_LIST_ITEM FAIL] {site_label}/{display}/{name}: {type(exc).__name__}: {exc}")
+                                blob_path = None
+
+                        batch_rows.append(SnapshotItem(
+                            id=uuid.uuid4(),
+                            snapshot_id=snapshot.id,
+                            tenant_id=tenant.id,
+                            external_id=f"{lst_id}:{it_id}",
+                            item_type=(
+                                "SHAREPOINT_FILE" if blob_path
+                                else ("SHAREPOINT_FOLDER" if is_folder else "SHAREPOINT_LIST_ITEM")
+                            ),
+                            name=str(name)[:255],
+                            folder_path=item_folder_path,
+                            content_size=downloaded_bytes if blob_path else size,
+                            content_hash=content_hash,
+                            content_checksum=None,
+                            blob_path=blob_path,
+                            extra_data={
+                                "list_id": lst_id,
+                                "list_name": display,
+                                "site_id": site_id,
+                                "site_label": site_label,
+                                "server_relative_url": srv_rel,
+                                "file": file_info,
+                                "is_folder": is_folder,
+                                "title": it.get("Title"),
+                                "created": it.get("Created") or (file_info or {}).get("TimeCreated"),
+                                "modified": it.get("Modified") or (file_info or {}).get("TimeLastModified"),
+                                "version": (file_info or {}).get("UIVersionLabel"),
+                                "source": "sp_rest",
+                            },
+                        ))
+                        if blob_path:
+                            list_files_persisted += 1
+                            list_files_bytes += downloaded_bytes
+
+                    if batch_rows:
+                        async with async_session_factory() as sess:
+                            sess.add_all(batch_rows)
+                            await sess.commit()
+                        list_rows_persisted += len(batch_rows)
+                  except Exception as list_exc:
+                    logger.warning("SP list capture failed for %s on %s: %s", lst.get("displayName") or lst.get("name") or lst.get("id"), site_label, list_exc)
+                    continue
+
+            print(f"[{self.worker_id}]   [SP_LISTS] Persisted {list_rows_persisted} rows, downloaded {list_files_persisted} files ({list_files_bytes} bytes) across {len(site_targets)} site target(s)")
+        except Exception as exc:
+            logger.warning("SP lists capture failed for %s: %s", resource.display_name, exc)
+
+        total_items += list_rows_persisted
+        total_bytes += list_files_bytes
 
         if new_subsite_tokens:
             async with async_session_factory() as sess:

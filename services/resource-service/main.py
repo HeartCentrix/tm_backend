@@ -307,6 +307,41 @@ async def list_resources(
         counts_result = await db.execute(counts_query, {"resource_ids": resource_ids})
         backup_counts = {str(row[0]): row[1] for row in counts_result.fetchall()}
 
+    # Roll up Tier 2 child sizes into the parent. After the Tier 2 refactor,
+    # ENTRA_USER rows only carry tiny metadata in their own storage_bytes;
+    # the real content bytes live on the 5 USER_* children linked via
+    # parent_resource_id. For the Protection table we want "whole backup"
+    # so sum the children here and add them to the parent's size. Resources
+    # without children (Tier 1 MAILBOX, SharePoint sites, etc.) just get 0
+    # from this map and fall back to their own storage_bytes.
+    child_size_map: dict = {}
+    if resource_ids:
+        child_size_query = text("""
+            SELECT parent_resource_id, COALESCE(SUM(storage_bytes), 0) AS children_total
+            FROM resources
+            WHERE parent_resource_id = ANY(:resource_ids)
+            GROUP BY parent_resource_id
+        """)
+        child_size_result = await db.execute(child_size_query, {"resource_ids": resource_ids})
+        child_size_map = {str(row[0]): int(row[1] or 0) for row in child_size_result.fetchall()}
+
+    # Likewise, treat a completed snapshot on ANY child as "the parent was
+    # backed up" so the UI chip flips to "protected" for parents whose only
+    # completed snapshots live on their children.
+    if resource_ids:
+        child_backup_query = text("""
+            SELECT r.parent_resource_id, COUNT(*) AS child_backups
+            FROM snapshots s
+            JOIN resources r ON r.id = s.resource_id
+            WHERE r.parent_resource_id = ANY(:resource_ids)
+              AND s.status = 'COMPLETED'
+            GROUP BY r.parent_resource_id
+        """)
+        child_backup_result = await db.execute(child_backup_query, {"resource_ids": resource_ids})
+        for row in child_backup_result.fetchall():
+            pid = str(row[0])
+            backup_counts[pid] = backup_counts.get(pid, 0) + int(row[1] or 0)
+
     def map_kind(t):
         m = {"MAILBOX": "office_user", "SHARED_MAILBOX": "shared_mailbox", "ROOM_MAILBOX": "room_mailbox",
              "ONEDRIVE": "onedrive", "SHAREPOINT_SITE": "sharepoint_site", "TEAMS_CHANNEL": "teams_channel",
@@ -338,7 +373,10 @@ async def list_resources(
 
     items = []
     for r in rows:
-        storage_bytes = r[9] or 0
+        # "Whole backup" = parent's own bytes + every Tier 2 child's bytes.
+        # For non-parents the map lookup returns 0 and this matches the old
+        # storage_bytes value exactly.
+        storage_bytes = (r[9] or 0) + child_size_map.get(str(r[0]), 0)
         has_backup = r[10] is not None  # last_backup_at is not None
         backup_count = backup_counts.get(str(r[0]), 0)
         items.append({
@@ -400,6 +438,29 @@ async def get_resources_by_type(
     if not includeHidden and type in UI_HIDDEN_TYPES:
         return {"items": [], "item_number": 0, "page_number": page, "next_page_token": None}
 
+    # SharePoint sub-section filter: exclude sites whose name+email
+    # collides with a Microsoft 365 group / Entra group / Teams channel.
+    # Those appear under the Groups & Teams tab instead, so showing them
+    # here duplicates the row. Match is case-insensitive on display_name
+    # AND identical on email (NULL treated equal).
+    sp_exclude_clause = ""
+    if type == "SHAREPOINT_SITE":
+        # A SP site backed by an M365 group / Entra group / Teams channel
+        # shares the group's display name (the admin API surfaces the
+        # group's name as the site title). When both the SP site and the
+        # group also have a mail address, require it to match; when the
+        # SP site has no email (the common case), match on name alone.
+        sp_exclude_clause = """AND NOT EXISTS (
+            SELECT 1 FROM resources g
+            WHERE g.tenant_id = r.tenant_id
+              AND g.type IN ('M365_GROUP', 'ENTRA_GROUP', 'TEAMS_CHANNEL')
+              AND LOWER(g.display_name) = LOWER(r.display_name)
+              AND (
+                    COALESCE(r.email, '') = ''
+                 OR LOWER(COALESCE(g.email, '')) = LOWER(COALESCE(r.email, ''))
+              )
+        )"""
+
     # Same lateral join as the main list — derive last_backup_status from
     # the latest BACKUP job touching this resource so Protection mirrors
     # Activity.
@@ -418,6 +479,7 @@ async def get_resources_by_type(
         ) latest_job ON TRUE
         WHERE r.type = :rtype
         {'AND r.tenant_id = :rtenant' if tenantId else ''}
+        {sp_exclude_clause}
         ORDER BY r.created_at DESC
         LIMIT :rlimit OFFSET :roffset
     """)
@@ -431,6 +493,7 @@ async def get_resources_by_type(
     count_query = text(f"""
         SELECT count(*) FROM resources r WHERE r.type = :rtype
         {'AND r.tenant_id = :rtenant' if tenantId else ''}
+        {sp_exclude_clause}
     """)
     count_result = await db.execute(count_query, params)
     total = count_result.scalar() or 0
@@ -486,10 +549,57 @@ async def get_resources_by_type(
         counts_result = await db.execute(counts_query, {"resource_ids": resource_ids})
         backup_counts = {str(r[0]): r[1] for r in counts_result.fetchall()}
 
+    # Tier 2 roll-up: sum storage_bytes of every child resource into its
+    # parent's total and count child-level snapshots as parent backups.
+    # Without this the Protection page shows an ENTRA_USER as "10 KB / No
+    # backups" even when its USER_MAIL / USER_ONEDRIVE / USER_CHATS
+    # children hold gigabytes of content. Mirrors the logic in /resources.
+    child_size_map: dict = {}
+    if resource_ids:
+        child_size_query = text("""
+            SELECT parent_resource_id, COALESCE(SUM(storage_bytes), 0) AS children_total
+            FROM resources
+            WHERE parent_resource_id = ANY(:resource_ids)
+            GROUP BY parent_resource_id
+        """)
+        child_size_result = await db.execute(child_size_query, {"resource_ids": resource_ids})
+        child_size_map = {str(r[0]): int(r[1] or 0) for r in child_size_result.fetchall()}
+
+        child_backup_query = text("""
+            SELECT r.parent_resource_id, COUNT(*) AS child_backups
+            FROM snapshots s
+            JOIN resources r ON r.id = s.resource_id
+            WHERE r.parent_resource_id = ANY(:resource_ids)
+              AND s.status = 'COMPLETED'
+            GROUP BY r.parent_resource_id
+        """)
+        child_backup_result = await db.execute(child_backup_query, {"resource_ids": resource_ids})
+        for r in child_backup_result.fetchall():
+            pid = str(r[0])
+            backup_counts[pid] = backup_counts.get(pid, 0) + int(r[1] or 0)
+
+    # Also bring in the latest child snapshot timestamp so a parent with
+    # no direct snapshots still flips to "protected" / shows a last-backup
+    # time when one of its children has been backed up.
+    child_last_backup_map: dict = {}
+    if resource_ids:
+        child_last_query = text("""
+            SELECT r.parent_resource_id, MAX(s.created_at) AS last_backup
+            FROM snapshots s
+            JOIN resources r ON r.id = s.resource_id
+            WHERE r.parent_resource_id = ANY(:resource_ids)
+              AND s.status = 'COMPLETED'
+            GROUP BY r.parent_resource_id
+        """)
+        child_last_result = await db.execute(child_last_query, {"resource_ids": resource_ids})
+        child_last_backup_map = {str(r[0]): r[1] for r in child_last_result.fetchall() if r[1] is not None}
+
     items = []
     for row in rows:
-        storage_bytes = row[9] or 0
-        has_backup = row[10] is not None
+        storage_bytes = (row[9] or 0) + child_size_map.get(str(row[0]), 0)
+        # has_backup = parent has own last_backup_at OR any child does
+        last_backup_dt = row[10] or child_last_backup_map.get(str(row[0]))
+        has_backup = last_backup_dt is not None
         backup_count = backup_counts.get(str(row[0]), 0)
         items.append({
             "id": str(row[0]), "tenant_id": str(row[1]), "owner": None,
@@ -504,7 +614,7 @@ async def get_resources_by_type(
             "backupSize": format_backup_size(storage_bytes) if has_backup else None,
             "status": map_status(row[8]),
             "sla": policies.get(str(row[7])) if row[7] else None,
-            "last_backup": row[10].isoformat() if row[10] else None,
+            "last_backup": last_backup_dt.isoformat() if last_backup_dt else None,
             "last_backup_status": row[11] if row[11] else None,
             "group_ids": [],
         })

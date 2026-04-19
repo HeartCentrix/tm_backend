@@ -594,30 +594,139 @@ class GraphClient:
         return drives
     
     async def discover_sharepoint(self) -> List[Dict[str, Any]]:
-        """Discover SharePoint sites"""
-        result = await self._get(
-            f"{self.GRAPH_URL}/sites",
-            params={"$search": '"contentclass:STS_Site" AND NOT "contentclass:STS_MySite"', "$top": "999"}
-        )
-        all_value = result.get("value", [])
-        while "@odata.nextLink" in result:
-            result = await self._get(result["@odata.nextLink"])
-            all_value.extend(result.get("value", []))
+        """Discover SharePoint sites via the tenant-admin REST API.
 
-        sites = []
-        for site in all_value:
-            sites.append({
-                "external_id": site.get("id", "").replace(",", "/"),
-                "display_name": site.get("displayName") or site.get("name", "Unknown Site"),
-                "email": None,
-                "type": "SHAREPOINT_SITE",
-                "metadata": {
-                    "web_url": site.get("webUrl"),
-                    "site_collection": site.get("siteCollection", {}),
-                },
-            })
+        The SharePoint Admin API at ``{tenant}-admin.sharepoint.com/_api/v2.1/sites``
+        is the authoritative site-list endpoint — same source the
+        SharePoint Admin Center uses. Returns every team site (not
+        personal OneDrives) with richer metadata than Graph's /sites:
+        ``template`` (GROUP#0, STS#3, SITEPAGEPUBLISHING#0, etc.),
+        ``lockState``, ``archiveStatus``, ``isHubSite``, ``hubSiteId``,
+        ``owner``, ``storageUsage``/``storageQuota``,
+        ``lastContentModifiedDate``, and ``isPersonalSite`` as a
+        first-class flag (no URL heuristics needed).
+
+        Requires:
+          1. App-registration with ``Sites.FullControl.All`` on the
+             **SharePoint Online** API (admin-scope).
+          2. Admin consent granted for that permission.
+          3. A self-signed cert uploaded to the app registration,
+             matching the PEM mounted at SHAREPOINT_CERT_PATH. SharePoint
+             REST refuses client-secret-minted tokens outright.
+
+        Raises on failure (no silent fallback) — the previous
+        Graph-based fallback returned personal OneDrives dressed up as
+        team sites, so a misconfigured tenant would appear to "work"
+        while discovering the wrong data.
+        """
+        admin_host = await self._resolve_sharepoint_admin_host()
+        if not admin_host:
+            raise RuntimeError(
+                "SharePoint admin host could not be resolved from Graph /sites/root; "
+                "tenant may have SharePoint disabled or Graph connectivity is down"
+            )
+
+        token = await self._get_sharepoint_token(admin_host)
+
+        sites: List[Dict[str, Any]] = []
+        next_url: Optional[str] = f"https://{admin_host}/_api/v2.1/sites?$top=500"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json;odata=nometadata",
+        }
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            while next_url:
+                resp = await client.get(next_url, headers=headers)
+                if resp.status_code in (401, 403):
+                    raise RuntimeError(
+                        f"SharePoint admin API rejected the cert-signed token ({resp.status_code}): "
+                        f"{resp.text[:300]}. Verify the cert's public key is uploaded to the AAD app "
+                        f"AND the app has Sites.FullControl.All on the SharePoint API with admin consent granted."
+                    )
+                resp.raise_for_status()
+                data = resp.json()
+                for s in (data.get("value") or []):
+                    if s.get("isPersonalSite") is True:
+                        continue
+                    # Compose the Graph-style composite id
+                    # "host/siteCollectionId/webId" so every other SP
+                    # helper in this module (subsites/lists/drives)
+                    # keeps working without changes.
+                    ext_id = s.get("id") or s.get("siteId") or ""
+                    ext_id = ext_id.replace(",", "/") if ext_id else ""
+                    if ext_id and "/" not in ext_id and s.get("webUrl"):
+                        from urllib.parse import urlparse as _up
+                        host = _up(s["webUrl"]).netloc
+                        web_id = s.get("webId") or ""
+                        if host and web_id:
+                            ext_id = f"{host}/{ext_id}/{web_id}"
+
+                    owner_val = s.get("owner") or s.get("ownerEmail")
+                    owner_email = s.get("ownerEmail")
+                    if isinstance(owner_val, dict):
+                        owner_email = owner_val.get("email") or owner_email
+
+                    sites.append({
+                        "external_id": ext_id,
+                        "display_name": s.get("title") or s.get("displayName") or s.get("name") or "Unknown Site",
+                        "email": owner_email,
+                        "type": "SHAREPOINT_SITE",
+                        "metadata": {
+                            "web_url": s.get("webUrl"),
+                            "template": s.get("template"),
+                            "lock_state": s.get("lockState"),
+                            "archive_status": s.get("archiveStatus"),
+                            "is_hub_site": s.get("isHubSite"),
+                            "hub_site_id": s.get("hubSiteId"),
+                            "owner": owner_val,
+                            "storage_usage_mb": s.get("storageUsage"),
+                            "storage_quota_mb": s.get("storageQuota"),
+                            "last_content_modified": s.get("lastContentModifiedDate"),
+                            "time_created": s.get("timeCreated"),
+                            "source": "sp_admin_api",
+                        },
+                    })
+                # v2.1 uses @odata.nextLink with a skipToken in the URL.
+                next_url = data.get("@odata.nextLink") or data.get("@nextLink")
+
+        print(f"[GraphClient] discover_sharepoint: {len(sites)} site(s) via admin API")
         return sites
-    
+
+    async def _resolve_sharepoint_admin_host(self) -> Optional[str]:
+        """Derive ``{tenant}-admin.sharepoint.com`` from the tenant's
+        SharePoint root site. Cached per-instance so we don't re-hit
+        Graph for every discovery pass.
+
+        The admin hostname is always the tenant name with ``-admin``
+        appended — e.g. ``qfion.sharepoint.com`` → ``qfion-admin.sharepoint.com``.
+        We just need to know the tenant name, which Graph's /sites/root
+        exposes via its siteCollection.hostname.
+        """
+        if hasattr(self, "_sp_admin_host") and self._sp_admin_host is not None:
+            return self._sp_admin_host
+        try:
+            root = await self._get(f"{self.GRAPH_URL}/sites/root", params={"$select": "siteCollection,webUrl"})
+            host = (root.get("siteCollection") or {}).get("hostname") or ""
+            if not host:
+                from urllib.parse import urlparse as _up
+                host = _up(root.get("webUrl") or "").netloc
+            if not host or ".sharepoint.com" not in host:
+                self._sp_admin_host = None
+                return None
+            # "qfion.sharepoint.com" → "qfion-admin.sharepoint.com"
+            # Already-admin hosts (belt-and-suspenders) pass through.
+            if "-admin.sharepoint.com" in host:
+                admin_host = host
+            else:
+                prefix = host.split(".sharepoint.com")[0]
+                admin_host = f"{prefix}-admin.sharepoint.com"
+            self._sp_admin_host = admin_host
+            return admin_host
+        except Exception as exc:
+            print(f"[GraphClient] _resolve_sharepoint_admin_host failed: {exc}")
+            self._sp_admin_host = None
+            return None
+
     async def discover_teams(self, include_chats: bool = True) -> List[Dict[str, Any]]:
         """Discover Teams groups (for channels) and, when ``include_chats`` is
         True, every 1:1 / group chat across the tenant.
@@ -1488,19 +1597,402 @@ class GraphClient:
         """
         Get SharePoint site lists.
         Graph API: GET /sites/{site-id}/lists
+
+        Normalises the DB-stored ``hostname/site-collection-id/site-id``
+        back to Graph's required ``hostname,site-collection-id,site-id``.
+        Without this conversion Graph returns 400 (interprets the slashes
+        as additional URL segments).
+
+        Graph's /lists endpoint only returns user-facing content lists —
+        it filters out hidden system catalogs like _catalogs/masterpage,
+        _catalogs/theme, TaxonomyHiddenList, User Information List, etc.
+        For full parity we ALSO call SharePoint REST API at
+        ``{siteUrl}/_api/web/lists`` which returns every list including
+        the _catalogs/*, and merge the two results de-duped by id. That
+        requires a SharePoint-scoped token (different audience from
+        Graph) minted via ``_get_sharepoint_token``.
         """
-        return await self._get(f"{self.GRAPH_URL}/sites/{site_id}/lists", params={"$top": "999"})
+        graph_site_id = site_id.replace("/", ",")
+        # Graph pass — user-facing content lists.
+        graph_result = await self._get(
+            f"{self.GRAPH_URL}/sites/{graph_site_id}/lists",
+            params={
+                "$top": "999",
+                "$select": "id,name,displayName,description,webUrl,createdDateTime,lastModifiedDateTime,lastModifiedBy,system,list",
+            },
+        )
+        graph_lists = graph_result.get("value") or []
+        seen_ids = {l.get("id") for l in graph_lists if l.get("id")}
+
+        # SharePoint REST pass — picks up system / _catalogs lists that
+        # Graph silently filters. Best-effort: if auth/site-URL lookup
+        # fails we still return whatever Graph gave us.
+        sp_lists: List[Dict[str, Any]] = []
+        try:
+            # Derive site URL from the composite id:
+            #   "qfion.sharepoint.com,<scid>,<webid>" → "qfion.sharepoint.com"
+            parts = site_id.replace(",", "/").split("/")
+            hostname = parts[0] if parts else ""
+            if hostname:
+                # The site's webUrl lives on the Graph response itself.
+                # First look for the root site in the existing Graph
+                # result; otherwise fetch it.
+                site_web_url = None
+                for l in graph_lists:
+                    # parentReference.siteUrl isn't a standard field but
+                    # webUrl of any list lets us derive the site root.
+                    web_url = l.get("webUrl") or ""
+                    if web_url:
+                        # https://<host>/... → strip any /Lists/... suffix
+                        from urllib.parse import urlparse
+                        parsed = urlparse(web_url)
+                        site_web_url = f"{parsed.scheme}://{parsed.netloc}"
+                        # Include site path if present (e.g. /sites/Foo).
+                        path_parts = parsed.path.strip("/").split("/")
+                        if len(path_parts) >= 2 and path_parts[0] == "sites":
+                            site_web_url += f"/sites/{path_parts[1]}"
+                        break
+                # Fallback to Graph's /sites/{id}?$select=webUrl
+                if not site_web_url:
+                    site_meta = await self._get(
+                        f"{self.GRAPH_URL}/sites/{graph_site_id}",
+                        params={"$select": "webUrl"},
+                    )
+                    site_web_url = site_meta.get("webUrl")
+
+                if site_web_url:
+                    sp_lists = await self._get_sharepoint_lists_via_rest(hostname, site_web_url)
+        except Exception as exc:
+            print(f"[GraphClient] SP REST lists fetch failed for {site_id}: {type(exc).__name__}: {exc}")
+
+        # Merge — prefer Graph's shape when both sources have the same id.
+        merged = list(graph_lists)
+        for rl in sp_lists:
+            rl_id = rl.get("id")
+            if rl_id and rl_id not in seen_ids:
+                merged.append(rl)
+                seen_ids.add(rl_id)
+
+        graph_result["value"] = merged
+        return graph_result
+
+    async def _get_sharepoint_token(self, hostname: str) -> str:
+        """Mint a SharePoint-scoped access token using the same app creds.
+
+        SharePoint REST requires a token with audience
+        ``https://<tenant>.sharepoint.com`` AND — unlike Graph — it
+        refuses client-secret-based app-only tokens outright
+        ("Unsupported app only token"). The only way to get a token
+        SharePoint REST will accept is to sign a JWT assertion with a
+        certificate whose public key is registered on the AAD app.
+
+        Auth path selection:
+          • If SHAREPOINT_CERT_PATH (or SHAREPOINT_CERT_PEM_B64) and
+            SHAREPOINT_CERT_THUMBPRINT are configured → JWT assertion
+            flow (accepted by SP REST).
+          • Otherwise → client-secret flow (Graph accepts, SP REST
+            rejects — only useful for diagnostics).
+
+        Tokens cached per-hostname for ~55 minutes. Cert loading is
+        also cached so every token refresh doesn't re-parse the PEM.
+        """
+        if not hasattr(self, "_sp_tokens"):
+            self._sp_tokens = {}
+        cached = self._sp_tokens.get(hostname)
+        if cached and cached[1] > datetime.utcnow():
+            return cached[0]
+
+        scope = f"https://{hostname}/.default"
+        token_url = self.TOKEN_URL.format(tenant_id=self.tenant_id)
+
+        # Prefer cert-based assertion when configured — this is the
+        # only path that yields SP-REST-acceptable tokens.
+        assertion = self._build_sharepoint_client_assertion(token_url)
+        if assertion:
+            data = {
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "scope": scope,
+                "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                "client_assertion": assertion,
+            }
+        else:
+            # Fallback — won't work against SP REST but useful for
+            # development and Graph-only call sites.
+            data = {
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "scope": scope,
+            }
+
+        async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT) as client:
+            resp = await client.post(token_url, data=data)
+            if resp.status_code >= 400:
+                # Surface AAD's error text — it's the only way to tell
+                # cert-thumbprint-mismatch from missing-permission.
+                print(f"[GraphClient] SP token POST failed ({resp.status_code}): {resp.text[:400]}")
+            resp.raise_for_status()
+            payload = resp.json()
+            token = payload["access_token"]
+            expires_in = payload.get("expires_in", 3600)
+            self._sp_tokens[hostname] = (token, datetime.utcnow() + timedelta(seconds=expires_in - 300))
+            return token
+
+    # ------------------------------------------------------------------
+    # Cert-based client-assertion helpers
+    # ------------------------------------------------------------------
+    _sp_cert_cache: Optional[tuple] = None  # (pem_bytes, thumbprint_b64url_bytes)
+
+    @classmethod
+    def _load_sharepoint_cert(cls) -> Optional[tuple]:
+        """Load the PEM + derive the base64url-encoded SHA-1 thumbprint
+        that Azure AD expects in the JWT header ``x5t`` claim.
+
+        Reads SHAREPOINT_CERT_PEM_B64 first (base64-encoded PEM for
+        env-var deployments), falls back to SHAREPOINT_CERT_PATH (file
+        path for local dev with a mounted PEM). Returns None if neither
+        is set — caller falls back to the secret flow.
+        """
+        if cls._sp_cert_cache is not None:
+            return cls._sp_cert_cache
+
+        import base64 as _b64
+        import os as _os
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives import hashes as _hashes
+        from cryptography.hazmat.primitives import serialization as _ser
+
+        pem_b64 = (_os.getenv("SHAREPOINT_CERT_PEM_B64") or "").strip()
+        pem_path = (_os.getenv("SHAREPOINT_CERT_PATH") or "").strip()
+        explicit_thumbprint = (_os.getenv("SHAREPOINT_CERT_THUMBPRINT") or "").strip().replace(":", "").lower()
+
+        pem_bytes: Optional[bytes] = None
+        if pem_b64:
+            try:
+                pem_bytes = _b64.b64decode(pem_b64)
+            except Exception as e:
+                print(f"[GraphClient] SHAREPOINT_CERT_PEM_B64 invalid base64: {e}")
+        elif pem_path:
+            try:
+                with open(pem_path, "rb") as f:
+                    pem_bytes = f.read()
+            except Exception as e:
+                print(f"[GraphClient] SHAREPOINT_CERT_PATH read failed: {e}")
+        if not pem_bytes:
+            return None
+
+        # Extract the public cert to derive the thumbprint. The PEM
+        # file may also contain the private key — load_pem_x509_certificates
+        # tolerates that by picking up the CERTIFICATE block.
+        try:
+            cert = _x509.load_pem_x509_certificate(pem_bytes)
+        except Exception:
+            # Fallback: some writers emit just the private key; Azure AD
+            # requires the thumbprint from the public cert. If there's
+            # no cert in the bundle we can't continue.
+            try:
+                certs = _x509.load_pem_x509_certificates(pem_bytes)
+                cert = certs[0] if certs else None
+            except Exception as e:
+                print(f"[GraphClient] SHAREPOINT_CERT_* PEM does not contain a usable X.509 cert: {e}")
+                return None
+        if cert is None:
+            return None
+
+        thumbprint_hex = cert.fingerprint(_hashes.SHA1()).hex().lower()
+        if explicit_thumbprint and explicit_thumbprint != thumbprint_hex:
+            print(f"[GraphClient] Warning: SHAREPOINT_CERT_THUMBPRINT ({explicit_thumbprint}) doesn't match cert fingerprint ({thumbprint_hex}); using the cert's real fingerprint.")
+        # Azure AD expects the SHA-1 fingerprint in base64url of the
+        # raw bytes (NOT hex) in the JWT header's `x5t` claim.
+        thumbprint_b64url = _b64.urlsafe_b64encode(cert.fingerprint(_hashes.SHA1())).rstrip(b"=")
+
+        cls._sp_cert_cache = (pem_bytes, thumbprint_b64url)
+        return cls._sp_cert_cache
+
+    def _build_sharepoint_client_assertion(self, token_url: str) -> Optional[str]:
+        """Build the signed JWT assertion that proves we control the cert
+        whose public key is registered on the AAD app. Returns None when
+        no cert is configured — caller falls back to the secret flow."""
+        loaded = self._load_sharepoint_cert()
+        if not loaded:
+            return None
+        pem_bytes, thumbprint_b64url = loaded
+
+        import uuid as _uuid
+        import jwt as _jwt
+
+        now = int(datetime.utcnow().timestamp())
+        payload = {
+            "aud": token_url,
+            "iss": self.client_id,
+            "sub": self.client_id,
+            "jti": str(_uuid.uuid4()),
+            "nbf": now,
+            "exp": now + 10 * 60,  # 10 minutes; AAD caps at 10
+        }
+        # The `x5t` header is what tells AAD which uploaded cert
+        # matches the signature on this assertion.
+        headers = {"alg": "RS256", "typ": "JWT", "x5t": thumbprint_b64url.decode()}
+        try:
+            return _jwt.encode(payload, pem_bytes, algorithm="RS256", headers=headers)
+        except Exception as e:
+            print(f"[GraphClient] Failed to build SP client assertion: {type(e).__name__}: {e}")
+            return None
+
+    async def _get_sharepoint_lists_via_rest(self, hostname: str, site_web_url: str) -> List[Dict[str, Any]]:
+        """Hit SharePoint REST ``_api/web/lists`` to pick up every list
+        including system catalogs that Graph hides.
+
+        Returns list objects normalised to roughly the Graph shape so
+        callers don't need to know which source each list came from.
+        """
+        token = await self._get_sharepoint_token(hostname)
+        url = f"{site_web_url.rstrip('/')}/_api/web/lists"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json;odata=nometadata",
+        }
+        # `$select` reduces response size + matches what Graph gives us.
+        params = {
+            "$top": "5000",
+            "$select": "Id,Title,Description,DefaultViewUrl,Created,LastItemModifiedDate,BaseTemplate,Hidden,IsCatalog,IsSystemList",
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code == 403 or resp.status_code == 401:
+                print(f"[GraphClient] SP REST denied for {site_web_url} (status={resp.status_code}); is AllSites.Read granted on THIS app registration?")
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+
+        raw = data.get("value") or data.get("d", {}).get("results") or []
+        out: List[Dict[str, Any]] = []
+        # Derive a Graph-style composite site id from the webUrl so callers
+        # that key on list.id can still join this back to the site row.
+        for lst in raw:
+            lst_id = (lst.get("Id") or "").lower().strip("{}")
+            if not lst_id:
+                continue
+            default_view = lst.get("DefaultViewUrl") or ""
+            list_web_url = f"https://{hostname}{default_view}" if default_view.startswith("/") else default_view
+            # Strip the trailing /AllItems.aspx or /AllListItems.aspx
+            if list_web_url:
+                if "/Forms/" in list_web_url:
+                    list_web_url = list_web_url.split("/Forms/")[0]
+                elif list_web_url.endswith("/AllItems.aspx"):
+                    list_web_url = list_web_url[: -len("/AllItems.aspx")]
+            out.append({
+                "id": lst_id,
+                "name": lst.get("Title"),
+                "displayName": lst.get("Title"),
+                "description": lst.get("Description") or "",
+                "webUrl": list_web_url,
+                "createdDateTime": lst.get("Created"),
+                "lastModifiedDateTime": lst.get("LastItemModifiedDate"),
+                "lastModifiedBy": None,
+                "system": bool(lst.get("IsSystemList")),
+                "list": {
+                    "template": lst.get("BaseTemplate"),
+                    "hidden": bool(lst.get("Hidden")),
+                    "contentTypesEnabled": None,
+                },
+                # Mark the source so callers (and debugging) can tell.
+                "_source": "sp_rest",
+                "_is_catalog": bool(lst.get("IsCatalog")),
+            })
+        return out
+
+    async def get_sharepoint_list_items_via_rest(self, hostname: str, site_web_url: str, list_id: str) -> List[Dict[str, Any]]:
+        """Fetch ALL items from a SharePoint list via SP REST.
+        Uses only base list-item fields (no $expand) so the call works
+        on every list shape — libraries, custom lists, system catalogs,
+        galleries. The crucial fields we rely on:
+
+          * FileRef              — server-relative URL of the item or file
+          * FileLeafRef          — the file/folder leaf name (real title)
+          * FileSystemObjectType — 0=list item or file, 1=folder
+          * Title, Created, Modified, ContentTypeId
+
+        For file items (FileRef ends in an extension and object type == 0
+        on a library), the caller can download via
+        ``/_api/web/GetFileByServerRelativeUrl``.
+        """
+        token = await self._get_sharepoint_token(hostname)
+        url = f"{site_web_url.rstrip('/')}/_api/web/lists(guid'{list_id}')/items"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json;odata=nometadata",
+        }
+        params = {"$top": "1000"}
+        out: List[Dict[str, Any]] = []
+        next_url: Optional[str] = url
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            while next_url:
+                resp = await client.get(next_url, headers=headers, params=params if next_url == url else None)
+                if resp.status_code in (401, 403):
+                    print(f"[GraphClient] SP REST items denied for list {list_id} ({resp.status_code}): {resp.text[:180]}")
+                    return out
+                if resp.status_code >= 400:
+                    print(f"[GraphClient] SP REST items {resp.status_code} for list {list_id}: {resp.text[:180]}")
+                    return out
+                data = resp.json()
+                for row in (data.get("value") or []):
+                    out.append(row)
+                next_url = data.get("odata.nextLink") or data.get("@odata.nextLink")
+                params = None  # next_url already includes query
+        return out
+
+    async def get_sharepoint_file_metadata_via_rest(self, hostname: str, site_web_url: str, server_relative_url: str) -> Optional[Dict[str, Any]]:
+        """HEAD-style metadata for a SharePoint file (Length, Name,
+        TimeLastModified, UIVersionLabel) without downloading bytes.
+        Returns None on any failure (treated as non-existent / not a file).
+        """
+        token = await self._get_sharepoint_token(hostname)
+        safe_path = server_relative_url.replace("'", "''")
+        url = f"{site_web_url.rstrip('/')}/_api/web/GetFileByServerRelativeUrl('{safe_path}')"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json;odata=nometadata",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code >= 400:
+                return None
+            try:
+                return resp.json()
+            except Exception:
+                return None
+
+    async def download_sharepoint_file_via_rest(self, hostname: str, site_web_url: str, server_relative_url: str) -> bytes:
+        """Stream a SharePoint file by its server-relative URL
+        (e.g. /sites/Foo/SitePages/Home.aspx). Used for catalog/system
+        lists where Graph doesn't expose a driveItem.
+        """
+        token = await self._get_sharepoint_token(hostname)
+        safe_path = server_relative_url.replace("'", "''")
+        url = f"{site_web_url.rstrip('/')}/_api/web/GetFileByServerRelativeUrl('{safe_path}')/$value"
+        async with httpx.AsyncClient(timeout=180.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+            resp.raise_for_status()
+            return resp.content
 
     async def get_sharepoint_site_list_items(self, site_id: str, list_id: str, delta_token: str = None) -> Dict[str, Any]:
         """
         Get items from a SharePoint list using delta API.
         Graph API: GET /sites/{site-id}/lists/{list-id}/items/delta
+
+        Same slash→comma normalisation as the other SharePoint helpers.
         """
-        url = f"{self.GRAPH_URL}/sites/{site_id}/lists/{list_id}/items/delta"
+        graph_site_id = site_id.replace("/", ",")
+        url = f"{self.GRAPH_URL}/sites/{graph_site_id}/lists/{list_id}/items/delta"
         if delta_token:
             url = delta_token
 
-        params = {"$expand": "fields", "$top": "999"}
+        # Expand both fields (list-row columns) AND driveItem so library
+        # items come back with the drive/item id needed to download bytes.
+        params = {"$expand": "fields,driveItem", "$top": "999"}
         result = await self._get(url, params=params)
         all_value = result.get("value", [])
 
@@ -1512,6 +2004,17 @@ class GraphClient:
 
         result["value"] = all_value
         return result
+
+    async def download_drive_item_bytes(self, drive_id: str, item_id: str) -> bytes:
+        """Stream a SharePoint/OneDrive driveItem's content as raw bytes.
+        Graph API: GET /drives/{drive-id}/items/{item-id}/content
+        """
+        token = await self._get_token()
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/content"
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+            resp.raise_for_status()
+            return resp.content
 
     async def get_site_permissions(self, site_id: str) -> Dict[str, Any]:
         """

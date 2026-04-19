@@ -78,11 +78,16 @@ async def run_tenant_discovery(db: AsyncSession, tenant: Tenant) -> int:
                 external_id=r["external_id"],
                 display_name=r.get("display_name", "Unknown"),
                 email=r.get("email"),
-                metadata=r.get("metadata", {}),
+                extra_data=r.get("metadata", {}),
                 status=ResourceStatus.DISCOVERED,
             )
             db.add(resource)
             count += 1
+        else:
+            existing.display_name = r.get("display_name", existing.display_name)
+            if r.get("email"):
+                existing.email = r["email"]
+            existing.extra_data = {**(existing.extra_data or {}), **(r.get("metadata") or {})}
 
     tenant.status = TenantStatus.ACTIVE
     tenant.last_discovery_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -316,6 +321,51 @@ async def trigger_azure_discovery(tenant_id: str, db: AsyncSession = Depends(get
     }, priority=5)
 
     return {"discoveryId": discovery_id, "tenantId": str(tenant.id), "resourcesFound": -1}
+
+
+@app.get("/api/v1/resources/{resource_id}/subsites")
+async def list_sharepoint_subsites(
+    resource_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the live list of subsites for a SharePoint site resource.
+    Used by the Recovery page's Subsites panel. The backup-worker tracks
+    subsite delta tokens per-resource but doesn't persist display names,
+    so we hit Graph directly here and let the frontend render whatever
+    subsites currently exist on the site.
+    """
+    resource = (await db.execute(select(Resource).where(Resource.id == UUID(resource_id)))).scalar_one_or_none()
+    if not resource:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    if resource.type != ResourceType.SHAREPOINT_SITE:
+        raise HTTPException(status_code=400, detail=f"Resource type {resource.type.value} is not a SharePoint site")
+
+    tenant = (await db.execute(select(Tenant).where(Tenant.id == resource.tenant_id))).scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    client_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
+    client_secret = settings.MICROSOFT_CLIENT_SECRET or settings.AZURE_AD_CLIENT_SECRET
+    ext_tenant_id = tenant.external_tenant_id or settings.MICROSOFT_TENANT_ID or settings.AZURE_AD_TENANT_ID or "common"
+    graph = GraphClient(client_id, client_secret, ext_tenant_id)
+
+    try:
+        data = await graph.get_sharepoint_subsites(resource.external_id)
+    except Exception as exc:
+        print(f"[tenant-service] subsites fetch failed for {resource.external_id}: {exc}")
+        raise HTTPException(status_code=502, detail=f"Failed to fetch subsites: {exc}")
+
+    subsites = []
+    for s in (data.get("value") or []):
+        subsites.append({
+            "id": (s.get("id") or "").replace(",", "/"),
+            "displayName": s.get("displayName") or s.get("name") or "Unknown subsite",
+            "name": s.get("name"),
+            "webUrl": s.get("webUrl"),
+            "createdDateTime": s.get("createdDateTime"),
+            "lastModifiedDateTime": s.get("lastModifiedDateTime"),
+        })
+    return {"resourceId": resource_id, "subsites": subsites, "count": len(subsites)}
 
 
 @app.post("/api/v1/tenants/{tenant_id}/users/{user_resource_id}/discover-content")
