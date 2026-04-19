@@ -137,6 +137,32 @@ class Settings:
         # ZIP assembly re-reads). Default 100 MiB.
         self.EXPORT_MBOX_INLINE_LIMIT_BYTES = int(os.getenv("EXPORT_MBOX_INLINE_LIMIT_BYTES", str(100 * 1024 * 1024)))
 
+        # ── OneDrive export v2 (see 2026-04-19-onedrive-export-and-backup-uncap-design.md) ──
+        self.EXPORT_ONEDRIVE_V2_ENABLED = os.getenv("EXPORT_ONEDRIVE_V2_ENABLED", "false").lower() in ("true", "1", "yes")
+        self.EXPORT_ONEDRIVE_MISSING_POLICY = os.getenv("EXPORT_ONEDRIVE_MISSING_POLICY", "skip").lower()
+        self.EXPORT_ONEDRIVE_INCLUDE_VERSIONS = os.getenv("EXPORT_ONEDRIVE_INCLUDE_VERSIONS", "false").lower() in ("true", "1", "yes")
+        self.EXPORT_ONEDRIVE_MAX_FILE_BYTES = int(os.getenv("EXPORT_ONEDRIVE_MAX_FILE_BYTES", str(200 * 1024 * 1024 * 1024)))
+        self.EXPORT_ONEDRIVE_PATH_MAX_LEN = int(os.getenv("EXPORT_ONEDRIVE_PATH_MAX_LEN", "260"))
+        self.EXPORT_ONEDRIVE_SANITIZE_CHARS = os.getenv("EXPORT_ONEDRIVE_SANITIZE_CHARS", '<>:"/\\|?*')
+
+        # ── OneDrive backup uncap ──
+        self.ONEDRIVE_BACKUP_V2_ENABLED = os.getenv("ONEDRIVE_BACKUP_V2_ENABLED", "false").lower() in ("true", "1", "yes")
+        self.ONEDRIVE_BACKUP_FILE_CONCURRENCY = int(os.getenv("ONEDRIVE_BACKUP_FILE_CONCURRENCY", "16"))
+        self.MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER = int(os.getenv("MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER", "4"))
+        self.ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS = int(os.getenv("ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS", "21600"))
+        self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES", "500"))
+        self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES", str(1024 * 1024 * 1024)))
+
+        # ── Heavy backup pool ──
+        self.BACKUP_HEAVY_ENABLED = os.getenv("BACKUP_HEAVY_ENABLED", "false").lower() in ("true", "1", "yes")
+        self.BACKUP_HEAVY_THRESHOLD_BYTES = int(os.getenv("BACKUP_HEAVY_THRESHOLD_BYTES", str(100 * 1024 * 1024 * 1024)))
+        self.BACKUP_HEAVY_QUEUE = os.getenv("BACKUP_HEAVY_QUEUE", "backup.heavy")
+        self.BACKUP_WORKER_QUEUE = os.getenv("BACKUP_WORKER_QUEUE", "backup.normal")
+
+        # ── RabbitMQ long-run safety ──
+        self.RABBITMQ_CONSUMER_HEARTBEAT_SECONDS = int(os.getenv("RABBITMQ_CONSUMER_HEARTBEAT_SECONDS", str(7 * 24 * 3600)))
+        self.RABBITMQ_CONSUMER_TIMEOUT_MS = int(os.getenv("RABBITMQ_CONSUMER_TIMEOUT_MS", str(7 * 24 * 3600 * 1000)))
+
         # Heavy export pool — routes >100 GB-with-attachments exports to a dedicated
         # worker set with a larger memory budget. See spec §13 promoted scope.
         self.HEAVY_EXPORT_THRESHOLD_BYTES = int(os.getenv(
