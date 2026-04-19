@@ -127,6 +127,13 @@ ACTIONS = {
     "RANSOMWARE_SIGNAL": "AI ransomware signal detected",
 }
 
+# Built-in audit filter presets surfaced to the UI via /audit/presets
+AUDIT_PRESETS = [
+    {"key": "chat_exports", "label": "Chat exports",
+     "actions": ["CHAT_EXPORT_START", "CHAT_EXPORT_COMPLETED", "CHAT_EXPORT_CANCELLED",
+                 "CHAT_EXPORT_DOWNLOADED", "CHAT_EXPORT_FORCE_DELETED"]},
+]
+
 WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE", "RANSOMWARE_SIGNAL"}
 
 # Discovery events (run start + completion, per-tenant) are surfaced in the
@@ -1021,6 +1028,12 @@ async def export_audit_csv(
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=audit-log.csv"},
         )
+
+
+@app.get("/api/v1/audit/presets")
+async def list_presets():
+    """List built-in audit filter presets for the UI (e.g. 'Chat exports')."""
+    return {"presets": AUDIT_PRESETS}
 
 
 @app.get("/api/v1/audit/actions")

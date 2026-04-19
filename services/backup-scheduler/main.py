@@ -341,6 +341,14 @@ async def startup():
             print(f"[backup-scheduler] exports_cleanup: deleted {len(deleted)} blobs")
         except Exception as exc:
             print(f"[backup-scheduler] exports_cleanup failed: {exc}")
+        # Task 17: enforce chat-export TTL + Hot->Cool tier shift across all
+        # configured blob-account shards.
+        try:
+            from services.exports_cleanup import apply_chat_export_lifecycle
+            await apply_chat_export_lifecycle()
+            print("[backup-scheduler] chat_export_lifecycle: ok")
+        except Exception as exc:
+            print(f"[backup-scheduler] chat_export_lifecycle failed: {exc}")
 
     scheduler.add_job(_exports_cleanup_daily, "cron", hour=3, minute=0, timezone="UTC", id="exports_cleanup_daily")
 
