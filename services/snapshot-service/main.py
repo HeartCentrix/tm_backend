@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, distinct, and_, or_
 
 from shared.database import get_db, init_db, close_db, AsyncSession
@@ -1121,6 +1122,163 @@ async def list_snapshot_chat_groups(
             g["lastMessageAt"] = ts
 
     return sorted(groups.values(), key=lambda g: (g.get("lastMessageAt") or ""), reverse=True)
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/azure-db/export")
+async def azure_db_export(
+    snapshot_id: str,
+    items: Optional[str] = Query(None, description="Comma-separated SnapshotItem ids to export"),
+    item_type: Optional[str] = Query(None, description="Fallback — export every item of this type in the snapshot"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Azure DB-aware download.
+
+    Builds a ZIP (or single file when only one item is requested) tailored
+    to each Azure DB item type:
+
+      * AZURE_DB_CONFIG      → `<db>-config.json` — raw JSON blob.
+      * AZURE_DB_TABLE       → `<db>/<schema>/<table>.csv` — rows JSON
+        converted to CSV, headers from the payload's `columns` list.
+      * AZURE_DB_SCHEMA_FILE → `<db>/<folder_path>/<name>` — raw blob
+        bytes, original extension preserved in the name.
+
+    Matches the Recovery UI's download semantics: picking one table
+    yields a plain .csv, picking a schema/database or mixed set yields
+    a .zip with the folder structure intact.
+    """
+    import csv as _csv
+    import io as _io
+    import json as _json
+    import zipfile as _zip
+
+    try:
+        snap_uuid = UUID(snapshot_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid snapshot_id")
+
+    item_ids: list = []
+    if items:
+        for tok in items.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                item_ids.append(UUID(tok))
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"Invalid item id: {tok}")
+
+    # Resolve the rows — either by explicit IDs, or fall back to "every
+    # item of a given type in this snapshot" when the caller only
+    # passed item_type. The fallback powers the Download button on the
+    # Azure DB Configuration / Database / Schema tabs when nothing is
+    # ticked (implicit "download all on this tab").
+    if item_ids:
+        rows_q = await db.execute(
+            select(SnapshotItem).where(
+                SnapshotItem.snapshot_id == snap_uuid,
+                SnapshotItem.id.in_(item_ids),
+            )
+        )
+    elif item_type:
+        rows_q = await db.execute(
+            select(SnapshotItem).where(
+                SnapshotItem.snapshot_id == snap_uuid,
+                SnapshotItem.item_type == item_type,
+            )
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Provide `items` or `item_type`")
+
+    snap_items = rows_q.scalars().all()
+    if not snap_items:
+        raise HTTPException(status_code=404, detail="No items found for export")
+
+    shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
+
+    async def _fetch_item_bytes(item: SnapshotItem) -> tuple[str, bytes]:
+        """Return (zip-path, bytes) for a single SnapshotItem per its
+        item_type's download format."""
+        ed = item.extra_data or {}
+        itype = (item.item_type or "").upper()
+
+        if itype == "AZURE_DB_CONFIG":
+            raw = ed.get("raw")
+            if raw is not None:
+                # Prefer the rich raw dict already stored on the row.
+                data = _json.dumps(raw, indent=2, default=str).encode("utf-8")
+            else:
+                data = await _download_item_blob(shard, tenant_id, candidates, item.blob_path)
+                if not data:
+                    data = b"{}"
+            return item.name or f"{(ed.get('server_name') or 'server')}-config.json", data
+
+        if itype == "AZURE_DB_TABLE":
+            rows_blob = ed.get("rows_blob_path") or item.blob_path
+            payload = await _read_blob_json(shard, tenant_id, candidates, rows_blob) if rows_blob else {}
+            columns = payload.get("columns") or ed.get("columns") or []
+            data_rows = payload.get("rows") or []
+            buf = _io.StringIO()
+            writer = _csv.writer(buf)
+            if columns:
+                writer.writerow(columns)
+            for r in data_rows:
+                if isinstance(r, dict):
+                    writer.writerow([r.get(c) for c in columns])
+                else:
+                    writer.writerow(r)
+            schema = ed.get("schema") or "public"
+            dbname = ed.get("database_name") or "db"
+            zip_name = f"{dbname}/{schema}/{item.name}.csv"
+            return zip_name, buf.getvalue().encode("utf-8")
+
+        if itype == "AZURE_DB_SCHEMA_FILE":
+            data = await _download_item_blob(shard, tenant_id, candidates, item.blob_path)
+            if not data:
+                data = b""
+            folder = (item.folder_path or "").strip("/")
+            zip_name = f"{folder}/{item.name}" if folder else (item.name or "schema")
+            return zip_name, data
+
+        # Unknown Azure DB type — fall back to raw bytes.
+        data = await _download_item_blob(shard, tenant_id, candidates, item.blob_path) if item.blob_path else b""
+        return item.name or str(item.id), data
+
+    # Single-item fast path — skip the ZIP wrapper. This makes "download
+    # one config" / "download one table" behave like the original file.
+    if len(snap_items) == 1:
+        name, data = await _fetch_item_bytes(snap_items[0])
+        basename = name.rsplit("/", 1)[-1]
+        # Content-type hinted from extension; Content-Disposition uses
+        # the item's original name so the browser keeps the extension.
+        if basename.endswith(".json"):
+            media = "application/json"
+        elif basename.endswith(".csv"):
+            media = "text/csv"
+        elif basename.endswith(".sql") or basename.endswith(".dump"):
+            media = "text/plain"
+        else:
+            media = "application/octet-stream"
+        return StreamingResponse(
+            _io.BytesIO(data),
+            media_type=media,
+            headers={"Content-Disposition": f'attachment; filename="{basename}"'},
+        )
+
+    # Multi-item → ZIP with the folder structure intact.
+    zbuf = _io.BytesIO()
+    with _zip.ZipFile(zbuf, "w", _zip.ZIP_DEFLATED) as zf:
+        for it in snap_items:
+            try:
+                path, data = await _fetch_item_bytes(it)
+                zf.writestr(path, data)
+            except Exception as fe:
+                logger.warning("azure_db_export skipping %s: %s", it.id, fe)
+    zbuf.seek(0)
+    return StreamingResponse(
+        zbuf,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="azure-db-export.zip"'},
+    )
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/azure-db/table")

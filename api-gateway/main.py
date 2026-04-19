@@ -259,6 +259,7 @@ async def job(request: Request):
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/files")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/onedrive/ids")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/azure-db/table")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/azure-db/export")
 async def snapshot_folders(request: Request):
     return await proxy_request("snapshot", request.url.path, request)
 
