@@ -934,15 +934,64 @@ async def list_snapshot_calendar(
     search: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return calendar events with start/end/location/attendees extracted from metadata."""
+    """Return calendar events with start/end/location/attendees extracted from metadata.
+
+    Backups are incremental (delta), so each snapshot only carries
+    *changes* (newly created / modified / cancelled occurrences). To
+    mirror AFI's behavior — "show the full running state of the
+    calendar as of this snapshot" — we UNION every CALENDAR_EVENT row
+    across every snapshot of the same resource taken on or before the
+    requested snapshot, then dedupe by external_id keeping the newest
+    version. Without this, the calendar view flickers in and out of
+    existence between full-pulls and delta-resumes (particularly for
+    cancelled events that only appeared in the initial full snapshot).
+    """
+    snap_uuid = UUID(snapshot_id)
+    snap_row = (await db.execute(select(Snapshot).where(Snapshot.id == snap_uuid))).scalar_one_or_none()
+    if not snap_row:
+        return {"content": [], "total": 0, "page": page, "size": size, "pages": 0}
+
+    # Every snapshot for this resource up to + including the requested one.
+    sibling_ids = [
+        row[0] for row in (await db.execute(
+            select(Snapshot.id).where(
+                Snapshot.resource_id == snap_row.resource_id,
+                Snapshot.created_at <= snap_row.created_at,
+            )
+        )).all()
+    ]
+    if not sibling_ids:
+        sibling_ids = [snap_uuid]
+
     filters = [
-        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.snapshot_id.in_(sibling_ids),
         SnapshotItem.item_type == "CALENDAR_EVENT",
     ]
     if search:
         filters.append(SnapshotItem.name.ilike(f"%{search}%"))
-    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
-    items = (await db.execute(select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size))).scalars().all()
+
+    # Pull every matching row and dedupe in Python by external_id with
+    # newest-snapshot-wins (we already get rows ordered by created_at).
+    # At 10K-events-per-calendar scale this is fine; if it gets bigger
+    # we can switch to a window-function + DISTINCT ON in SQL.
+    all_items = (await db.execute(
+        select(SnapshotItem)
+        .where(*filters)
+        .order_by(SnapshotItem.created_at.desc())
+    )).scalars().all()
+
+    seen: set = set()
+    deduped = []
+    for it in all_items:
+        key = it.external_id or str(it.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(it)
+
+    total = len(deduped)
+    offset = (page - 1) * size
+    items = deduped[offset: offset + size]
 
     shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
     sem = asyncio.Semaphore(20)

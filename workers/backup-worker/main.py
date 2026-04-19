@@ -23,7 +23,7 @@ import hashlib
 import logging
 import os
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 from typing import Dict, List, Any, Optional, Tuple
 import aio_pika
@@ -662,12 +662,135 @@ class BackupWorker:
                     return out_rows
 
                 if kind == "USER_CALENDAR":
-                    page = await graph_client._get(
-                        f"{graph_client.GRAPH_URL}/users/{user_id}/events",
-                        params={"$top": str(ITEM_LIMIT)},
-                    )
-                    return [("CALENDAR_EVENT", e.get("subject") or "(no subject)", e.get("id"), {"raw": e}, "Calendar")
-                            for e in page.get("value", [])]
+                    # AFI-parity calendar backup:
+                    #   • Enumerate every calendar under /users/{id}/calendars
+                    #     (default + shared + secondary) so we're not limited
+                    #     to the main calendar.
+                    #   • For each calendar, use /calendarView/delta with a
+                    #     sliding 2-year-back / 1-year-forward window, which
+                    #     EXPANDS every recurring series into one row per
+                    #     occurrence (a daily standup becomes ~750 rows,
+                    #     not 1). First run walks the window; subsequent
+                    #     runs resume from the saved @odata.deltaLink.
+                    #   • Per-calendar delta tokens live in
+                    #     resource.extra_data["calendar_delta_tokens"]:
+                    #       { calendarId: "<full deltaLink URL>" }
+                    from datetime import timedelta as _td
+                    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+                    win_start = (now_utc - _td(days=365 * 2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    win_end   = (now_utc + _td(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                    # Current delta-token map (per calendar).
+                    cal_delta_map: Dict[str, str] = dict((resource.extra_data or {}).get("calendar_delta_tokens") or {})
+                    new_delta_map: Dict[str, str] = {}
+
+                    # 1) Enumerate calendars owned by the user.
+                    try:
+                        cal_page = await graph_client._get(
+                            f"{graph_client.GRAPH_URL}/users/{user_id}/calendars",
+                            params={"$top": "100", "$select": "id,name,color,owner,canEdit,isDefaultCalendar"},
+                        )
+                        calendars = (cal_page or {}).get("value", []) or []
+                    except Exception as _e:
+                        # Fallback: at least hit the default calendar so we
+                        # don't return zero events on a permissions blip.
+                        logger.warning("[%s] Calendars enumeration failed for %s: %s", self.worker_id, user_id, _e)
+                        calendars = [{"id": "default", "name": "Calendar", "isDefaultCalendar": True}]
+
+                    out_rows: List[tuple] = []
+                    for cal in calendars:
+                        cal_id = cal.get("id") or "default"
+                        cal_name = cal.get("name") or "Calendar"
+                        is_default = bool(cal.get("isDefaultCalendar"))
+                        # Resume from saved deltaLink if we have one for this
+                        # calendar; otherwise start a fresh window.
+                        #
+                        # Graph supports /calendarView/delta only on the
+                        # DEFAULT calendar (/users/{id}/calendarView/delta).
+                        # Secondary calendars (US Holidays, Birthdays, shared,
+                        # group calendars) 400 on the delta variant — we fall
+                        # back to non-delta /calendars/{cid}/calendarView which
+                        # still expands recurring series but has no delta
+                        # token (so it's a full re-pull each run — acceptable
+                        # because sub-calendars rarely have daily change volume).
+                        # NB: _iter_pages treats URLs starting with "http" as
+                        # already-complete (nextLink-style) and drops the
+                        # params dict, so we inline startDateTime/endDateTime
+                        # into the URL directly. This matches what Graph
+                        # actually needs on the very first request.
+                        saved_delta = cal_delta_map.get(cal_id)
+                        if saved_delta and is_default:
+                            stream_url = saved_delta
+                            stream_params: Optional[Dict[str, str]] = None
+                            print(f"[{self.worker_id}]   [USER_CALENDAR] resuming delta for {cal_name} ({user_id})")
+                        elif is_default:
+                            stream_url = (
+                                f"{graph_client.GRAPH_URL}/users/{user_id}"
+                                f"/calendarView/delta"
+                                f"?startDateTime={win_start}&endDateTime={win_end}"
+                            )
+                            stream_params = None
+                        else:
+                            stream_url = (
+                                f"{graph_client.GRAPH_URL}/users/{user_id}"
+                                f"/calendars/{cal_id}/calendarView"
+                                f"?startDateTime={win_start}&endDateTime={win_end}&$top=999"
+                            )
+                            stream_params = None
+
+                        # Drain the stream. _iter_pages captures the terminal
+                        # @odata.deltaLink into self._last_delta_link — we
+                        # grab it per-calendar and stash into the new map.
+                        try:
+                            async for page in graph_client._iter_pages(stream_url, params=stream_params):
+                                for e in page.get("value", []) or []:
+                                    # calendarView/delta emits `@removed` blobs
+                                    # when an event is deleted from the window;
+                                    # skip those — they don't carry a subject.
+                                    if "@removed" in e or not e.get("id"):
+                                        continue
+                                    out_rows.append((
+                                        "CALENDAR_EVENT",
+                                        e.get("subject") or "(no subject)",
+                                        e.get("id"),
+                                        {
+                                            "raw": e,
+                                            "calendarId": cal_id,
+                                            "calendarName": cal_name,
+                                            "seriesMasterId": e.get("seriesMasterId"),
+                                            "type": e.get("type"),
+                                        },
+                                        # folder_path groups events per
+                                        # calendar so the Recovery left rail
+                                        # can show "Calendar / <name>".
+                                        f"Calendar/{cal_name}",
+                                    ))
+                        except Exception as _e:
+                            print(f"[{self.worker_id}]   [USER_CALENDAR] stream aborted for {cal_name}: {type(_e).__name__}: {_e}")
+
+                        cap = getattr(graph_client, "_last_delta_link", None)
+                        if cap:
+                            new_delta_map[cal_id] = cap
+
+                    # Persist the per-calendar delta tokens for next run. We
+                    # merge with existing map so a failed calendar doesn't
+                    # wipe tokens we still hold for others.
+                    if new_delta_map:
+                        try:
+                            async with async_session_factory() as _s:
+                                r = await _s.get(Resource, resource.id)
+                                if r is not None:
+                                    ed = dict(r.extra_data or {})
+                                    merged = dict(ed.get("calendar_delta_tokens") or {})
+                                    merged.update(new_delta_map)
+                                    ed["calendar_delta_tokens"] = merged
+                                    r.extra_data = ed
+                                    await _s.commit()
+                        except Exception as _e:
+                            print(f"[{self.worker_id}]   [USER_CALENDAR] delta persist failed: {_e}")
+
+                    print(f"[{self.worker_id}]   [USER_CALENDAR] {user_id}: {len(calendars)} calendar(s), {len(out_rows)} event occurrence(s)")
+                    return out_rows
 
                 if kind == "USER_CHATS":
                     # Per-chat metadata map: chat_id → {displayName, chatType,
@@ -765,6 +888,10 @@ class BackupWorker:
                         })
 
                     out: List = []
+                    # Log label for this stream — resource.display_name like
+                    # "Chats — Akshat Verma" is fine; fall back to the user
+                    # id if the resource row had no display_name captured.
+                    user_label = resource.display_name or user_id
                     # Route through GraphClient._iter_pages so pacing,
                     # multi-app rotation, Retry-After, cumulative-cap, and
                     # sticky failover all apply automatically. The hardened
