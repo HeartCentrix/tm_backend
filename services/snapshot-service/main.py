@@ -1088,6 +1088,105 @@ async def list_snapshot_chat_groups(
     return sorted(groups.values(), key=lambda g: (g.get("lastMessageAt") or ""), reverse=True)
 
 
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/azure-db/table")
+async def azure_db_table(
+    snapshot_id: str,
+    item_id: str = Query(..., description="SnapshotItem id of the AZURE_DB_TABLE row"),
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=500),
+    search_op: Optional[str] = Query(None, description="One of =, <, >, <=, >=, [] (between)"),
+    search_val: Optional[str] = Query(None, description="Value to compare against the first column"),
+    search_val2: Optional[str] = Query(None, description="Upper bound — only used when search_op is '[]'"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return paginated rows of a single backed-up Azure DB table.
+
+    The backup handler writes each table as a JSON blob alongside the
+    .sql dump. This endpoint reads that blob, applies a search filter
+    on the first column (if provided), then returns one page.
+
+    Response shape:
+      { columns: [...], rows: [[...], ...], total, page, size, hasMore }
+    """
+    try:
+        snap_uuid = UUID(snapshot_id)
+        it_uuid = UUID(item_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid snapshot_id / item_id")
+
+    item = (await db.execute(select(SnapshotItem).where(SnapshotItem.id == it_uuid))).scalar_one_or_none()
+    if not item or item.snapshot_id != snap_uuid:
+        raise HTTPException(status_code=404, detail="Table row not found")
+    if (item.item_type or "") != "AZURE_DB_TABLE":
+        raise HTTPException(status_code=400, detail="Item is not an AZURE_DB_TABLE row")
+
+    ed = item.extra_data or {}
+    rows_blob = ed.get("rows_blob_path") or item.blob_path
+    if not rows_blob:
+        return {"columns": ed.get("columns", []), "rows": [], "total": 0, "page": page, "size": size, "hasMore": False}
+
+    shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
+    payload = await _read_blob_json(shard, tenant_id, candidates, rows_blob)
+    if not isinstance(payload, dict):
+        payload = {}
+
+    columns = payload.get("columns") or ed.get("columns") or []
+    all_rows = payload.get("rows") or []
+
+    # Filter on the first column using the chosen operator. "[]" is a
+    # set match: the value is split on commas and whitespace, each
+    # token is coerced, and the row matches if the first-column value
+    # equals any token. Other operators are scalar comparisons.
+    if search_op and columns and search_val is not None and search_val != "":
+        col = columns[0]
+        def _coerce(x):
+            try:
+                return float(x)
+            except Exception:
+                return str(x)
+
+        target_set: list = []
+        target = None
+        if search_op == "[]":
+            import re as _re
+            for tok in _re.split(r"[\s,]+", search_val.strip()):
+                if tok:
+                    target_set.append(_coerce(tok))
+        else:
+            target = _coerce(search_val)
+
+        def _match(val) -> bool:
+            v = _coerce(val)
+            try:
+                if search_op == "=":  return v == target
+                if search_op == ">":  return v > target
+                if search_op == "<":  return v < target
+                if search_op == ">=": return v >= target
+                if search_op == "<=": return v <= target
+                if search_op == "[]":
+                    # Coerce the row value once; check containment.
+                    return v in target_set or str(val) in {str(t) for t in target_set}
+            except TypeError:
+                return str(val) == str(search_val)
+            return False
+
+        all_rows = [r for r in all_rows if _match(r.get(col) if isinstance(r, dict) else None)]
+
+    total = len(all_rows)
+    offset = (page - 1) * size
+    page_rows = all_rows[offset: offset + size]
+
+    return {
+        "columns": columns,
+        "rows": page_rows,
+        "total": total,
+        "page": page,
+        "size": size,
+        "hasMore": offset + size < total,
+        "firstColumn": columns[0] if columns else None,
+    }
+
+
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/calendar")
 async def list_snapshot_calendar(
     snapshot_id: str,

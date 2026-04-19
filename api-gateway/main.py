@@ -258,6 +258,7 @@ async def job(request: Request):
 # Files view for resource kinds outside the five fixed tabs.
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/files")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/onedrive/ids")
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/azure-db/table")
 async def snapshot_folders(request: Request):
     return await proxy_request("snapshot", request.url.path, request)
 
