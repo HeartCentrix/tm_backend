@@ -686,6 +686,8 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         "azureRestoreParams": request.get("azureRestoreParams", {}),
         # Sub-mode selector for Azure restores: VM → FULL_VM|DISK, SQL → FULL|PITR|SCHEMA_ONLY
         "azureRestoreMode": request.get("azureRestoreMode"),
+        # Optional folder filter for USER_CONTACT exports. Empty/missing = all.
+        "contactFolders": request.get("contactFolders"),
     }
 
     # Fetch tenant/resource info — try snapshot first, then fall back to item lookup.
