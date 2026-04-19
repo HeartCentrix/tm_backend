@@ -118,3 +118,58 @@ async def test_bucket_rate_zero_disables_pacing():
     for _ in range(20):
         await b.acquire()
     assert asyncio.get_event_loop().time() - t0 < 0.05
+
+
+@pytest.mark.asyncio
+async def test_policy_decide_throttle_with_retry_after():
+    from shared.graph_ratelimit import RateLimitPolicy
+    p = RateLimitPolicy(
+        stream_rate=0.0, app_rate=0.0,
+        throttle_sequence=[60], transient_sequence=[1],
+        jitter_ratio=0.0, cumulative_cap_s=10_000,
+    )
+    action = p.decide(status_code=429, retry_after="5")
+    assert action.should_sleep is True
+    assert action.sleep_seconds == 5.0
+    assert action.exhausted is False
+
+
+@pytest.mark.asyncio
+async def test_policy_decide_throttle_without_retry_after():
+    from shared.graph_ratelimit import RateLimitPolicy
+    p = RateLimitPolicy(
+        stream_rate=0.0, app_rate=0.0,
+        throttle_sequence=[60, 120], transient_sequence=[1],
+        jitter_ratio=0.0, cumulative_cap_s=10_000,
+    )
+    a1 = p.decide(status_code=429, retry_after=None)
+    a2 = p.decide(status_code=429, retry_after=None)
+    assert a1.sleep_seconds == 60.0
+    assert a2.sleep_seconds == 120.0
+
+
+@pytest.mark.asyncio
+async def test_policy_decide_raises_on_cumulative_cap():
+    from shared.graph_ratelimit import RateLimitPolicy
+    p = RateLimitPolicy(
+        stream_rate=0.0, app_rate=0.0,
+        throttle_sequence=[60], transient_sequence=[1],
+        jitter_ratio=0.0, cumulative_cap_s=30,
+    )
+    p.decide(status_code=429, retry_after=None)
+    action = p.decide(status_code=429, retry_after=None)
+    assert action.exhausted is True
+
+
+@pytest.mark.asyncio
+async def test_policy_decide_timeout_uses_transient_sequence():
+    from shared.graph_ratelimit import RateLimitPolicy
+    p = RateLimitPolicy(
+        stream_rate=0.0, app_rate=0.0,
+        throttle_sequence=[60], transient_sequence=[2, 4, 8],
+        jitter_ratio=0.0, cumulative_cap_s=10_000,
+    )
+    a = p.decide_transient_error()
+    assert a.sleep_seconds == 2.0
+    a = p.decide_transient_error()
+    assert a.sleep_seconds == 4.0

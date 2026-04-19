@@ -128,3 +128,98 @@ class AsyncTokenBucket:
 
     def rate(self) -> float:
         return self._rate
+
+
+@dataclass
+class PolicyAction:
+    """Decision returned by RateLimitPolicy for one response."""
+    should_sleep: bool
+    sleep_seconds: float
+    exhausted: bool
+    reason: str
+
+
+class RateLimitPolicy:
+    """Per-stream retry + pacing state machine.
+
+    Call `.decide(status_code, retry_after)` after every Graph response.
+    Returns a `PolicyAction` telling the caller whether to sleep, for
+    how long, or to raise because the cumulative cap is exhausted.
+
+    Pacing is enforced separately via the bucket properties. Callers are
+    expected to `await policy.stream_bucket.acquire()` and
+    `await policy.app_bucket.acquire()` BEFORE every request.
+    """
+
+    def __init__(
+        self,
+        *,
+        stream_rate: float,
+        app_rate: float,
+        throttle_sequence: List[int],
+        transient_sequence: List[int],
+        jitter_ratio: float,
+        cumulative_cap_s: float,
+        stream_capacity: int = 1,
+        app_capacity: int = 1,
+    ):
+        self.stream_bucket = AsyncTokenBucket(stream_rate, stream_capacity)
+        self.app_bucket = AsyncTokenBucket(app_rate, app_capacity)
+        self._throttle_walker = BackoffWalker(throttle_sequence, jitter_ratio)
+        self._transient_walker = BackoffWalker(transient_sequence, jitter_ratio)
+        self._cumulative_cap = cumulative_cap_s
+
+    def decide(
+        self, *, status_code: int, retry_after: Optional[str]
+    ) -> PolicyAction:
+        if status_code in (429, 503):
+            parsed = parse_retry_after(retry_after)
+            if parsed is not None:
+                # Trust the server. Still count it toward the cumulative cap.
+                self._throttle_walker._cumulative += parsed
+                if self._throttle_walker.exceeded_cumulative_cap(self._cumulative_cap):
+                    return PolicyAction(
+                        should_sleep=False, sleep_seconds=0.0,
+                        exhausted=True,
+                        reason=f"cumulative-cap-hit-after-retry-after-{parsed}s",
+                    )
+                return PolicyAction(
+                    should_sleep=True, sleep_seconds=parsed,
+                    exhausted=False, reason=f"retry-after-{parsed}s",
+                )
+            wait = self._throttle_walker.next()
+            if self._throttle_walker.exceeded_cumulative_cap(self._cumulative_cap):
+                return PolicyAction(
+                    should_sleep=False, sleep_seconds=0.0,
+                    exhausted=True, reason=f"cumulative-cap-hit-at-{wait:.0f}s",
+                )
+            return PolicyAction(
+                should_sleep=True, sleep_seconds=wait,
+                exhausted=False, reason=f"backoff-{wait:.0f}s",
+            )
+        return PolicyAction(
+            should_sleep=False, sleep_seconds=0.0,
+            exhausted=False, reason=f"no-sleep-for-{status_code}",
+        )
+
+    def decide_transient_error(self) -> PolicyAction:
+        wait = self._transient_walker.next()
+        if self._transient_walker.exceeded_cumulative_cap(self._cumulative_cap):
+            return PolicyAction(
+                should_sleep=False, sleep_seconds=0.0,
+                exhausted=True, reason="cumulative-cap-hit-transient",
+            )
+        return PolicyAction(
+            should_sleep=True, sleep_seconds=wait,
+            exhausted=False, reason=f"transient-backoff-{wait:.0f}s",
+        )
+
+    def reset_on_success(self) -> None:
+        """Reset walkers after a clean response. Cumulative cap stays in place."""
+        self._throttle_walker._index = 0
+        self._transient_walker._index = 0
+
+
+class GraphRetryExhaustedError(Exception):
+    """Cumulative-wait cap hit on a stream. Caller should raise, let
+    RabbitMQ redeliver, and the next worker resumes from checkpoint."""
