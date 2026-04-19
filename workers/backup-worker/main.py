@@ -116,6 +116,18 @@ class BackupWorker:
         # Concurrency controls
         self.backup_semaphore = asyncio.Semaphore(8)  # 8 concurrent file streams per worker NIC
         self.copy_semaphore = asyncio.Semaphore(20)  # Azure Storage account ingress limit
+        # v2: cap simultaneous USER_ONEDRIVE backup jobs per worker. An uncapped
+        # run can take hours; without this a single worker would accept every
+        # redelivered OneDrive message and thrash. Heavy-pool workers
+        # (backup-worker-heavy) set MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER
+        # to 1 so they finish one monster drive before touching the next.
+        self._onedrive_backup_semaphore = asyncio.Semaphore(
+            settings.MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER
+        )
+        # Which normal-priority queue this instance consumes. Default
+        # replicas read backup.normal; backup-worker-heavy sets
+        # BACKUP_WORKER_QUEUE=backup.heavy via compose env.
+        self._backup_queue_name = settings.BACKUP_WORKER_QUEUE
 
     async def initialize(self):
         await message_bus.connect()
@@ -147,7 +159,7 @@ class BackupWorker:
         queues = [
             ("backup.urgent", 1),
             ("backup.high", 5),
-            ("backup.normal", 20),
+            (self._backup_queue_name, 20),
             ("backup.low", 50),
         ]
 
@@ -895,9 +907,15 @@ class BackupWorker:
                         # captures the REAL file bytes uploaded to blob so
                         # the snapshot's bytes_total reflects actual storage
                         # consumed, not just the JSON metadata footprint.
-                        _uploaded, att_bytes = await self._useronedrive_backup_files(
-                            graph_client, resource, snapshot, tenant, drive_id, file_items,
-                        )
+                        #
+                        # The per-worker semaphore caps how many simultaneous
+                        # OneDrive drives one worker replica runs — without it,
+                        # an uncapped v2 run lets a single worker pick up
+                        # every redelivered drive and thrash under memory.
+                        async with self._onedrive_backup_semaphore:
+                            _uploaded, att_bytes = await self._useronedrive_backup_files(
+                                graph_client, resource, snapshot, tenant, drive_id, file_items,
+                            )
 
                 if att_items:
                     async with async_session_factory() as session:

@@ -40,8 +40,12 @@ class MessageBus:
                 # once the INITIAL connection is established, so this outer
                 # loop only needs to cover the cold-boot window before the
                 # first connect succeeds.
+                # Heartbeat bumped to 1 week so hour-long backup jobs don't
+                # trigger consumer redelivery — OneDrive drives in the 100 GB+
+                # class can legitimately hold a message for many hours.
                 self.connection = await aio_pika.connect_robust(
                     settings.RABBITMQ_URL,
+                    heartbeat=settings.RABBITMQ_CONSUMER_HEARTBEAT_SECONDS,
                 )
                 self.channel = await self.connection.channel()
                 self.exchange = await self.channel.declare_exchange(
@@ -53,6 +57,13 @@ class MessageBus:
                 await self._declare_queue("backup.high", routing_key="backup.high")
                 await self._declare_queue("backup.normal", routing_key="backup.normal")
                 await self._declare_queue("backup.low", routing_key="backup.low")
+                # Heavy queue routes oversized OneDrive drives to a dedicated
+                # worker pool (backup-worker-heavy) so regular backups aren't
+                # blocked waiting for 500 GB drives to finish.
+                await self._declare_queue(
+                    settings.BACKUP_HEAVY_QUEUE,
+                    routing_key=settings.BACKUP_HEAVY_QUEUE,
+                )
                 await self._declare_queue("restore.urgent", routing_key="restore.urgent")
                 await self._declare_queue("restore.normal", routing_key="restore.normal")
                 await self._declare_queue("restore.low", routing_key="restore.low")
@@ -113,13 +124,16 @@ class MessageBus:
         dlq_routing_key = f"{routing_key}.dlq"
         await dlq.bind(self.exchange, dlq_routing_key)
 
-        # Main queue routes rejected messages to the DLQ
+        # Main queue routes rejected messages to the DLQ. Override
+        # x-consumer-timeout at queue level so RabbitMQ's default (30 min on
+        # 3.12+) doesn't redeliver week-long OneDrive backups mid-run.
         queue = await self.channel.declare_queue(
             queue_name,
             durable=True,
             arguments={
                 "x-dead-letter-exchange": "tm.exchange",
                 "x-dead-letter-routing-key": dlq_routing_key,
+                "x-consumer-timeout": settings.RABBITMQ_CONSUMER_TIMEOUT_MS,
             },
         )
         await queue.bind(self.exchange, routing_key)
