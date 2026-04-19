@@ -136,6 +136,109 @@ def _event_to_ics(event: dict) -> str:
     return "\r\n".join(lines) + "\r\n"
 
 
+def _vcard_escape(value: str) -> str:
+    """Escape per RFC 6350 §3.4: comma, semicolon, backslash, newline."""
+    if value is None:
+        return ""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "")
+        .replace(",", "\\,")
+        .replace(";", "\\;")
+    )
+
+
+def _contact_to_vcard(raw: dict, folder: str = "") -> str:
+    """vCard 3.0 representation of a Microsoft Graph contact resource.
+    Outlook + Google + Apple all import 3.0 reliably; 4.0 has Outlook quirks."""
+    if not isinstance(raw, dict):
+        raw = {}
+    lines = ["BEGIN:VCARD", "VERSION:3.0"]
+
+    fn = raw.get("displayName") or (
+        (raw.get("emailAddresses") or [{}])[0].get("address") or "(unnamed)"
+    )
+    lines.append(f"FN:{_vcard_escape(fn)}")
+
+    given = _vcard_escape(raw.get("givenName") or "")
+    surname = _vcard_escape(raw.get("surname") or "")
+    if given or surname:
+        lines.append(f"N:{surname};{given};;;")
+
+    if raw.get("companyName"):
+        lines.append(f"ORG:{_vcard_escape(raw['companyName'])}")
+    if raw.get("jobTitle"):
+        lines.append(f"TITLE:{_vcard_escape(raw['jobTitle'])}")
+
+    for email in raw.get("emailAddresses") or []:
+        addr = (email or {}).get("address") if isinstance(email, dict) else None
+        if addr:
+            lines.append(f"EMAIL;TYPE=INTERNET:{_vcard_escape(addr)}")
+
+    for phone in raw.get("businessPhones") or []:
+        if phone:
+            lines.append(f"TEL;TYPE=WORK,VOICE:{_vcard_escape(phone)}")
+    if raw.get("mobilePhone"):
+        lines.append(f"TEL;TYPE=CELL,VOICE:{_vcard_escape(raw['mobilePhone'])}")
+    for phone in raw.get("homePhones") or []:
+        if phone:
+            lines.append(f"TEL;TYPE=HOME,VOICE:{_vcard_escape(phone)}")
+
+    for im in raw.get("imAddresses") or []:
+        if im:
+            lines.append(f"IMPP:{_vcard_escape(im)}")
+
+    if raw.get("birthday"):
+        bday = str(raw["birthday"])[:10].replace("-", "")
+        if len(bday) == 8 and bday.isdigit():
+            lines.append(f"BDAY:{bday}")
+
+    if raw.get("personalNotes"):
+        lines.append(f"NOTE:{_vcard_escape(raw['personalNotes'])}")
+
+    cats = [c for c in (raw.get("categories") or []) if c]
+    if cats:
+        lines.append("CATEGORIES:" + ",".join(_vcard_escape(c) for c in cats))
+
+    if folder:
+        lines.append(f"X-MS-OL-DESIGN:folder={_vcard_escape(folder)}")
+
+    lines.append("END:VCARD")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _contact_to_csv_row(raw: dict, folder: str) -> dict:
+    """Flatten a Graph contact into one CSV row. All values are strings."""
+    if not isinstance(raw, dict):
+        raw = {}
+    emails = ";".join(
+        ((e or {}).get("address") or "")
+        for e in (raw.get("emailAddresses") or [])
+        if isinstance(e, dict) and (e or {}).get("address")
+    )
+    bday = ""
+    if raw.get("birthday"):
+        bday = str(raw["birthday"])[:10]
+    return {
+        "displayName": raw.get("displayName") or "",
+        "givenName": raw.get("givenName") or "",
+        "surname": raw.get("surname") or "",
+        "companyName": raw.get("companyName") or "",
+        "jobTitle": raw.get("jobTitle") or "",
+        "emails": emails,
+        "businessPhones": ";".join(p for p in (raw.get("businessPhones") or []) if p),
+        "mobilePhone": raw.get("mobilePhone") or "",
+        "homePhones": ";".join(p for p in (raw.get("homePhones") or []) if p),
+        "imAddresses": ";".join(p for p in (raw.get("imAddresses") or []) if p),
+        "categories": ";".join(c for c in (raw.get("categories") or []) if c),
+        "personalNotes": raw.get("personalNotes") or "",
+        "birthday": bday,
+        "folder": folder or "",
+    }
+
+
 def _event_to_csv_row(event: dict) -> dict:
     """Flatten a Graph event into one CSV row."""
     if not isinstance(event, dict):
