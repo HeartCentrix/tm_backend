@@ -61,6 +61,47 @@ from shared.azure_storage import (
 logger = logging.getLogger(__name__)
 
 
+def _message_to_contact_shape(msg: dict) -> dict:
+    """Best-effort: convert an IPM.Contact message (from Deleted Items or
+    Recoverable Items folders) into a dict that looks like a Graph contact
+    resource. Field recovery is lossy by nature — deleted contacts lose
+    most structured fields when they enter the message store. We preserve
+    the original id, fall back to subject for displayName, and extract
+    any emails we can find from the 'from' field."""
+    if not isinstance(msg, dict):
+        msg = {}
+    display = msg.get("subject") or "(deleted contact)"
+    emails: list = []
+
+    from_field = msg.get("from") or {}
+    addr = (from_field.get("emailAddress") or {}).get("address")
+    if addr:
+        emails.append({
+            "address": addr,
+            "name": (from_field.get("emailAddress") or {}).get("name") or display,
+        })
+
+    shape = {
+        "id": msg.get("id"),
+        "displayName": display,
+        "givenName": "",
+        "surname": "",
+        "companyName": "",
+        "jobTitle": "",
+        "emailAddresses": emails,
+        "businessPhones": [],
+        "mobilePhone": "",
+        "homePhones": [],
+        "imAddresses": [],
+        "categories": msg.get("categories") or [],
+        "personalNotes": msg.get("bodyPreview") or "",
+        "birthday": "",
+    }
+    if "singleValueExtendedProperties" in msg:
+        shape["singleValueExtendedProperties"] = msg["singleValueExtendedProperties"]
+    return shape
+
+
 class AuditLogger:
     """Logs backup events via HTTP POST and RabbitMQ"""
 
