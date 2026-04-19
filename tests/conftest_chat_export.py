@@ -116,3 +116,31 @@ async def seeded():
             "message_count": 3,
             "multi_thread_ids": [str(msgs[0].id), str(other_thread.id)],
         }
+
+
+@pytest.fixture
+async def seeded_missing_att(seeded):
+    """Add a CHAT_ATTACHMENT item with a blob_path that does not exist in
+    storage so the export worker exercises the soft-fail / placeholder path.
+    """
+    if not os.environ.get("INTEGRATION"):
+        pytest.skip("seeded_missing_att fixture needs a real DB; set INTEGRATION=1 to run")
+
+    from shared.database import async_session_factory  # type: ignore
+    from shared.models import SnapshotItem  # type: ignore
+
+    async with async_session_factory() as s:
+        s.add(SnapshotItem(
+            id=uuid.uuid4(),
+            snapshot_id=seeded["snapshot_id"],
+            tenant_id=seeded["tenant_id"],
+            item_type="CHAT_ATTACHMENT",
+            external_id="att1",
+            parent_external_id="m0",
+            name="gone.pdf",
+            blob_path="missing/not/here.pdf",
+            content_size=10,
+            extra_data={"name": "gone.pdf", "content_type": "application/pdf"},
+        ))
+        await s.commit()
+    return seeded
