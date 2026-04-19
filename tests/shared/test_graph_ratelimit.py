@@ -6,6 +6,7 @@ import pytest
 from shared.graph_ratelimit import (
     parse_retry_after,
     jittered,
+    BackoffWalker,
 )
 
 
@@ -38,3 +39,38 @@ def test_jittered_ratio_bounds():
     for _ in range(50):
         v = jittered(100.0, ratio=0.2)
         assert 80.0 <= v <= 120.0
+
+
+def test_walker_walks_sequence():
+    w = BackoffWalker([60, 120, 240, 480, 600], jitter_ratio=0.0)
+    assert w.next() == 60
+    assert w.next() == 120
+    assert w.next() == 240
+    assert w.next() == 480
+    assert w.next() == 600
+
+
+def test_walker_loops_back_when_exhausted():
+    w = BackoffWalker([10, 20, 30], jitter_ratio=0.0)
+    assert [w.next() for _ in range(6)] == [10, 20, 30, 10, 20, 30]
+
+
+def test_walker_jitter_range():
+    w = BackoffWalker([100], jitter_ratio=0.2)
+    for _ in range(50):
+        v = w.next()
+        assert 80.0 <= v <= 120.0
+
+
+def test_walker_cumulative_wait():
+    w = BackoffWalker([10, 20, 30], jitter_ratio=0.0)
+    w.next(); w.next(); w.next()
+    assert w.cumulative_wait() == 60.0
+
+
+def test_walker_exceeded_cap():
+    w = BackoffWalker([10], jitter_ratio=0.0)
+    for _ in range(5):
+        w.next()
+    assert w.exceeded_cumulative_cap(40) is True
+    assert w.exceeded_cumulative_cap(60) is False

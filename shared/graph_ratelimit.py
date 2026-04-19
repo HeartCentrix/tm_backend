@@ -54,3 +54,37 @@ def jittered(base_seconds: float, ratio: float) -> float:
         return base_seconds
     factor = 1.0 + random.uniform(-ratio, ratio)
     return max(base_seconds * factor, 0.0)
+
+
+@dataclass
+class BackoffWalker:
+    """Walks a configured sleep-sequence, tracks cumulative wait, loops on exhaustion.
+
+    Used when 429/503 arrives without a Retry-After header. Each call to
+    `.next()` returns the next jittered sleep duration and records it so
+    callers can check `.exceeded_cumulative_cap()` before sleeping again.
+    """
+
+    sequence: List[int]
+    jitter_ratio: float = 0.2
+    _index: int = field(default=0, init=False)
+    _cumulative: float = field(default=0.0, init=False)
+
+    def next(self) -> float:
+        if not self.sequence:
+            return 0.0
+        base = float(self.sequence[self._index % len(self.sequence)])
+        self._index += 1
+        wait = jittered(base, self.jitter_ratio)
+        self._cumulative += wait
+        return wait
+
+    def cumulative_wait(self) -> float:
+        return self._cumulative
+
+    def exceeded_cumulative_cap(self, cap_seconds: float) -> bool:
+        return self._cumulative >= cap_seconds
+
+    def reset(self) -> None:
+        self._index = 0
+        self._cumulative = 0.0
