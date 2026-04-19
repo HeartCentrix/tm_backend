@@ -664,6 +664,11 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         "targetResourceId": request.get("targetResourceId"),
         "targetEnvironmentId": request.get("targetEnvironmentId"),
         "exportFormat": request.get("exportFormat"),
+        # Folder-select intent: true when user chose a folder checkbox
+        # (not individual files). Restore-worker uses this to skip the
+        # single-file raw-stream shortcut so even a 1-item expansion is
+        # zipped with its folder path preserved.
+        "preserveTree": bool(request.get("preserveTree", False)),
         "targetFolder": request.get("targetFolder"),
         "overwrite": request.get("overwrite", False),
         # RestoreModal sends labels like ["Mail","OneDrive","Contacts","Calendar","Chats"].

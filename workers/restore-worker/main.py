@@ -751,6 +751,14 @@ class RestoreWorker:
                 except Exception:
                     it.shard_index = 0
 
+            # Folder-select intent: spec.preserveTree=true means the user
+            # picked a folder (not individual files), so even a 1-item
+            # expansion must produce a ZIP that preserves the folder path.
+            preserve_tree = bool(
+                _spec.get("preserveTree")
+                or (message or {}).get("preserveTree")
+                or False
+            )
             orch = FileExportOrchestrator(
                 job_id=job_id,
                 snapshot_ids=snapshot_ids,
@@ -766,6 +774,7 @@ class RestoreWorker:
                 max_file_bytes=_mail_export_settings.EXPORT_ONEDRIVE_MAX_FILE_BYTES,
                 path_max_len=_mail_export_settings.EXPORT_ONEDRIVE_PATH_MAX_LEN,
                 sanitize_chars=_mail_export_settings.EXPORT_ONEDRIVE_SANITIZE_CHARS,
+                preserve_tree=preserve_tree,
             )
             async with self._export_semaphore:
                 result = await orch.run()
