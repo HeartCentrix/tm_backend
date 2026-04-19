@@ -196,9 +196,17 @@ def normalize_messages(
         body_rewritten = _rewrite_inline_imgs(body_raw, hosted) if body_is_html else ihtml.escape(body_raw)
         body_safe = _sanitize(body_rewritten) if body_is_html else f"<p>{ihtml.escape(body_raw)}</p>"
 
-        sender = (meta.get("from") or {})
-        sender_name = sender.get("display_name") or "Unknown"
+        # Prefer the normalized `from` the extractor produces; fall back to the
+        # raw Graph shape (meta.raw.from.user) since backup-worker often stores
+        # just the raw NDJSON payload without re-normalizing per message.
+        sender = meta.get("from") or {}
+        sender_name = sender.get("display_name")
         sender_email = sender.get("email") or sender.get("user_id")
+        if not sender_name:
+            raw_from = (raw.get("from") or {}).get("user") or {}
+            sender_name = raw_from.get("displayName")
+            sender_email = sender_email or raw_from.get("userPrincipalName") or raw_from.get("id")
+        sender_name = sender_name or "Unknown"
         atts_meta = attachments_by_msg.get(meta.get("message_id") or g(it, "external_id"), [])
         attachments = [
             AttachmentRef(
