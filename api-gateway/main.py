@@ -1,4 +1,5 @@
 """API Gateway - Routes requests to microservices"""
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException
@@ -7,6 +8,23 @@ from fastapi.responses import JSONResponse, Response
 import httpx
 
 from shared.config import settings
+
+
+class _SilentPollFilter(logging.Filter):
+    """Drop uvicorn.access log lines for requests tagged with
+    `_silent=1`. The frontend appends that query param on the Protection
+    / Activity auto-refresh fetches so live-progress polling doesn't
+    flood docker logs while a backup is in flight."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return "_silent=1" not in msg
+
+
+logging.getLogger("uvicorn.access").addFilter(_SilentPollFilter())
 
 # Service URLs
 SERVICES = {

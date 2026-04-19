@@ -62,6 +62,29 @@ class VmBackupHandler:
         self.worker_id = worker_id
         # Track containers we've already created in this run
         self._containers_created: set = set()
+        # Per-disk live copy progress. Keyed by disk_name, value = 0-100.
+        # `_push_job_progress` reads this to publish the overall % to
+        # `jobs.progress_pct` so the Activity page can render a live
+        # progress bar instead of jumping from 0 → 100 at the end.
+        self._disk_progress: dict = {}
+
+    async def _push_job_progress(self, job_id) -> None:
+        """Persist the current overall copy % to the job row. Computed
+        as the minimum across all tracked disks — "done" means every
+        disk is at 100%. Best-effort: swallow errors so a DB hiccup
+        never interrupts the long-running copy loop."""
+        if not job_id or not self._disk_progress:
+            return
+        try:
+            from shared.models import Job as _Job
+            pct = int(min(self._disk_progress.values()))
+            async with async_session_factory() as session:
+                job = await session.get(_Job, job_id)
+                if job is not None and job.status.name if hasattr(job.status, "name") else str(job.status) in ("RUNNING", "QUEUED"):
+                    job.progress_pct = pct
+                    await session.commit()
+        except Exception as e:
+            self._log(f"progress push failed: {e}", "WARNING")
 
     async def backup(self, resource: Resource, tenant: Tenant,
                      snapshot: Snapshot, msg: Dict) -> Dict:
@@ -80,6 +103,21 @@ class VmBackupHandler:
         sub_id = resource.azure_subscription_id
         rg_name = resource.azure_resource_group
         vm_name = resource.external_id
+
+        # Reset the per-run disk-progress tracker so leftovers from a
+        # previous backup don't leak into this one's % estimate.
+        self._disk_progress = {}
+        # Pulled from the incoming RabbitMQ payload — used to write
+        # live copy progress back to jobs.progress_pct during the disk
+        # copy loop so the Activity feed can animate.
+        import uuid as _uuid_mod
+        job_id = None
+        try:
+            jid = (msg or {}).get("jobId")
+            if jid:
+                job_id = _uuid_mod.UUID(jid)
+        except Exception:
+            job_id = None
 
         if not rg_name or not vm_name:
             raise ValueError(f"VM resource missing azure_resource_group or external_id: {resource.id}")
@@ -108,10 +146,15 @@ class VmBackupHandler:
             )
 
             # === Phase 4: Copy Disk VHDs to Blob Storage (PARALLEL) ===
+            # Seed the per-disk tracker with 0% entries so the aggregate
+            # "min across disks" starts at 0 even before the first poll.
+            for disk_data in disk_info:
+                self._disk_progress[disk_data["name"]] = 0
+
             copy_tasks = []
             for disk_data in disk_info:
                 task = self._copy_disk_to_blob(
-                    compute_client, tenant, resource, snapshot, disk_data, rg_name
+                    compute_client, tenant, resource, snapshot, disk_data, rg_name, job_id
                 )
                 copy_tasks.append(task)
 
@@ -637,7 +680,8 @@ class VmBackupHandler:
     # ==================== Phase 4: Copy Disk VHDs to Blob Storage (PARALLEL, SERVER-SIDE) ====================
 
     async def _copy_disk_to_blob(self, compute_client, tenant: Tenant, resource: Resource,
-                                  snapshot: Snapshot, disk_data: Dict, vm_rg: str) -> Dict:
+                                  snapshot: Snapshot, disk_data: Dict, vm_rg: str,
+                                  job_id=None) -> Dict:
         """
         Copy a disk snapshot to Azure Blob storage using Azure's NATIVE ASYNC COPY.
         
@@ -770,6 +814,14 @@ class VmBackupHandler:
                             pass
 
                 self._log(f"  {disk_name} copy: {status} ({progress_pct:.0f}%, waited {waited}s)")
+                # Publish per-disk % to the shared tracker + push the
+                # overall aggregate (min across disks) to jobs.progress_pct
+                # so the Activity UI animates instead of jumping 0 → 100.
+                try:
+                    self._disk_progress[disk_name] = int(progress_pct)
+                    await self._push_job_progress(job_id)
+                except Exception:
+                    pass
                 await aio.sleep(poll_interval)
                 waited += poll_interval
 

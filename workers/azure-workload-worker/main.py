@@ -282,6 +282,7 @@ class AzureWorkloadWorker:
             # Denormalized resource.last_backup_status is updated too so
             # queries that read straight off the resource agree.
             job.status = JobStatus.RUNNING
+            job.progress_pct = 5  # worker picked the message up
             resource.last_backup_status = "RUNNING"
 
             # Create snapshot

@@ -25,6 +25,7 @@ from shared.database import async_session_factory
 from shared.azure_storage import azure_storage_manager
 from shared.config import settings
 import uuid as _uuid
+from handlers._progress import update_job_pct
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 from lro import await_lro
@@ -70,6 +71,15 @@ class SqlBackupHandler:
 
         self._log(f"Starting SQL backup: {db_name} on server {server_name} (RG={rg})")
 
+        # Live-progress job id pulled from the RabbitMQ payload.
+        job_id = None
+        try:
+            jid = (msg or {}).get("jobId")
+            if jid:
+                job_id = _uuid.UUID(jid)
+        except Exception:
+            job_id = None
+
         try:
             # Get our SP credentials for SQL data-plane auth
             # Our SP is Entra admin of this SQL server (assigned during discovery)
@@ -81,22 +91,27 @@ class SqlBackupHandler:
                     f"No SP credentials configured. Set MICROSOFT_CLIENT_ID/SECRET or AZURE_AD_CLIENT_ID/SECRET."
                 )
 
+            await update_job_pct(job_id, 10)  # creds resolved
+
             # Phase 1: Connect and stream data
             data_result = await self._stream_tables(
                 resource, tenant, snapshot, rg, server_name, db_name,
                 sp_client_id, sp_client_secret
             )
+            await update_job_pct(job_id, 70)  # data streamed
 
             # Phase 2: Capture schema
             schema_result = await self._capture_schema(
                 resource, tenant, snapshot, rg, server_name, db_name,
                 sp_client_id, sp_client_secret
             )
+            await update_job_pct(job_id, 85)  # schema captured
 
             # Phase 3: Capture configuration
             config_result = await self._capture_configuration(
                 sql_mgmt, resource, tenant, snapshot, rg, server_name, db_name
             )
+            await update_job_pct(job_id, 95)  # config captured
 
             # Persist SnapshotItem rows so Recovery can list Config /
             # Database / Schema files / Tables. Without this the backup
