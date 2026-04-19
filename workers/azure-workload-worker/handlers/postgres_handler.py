@@ -20,7 +20,10 @@ from azure.mgmt.rdbms.postgresql_flexibleservers.aio import PostgreSQLManagement
 from azure.mgmt.rdbms.postgresql.aio import PostgreSQLManagementClient as SingleServerClient
 from azure.identity.aio import ClientSecretCredential
 
-from shared.models import Resource, Tenant, Snapshot
+from shared.models import Resource, Tenant, Snapshot, SnapshotItem
+from shared.database import async_session_factory
+import hashlib as _hashlib
+import uuid as _uuid
 from shared.azure_storage import azure_storage_manager
 from shared.config import settings
 
@@ -99,6 +102,19 @@ class PostgresBackupHandler:
             config_result = await self._capture_configuration(
                 server_name, sub_id, rg, snapshot, resource, server_type
             )
+
+            # Persist SnapshotItem rows so the Recovery UI (AzureDbView)
+            # can render Configuration / Schema / Data tabs. Each phase
+            # above wrote blobs; this step surfaces them as indexed rows.
+            try:
+                await self._persist_snapshot_items(
+                    resource=resource, tenant=tenant, snapshot=snapshot,
+                    server_name=server_name, db_name=db_name, server_type=server_type,
+                    data_result=data_result, schema_result=schema_result,
+                    config_result=config_result,
+                )
+            except Exception as pe:
+                self._log(f"WARN snapshot_item persist failed: {pe}", "WARN")
 
             # Finalize
             total_size = data_result.get("total_bytes", 0) + schema_result.get("size_bytes", 0) + config_result.get("size_bytes", 0)
@@ -243,6 +259,8 @@ class PostgresBackupHandler:
         total_bytes = 0
         total_rows = 0
         tables_count = 0
+        # Per-table summary for SnapshotItem persistence (populated below).
+        table_details: list = []
 
         # Get incremental watermark
         last_backup_time = resource.last_backup_at
@@ -334,6 +352,14 @@ class PostgresBackupHandler:
             tables_count += 1
             total_rows += len(rows)
             total_bytes += sql_bytes
+            table_details.append({
+                "schema": schema,
+                "table": table,
+                "blob_path": blob_path,
+                "size_bytes": sql_bytes,
+                "row_count": len(rows),
+                "incremental": bool(timestamp_col),
+            })
 
             size_str = self._format_size(sql_bytes)
             self._log(f"  ✓ Table {full_table}: {len(rows)} rows, {size_str} in {elapsed:.1f}s")
@@ -342,6 +368,7 @@ class PostgresBackupHandler:
             "tables_count": tables_count,
             "rows_count": total_rows,
             "total_bytes": total_bytes,
+            "tables": table_details,
         }
 
     async def _find_timestamp_column(self, conn, schema: str, table: str) -> Optional[str]:
@@ -456,27 +483,112 @@ class PostgresBackupHandler:
                     resource_group_name=rg,
                     server_name=server_name,
                 )
+                storage_mb = getattr(getattr(server, "storage", None), "storage_size_gb", None)
+                if storage_mb is None:
+                    storage_mb = getattr(getattr(server, "storage", None), "storage_size_mb", 0)
+
+                # Time created — try in order:
+                #   1) server.create_date (legacy SDK attribute)
+                #   2) server.system_data.created_at (newer SDK versions)
+                #   3) as_dict()["systemData"]["createdAt"] — Azure ARM
+                #      always returns this field in the raw JSON even when
+                #      the SDK doesn't expose it as a typed attribute.
+                #      This is the one that actually resolves on Flexible
+                #      Server today.
+                #   4) tags["createdAt"] — customer-set fallback.
+                time_created = ""
+                cd = getattr(server, "create_date", None)
+                if cd:
+                    try:
+                        time_created = cd.isoformat()
+                    except Exception:
+                        time_created = str(cd)
+                if not time_created:
+                    sys_data = getattr(server, "system_data", None)
+                    sd_created = getattr(sys_data, "created_at", None) if sys_data else None
+                    if sd_created:
+                        try:
+                            time_created = sd_created.isoformat()
+                        except Exception:
+                            time_created = str(sd_created)
+                if not time_created:
+                    try:
+                        raw_dict = server.as_dict() if hasattr(server, "as_dict") else {}
+                        sd = (raw_dict.get("systemData") or raw_dict.get("system_data") or {})
+                        time_created = sd.get("createdAt") or sd.get("created_at") or ""
+                    except Exception:
+                        pass
+                if not time_created:
+                    tags = getattr(server, "tags", None) or {}
+                    time_created = tags.get("createdAt") or tags.get("created_at") or ""
+                # Final fallback — direct ARM REST call with a recent
+                # api-version that always surfaces systemData.createdAt.
+                # The typed SDK response strips it on older API versions,
+                # so bypass it entirely for this one field.
+                if not time_created:
+                    try:
+                        import httpx as _httpx
+                        tok = await credential.get_token("https://management.azure.com/.default")
+                        arm_url = (
+                            f"https://management.azure.com/subscriptions/{sub_id}"
+                            f"/resourceGroups/{rg}/providers/Microsoft.DBforPostgreSQL"
+                            f"/flexibleServers/{server_name}?api-version=2024-08-01"
+                        )
+                        async with _httpx.AsyncClient(timeout=15.0) as _c:
+                            _r = await _c.get(arm_url, headers={"Authorization": f"Bearer {tok.token}"})
+                            if _r.status_code == 200:
+                                sd = (_r.json().get("systemData") or {})
+                                time_created = sd.get("createdAt") or sd.get("created_at") or ""
+                    except Exception as tce:
+                        self._log(f"WARN systemData.createdAt REST fallback failed: {tce}", "WARN")
+
+                # Firewall rules — the Azure screenshots show the count
+                # ("1 firewall rules") rather than the full list. One
+                # extra ARM call gives us the count without bloating
+                # the captured config blob.
+                firewall_rule_count = 0
+                try:
+                    fw_iter = pg_client.firewall_rules.list_by_server(
+                        resource_group_name=rg, server_name=server_name,
+                    )
+                    async for _ in fw_iter:
+                        firewall_rule_count += 1
+                except Exception as fe:
+                    self._log(f"WARN firewall rules fetch failed: {fe}", "WARN")
+
                 config = {
                     "server_type": "FLEXIBLE",
                     "server_name": server_name,
                     "resource_group": rg,
                     "subscription_id": sub_id,
                     "location": getattr(server, "location", "unknown"),
-                    "sku": getattr(getattr(server, "sku", None), "name", "unknown"),
-                    "tier": getattr(getattr(server, "sku", None), "tier", "unknown"),
+                    "fully_qualified_domain_name": getattr(server, "fully_qualified_domain_name", "") or "",
+                    "administrator_login": getattr(server, "administrator_login", "") or "",
+                    "availability_zone": getattr(server, "availability_zone", "") or "",
+                    "time_created": time_created,
+                    "sku": {
+                        "name": getattr(getattr(server, "sku", None), "name", ""),
+                        "tier": getattr(getattr(server, "sku", None), "tier", ""),
+                    },
                     "version": getattr(server, "version", "unknown"),
                     "state": getattr(server, "state", "unknown"),
-                    "storage_mb": getattr(getattr(server, "storage", None), "storage_size_mb", 0),
-                    "backup_retention_days": getattr(
-                        getattr(server, "backup", None), "backup_retention_days", 7
-                    ),
-                    "geo_redundant_backup": getattr(
-                        getattr(server, "backup", None), "geo_redundant_backup", "Disabled"
-                    ),
-                    "replication_role": getattr(server, "replication_role", "None"),
-                    "high_availability": getattr(
-                        getattr(server, "high_availability", None), "mode", "Disabled"
-                    ),
+                    "storage": {
+                        "storageSizeGB": storage_mb,
+                        "autoGrow": getattr(getattr(server, "storage", None), "auto_grow", "Disabled"),
+                    },
+                    "backup": {
+                        "backupRetentionDays": getattr(getattr(server, "backup", None), "backup_retention_days", 7),
+                        "geoRedundantBackup": getattr(getattr(server, "backup", None), "geo_redundant_backup", "Disabled"),
+                    },
+                    "network": {
+                        "publicNetworkAccess": getattr(getattr(server, "network", None), "public_network_access", "Enabled"),
+                        "delegatedSubnetResourceId": getattr(getattr(server, "network", None), "delegated_subnet_resource_id", None),
+                    },
+                    "firewallRuleCount": firewall_rule_count,
+                    "highAvailability": {
+                        "mode": getattr(getattr(server, "high_availability", None), "mode", "Disabled"),
+                    },
+                    "replicationRole": getattr(server, "replication_role", "None"),
                 }
             else:
                 # Single Server (deprecated)
@@ -533,7 +645,130 @@ class PostgresBackupHandler:
 
         self._log(f"  Phase 3: Configuration captured: {self._format_size(config_bytes)}")
 
-        return {"blob_path": config_blob_path, "size_bytes": config_bytes}
+        return {"blob_path": config_blob_path, "size_bytes": config_bytes, "config": config}
+
+    async def _persist_snapshot_items(
+        self, *, resource: Resource, tenant: Tenant, snapshot: Snapshot,
+        server_name: str, db_name: str, server_type: str,
+        data_result: Dict, schema_result: Dict, config_result: Dict,
+    ) -> None:
+        """Insert SnapshotItem rows for the Recovery UI.
+
+        Shape matches what AzureDbView expects:
+          • 1 × AZURE_DB_CONFIG    — server metadata JSON (detail card).
+          • 1 × AZURE_DB_DATABASE  — the database itself (left rails).
+          • 1 × AZURE_DB_SCHEMA_FILE — the schema.sql dump file.
+          • N × AZURE_DB_TABLE     — one per captured table (Data left rail).
+
+        Each row carries blob_path so the existing
+        /snapshots/{id}/items/{id}/content endpoint can stream the bytes
+        back on download without handler-side special casing.
+        """
+        now_hash = _hashlib.sha256(f"{snapshot.id}".encode()).hexdigest()
+        rows: list = []
+
+        # AZURE_DB_CONFIG — the rich per-row metadata powers the
+        # Configuration tab's detail card directly.
+        cfg = config_result.get("config") or {}
+        rows.append(SnapshotItem(
+            id=_uuid.uuid4(),
+            snapshot_id=snapshot.id,
+            tenant_id=tenant.id,
+            external_id=f"{server_name}:{db_name}:config",
+            item_type="AZURE_DB_CONFIG",
+            name=f"{server_name}-config.json",
+            folder_path="",
+            content_size=int(config_result.get("size_bytes") or 0),
+            content_hash=now_hash,
+            content_checksum=None,
+            blob_path=config_result.get("blob_path"),
+            extra_data={
+                "raw": cfg,
+                "server_name": server_name,
+                "database_name": db_name,
+                "server_type": server_type,
+            },
+        ))
+
+        # AZURE_DB_DATABASE — one per database. Each AZURE_POSTGRESQL
+        # resource today maps to a single database (resource.external_id
+        # includes `server/db`), so emit just this one. When discovery
+        # expands to enumerate every database on the server we'll loop
+        # here instead.
+        rows.append(SnapshotItem(
+            id=_uuid.uuid4(),
+            snapshot_id=snapshot.id,
+            tenant_id=tenant.id,
+            external_id=f"{server_name}:{db_name}",
+            item_type="AZURE_DB_DATABASE",
+            name=db_name,
+            folder_path="",
+            content_size=0,
+            content_hash=None,
+            content_checksum=None,
+            blob_path=None,
+            extra_data={
+                "server_name": server_name,
+                "database_name": db_name,
+                "server_type": server_type,
+            },
+        ))
+
+        # AZURE_DB_SCHEMA_FILE — schema dump lives under the db name in
+        # the Schema tab's file list.
+        if schema_result.get("blob_path"):
+            schema_name = schema_result["blob_path"].rsplit("/", 1)[-1]
+            rows.append(SnapshotItem(
+                id=_uuid.uuid4(),
+                snapshot_id=snapshot.id,
+                tenant_id=tenant.id,
+                external_id=f"{server_name}:{db_name}:schema",
+                item_type="AZURE_DB_SCHEMA_FILE",
+                name=schema_name or f"{db_name}-schema.sql",
+                folder_path=db_name,
+                content_size=int(schema_result.get("size_bytes") or 0),
+                content_hash=None,
+                content_checksum=None,
+                blob_path=schema_result.get("blob_path"),
+                extra_data={
+                    "server_name": server_name,
+                    "database_name": db_name,
+                    "server_type": server_type,
+                },
+            ))
+
+        # AZURE_DB_TABLE — one row per exported table. folder_path is
+        # `<db_name>/<schema>` so Data tab left rail can nest tables
+        # under schema when we have multiple schemas.
+        for t in (data_result.get("tables") or []):
+            schema = t.get("schema") or "public"
+            table = t.get("table") or "(unnamed)"
+            rows.append(SnapshotItem(
+                id=_uuid.uuid4(),
+                snapshot_id=snapshot.id,
+                tenant_id=tenant.id,
+                external_id=f"{server_name}:{db_name}:{schema}:{table}",
+                item_type="AZURE_DB_TABLE",
+                name=table,
+                folder_path=f"{db_name}/{schema}",
+                content_size=int(t.get("size_bytes") or 0),
+                content_hash=None,
+                content_checksum=None,
+                blob_path=t.get("blob_path"),
+                extra_data={
+                    "server_name": server_name,
+                    "database_name": db_name,
+                    "schema": schema,
+                    "table": table,
+                    "row_count": int(t.get("row_count") or 0),
+                    "incremental": bool(t.get("incremental")),
+                },
+            ))
+
+        async with async_session_factory() as sess:
+            sess.add_all(rows)
+            await sess.commit()
+        self._log(f"  Persisted {len(rows)} SnapshotItem rows for Recovery UI")
 
     def _format_size(self, size_bytes: int) -> str:
         """Human-readable file size."""

@@ -294,7 +294,7 @@ async def init_db() -> None:
             org_id UUID REFERENCES organizations(id),
             type VARCHAR DEFAULT 'M365',
             display_name VARCHAR NOT NULL,
-            external_tenant_id VARCHAR UNIQUE,
+            external_tenant_id VARCHAR,
             customer_id VARCHAR,
             subscription_id VARCHAR,
             client_id VARCHAR,
@@ -807,6 +807,15 @@ async def init_db() -> None:
         """ALTER TABLE snapshots ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE snapshottype USING type::snapshottype, ALTER COLUMN type SET DEFAULT 'FULL'::snapshottype;""",
         """ALTER TABLE snapshots ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE snapshotstatus USING status::snapshotstatus, ALTER COLUMN status SET DEFAULT 'IN_PROGRESS'::snapshotstatus;""",
         """ALTER TABLE user_roles ALTER COLUMN role TYPE userrole USING role::userrole;""",
+        # M365 and Azure datasources share the same Entra tenant id but
+        # live in separate tenant rows (distinct Protection pages). Drop
+        # the single-column unique constraint on external_tenant_id and
+        # replace with a composite (external_tenant_id, type) constraint
+        # so both rows can coexist without a duplicate-key error at
+        # onboarding time.
+        """ALTER TABLE tenants DROP CONSTRAINT IF EXISTS tenants_external_tenant_id_key;""",
+        """DROP INDEX IF EXISTS tenants_external_tenant_id_key;""",
+        """CREATE UNIQUE INDEX IF NOT EXISTS tenants_external_tenant_id_type_key ON tenants (external_tenant_id, type) WHERE external_tenant_id IS NOT NULL;""",
     ]
 
     try:
