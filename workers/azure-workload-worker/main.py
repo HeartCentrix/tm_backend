@@ -310,11 +310,28 @@ class AzureWorkloadWorker:
                                    self.worker_id, resource_type, resource_id)
                     result = {"success": False, "error": f"Unsupported type: {resource_type}"}
 
-                # Update snapshot
+                # Update snapshot. VM/SQL/PG handlers report the captured
+                # blob size as `total_size_bytes`; VM also reports per-disk
+                # `size_bytes`. Fall back gracefully so no backend change
+                # is needed when a handler renames one but not the other.
+                size_bytes = int(
+                    result.get("total_size_bytes")
+                    or result.get("size_bytes")
+                    or 0
+                )
                 if result.get("success"):
                     snapshot.status = SnapshotStatus.COMPLETED
-                    snapshot.item_count = result.get("disks_copied", 1)
-                    snapshot.bytes_added = result.get("size_bytes", 0)
+                    snapshot.item_count = (
+                        result.get("disks_copied")
+                        or result.get("tables_exported")
+                        or 1
+                    )
+                    # bytes_added and bytes_total both get the captured
+                    # size — the Recovery sparkline reads bytes_total and
+                    # the per-day delta bars read bytes_added. Without
+                    # this, both were 0 and the chart rendered flat.
+                    snapshot.bytes_added = size_bytes
+                    snapshot.bytes_total = size_bytes
                 else:
                     snapshot.status = SnapshotStatus.FAILED
 
