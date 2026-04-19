@@ -372,9 +372,22 @@ def _job_snapshot(job: Job) -> dict:
 async def status_or_sse(
     job_id: str,
     request: Request,
-    user: dict = Depends(get_current_user_from_token),
+    access_token: str | None = None,
     sess: AsyncSession = Depends(get_db),
 ):
+    # EventSource can't set custom headers, so the frontend passes the JWT
+    # via `?access_token=<jwt>` on the SSE URL. Support either transport.
+    from shared.security import _get_user_from_token
+    auth = request.headers.get("Authorization") or request.headers.get("authorization") or ""
+    token = None
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+    elif access_token:
+        token = access_token
+    if not token:
+        raise HTTPException(401, detail={"error": "AUTH_REQUIRED"})
+    user = _get_user_from_token(token)
+
     try:
         jid = uuid.UUID(job_id)
     except (ValueError, TypeError):
