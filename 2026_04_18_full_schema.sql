@@ -1885,3 +1885,40 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_column THEN NULL; END $$;
 CREATE INDEX IF NOT EXISTS idx_snapshot_items_search_vector
     ON tm_vault.snapshot_items USING gin (search_vector);
+
+-- ============================================================
+-- Teams chat export (v1) — schema additions
+-- Required for tm_backend/workers/chat-export-worker and
+-- tm_backend/services/job-service/chat_export.py.
+-- ============================================================
+
+-- snapshot_items.parent_external_id: links CHAT_ATTACHMENT and
+-- CHAT_HOSTED_CONTENT rows back to their parent message so the export
+-- pipeline can resolve attachments without table-scanning metadata JSONB.
+DO $$ BEGIN
+    ALTER TABLE tm_vault.snapshot_items ADD COLUMN parent_external_id VARCHAR;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+
+-- jobstatus gains PENDING (queued-but-idempotency-safe) and CANCELLING
+-- (transient while worker wraps up a user-cancelled export).
+ALTER TYPE tm_vault.jobstatus ADD VALUE IF NOT EXISTS 'PENDING';
+ALTER TYPE tm_vault.jobstatus ADD VALUE IF NOT EXISTS 'CANCELLING';
+
+-- Chat-export scope resolution + job-concurrency indexes
+CREATE INDEX IF NOT EXISTS idx_snapshot_items_folder_type
+    ON tm_vault.snapshot_items (folder_path, item_type);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_items_parent_ext
+    ON tm_vault.snapshot_items (parent_external_id)
+    WHERE item_type IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT');
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_items_snapshot_type
+    ON tm_vault.snapshot_items (snapshot_id, item_type);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_items_chat_created
+    ON tm_vault.snapshot_items (snapshot_id, folder_path, created_at)
+    WHERE item_type IN ('TEAMS_CHAT_MESSAGE','TEAMS_MESSAGE','TEAMS_MESSAGE_REPLY');
+
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_type_status
+    ON tm_vault.jobs (tenant_id, type, status)
+    WHERE status IN ('QUEUED','PENDING','RUNNING');
