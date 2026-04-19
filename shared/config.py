@@ -163,6 +163,53 @@ class Settings:
         self.RABBITMQ_CONSUMER_HEARTBEAT_SECONDS = int(os.getenv("RABBITMQ_CONSUMER_HEARTBEAT_SECONDS", str(7 * 24 * 3600)))
         self.RABBITMQ_CONSUMER_TIMEOUT_MS = int(os.getenv("RABBITMQ_CONSUMER_TIMEOUT_MS", str(7 * 24 * 3600 * 1000)))
 
+        # ── Graph API throttle hardening ──
+        # Spec: docs/superpowers/specs/2026-04-19-graph-api-throttle-hardening-design.md
+        self.GRAPH_HARDENING_ENABLED = os.getenv(
+            "GRAPH_HARDENING_ENABLED", "false"
+        ).lower() in ("true", "1", "yes")
+        # Per-(app, tenant) sustained rate cap. Half of OneDrive's published
+        # 5 rps floor so we're invisible to any tenant admin's throttle alerts.
+        self.GRAPH_APP_PACE_REQS_PER_SEC = float(
+            os.getenv("GRAPH_APP_PACE_REQS_PER_SEC", "2.5")
+        )
+        # Per-stream (= per concurrent backup) sustained rate cap.
+        self.GRAPH_STREAM_PACE_REQS_PER_SEC = float(
+            os.getenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "1.0")
+        )
+        self.GRAPH_MAX_RETRIES = int(os.getenv("GRAPH_MAX_RETRIES", "5"))
+        # Sequence walked when 429/503 arrives without a Retry-After header.
+        # Loops back to the start on exhaustion; the real ceiling is the
+        # cumulative-wait cap below.
+        self.GRAPH_THROTTLE_BACKOFF_SECONDS = [
+            int(x) for x in os.getenv(
+                "GRAPH_THROTTLE_BACKOFF_SECONDS", "60,120,240,480,600"
+            ).split(",") if x.strip()
+        ]
+        # Sequence for transient network errors (not throttle).
+        self.GRAPH_TRANSIENT_BACKOFF_SECONDS = [
+            int(x) for x in os.getenv(
+                "GRAPH_TRANSIENT_BACKOFF_SECONDS", "2,4,8,16,32"
+            ).split(",") if x.strip()
+        ]
+        self.GRAPH_JITTER_RATIO = float(os.getenv("GRAPH_JITTER_RATIO", "0.2"))
+        self.GRAPH_POST_THROTTLE_BRAKE_MS = int(
+            os.getenv("GRAPH_POST_THROTTLE_BRAKE_MS", "500")
+        )
+        # Hard cap on total wait time per stream. After this, raise and let
+        # RabbitMQ redeliver (resume from last checkpoint).
+        self.GRAPH_MAX_CUMULATIVE_WAIT_SECONDS = int(
+            os.getenv("GRAPH_MAX_CUMULATIVE_WAIT_SECONDS", "14400")
+        )
+        # Clamp on the all-apps-throttled wait.
+        self.GRAPH_MAX_THROTTLE_WAIT_SECONDS = int(
+            os.getenv("GRAPH_MAX_THROTTLE_WAIT_SECONDS", "1800")
+        )
+        self.GRAPH_STICKY_PAGES_BEFORE_RETURN = int(
+            os.getenv("GRAPH_STICKY_PAGES_BEFORE_RETURN", "50")
+        )
+        self.GRAPH_BATCH_MAX_SIZE = int(os.getenv("GRAPH_BATCH_MAX_SIZE", "20"))
+
         # Heavy export pool — routes >100 GB-with-attachments exports to a dedicated
         # worker set with a larger memory budget. See spec §13 promoted scope.
         self.HEAVY_EXPORT_THRESHOLD_BYTES = int(os.getenv(
