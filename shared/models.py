@@ -435,6 +435,7 @@ class SnapshotItem(Base):
     snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id"), nullable=False, index=True)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
     external_id = Column(String, nullable=False)
+    parent_external_id = Column(String, index=True)
     item_type = Column(String, nullable=False)
     name = Column(String, nullable=False)
     folder_path = Column(String)
