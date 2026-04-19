@@ -70,6 +70,13 @@ async def _update_job(sess, job_id, **values):
     await sess.commit()
 
 
+async def _check_cancelled(sess, job_id) -> bool:
+    from sqlalchemy import select
+    from shared.models import Job, JobStatus
+    st = (await sess.execute(select(Job.status).where(Job.id == job_id))).scalar_one()
+    return st == JobStatus.CANCELLING
+
+
 async def consume_thread(message: aio_pika.IncomingMessage) -> None:
     async with message.process(requeue=False):
         body = json.loads(message.body)
@@ -135,11 +142,7 @@ async def consume_thread(message: aio_pika.IncomingMessage) -> None:
                 "snapshot_at": job.created_at,
             }
 
-            # Re-check cancel between stages
-            job_state = (await sess.execute(
-                select(Job.status).where(Job.id == job_id)
-            )).scalar_one()
-            if job_state == JobStatus.CANCELLING:
+            if await _check_cancelled(sess, job_id):
                 await _update_job(sess, job_id, status=JobStatus.CANCELLED)
                 await publish(job_id, "cancelled", {})
                 return
@@ -161,6 +164,11 @@ async def consume_thread(message: aio_pika.IncomingMessage) -> None:
             )
 
             await publish(job_id, "progress", {"stage": "uploading", "percent": 85})
+            if await _check_cancelled(sess, job_id):
+                await _update_job(sess, job_id, status=JobStatus.CANCELLED)
+                await publish(job_id, "cancelled", {})
+                return
+
             shard = pick_shard(str(job_id))
             account = shard_account(shard)
             blob_path = f"{job_id}/export.zip"

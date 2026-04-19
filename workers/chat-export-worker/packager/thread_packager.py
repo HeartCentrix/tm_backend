@@ -50,11 +50,18 @@ class ThreadPackager:
             per_file.append({"path": path, "sha256": sha256(data).hexdigest(), "bytes": len(data)})
             total_bytes += len(data)
 
-        async def _read(src_path: str) -> bytes:
-            ait, _ctype, _size = await self.attachment_source.open(src_path)
-            buf = b""
-            async for chunk in ait: buf += chunk
-            return buf
+        async def _read(src_path: str) -> tuple[bytes, bool]:
+            try:
+                ait, _ct, _sz = await self.attachment_source.open(src_path)
+                buf = b""
+                async for chunk in ait: buf += chunk
+                return buf, False
+            except Exception as e:
+                placeholder = (
+                    f"[ATTACHMENT_MISSING]\nblob_path: {src_path}\nerror: {e!r}\n"
+                    "This attachment was not available at export time.\n"
+                ).encode()
+                return placeholder, True
 
         inline_count = 0; attachment_count = 0
         for m in messages:
@@ -62,18 +69,23 @@ class ThreadPackager:
                        else f"per-message/{tsafe}/{_safe_name(m.external_id)}/attachments")
             new_atts = []
             for att in attachment_map.get(m.external_id, []):
-                data = await _read(att["blob_path"])
-                target = f"{att_dir}/{_safe_name(att['name'])}"
+                data, missing = await _read(att["blob_path"])
+                target_name = _safe_name(att["name"]) + (".MISSING.txt" if missing else "")
+                target = f"{att_dir}/{target_name}"
                 _add(target, data)
                 new_atts.append(AttachmentRef(
-                    name=_safe_name(att["name"]), local_path=f"./{target}",
-                    content_type=att.get("content_type"), size=len(data),
+                    name=target_name, local_path=f"./{target}",
+                    content_type="text/plain" if missing else att.get("content_type"),
+                    size=len(data),
                 ))
                 attachment_count += 1
             m.attachments = new_atts
             for hc in hosted_map.get(m.external_id, []):
-                data = await _read(hc["blob_path"])
-                target = f"{att_dir}/inline/{hc['hc_id']}{hc.get('ext', '.bin')}"
+                data, missing = await _read(hc["blob_path"])
+                if missing:
+                    target = f"{att_dir}/inline/{hc['hc_id']}.MISSING.txt"
+                else:
+                    target = f"{att_dir}/inline/{hc['hc_id']}{hc.get('ext', '.bin')}"
                 _add(target, data); inline_count += 1
 
         _add("styles.css", _STYLES.read_bytes())
