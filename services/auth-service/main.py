@@ -501,12 +501,18 @@ async def azure_datasource_callback(
     # Check if tenant already exists for this org
     org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
 
-    # CRITICAL: Query by external_tenant_id WITHOUT type filter.
-    # The same Azure AD tenant ID is used for both M365 and Azure datasources.
-    # If M365 was onboarded first, a tenant with this external_tenant_id exists as type M365.
-    # We should reuse that tenant or upgrade it to BOTH, not create a duplicate.
+    # The same Azure AD tenant ID is used for both M365 and Azure
+    # datasources. Scope the lookup by type so onboarding Azure on a
+    # tenant that was already onboarded as M365 creates a SEPARATE
+    # AZURE tenant row — matches AFI's model and keeps the Tenants page
+    # able to list the Azure datasource independently (was a bug where
+    # Azure onboarding silently reused the M365 row, leaving the
+    # Tenants page's Azure section empty while discovery ran).
     if external_tenant_id:
-        stmt = select(Tenant).where(Tenant.external_tenant_id == external_tenant_id)
+        stmt = select(Tenant).where(
+            Tenant.external_tenant_id == external_tenant_id,
+            Tenant.type.cast(String) == "AZURE",
+        )
     else:
         stmt = select(Tenant).where(
             Tenant.type.cast(String) == "AZURE",
