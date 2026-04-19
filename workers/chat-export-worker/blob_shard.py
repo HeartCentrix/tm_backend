@@ -25,7 +25,8 @@ def _sas_sig(**kw) -> str:
 def sign_download_url(*, account: str, container: str, blob_path: str,
                       expires_in_hours: int | None = None) -> str:
     ttl = expires_in_hours or settings.chat_export_sas_ttl_hours
-    key = os.environ.get(f"CHAT_EXPORT_KEY_{account.upper()}", "")
+    key = (getattr(settings, "AZURE_STORAGE_ACCOUNT_KEY", None)
+           or os.environ.get(f"CHAT_EXPORT_KEY_{account.upper()}", ""))
     expiry = datetime.now(timezone.utc) + timedelta(hours=ttl)
     sig = _sas_sig(account_name=account, container_name=container, blob_name=blob_path,
                    account_key=key, permission=BlobSasPermissions(read=True),

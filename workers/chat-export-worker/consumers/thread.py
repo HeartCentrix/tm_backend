@@ -9,14 +9,13 @@ import json
 import logging
 import aio_pika
 from sqlalchemy import select, update
-from azure.storage.blob.aio import BlobServiceClient
 
 from shared.database import async_session_factory
 from shared.models import Job, JobStatus, Resource
+from shared.azure_storage import azure_storage_manager, upload_blob_with_retry
+from shared.config import settings
 
-from workers.chat_export_worker.blob_shard import (
-    pick_shard, shard_account, sign_download_url,
-)
+from workers.chat_export_worker.blob_shard import sign_download_url
 from workers.chat_export_worker.progress import publish
 from workers.chat_export_worker.scope import resolve
 from workers.chat_export_worker.render.normalizer import normalize_messages
@@ -169,30 +168,26 @@ async def consume_thread(message: aio_pika.IncomingMessage) -> None:
                 await publish(job_id, "cancelled", {})
                 return
 
-            shard = pick_shard(str(job_id))
-            account = shard_account(shard)
+            account = settings.AZURE_STORAGE_ACCOUNT_NAME
+            container = "exports"
             blob_path = f"{job_id}/export.zip"
             buf.seek(0)
-            bsc = BlobServiceClient(
-                account_url=f"https://{account}.blob.core.windows.net",
-                credential=None,
-            )
-            await bsc.get_container_client("exports").get_blob_client(blob_path).upload_blob(
-                buf.getvalue(), overwrite=True,
+            await upload_blob_with_retry(
+                container, blob_path, buf.getvalue(),
+                shard_index=0, max_retries=3,
             )
             url = sign_download_url(
-                account=account, container="exports", blob_path=blob_path,
+                account=account, container=container, blob_path=blob_path,
             )
 
             await _update_job(
                 sess, job_id, status=JobStatus.COMPLETED,
                 result={
-                    "export_zip_blob_path": f"{account}/exports/{blob_path}",
+                    "export_zip_blob_path": f"{account}/{container}/{blob_path}",
                     "signed_url": url,
                     "total_msgs": len(render_messages),
                     "total_bytes": summary["total_bytes"],
                     "sha256": summary["sha256"],
-                    "blob_shard": shard,
                 },
             )
             await publish(
