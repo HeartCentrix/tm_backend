@@ -9,7 +9,7 @@ COPY shared /app/shared
 COPY services/backup-scheduler /app/services/backup-scheduler
 
 # Install dependencies
-RUN pip install --no-cache-dir -r /app/services/backup-scheduler/requirements.txt
+RUN pip install --default-timeout=300 --retries 5 --no-cache-dir -r /app/services/backup-scheduler/requirements.txt
 
 ENV PYTHONPATH=/app
 ENV PORT=8008

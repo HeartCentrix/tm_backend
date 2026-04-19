@@ -31,7 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY shared /app/shared
 COPY workers/azure-workload-worker /app/workers/azure-workload-worker
 
-RUN pip install --no-cache-dir --prefer-binary -r /app/workers/azure-workload-worker/requirements.txt
+RUN pip install --default-timeout=300 --retries 5 --no-cache-dir --prefer-binary -r /app/workers/azure-workload-worker/requirements.txt
 
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1

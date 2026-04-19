@@ -2,7 +2,7 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY shared/ /app/shared/
 COPY api-gateway/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --default-timeout=300 --retries 5 --no-cache-dir -r requirements.txt
 COPY api-gateway/ .
 ENV PORT=8000
 EXPOSE ${PORT}

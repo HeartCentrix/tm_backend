@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY shared /app/shared
 COPY workers/backup-worker /app/workers/backup-worker
 
-RUN pip install --no-cache-dir --prefer-binary -r /app/workers/backup-worker/requirements.txt
+RUN pip install --default-timeout=300 --retries 5 --no-cache-dir --prefer-binary -r /app/workers/backup-worker/requirements.txt
 
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1

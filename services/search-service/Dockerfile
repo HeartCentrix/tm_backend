@@ -5,7 +5,7 @@ WORKDIR /app
 COPY shared /app/shared
 COPY services/search-service /app/services/search-service
 
-RUN pip install --no-cache-dir -r /app/services/search-service/requirements.txt
+RUN pip install --default-timeout=300 --retries 5 --no-cache-dir -r /app/services/search-service/requirements.txt
 
 ENV PYTHONPATH=/app
 ENV PORT=8013
