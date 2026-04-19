@@ -196,6 +196,7 @@ class FileExportOrchestrator:
         manifest: Optional["ExportManifestBuilder"] = None,
         checkpoint: Optional[dict] = None,
         persist_checkpoint=None,
+        preserve_tree: bool = False,
     ):
         self.job_id = job_id
         self.snapshot_ids = snapshot_ids
@@ -217,6 +218,11 @@ class FileExportOrchestrator:
         )
         self.checkpoint = dict(checkpoint or {"completed_folders": [], "produced_blobs": {}})
         self.persist_checkpoint = persist_checkpoint
+        # When true, always produce a ZIP even for a single item, so the
+        # folder-tree structure is preserved in the download. Set by the
+        # frontend when the user selects via folder-checkbox (where the
+        # intent is "download the folder", not "download a lone file").
+        self.preserve_tree = preserve_tree
 
     async def run(self) -> dict:
         print(
@@ -225,10 +231,14 @@ class FileExportOrchestrator:
         )
 
         # ── Single-file ORIGINAL raw-stream shortcut ──
+        # Skipped when preserve_tree=true (user selected a folder that
+        # happens to contain 1 file — they expect a ZIP with the folder
+        # path preserved, not the file alone).
         if (
             self.export_format == "ORIGINAL"
             and len(self.items) == 1
             and getattr(self.items[0], "blob_path", None)
+            and not self.preserve_tree
         ):
             return await self._single_raw_stream_result(self.items[0])
 

@@ -35,6 +35,129 @@ from shared.power_platform_client import PowerPlatformClient
 from shared.azure_storage import azure_storage_manager
 
 
+def _safe_name(name: str) -> str:
+    """Sanitize a string for use as a filename inside the ZIP — strip
+    path separators and colons, collapse whitespace, cap length."""
+    import re
+    s = (name or "event").strip()
+    s = re.sub(r"[\\/:*?\"<>|]+", "_", s)
+    s = re.sub(r"\s+", " ", s).strip() or "event"
+    return s[:120]
+
+
+def _ics_escape(value: str) -> str:
+    """Escape commas, semicolons, and newlines per RFC 5545 section 3.3.11."""
+    if value is None:
+        return ""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "")
+        .replace(",", "\\,")
+        .replace(";", "\\;")
+    )
+
+
+def _ics_datetime(raw: dict) -> str:
+    """Graph event start/end payloads look like:
+       {'dateTime': '2026-04-19T10:00:00.0000000', 'timeZone': 'UTC'}
+    Convert to RFC 5545 form: 20260419T100000Z (if UTC) or the local
+    form plus TZID param when timeZone is present."""
+    from datetime import datetime
+    dt_str = (raw or {}).get("dateTime") or ""
+    tz = ((raw or {}).get("timeZone") or "").strip()
+    if not dt_str:
+        return ""
+    # Graph sometimes includes 7-digit fractional seconds — trim to 6.
+    if "." in dt_str:
+        head, tail = dt_str.split(".", 1)
+        tail = tail[:6]
+        dt_str = f"{head}.{tail}"
+    try:
+        dt = datetime.fromisoformat(dt_str)
+    except ValueError:
+        return dt_str
+    compact = dt.strftime("%Y%m%dT%H%M%S")
+    if tz.lower() in ("utc", "coordinated universal time", "gmt"):
+        return compact + "Z"
+    return compact  # consumers interpret per the TZID param on DTSTART
+
+
+def _event_to_ics(event: dict) -> str:
+    """Serialize a Graph event dict to a minimal VCALENDAR/VEVENT block."""
+    if not isinstance(event, dict):
+        return ""
+    uid = event.get("id") or event.get("iCalUId") or "tmvault-event"
+    summary = event.get("subject") or "(no subject)"
+    body_preview = ((event.get("body") or {}).get("content") or event.get("bodyPreview") or "")[:2000]
+    location = (event.get("location") or {}).get("displayName") or ""
+    organizer = (((event.get("organizer") or {}).get("emailAddress") or {}).get("address") or "")
+    attendees = []
+    for a in (event.get("attendees") or []):
+        addr = ((a.get("emailAddress") or {}).get("address") or "").strip()
+        if addr:
+            attendees.append(addr)
+    start_raw = event.get("start") or {}
+    end_raw = event.get("end") or {}
+    start_ics = _ics_datetime(start_raw)
+    end_ics = _ics_datetime(end_raw)
+    start_tz = (start_raw.get("timeZone") or "").strip()
+    end_tz = (end_raw.get("timeZone") or "").strip()
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//TMvault//Calendar Export//EN",
+        "CALSCALE:GREGORIAN",
+        "BEGIN:VEVENT",
+        f"UID:{_ics_escape(uid)}",
+        f"SUMMARY:{_ics_escape(summary)}",
+    ]
+    if start_ics:
+        if start_tz and not start_ics.endswith("Z"):
+            lines.append(f"DTSTART;TZID={_ics_escape(start_tz)}:{start_ics}")
+        else:
+            lines.append(f"DTSTART:{start_ics}")
+    if end_ics:
+        if end_tz and not end_ics.endswith("Z"):
+            lines.append(f"DTEND;TZID={_ics_escape(end_tz)}:{end_ics}")
+        else:
+            lines.append(f"DTEND:{end_ics}")
+    if location:
+        lines.append(f"LOCATION:{_ics_escape(location)}")
+    if organizer:
+        lines.append(f"ORGANIZER:mailto:{organizer}")
+    for addr in attendees:
+        lines.append(f"ATTENDEE:mailto:{addr}")
+    if body_preview:
+        lines.append(f"DESCRIPTION:{_ics_escape(body_preview)}")
+    lines.append("END:VEVENT")
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _event_to_csv_row(event: dict) -> dict:
+    """Flatten a Graph event into one CSV row."""
+    if not isinstance(event, dict):
+        return {}
+    attendees = [
+        ((a.get("emailAddress") or {}).get("address") or "")
+        for a in (event.get("attendees") or [])
+    ]
+    return {
+        "id": event.get("id") or "",
+        "subject": event.get("subject") or "",
+        "start": (event.get("start") or {}).get("dateTime") or "",
+        "end": (event.get("end") or {}).get("dateTime") or "",
+        "isAllDay": bool(event.get("isAllDay")),
+        "location": (event.get("location") or {}).get("displayName") or "",
+        "organizer": ((event.get("organizer") or {}).get("emailAddress") or {}).get("address") or "",
+        "attendees": ";".join(a for a in attendees if a),
+        "bodyPreview": (event.get("bodyPreview") or "")[:500],
+        "webLink": event.get("webLink") or "",
+    }
+
+
 class RestoreWorker:
     """Main restore worker that processes restore jobs from RabbitMQ queues"""
 
@@ -751,6 +874,14 @@ class RestoreWorker:
                 except Exception:
                     it.shard_index = 0
 
+            # Folder-select intent: spec.preserveTree=true means the user
+            # picked a folder (not individual files), so even a 1-item
+            # expansion must produce a ZIP that preserves the folder path.
+            preserve_tree = bool(
+                _spec.get("preserveTree")
+                or (message or {}).get("preserveTree")
+                or False
+            )
             orch = FileExportOrchestrator(
                 job_id=job_id,
                 snapshot_ids=snapshot_ids,
@@ -766,6 +897,7 @@ class RestoreWorker:
                 max_file_bytes=_mail_export_settings.EXPORT_ONEDRIVE_MAX_FILE_BYTES,
                 path_max_len=_mail_export_settings.EXPORT_ONEDRIVE_PATH_MAX_LEN,
                 sanitize_chars=_mail_export_settings.EXPORT_ONEDRIVE_SANITIZE_CHARS,
+                preserve_tree=preserve_tree,
             )
             async with self._export_semaphore:
                 result = await orch.run()
@@ -799,6 +931,15 @@ class RestoreWorker:
             if item_type.startswith("POWER_FLOW"): return "power-automate"
             if item_type.startswith("POWER_DLP"): return "power-dlp"
             return "files"
+
+        # Per-request export-format selector. Calendar uses ICS | CSV
+        # | (fallthrough JSON); other workloads currently ignore this.
+        _zip_spec = spec or {}
+        fmt = (
+            _zip_spec.get("exportFormat")
+            or (message or {}).get("exportFormat")
+            or ""
+        ).upper()
 
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for item in items:
@@ -836,6 +977,25 @@ class RestoreWorker:
                             f"files/{item.name or item.external_id}.json",
                             content if isinstance(content, str) else json.dumps(content, indent=2)
                         )
+                    elif item.item_type == "CALENDAR_EVENT":
+                        # Honor exportFormat for calendar. ICS = one .ics
+                        # per event (Outlook / Google / Apple importable);
+                        # CSV = all events aggregated into one
+                        # calendar.csv; anything else = JSON fallback.
+                        if fmt == "ICS":
+                            zip_file.writestr(
+                                f"calendar/{_safe_name(item.name or item.external_id)}.ics",
+                                _event_to_ics(raw_data),
+                            )
+                        elif fmt == "CSV":
+                            if not hasattr(self, "_calendar_csv_rows"):
+                                self._calendar_csv_rows = []
+                            self._calendar_csv_rows.append(_event_to_csv_row(raw_data))
+                        else:
+                            zip_file.writestr(
+                                f"calendar/{item.external_id}.json",
+                                json.dumps(raw_data, indent=2),
+                            )
                     elif item.item_type in ("TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY", "TEAMS_CHAT_MESSAGE"):
                         # Export Teams message as JSON
                         zip_file.writestr(
@@ -873,6 +1033,27 @@ class RestoreWorker:
                     exported_count += 1
                 except Exception as e:
                     print(f"[{self.worker_id}] Failed to export item {item.id}: {e}")
+
+            # Flush the accumulated CSV rows as a single calendar.csv.
+            csv_rows = getattr(self, "_calendar_csv_rows", None)
+            if csv_rows:
+                import io as _io
+                import csv as _csv
+                buf = _io.StringIO()
+                writer = _csv.DictWriter(
+                    buf,
+                    fieldnames=[
+                        "subject", "start", "end", "isAllDay",
+                        "location", "organizer", "attendees",
+                        "bodyPreview", "webLink", "id",
+                    ],
+                    extrasaction="ignore",
+                )
+                writer.writeheader()
+                for row in csv_rows:
+                    writer.writerow(row)
+                zip_file.writestr("calendar/calendar.csv", buf.getvalue())
+                self._calendar_csv_rows = []
 
         zip_buffer.seek(0)
         zip_bytes = zip_buffer.getvalue()
