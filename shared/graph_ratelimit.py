@@ -88,3 +88,43 @@ class BackoffWalker:
     def reset(self) -> None:
         self._index = 0
         self._cumulative = 0.0
+
+
+class AsyncTokenBucket:
+    """Token bucket pacing, asyncio-safe.
+
+    Tokens accrue at `rate_per_sec`. `acquire()` blocks until one is
+    available. `capacity` allows short bursts up to that many tokens.
+
+    rate_per_sec=0 disables pacing — `acquire()` always returns
+    immediately. This is the degraded-mode fallback so turning a pace
+    knob to 0 in env disables it without code changes.
+    """
+
+    def __init__(self, rate_per_sec: float, capacity: int = 1):
+        self._rate = max(rate_per_sec, 0.0)
+        self._capacity = max(capacity, 1)
+        self._tokens = float(self._capacity)
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, cost: float = 1.0) -> None:
+        if self._rate <= 0:
+            return
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                self._tokens = min(
+                    self._capacity, self._tokens + elapsed * self._rate
+                )
+                self._last_refill = now
+                if self._tokens >= cost:
+                    self._tokens -= cost
+                    return
+                deficit = cost - self._tokens
+                wait = deficit / self._rate
+            await asyncio.sleep(wait)
+
+    def rate(self) -> float:
+        return self._rate

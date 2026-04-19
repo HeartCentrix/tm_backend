@@ -74,3 +74,47 @@ def test_walker_exceeded_cap():
         w.next()
     assert w.exceeded_cumulative_cap(40) is True
     assert w.exceeded_cumulative_cap(60) is False
+
+
+import asyncio
+
+
+@pytest.mark.asyncio
+async def test_bucket_admits_first_request_immediately():
+    from shared.graph_ratelimit import AsyncTokenBucket
+    b = AsyncTokenBucket(rate_per_sec=1.0, capacity=1)
+    t0 = asyncio.get_event_loop().time()
+    await b.acquire()
+    elapsed = asyncio.get_event_loop().time() - t0
+    assert elapsed < 0.05
+
+
+@pytest.mark.asyncio
+async def test_bucket_paces_second_request():
+    from shared.graph_ratelimit import AsyncTokenBucket
+    b = AsyncTokenBucket(rate_per_sec=5.0, capacity=1)
+    await b.acquire()
+    t0 = asyncio.get_event_loop().time()
+    await b.acquire()
+    elapsed = asyncio.get_event_loop().time() - t0
+    assert 0.15 < elapsed < 0.35
+
+
+@pytest.mark.asyncio
+async def test_bucket_burst_up_to_capacity():
+    from shared.graph_ratelimit import AsyncTokenBucket
+    b = AsyncTokenBucket(rate_per_sec=1.0, capacity=3)
+    t0 = asyncio.get_event_loop().time()
+    for _ in range(3):
+        await b.acquire()
+    assert asyncio.get_event_loop().time() - t0 < 0.05
+
+
+@pytest.mark.asyncio
+async def test_bucket_rate_zero_disables_pacing():
+    from shared.graph_ratelimit import AsyncTokenBucket
+    b = AsyncTokenBucket(rate_per_sec=0.0, capacity=1)
+    t0 = asyncio.get_event_loop().time()
+    for _ in range(20):
+        await b.acquire()
+    assert asyncio.get_event_loop().time() - t0 < 0.05
