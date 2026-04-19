@@ -595,28 +595,71 @@ class BackupWorker:
                     return out
 
                 if kind == "USER_CONTACTS":
+                    # `/users/{id}/contacts` returns ONLY the root Contacts
+                    # folder. To cover every folder (Skype-synced contacts,
+                    # mobile-device folders, custom folders) we first list
+                    # contactFolders and then fetch per-folder contacts.
+                    # Root folder's items are also included via the direct
+                    # /contacts call so nothing slips through if the folder
+                    # list is truncated.
                     folder_map: Dict[str, str] = {}
+                    folder_ids: List[str] = []
                     try:
                         f_page = await graph_client._get(
                             f"{graph_client.GRAPH_URL}/users/{user_id}/contactFolders",
                             params={"$top": "100", "$select": "id,displayName"},
                         )
                         for f in (f_page or {}).get("value", []) or []:
-                            folder_map[f.get("id")] = f.get("displayName") or ""
+                            fid = f.get("id")
+                            if fid:
+                                folder_map[fid] = f.get("displayName") or ""
+                                folder_ids.append(fid)
                     except Exception:
                         pass
-                    page = await graph_client._get(
-                        f"{graph_client.GRAPH_URL}/users/{user_id}/contacts",
-                        params={"$top": str(ITEM_LIMIT), "$select": "id,displayName,givenName,surname,companyName,jobTitle,emailAddresses,businessPhones,parentFolderId"},
-                    )
-                    return [
+
+                    select_fields = "id,displayName,givenName,surname,companyName,jobTitle,emailAddresses,businessPhones,mobilePhone,homePhones,parentFolderId,categories,imAddresses,personalNotes,birthday"
+
+                    async def _fetch_contacts(url: str) -> List[Dict[str, Any]]:
+                        all_rows: List[Dict[str, Any]] = []
+                        next_url: Optional[str] = url
+                        params: Optional[Dict[str, str]] = {"$top": str(ITEM_LIMIT), "$select": select_fields}
+                        pages = 0
+                        while next_url and pages < 50:
+                            try:
+                                page_data = await graph_client._get(next_url, params=params)
+                            except Exception as exc:
+                                logger.warning("[%s] Contact fetch failed on %s: %s", self.worker_id, next_url, exc)
+                                break
+                            all_rows.extend(page_data.get("value", []) or [])
+                            next_url = page_data.get("@odata.nextLink")
+                            params = None
+                            pages += 1
+                        return all_rows
+
+                    aggregated: Dict[str, Dict[str, Any]] = {}
+                    # 1) Root-folder direct fetch.
+                    for c in await _fetch_contacts(f"{graph_client.GRAPH_URL}/users/{user_id}/contacts"):
+                        cid = c.get("id")
+                        if cid and cid not in aggregated:
+                            aggregated[cid] = c
+                    # 2) Every enumerated contactFolder.
+                    for fid in folder_ids:
+                        url = f"{graph_client.GRAPH_URL}/users/{user_id}/contactFolders/{fid}/contacts"
+                        for c in await _fetch_contacts(url):
+                            cid = c.get("id")
+                            if cid and cid not in aggregated:
+                                aggregated[cid] = c
+
+                    out_rows = [
                         ("USER_CONTACT",
-                         c.get("displayName") or "(unnamed)",
+                         c.get("displayName") or (c.get("emailAddresses") or [{}])[0].get("address") or "(unnamed)",
                          c.get("id"),
                          {"raw": c},
                          folder_map.get(c.get("parentFolderId")) or "Contacts")
-                        for c in page.get("value", [])
+                        for c in aggregated.values()
                     ]
+                    print(f"[{self.worker_id}]   [USER_CONTACTS] {user_id}: {len(folder_ids)} folders, {len(out_rows)} contacts aggregated")
+                    return out_rows
 
                 if kind == "USER_CALENDAR":
                     page = await graph_client._get(

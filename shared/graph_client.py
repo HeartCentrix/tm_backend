@@ -294,6 +294,12 @@ class GraphClient:
         next_url = url
         max_retries = 5
         retry_count = 0
+        # Reset the captured delta link at the start of each stream so a
+        # stale value from a previous call never leaks into the caller's
+        # `getattr(graph_client, "_last_delta_link", None)` read. Without
+        # this the legacy path silently breaks incremental backups (every
+        # run re-fetches full history because the token is never stored).
+        self._last_delta_link: Optional[str] = None
 
         while next_url:
             token = await self._get_token()
@@ -325,6 +331,11 @@ class GraphClient:
                     data = resp.json()
                     retry_count = 0
                     yield data
+                    # Graph returns @odata.deltaLink on the FINAL page of a
+                    # delta stream (mutually exclusive with @odata.nextLink).
+                    # Persist it so callers can store and resume next run.
+                    if "@odata.deltaLink" in data:
+                        self._last_delta_link = data["@odata.deltaLink"]
                     next_url = data.get("@odata.nextLink")
                     params = None  # params only on the first request
 
