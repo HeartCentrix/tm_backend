@@ -283,7 +283,7 @@ class Settings:
     def _parse_graph_apps(self) -> List[dict]:
         """Parse multiple Graph app registrations from env vars."""
         apps = []
-        for i in range(1, 11):  # Support up to 10 app registrations
+        for i in range(1, 17):  # Support up to 16 app registrations
             # Only use fallback for APP_1 (legacy single-app mode)
             if i == 1:
                 client_id = os.getenv(f"APP_{i}_CLIENT_ID") or os.getenv("AZURE_AD_CLIENT_ID", "")
