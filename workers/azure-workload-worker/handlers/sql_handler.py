@@ -20,9 +20,11 @@ import pyodbc
 from azure.mgmt.sql.aio import SqlManagementClient
 from azure.core.exceptions import HttpResponseError
 
-from shared.models import Resource, Tenant, Snapshot
+from shared.models import Resource, Tenant, Snapshot, SnapshotItem
+from shared.database import async_session_factory
 from shared.azure_storage import azure_storage_manager
 from shared.config import settings
+import uuid as _uuid
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 from lro import await_lro
@@ -95,6 +97,19 @@ class SqlBackupHandler:
             config_result = await self._capture_configuration(
                 sql_mgmt, resource, tenant, snapshot, rg, server_name, db_name
             )
+
+            # Persist SnapshotItem rows so Recovery can list Config /
+            # Database / Schema files / Tables. Without this the backup
+            # writes to blob storage but /files returns an empty list.
+            try:
+                await self._persist_snapshot_items(
+                    resource=resource, tenant=tenant, snapshot=snapshot,
+                    server_name=server_name, db_name=db_name,
+                    data_result=data_result, schema_result=schema_result,
+                    config_result=config_result,
+                )
+            except Exception as pe:
+                self._log(f"WARN snapshot_item persist failed: {pe}", "WARNING")
 
             # Finalize
             total_size = data_result.get("total_bytes", 0) + schema_result.get("size_bytes", 0) + config_result.get("size_bytes", 0)
@@ -220,6 +235,7 @@ class SqlBackupHandler:
 
         total_bytes = 0
         total_rows = 0
+        table_details: list = []
 
         # Check for incremental: get last successful backup time from resource column
         last_backup_time = resource.last_backup_at
@@ -238,12 +254,17 @@ class SqlBackupHandler:
             nonlocal total_bytes, total_rows
             async with semaphore:
                 table_start = time.monotonic()
-                table_bytes, table_rows = await self._export_single_table(
+                table_bytes, table_rows, blob_name = await self._export_single_table(
                     conn_str, container, blob_prefix, schema, table, shard,
                     last_backup_time=last_backup_time,
                 )
                 total_bytes += table_bytes
                 total_rows += table_rows
+                table_details.append({
+                    "schema": schema, "table": table,
+                    "blob_path": blob_name,
+                    "size_bytes": table_bytes, "row_count": table_rows,
+                })
                 table_duration = time.monotonic() - table_start
                 self._log(f"  ✓ Table [{schema}].[{table}]: {table_rows} rows, "
                           f"{table_bytes / 1024:.1f} KB in {table_duration:.1f}s")
@@ -256,6 +277,7 @@ class SqlBackupHandler:
             "rows_count": total_rows,
             "total_bytes": total_bytes,
             "blob_prefix": blob_prefix,
+            "tables": table_details,
         }
 
     async def _export_single_table(self, conn_str: str, container: str,
@@ -379,7 +401,7 @@ class SqlBackupHandler:
                 },
             )
 
-            return file_size, row_count
+            return file_size, row_count, blob_name
         finally:
             # Clean up temp file
             try:
@@ -459,7 +481,11 @@ class SqlBackupHandler:
                 )
 
                 schema_size += len(content_bytes)
-                schema_artifacts.append({"name": artifact_name, "size": len(content_bytes)})
+                schema_artifacts.append({
+                    "name": artifact_name,
+                    "size_bytes": len(content_bytes),
+                    "blob_path": blob_path,
+                })
             except Exception as e:
                 self._log(f"  Warning: Failed to capture {artifact_name}: {e}", "WARNING")
 
@@ -483,80 +509,226 @@ class SqlBackupHandler:
             metadata={"content_type": "dacpac-metadata"},
         )
         schema_size += len(dacpac_content)
+        schema_artifacts.append({
+            "name": f"{db_name}.dacpac.metadata.json",
+            "size_bytes": len(dacpac_content),
+            "blob_path": dacpac_blob_path,
+        })
 
         self._log(f"  ✓ Schema captured: {len(schema_artifacts)} artifacts, {schema_size / 1024:.1f} KB")
-        return {"blob_path": f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/schema/", "size_bytes": schema_size}
+        return {
+            "blob_path": f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/schema/",
+            "size_bytes": schema_size,
+            "artifacts": schema_artifacts,
+        }
 
     # ==================== Phase 3: Capture Configuration ====================
 
     async def _capture_configuration(self, sql_mgmt, resource: Resource, tenant: Tenant,
                                       snapshot: Snapshot, rg: str, server_name: str,
                                       db_name: str) -> Dict:
-        """
-        Capture SQL server + database configuration as JSON.
+        """Capture SQL server + database configuration with the full set of
+        fields the Configuration tab renders (Essential / Compute+storage /
+        Backup / Maintenance / Networking / HA / Replication).
+
+        Shape mirrors the Postgres handler so the shared AzureDbConfiguration
+        React component can render both without branching per server type.
         """
         container = azure_storage_manager.get_container_name(str(tenant.id), "azure-sql")
         shard = azure_storage_manager.get_default_shard()
 
         self._log(f"  Phase 3: Capturing configuration for {db_name}...")
 
-        config = {
+        config: Dict[str, Any] = {
+            "server_type": "AZURE_SQL",
             "server_name": server_name,
             "database_name": db_name,
             "resource_group": rg,
             "subscription_id": resource.azure_subscription_id,
             "captured_at": datetime.now(timezone.utc).isoformat(),
-            "server_config": {},
-            "database_config": {},
-            "firewall_rules": [],
-            "tde": {},
         }
 
         try:
-            db = await sql_mgmt.databases.get(
-                resource_group_name=rg,
-                server_name=server_name,
-                database_name=db_name,
-            )
-            config["database_config"] = {
-                "edition": getattr(db, 'edition', None),
-                "status": getattr(db, 'status', None),
-                "collation": getattr(db, 'collation', None),
-                "max_size_bytes": getattr(db, 'max_size_bytes', None),
-                "service_objective_name": getattr(db, 'current_service_objective_name', None),
-                "zone_redundant": getattr(db, 'zone_redundant', None),
+            server = await sql_mgmt.servers.get(rg, server_name)
+
+            config["location"] = getattr(server, "location", None)
+            config["fully_qualified_domain_name"] = getattr(server, "fully_qualified_domain_name", None)
+            config["administrator_login"] = getattr(server, "administrator_login", None)
+            config["version"] = getattr(server, "version", None)
+            config["state"] = getattr(server, "state", None)
+
+            # Server identity (for Security panel).
+            identity = getattr(server, "identity", None)
+            id_type = str(getattr(identity, "type", "") or "")
+            user_ids = getattr(identity, "user_assigned_identities", None) or {}
+            primary_uid = getattr(identity, "user_assigned_identity_id", "") or ""
+            config["identity"] = {
+                "type": id_type,
+                "system_assigned": "Enabled" if "SystemAssigned" in id_type else "Disabled",
+                "user_assigned_count": len(user_ids) if isinstance(user_ids, dict) else 0,
+                "primary_user_assigned": primary_uid or "Not configured",
             }
 
-            fw_rules = []
+            # Network — public access + private endpoints.
+            public_net = getattr(server, "public_network_access", None)
+            pe_list = getattr(server, "private_endpoint_connections", None) or []
+            config["network"] = {
+                "publicNetworkAccess": public_net,
+                "delegatedSubnetResourceId": None,
+                "privateEndpointCount": len(pe_list) if isinstance(pe_list, (list, tuple)) else 0,
+            }
+
+            # Entra ID admin assignment (who can log in as "AAD admin").
+            entra_admin_login = ""
             try:
-                async for rule in sql_mgmt.firewall_rules.list_by_server(rg, server_name):
-                    fw_rules.append({
-                        "name": rule.name,
-                        "start_ip": rule.start_ip_address,
-                        "end_ip": rule.end_ip_address,
-                    })
+                async for adm in sql_mgmt.server_azure_ad_administrators.list_by_server(rg, server_name):
+                    entra_admin_login = getattr(adm, "login", "") or entra_admin_login
+                    break
             except Exception:
                 pass
-            config["firewall_rules"] = fw_rules
+            config["authentication"] = {
+                # If an Entra admin exists the server supports both. Pure
+                # SQL auth if it's absent.
+                "method": "Entra ID & SQL" if entra_admin_login else "SQL",
+                "sql_admin": getattr(server, "administrator_login", "") or "",
+                "entra_admin": entra_admin_login or "",
+            }
 
+            # Firewall rule count — the Configuration tab shows this as
+            # "N firewall rules"; list + count rather than embedding.
+            fw_count = 0
+            try:
+                async for _ in sql_mgmt.firewall_rules.list_by_server(rg, server_name):
+                    fw_count += 1
+            except Exception as fe:
+                self._log(f"firewall rules fetch failed: {fe}", "WARNING")
+            config["firewallRuleCount"] = fw_count
+        except Exception as e:
+            self._log(f"server capture failed: {e}", "WARNING")
+
+        try:
+            db = await sql_mgmt.databases.get(
+                resource_group_name=rg, server_name=server_name, database_name=db_name,
+            )
+
+            # The SDK exposes currentSku as `current_sku`; the plain
+            # `sku` attribute is often the requested one (or None). Fall
+            # back to whichever is populated.
+            sku = getattr(db, "current_sku", None) or getattr(db, "sku", None)
+            config["sku"] = {
+                "name": getattr(sku, "name", "") or "",
+                "tier": getattr(sku, "tier", "") or "",
+                "capacity": getattr(sku, "capacity", "") or "",
+            }
+
+            max_bytes = getattr(db, "max_size_bytes", None) or 0
+            max_gb = round(max_bytes / (1024 ** 3), 2) if max_bytes else None
+            config["storage"] = {
+                "storageSizeGB": max_gb,
+                # Azure SQL has no user-visible auto-grow — storage is
+                # service-managed. Be explicit about it so the UI shows
+                # a meaningful value instead of blank.
+                "autoGrow": "Service-managed",
+            }
+            config["database_state"] = getattr(db, "status", None)
+            config["collation"] = getattr(db, "collation", None)
+            config["zone_redundant"] = bool(getattr(db, "zone_redundant", False))
+
+            # Auto-pause delay (serverless). -1 means "disabled" in Azure's model.
+            ap = getattr(db, "auto_pause_delay", None)
+            if ap is None or ap == -1:
+                config["auto_pause_delay"] = "Disabled"
+            else:
+                config["auto_pause_delay"] = f"{ap} minutes"
+
+            # Ledger + secure-enclave flags for the Security panel.
+            config["ledger"] = {
+                "enabled": "Enabled" if bool(getattr(db, "is_ledger_on", False)) else "Disabled",
+                "digest_storage": "Not configured",  # set only when managed digests are configured
+            }
+            pref = getattr(db, "preferred_enclave_type", None)
+            config["secure_enclaves"] = "Enabled" if (pref and str(pref).lower() != "default") else "Disabled"
+
+            # Replication count for the Availability panel. read_scale
+            # controls read-only secondary replicas; high_availability
+            # reflects primary+secondary copies.
+            ha_count = getattr(db, "high_availability_replica_count", 0) or 0
+            rs = getattr(db, "read_scale", None)
+            rs_str = str(rs) if rs is not None else ""
+            config["replication"] = {
+                "replica_count": int(ha_count),
+                "read_scale": rs_str,
+            }
+
+            # Backup storage redundancy (Geo / Local / Zone).
+            cbsr = getattr(db, "current_backup_storage_redundancy", None)
+            rbsr = getattr(db, "requested_backup_storage_redundancy", None)
+            config["backup_storage_redundancy"] = str(cbsr or rbsr or "")
+
+            # availabilityZone lives on the database, not the server
+            # (values observed: "NoPreference", "1", "2", "3").
+            az_val = getattr(db, "availability_zone", None)
+            if not az_val:
+                az_val = "Zone redundant" if bool(getattr(db, "zone_redundant", False)) else ""
+            config["availability_zone"] = str(az_val) if az_val else ""
+
+            # Time created — SQL puts creationDate on the database, not
+            # the server (servers have systemData=null in this tenant).
+            created = getattr(db, "creation_date", None)
+            if created:
+                try:
+                    config["time_created"] = created.isoformat()
+                except Exception:
+                    config["time_created"] = str(created)
+            else:
+                config["time_created"] = ""
+
+            # Short-term backup retention — the Backup panel shows this
+            # as "Retention period (days)".
+            retention_days = None
+            try:
+                rp = await sql_mgmt.backup_short_term_retention_policies.get(
+                    rg, server_name, db_name, "default",
+                )
+                retention_days = getattr(rp, "retention_days", None)
+            except Exception:
+                pass
+            config["backup"] = {
+                "backupRetentionDays": retention_days,
+                "geoRedundantBackup": "Enabled" if (
+                    str(getattr(db, "requested_backup_storage_redundancy", "")).lower() == "geo"
+                    or str(getattr(db, "current_backup_storage_redundancy", "")).lower() == "geo"
+                ) else "Disabled",
+            }
+
+            # Maintenance window — surfaces the SQL database's assigned
+            # maintenance configuration (e.g. SQL_Default).
+            maint_cfg_id = getattr(db, "maintenance_configuration_id", "") or ""
+            maint_name = maint_cfg_id.rsplit("/", 1)[-1] if maint_cfg_id else ""
+            config["maintenance"] = {
+                "configurationId": maint_cfg_id,
+                "configurationName": maint_name or "SQL_Default",
+            }
+
+            # High-availability + replication.
+            config["highAvailability"] = {
+                "mode": "Enabled" if bool(getattr(db, "zone_redundant", False)) else "Disabled",
+            }
+            replication_role = (
+                getattr(db, "secondary_type", None)
+                or getattr(db, "source_database_id", None) and "Secondary"
+                or "None"
+            )
+            config["replicationRole"] = replication_role or "None"
+
+            # TDE (kept for ops use in the raw JSON, not surfaced on UI yet).
             try:
                 tde = await sql_mgmt.transparent_data_encryptions.get(rg, server_name, db_name, "current")
-                config["tde"] = {"status": getattr(tde, 'status', None)}
+                config["tde"] = {"status": getattr(tde, "status", None)}
             except Exception:
                 config["tde"] = {"status": "unknown"}
-
-            try:
-                server = await sql_mgmt.servers.get(rg, server_name)
-                config["server_config"] = {
-                    "location": getattr(server, 'location', None),
-                    "version": getattr(server, 'version', None),
-                    "state": getattr(server, 'state', None),
-                }
-            except Exception:
-                pass
-
         except Exception as e:
-            self._log(f"  Warning: Failed to capture config: {e}", "WARNING")
+            self._log(f"database capture failed: {e}", "WARNING")
 
         blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/config/{db_name}-config.json"
         content = json.dumps(config, indent=2, default=str).encode()
@@ -568,7 +740,7 @@ class SqlBackupHandler:
         )
 
         self._log(f"  ✓ Configuration captured: {len(content) / 1024:.1f} KB")
-        return {"blob_path": blob_path, "size_bytes": len(content)}
+        return {"blob_path": blob_path, "size_bytes": len(content), "config": config}
 
     # ==================== Helper Methods ====================
 
@@ -603,6 +775,119 @@ class SqlBackupHandler:
                 lines.append(f"-- Column: [{schema}].[{table}].[{col}] {dtype} {nullable}")
 
         return "\n".join(lines)
+
+    async def _persist_snapshot_items(
+        self, *, resource: Resource, tenant: Tenant, snapshot: Snapshot,
+        server_name: str, db_name: str,
+        data_result: Dict, schema_result: Dict, config_result: Dict,
+    ) -> None:
+        """Emit the SnapshotItem rows that power the Azure SQL Recovery UI.
+
+        Shape mirrors Postgres so the existing AzureDbView can render:
+          • 1 × AZURE_DB_CONFIG     — <db>-config.json (Configuration tab)
+          • 1 × AZURE_DB_DATABASE   — the database (left rail)
+          • N × AZURE_DB_SCHEMA_FILE — tables.sql / indexes.sql / views.sql / … / .dacpac.json
+          • N × AZURE_DB_TABLE      — per-table data dump
+        """
+        rows: list = []
+
+        cfg_blob = config_result.get("blob_path") or ""
+        cfg_name = cfg_blob.rsplit("/", 1)[-1] or f"{db_name}-config.json"
+        cfg_raw = config_result.get("config") or {}
+        rows.append(SnapshotItem(
+            id=_uuid.uuid4(),
+            snapshot_id=snapshot.id,
+            tenant_id=tenant.id,
+            external_id=f"{server_name}:{db_name}:config",
+            item_type="AZURE_DB_CONFIG",
+            name=cfg_name,
+            folder_path="",
+            content_size=int(config_result.get("size_bytes") or 0),
+            content_hash=None,
+            content_checksum=None,
+            blob_path=cfg_blob,
+            extra_data={
+                "server_name": server_name,
+                "database_name": db_name,
+                "server_type": "AZURE_SQL",
+                "raw": cfg_raw,
+            },
+        ))
+
+        rows.append(SnapshotItem(
+            id=_uuid.uuid4(),
+            snapshot_id=snapshot.id,
+            tenant_id=tenant.id,
+            external_id=f"{server_name}:{db_name}",
+            item_type="AZURE_DB_DATABASE",
+            name=db_name,
+            folder_path="",
+            content_size=0,
+            content_hash=None,
+            content_checksum=None,
+            blob_path=None,
+            extra_data={
+                "server_name": server_name,
+                "database_name": db_name,
+                "server_type": "AZURE_SQL",
+                "tables_count": int(data_result.get("tables_count") or 0),
+                "rows_count": int(data_result.get("rows_count") or 0),
+            },
+        ))
+
+        # Schema artifacts — flat list under <db>/ so the Schema tab's
+        # tree renderer shows them at root. We keep extensions in the
+        # name field (tables.sql, indexes.sql, etc.).
+        for art in (schema_result.get("artifacts") or []):
+            rows.append(SnapshotItem(
+                id=_uuid.uuid4(),
+                snapshot_id=snapshot.id,
+                tenant_id=tenant.id,
+                external_id=f"{server_name}:{db_name}:schema:{art.get('name')}",
+                item_type="AZURE_DB_SCHEMA_FILE",
+                name=art.get("name") or "schema.sql",
+                folder_path=db_name,
+                content_size=int(art.get("size_bytes") or 0),
+                content_hash=None,
+                content_checksum=None,
+                blob_path=art.get("blob_path"),
+                extra_data={
+                    "server_name": server_name,
+                    "database_name": db_name,
+                    "server_type": "AZURE_SQL",
+                },
+            ))
+
+        # Per-table data dumps.
+        for t in (data_result.get("tables") or []):
+            schema = t.get("schema") or "dbo"
+            table = t.get("table") or "(unnamed)"
+            rows.append(SnapshotItem(
+                id=_uuid.uuid4(),
+                snapshot_id=snapshot.id,
+                tenant_id=tenant.id,
+                external_id=f"{server_name}:{db_name}:{schema}:{table}",
+                item_type="AZURE_DB_TABLE",
+                name=table,
+                folder_path=f"{db_name}/{schema}",
+                content_size=int(t.get("size_bytes") or 0),
+                content_hash=None,
+                content_checksum=None,
+                blob_path=t.get("blob_path"),
+                extra_data={
+                    "server_name": server_name,
+                    "database_name": db_name,
+                    "schema": schema,
+                    "table": table,
+                    "row_count": int(t.get("row_count") or 0),
+                    "server_type": "AZURE_SQL",
+                },
+            ))
+
+        async with async_session_factory() as sess:
+            sess.add_all(rows)
+            await sess.commit()
+        self._log(f"  Persisted {len(rows)} SnapshotItem rows for Recovery UI")
 
     def _log(self, message: str, level: str = "INFO"):
         prefix = f"[{self.worker_id}]"

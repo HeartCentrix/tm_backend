@@ -274,6 +274,16 @@ class AzureWorkloadWorker:
             logger.info("[%s] Processing %s backup for %s (%s, tenant=%s)",
                         self.worker_id, resource_type, resource.display_name, resource_id, tenant.id)
 
+            # Flip job to RUNNING so the Protection page + Activity feed
+            # can show "In Progress" while the backup is actually running.
+            # Without this the job stayed QUEUED → COMPLETED/FAILED and
+            # the UI never showed a running state (the server-side
+            # last_backup_status read from jobs.status never hit RUNNING).
+            # Denormalized resource.last_backup_status is updated too so
+            # queries that read straight off the resource agree.
+            job.status = JobStatus.RUNNING
+            resource.last_backup_status = "RUNNING"
+
             # Create snapshot
             snapshot = Snapshot(
                 id=uuid.uuid4(),

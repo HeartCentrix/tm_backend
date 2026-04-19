@@ -119,10 +119,12 @@ services:
       DB_HOST: postgres
       # Manual discovery triggered from Protection/Tenant pages runs
       # here too — needs cert access for the SharePoint admin API.
-      SHAREPOINT_CERT_PATH: ${SHAREPOINT_CERT_PATH:-/app/secrets/sharepoint_auth.pem}
+      # Cert shipped via SHAREPOINT_CERT_PEM_B64 env var (graph_client
+      # reads that first, then falls back to disk). Avoids Docker Desktop
+      # WSL "mkdir /run/desktop/mnt/host/d: file exists" glitch that
+      # used to block this container from starting.
+      SHAREPOINT_CERT_PEM_B64: ${SHAREPOINT_CERT_PEM_B64:-}
       SHAREPOINT_CERT_THUMBPRINT: ${SHAREPOINT_CERT_THUMBPRINT:-}
-    volumes:
-      - ../secrets:/app/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -227,10 +229,12 @@ services:
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
       # SharePoint admin API requires a cert-signed JWT. Same setup as
       # backup-worker — see secrets/sharepoint_auth.pem.
-      SHAREPOINT_CERT_PATH: ${SHAREPOINT_CERT_PATH:-/app/secrets/sharepoint_auth.pem}
+      # Cert shipped via SHAREPOINT_CERT_PEM_B64 env var (graph_client
+      # reads that first, then falls back to disk). Avoids Docker Desktop
+      # WSL "mkdir /run/desktop/mnt/host/d: file exists" glitch that
+      # used to block this container from starting.
+      SHAREPOINT_CERT_PEM_B64: ${SHAREPOINT_CERT_PEM_B64:-}
       SHAREPOINT_CERT_THUMBPRINT: ${SHAREPOINT_CERT_THUMBPRINT:-}
-    volumes:
-      - ../secrets:/app/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -320,16 +324,13 @@ services:
       # the client-secret path when unset (Graph works, SP REST 401s
       # with "Unsupported app only token"). See
       # scripts/generate_sharepoint_cert.py + secrets/.
-      SHAREPOINT_CERT_PATH: ${SHAREPOINT_CERT_PATH:-/app/secrets/sharepoint_auth.pem}
+      # Cert shipped via SHAREPOINT_CERT_PEM_B64 env var (graph_client
+      # reads that first, then falls back to disk). The bind-mount was
+      # dropped because Docker Desktop on Windows intermittently errors
+      # with "mkdir /run/desktop/mnt/host/d: file exists" when the WSL
+      # distro reloads, blocking every worker container from starting.
+      SHAREPOINT_CERT_PEM_B64: ${SHAREPOINT_CERT_PEM_B64:-}
       SHAREPOINT_CERT_THUMBPRINT: ${SHAREPOINT_CERT_THUMBPRINT:-}
-    volumes:
-      # Bind-mount the generated cert in read-only. The secrets/ dir
-      # lives one level above the backend (sibling of tm_backend/) so
-      # private keys and certs don't get dragged into the backend image
-      # or accidentally committed with backend code. For Railway/prod,
-      # set SHAREPOINT_CERT_PEM_B64 on the service env instead and drop
-      # this mount.
-      - ../secrets:/app/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -385,13 +386,13 @@ services:
       APP_3_TENANT_ID: ${APP_3_TENANT_ID:-}
       AZURE_AD_CLIENT_ID: ${AZURE_AD_CLIENT_ID}
       AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
-      SHAREPOINT_CERT_PATH: ${SHAREPOINT_CERT_PATH:-/app/secrets/sharepoint_auth.pem}
+      # Cert via env var — drops the /app/secrets bind-mount that was
+      # hitting Docker Desktop's WSL mkdir glitch.
+      SHAREPOINT_CERT_PEM_B64: ${SHAREPOINT_CERT_PEM_B64:-}
       SHAREPOINT_CERT_THUMBPRINT: ${SHAREPOINT_CERT_THUMBPRINT:-}
       # Heavy-pool knobs.
       BACKUP_WORKER_QUEUE: backup.heavy
       MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER: "1"
-    volumes:
-      - ../secrets:/app/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy

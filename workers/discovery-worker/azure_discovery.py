@@ -69,10 +69,12 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
             sql_servers = sql_resp.json().get("value", [])
 
             for server in sql_servers:
-                # Auto-assign our SP as Entra admin — the magic step
+                # Auto-assign our SP as Entra admin — the magic step.
+                # Imports from shared/ so discovery-worker actually has the
+                # module on its PYTHONPATH (the old services.tenant_service
+                # path didn't exist in this image and failed silently).
                 try:
-                    # Dynamic import — directory has hyphen, Python converts to underscore
-                    from services.tenant_service.azure_provisioning import ensure_sql_server_backup_ready
+                    from shared.azure_provisioning import ensure_sql_server_backup_ready
                     await ensure_sql_server_backup_ready(tenant, server, arm_token)
                 except Exception as e:
                     print(f"[AzureDiscovery] Warning: Failed to provision SQL server {server.get('name')}: {e}")
@@ -114,9 +116,9 @@ async def discover_azure_tenant(tenant: Tenant) -> Dict[str, Any]:
                 pg_id = pg.get("id", "")
                 pg_rg = pg_id.split("/")[4] if pg_id else ""
 
-                # Auto-assign our SP as Azure AD admin — the magic step
+                # Auto-assign our SP as Azure AD admin — the magic step.
                 try:
-                    from services.tenant_service.azure_provisioning import ensure_pg_server_backup_ready
+                    from shared.azure_provisioning import ensure_pg_server_backup_ready
                     await ensure_pg_server_backup_ready(tenant, pg, arm_token)
                 except Exception as e:
                     print(f"[AzureDiscovery] Warning: Failed to provision PostgreSQL server {pg_name}: {e}")
