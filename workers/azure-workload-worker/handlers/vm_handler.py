@@ -38,10 +38,12 @@ from azure.mgmt.compute.aio import ComputeManagementClient
 from azure.mgmt.compute.models import DiskCreateOptionTypes
 from azure.mgmt.network.aio import NetworkManagementClient
 
-from shared.models import Resource, Tenant, Snapshot, SnapshotStatus
+from shared.models import Resource, Tenant, Snapshot, SnapshotStatus, SnapshotItem
+from shared.database import async_session_factory
 from shared.azure_storage import azure_storage_manager
 from shared.azure_storage import upload_blob_with_retry
 from shared.config import settings
+import uuid as _uuid
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 from lro import await_lro
@@ -157,6 +159,21 @@ class VmBackupHandler:
             success = len(failed_copies) == 0
             total_bytes = sum(r.get("size_bytes", 0) for r in successful_copies)
 
+            # Persist SnapshotItem rows so Recovery's VM view can render
+            # Virtual machine / Volumes / Disks / Network interfaces /
+            # Public IP addresses tabs. Non-fatal — failure here doesn't
+            # invalidate the already-captured blob data.
+            try:
+                await self._persist_snapshot_items(
+                    resource=resource, tenant=tenant, snapshot=snapshot,
+                    vm_config=vm_config, network_config=network_config,
+                    disk_info=disk_info, copy_results=final_results,
+                    config_blob_result=config_blob_result,
+                    network_blob_result=network_blob_result,
+                )
+            except Exception as pe:
+                self._log(f"snapshot_item persist failed: {pe}", "WARNING")
+
             self._log(
                 f"VM backup {'completed' if success else 'completed with errors'}: "
                 f"{vm_name} — {len(successful_copies)}/{len(disk_info)} disks copied, "
@@ -222,14 +239,17 @@ class VmBackupHandler:
 
         config = self._parse_vm_config(vm, vm_name, rg_name)
         
-        # Fetch extensions (separate API call)
+        # Fetch extensions (separate API call). The aio SDK returns a
+        # VirtualMachineExtensionsListResult wrapper with a `.value`
+        # attribute — not an async iterable. Unwrap before iterating.
         try:
-            extensions_list = await compute_client.virtual_machine_extensions.list(rg_name, vm_name)
+            extensions_result = await compute_client.virtual_machine_extensions.list(rg_name, vm_name)
+            extensions_list = getattr(extensions_result, "value", None) or []
             config["extensions"] = [
                 {
                     "name": ext.name,
-                    "type": ext.type_properties.type if ext.type_properties else None,
-                    "publisher": ext.type_properties.publisher if ext.type_properties else None,
+                    "type": ext.type_properties.type if getattr(ext, "type_properties", None) else None,
+                    "publisher": ext.type_properties.publisher if getattr(ext, "type_properties", None) else None,
                 }
                 for ext in extensions_list
             ]
@@ -677,19 +697,24 @@ class VmBackupHandler:
             async_client = shard.get_async_client()
             blob_client = async_client.get_blob_client(container=container, blob=blob_path)
 
-            # Start the async copy (returns immediately, copy runs on Azure side)
+            # Start the async copy (returns immediately, copy runs on Azure side).
+            # Azure blob metadata must be str→str: coerce every value and drop
+            # Nones (data disks have no os_type, so raw dict had a None value
+            # that blew up the Storage SDK's internal serialization).
+            raw_metadata = {
+                "source_vm": resource.external_id,
+                "source_disk": disk_name,
+                "disk_type": disk_data["type"],
+                "snapshot_id": snapshot_id,
+                "snapshot_name": disk_data["snapshot_name"],
+                "backup_timestamp": datetime.now(timezone.utc).isoformat(),
+                "os_type": disk_data.get("os_type") or "",
+                "cbt_incremental": "true",
+            }
+            safe_metadata = {str(k): str(v) for k, v in raw_metadata.items() if v is not None}
             copy_poller = await blob_client.start_copy_from_url(
                 source_url=sas_url,
-                metadata={
-                    "source_vm": resource.external_id,
-                    "source_disk": disk_name,
-                    "disk_type": disk_data["type"],
-                    "snapshot_id": snapshot_id,
-                    "snapshot_name": disk_data["snapshot_name"],
-                    "backup_timestamp": datetime.now(timezone.utc).isoformat(),
-                    "os_type": disk_data.get("os_type", ""),
-                    "cbt_incremental": "true",
-                },
+                metadata=safe_metadata,
             )
 
             # DO NOT revoke SAS yet — Azure's async copy reads from the SAS URL
@@ -857,6 +882,168 @@ class VmBackupHandler:
         except Exception as e:
             self._log(f"Failed to store network config: {e}", "ERROR")
             return {"success": False, "error": str(e)}
+
+    # ==================== Persist SnapshotItem rows ====================
+
+    async def _persist_snapshot_items(
+        self, *, resource: Resource, tenant: Tenant, snapshot: Snapshot,
+        vm_config: Dict, network_config: Dict, disk_info: list,
+        copy_results: list, config_blob_result: Dict, network_blob_result: Dict,
+    ) -> None:
+        """Emit SnapshotItem rows powering the VM Recovery tabs:
+          • 1 × AZURE_VM_CONFIG     — vm-config.json          (Virtual machine tab)
+          • N × AZURE_VM_DISK       — OS + data disk snapshots (Disks tab)
+          • N × AZURE_VM_VOLUME     — one per disk logical view (Volumes tab)
+          • N × AZURE_VM_NIC        — network_config.network_interfaces (Network interfaces tab)
+          • N × AZURE_VM_PUBLIC_IP  — network_config.public_ips (Public IP addresses tab)
+        """
+        vm_name = resource.external_id
+        rows: list = []
+
+        # Virtual machine (single config item).
+        cfg_blob = config_blob_result.get("blob_path") or ""
+        rows.append(SnapshotItem(
+            id=_uuid.uuid4(),
+            snapshot_id=snapshot.id,
+            tenant_id=tenant.id,
+            external_id=f"{vm_name}:config",
+            item_type="AZURE_VM_CONFIG",
+            name=vm_name,
+            folder_path="",
+            content_size=int(config_blob_result.get("size_bytes") or 0),
+            content_hash=None,
+            content_checksum=None,
+            blob_path=cfg_blob,
+            extra_data={
+                "vm_name": vm_name,
+                "vm_size": vm_config.get("vm_size"),
+                "os_type": (vm_config.get("os_disk") or {}).get("os_type"),
+                "location": vm_config.get("location"),
+                "resource_group": vm_config.get("resource_group"),
+                "raw": vm_config,
+            },
+        ))
+
+        # Disks + Volumes. One DISK item per physical managed disk, plus
+        # one VOLUME item mirroring the same disk (Volumes tab renders
+        # logical attachments; we don't crack open the guest filesystem,
+        # so volume == disk for now, sized the same as the disk).
+        by_name = {d["name"]: d for d in (disk_info or [])}
+        copied_by_name = {r.get("disk_name"): r for r in (copy_results or [])}
+        for d in (disk_info or []):
+            name = d.get("name") or "(unnamed-disk)"
+            cr = copied_by_name.get(name, {})
+            disk_size_gb = d.get("disk_size_gb") or cr.get("size_bytes", 0) / (1024**3) if cr else None
+            meta = {
+                "vm_name": vm_name,
+                "disk_name": name,
+                "disk_type": d.get("type"),
+                "os_type": d.get("os_type"),
+                "snapshot_name": d.get("snapshot_name"),
+                "size_bytes": cr.get("size_bytes", 0),
+                "size_gb": disk_size_gb,
+                "status": cr.get("status") or "pending",
+                "lun": d.get("lun"),
+            }
+            rows.append(SnapshotItem(
+                id=_uuid.uuid4(),
+                snapshot_id=snapshot.id,
+                tenant_id=tenant.id,
+                external_id=f"{vm_name}:disk:{name}",
+                item_type="AZURE_VM_DISK",
+                name=name,
+                folder_path=vm_name,
+                content_size=int(cr.get("size_bytes") or 0),
+                content_hash=None,
+                content_checksum=None,
+                blob_path=cr.get("blob_path"),
+                extra_data=meta,
+            ))
+            # Volume row — mirrors the disk so the Volumes tab has a row
+            # even though we don't enumerate NTFS/ext4 partitions.
+            vol_name = f"{name} (volume)"
+            rows.append(SnapshotItem(
+                id=_uuid.uuid4(),
+                snapshot_id=snapshot.id,
+                tenant_id=tenant.id,
+                external_id=f"{vm_name}:volume:{name}",
+                item_type="AZURE_VM_VOLUME",
+                name=vol_name,
+                folder_path=vm_name,
+                content_size=int(cr.get("size_bytes") or 0),
+                content_hash=None,
+                content_checksum=None,
+                blob_path=None,
+                extra_data=meta,
+            ))
+        # Reference so linters don't complain about the helper dict.
+        _ = by_name
+
+        # Network interfaces — one row per NIC from the captured
+        # network_config. The NIC payload is small enough to keep inline
+        # in extra_data; the full raw dict goes into `raw` for the
+        # detail panel to render.
+        nics = (network_config or {}).get("network_interfaces", []) or []
+        for nic in nics:
+            nic_name = nic.get("name") or nic.get("id", "").rsplit("/", 1)[-1] or "(nic)"
+            rows.append(SnapshotItem(
+                id=_uuid.uuid4(),
+                snapshot_id=snapshot.id,
+                tenant_id=tenant.id,
+                external_id=f"{vm_name}:nic:{nic_name}",
+                item_type="AZURE_VM_NIC",
+                name=nic_name,
+                folder_path=vm_name,
+                content_size=0,
+                content_hash=None,
+                content_checksum=None,
+                blob_path=network_blob_result.get("blob_path"),
+                extra_data={
+                    "vm_name": vm_name,
+                    "nic_name": nic_name,
+                    "id": nic.get("id"),
+                    "mac_address": nic.get("mac_address"),
+                    "primary": nic.get("primary"),
+                    "ip_configurations": nic.get("ip_configurations", []),
+                    "nsg": nic.get("network_security_group"),
+                    "raw": nic,
+                },
+            ))
+
+        # Public IP addresses.
+        pips = (network_config or {}).get("public_ips", []) or []
+        for pip in pips:
+            pip_name = pip.get("name") or "(public-ip)"
+            rows.append(SnapshotItem(
+                id=_uuid.uuid4(),
+                snapshot_id=snapshot.id,
+                tenant_id=tenant.id,
+                external_id=f"{vm_name}:pip:{pip_name}",
+                item_type="AZURE_VM_PUBLIC_IP",
+                name=pip_name,
+                folder_path=vm_name,
+                content_size=0,
+                content_hash=None,
+                content_checksum=None,
+                blob_path=network_blob_result.get("blob_path"),
+                extra_data={
+                    "vm_name": vm_name,
+                    "public_ip_name": pip_name,
+                    "id": pip.get("id"),
+                    "ip_address": pip.get("ip_address"),
+                    "allocation_method": pip.get("public_ip_allocation_method") or pip.get("allocation_method"),
+                    "version": pip.get("public_ip_address_version") or pip.get("version"),
+                    "raw": pip,
+                },
+            ))
+
+        async with async_session_factory() as sess:
+            sess.add_all(rows)
+            await sess.commit()
+        self._log(f"Persisted {len(rows)} SnapshotItem rows for Recovery UI "
+                  f"(1 config + {sum(1 for r in rows if r.item_type=='AZURE_VM_DISK')} disks + "
+                  f"{sum(1 for r in rows if r.item_type=='AZURE_VM_VOLUME')} volumes + "
+                  f"{len(nics)} NICs + {len(pips)} public IPs)")
 
     # ==================== Utility ====================
 

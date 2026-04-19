@@ -744,6 +744,12 @@ async def init_db() -> None:
         "ALTER TABLE resources ADD COLUMN IF NOT EXISTS resource_hash VARCHAR;",
         # Two-tier discovery: child rows point at their parent user resource.
         "ALTER TABLE resources ADD COLUMN IF NOT EXISTS parent_resource_id UUID REFERENCES resources(id) ON DELETE CASCADE;",
+        # Matching tier-2 pointer on snapshot items — models.py declared the
+        # column but the DB was missing it, which made every Azure Postgres /
+        # SQL / VM snapshot persist zero items (INSERT aborted inside the
+        # handler's try/except, Recovery returned an empty list).
+        "ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS parent_external_id VARCHAR;",
+        "CREATE INDEX IF NOT EXISTS ix_snapshot_items_parent_external_id ON snapshot_items(parent_external_id);",
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS azure_restore_point_id VARCHAR;",
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS azure_operation_id VARCHAR;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS retention_hot_days INTEGER DEFAULT 7;",
