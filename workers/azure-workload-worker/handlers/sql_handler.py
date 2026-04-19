@@ -227,7 +227,11 @@ class SqlBackupHandler:
         tables = await loop.run_in_executor(None, _get_tables)
         self._log(f"  Phase 1: Found {len(tables)} tables in {db_name}")
 
-        container = azure_storage_manager.get_container_name(str(tenant.id), "azure-sql")
+        # Must match RESOURCE_TYPE_TO_WORKLOADS["AZURE_SQL_DB"] = ("azure-sql-db",)
+        # so the snapshot-service read path and the backup-worker write path
+        # agree on the container. Writing "azure-sql" made /azure-db/table
+        # look in "backup-azure-sql-db-*" (empty) and return zero rows.
+        container = azure_storage_manager.get_container_name(str(tenant.id), "azure-sql-db")
         shard = azure_storage_manager.get_default_shard()
         await shard._ensure_container(container)
 
@@ -254,7 +258,7 @@ class SqlBackupHandler:
             nonlocal total_bytes, total_rows
             async with semaphore:
                 table_start = time.monotonic()
-                table_bytes, table_rows, blob_name = await self._export_single_table(
+                table_bytes, table_rows, blob_name, rows_blob_name, col_names = await self._export_single_table(
                     conn_str, container, blob_prefix, schema, table, shard,
                     last_backup_time=last_backup_time,
                 )
@@ -263,6 +267,8 @@ class SqlBackupHandler:
                 table_details.append({
                     "schema": schema, "table": table,
                     "blob_path": blob_name,
+                    "rows_blob_path": rows_blob_name,
+                    "columns": col_names,
                     "size_bytes": table_bytes, "row_count": table_rows,
                 })
                 table_duration = time.monotonic() - table_start
@@ -296,7 +302,10 @@ class SqlBackupHandler:
         loop = asyncio.get_event_loop()
 
         def _stream_table():
-            """Export table rows as SQL INSERT statements."""
+            """Export table rows as SQL INSERT statements AND capture the
+            full row set in memory so we can emit a JSON blob for the
+            Database tab's paginated/search view. Keeping both shapes in
+            one pass means we only query SQL Server once per table."""
             conn = pyodbc.connect(conn_str)
             cursor = conn.cursor()
 
@@ -320,14 +329,12 @@ class SqlBackupHandler:
                         incremental_col = candidate
                         break
 
-            # Build WHERE clause for incremental
+            # Delta slice for the .sql dump; full slice for JSON blob.
             where_clause = ""
-            row_count_for_log = 0
             if incremental_col and last_backup_time:
                 where_clause = f" WHERE [{incremental_col}] >= '{last_backup_time.strftime('%Y-%m-%d %H:%M:%S')}'"
-                self._log(f"    Incremental export for [{schema}].[{table}] via [{incremental_col}] >= {last_backup_time}")
+                self._log(f"    Incremental .sql export for [{schema}].[{table}] via [{incremental_col}] >= {last_backup_time}")
 
-            # Stream rows in batches
             batch_size = 1000
             offset = 0
             total_rows = 0
@@ -374,11 +381,31 @@ class SqlBackupHandler:
                     total_rows += len(rows)
                     offset += batch_size
 
+            # Full row fetch for the JSON blob — the Database tab shows
+            # the whole table at the time of this snapshot, not just the
+            # delta since the prior run.
+            cursor.execute(f"SELECT * FROM [{schema}].[{table}] ORDER BY {col_names[0]}")
+            full_rows = []
+            while True:
+                chunk = cursor.fetchmany(1000)
+                if not chunk:
+                    break
+                for row in chunk:
+                    out_row = []
+                    for val in row:
+                        if isinstance(val, datetime):
+                            out_row.append(val.isoformat())
+                        elif isinstance(val, (bytes, bytearray)):
+                            out_row.append(val.hex())
+                        else:
+                            out_row.append(val)
+                    full_rows.append(out_row)
+
             cursor.close()
             conn.close()
-            return tmp_path, total_rows, len(columns)
+            return tmp_path, total_rows, col_names, full_rows
 
-        tmp_path, row_count, col_count = await loop.run_in_executor(None, _stream_table)
+        tmp_path, row_count, col_names, full_rows = await loop.run_in_executor(None, _stream_table)
 
         try:
             # Upload to blob using parallel chunked upload
@@ -395,13 +422,32 @@ class SqlBackupHandler:
                     "table_schema": schema,
                     "table_name": table,
                     "row_count": str(row_count),
-                    "column_count": str(col_count),
+                    "column_count": str(len(col_names)),
                     "compression": "none",
                     "backup_type": "incremental" if row_count > 0 and last_backup_time else "full",
                 },
             )
 
-            return file_size, row_count, blob_name
+            # JSON companion — the /azure-db/table endpoint reads this to
+            # render paginated rows in the Recovery UI. Without it the
+            # Database tab looked empty (the .sql blob can't be parsed
+            # row-by-row).
+            rows_blob_name = f"{blob_prefix}/{schema}.{table}.json"
+            rows_payload = {
+                "schema": schema,
+                "table": table,
+                "columns": col_names,
+                "rows": full_rows,
+            }
+            await shard.upload_blob(
+                container_name=container,
+                blob_path=rows_blob_name,
+                content=json.dumps(rows_payload, default=str).encode("utf-8"),
+                metadata={"content_type": "sql-data-json",
+                          "table_schema": schema, "table_name": table},
+            )
+
+            return file_size, row_count, blob_name, rows_blob_name, col_names
         finally:
             # Clean up temp file
             try:
@@ -414,8 +460,22 @@ class SqlBackupHandler:
     async def _capture_schema(self, resource: Resource, tenant: Tenant,
                                snapshot: Snapshot, rg: str, server_name: str,
                                db_name: str, sp_id: str, sp_secret: str) -> Dict:
-        """
-        Capture database schema as SQL scripts.
+        """Capture Azure SQL schema as a folder tree mirroring Postgres.
+
+        Produces (relative to <db_name>):
+
+          <db>.dacpac.metadata.json    — root-level metadata
+          sql/<schema>/Tables/<table>  — CREATE TABLE per table
+          sql/<schema>/Views/<view>    — CREATE VIEW per view
+          sql/<schema>/Procedures/<p>  — stored procedure body
+          sql/<schema>/Functions/<f>   — function body
+          sql/Other/indexes            — aggregate index list
+          sql/Other/foreign_keys       — aggregate FK list
+          sql/Other/users_permissions  — aggregate grants
+
+        Returns {"artifacts": [...]} with name/folder_path/blob_path/size
+        so the shared persister can emit AZURE_DB_SCHEMA_FILE rows and
+        the Recovery tree renders expandable folders.
         """
         server_fqdn = f"{server_name}.database.windows.net"
 
@@ -431,65 +491,154 @@ class SqlBackupHandler:
             f"Connection Timeout=30;"
         )
 
-        container = azure_storage_manager.get_container_name(str(tenant.id), "azure-sql")
+        # Must match RESOURCE_TYPE_TO_WORKLOADS["AZURE_SQL_DB"] = ("azure-sql-db",)
+        # so the snapshot-service read path and the backup-worker write path
+        # agree on the container. Writing "azure-sql" made /azure-db/table
+        # look in "backup-azure-sql-db-*" (empty) and return zero rows.
+        container = azure_storage_manager.get_container_name(str(tenant.id), "azure-sql-db")
         shard = azure_storage_manager.get_default_shard()
+        schema_prefix = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/schema"
 
-        self._log(f"  Phase 2: Capturing schema for {db_name}...")
-
-        # Schema queries
-        schema_queries = [
-            {"name": "tables.sql", "query": self._QUERY_TABLES},
-            {"name": "table_definitions.sql", "query": self._QUERY_COLUMNS},
-            {"name": "indexes.sql", "query": self._QUERY_INDEXES},
-            {"name": "foreign_keys.sql", "query": self._QUERY_FK},
-            {"name": "stored_procedures.sql", "query": self._QUERY_PROCEDURES},
-            {"name": "views.sql", "query": self._QUERY_VIEWS},
-            {"name": "users_permissions.sql", "query": self._QUERY_USERS},
-        ]
-
-        schema_size = 0
-        schema_artifacts = []
+        self._log(f"  Phase 2: Capturing schema tree for {db_name}...")
 
         loop = asyncio.get_event_loop()
+        artifacts: list = []
+        schema_size = 0
 
-        for artifact in schema_queries:
-            artifact_name = artifact["name"]
-            query = artifact["query"]
+        async def _upload_artifact(rel_path: str, name: str, folder_path: str, content: str) -> None:
+            nonlocal schema_size
+            blob_path = f"{schema_prefix}/{rel_path}"
+            data = content.encode("utf-8")
+            await shard.upload_blob(
+                container_name=container,
+                blob_path=blob_path,
+                content=data,
+                metadata={"content_type": "sql-schema", "artifact_type": name[:60]},
+            )
+            schema_size += len(data)
+            artifacts.append({
+                "name": name,
+                "folder_path": folder_path,
+                "blob_path": blob_path,
+                "size_bytes": len(data),
+            })
 
-            try:
-                def _run_query():
-                    conn = pyodbc.connect(conn_str)
-                    cursor = conn.cursor()
-                    cursor.execute(query)
-                    columns = [col[0] for col in cursor.description]
-                    rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
-                    cursor.close()
-                    conn.close()
-                    return rows
+        def _fetch_rows(query: str) -> list:
+            conn = pyodbc.connect(conn_str)
+            cursor = conn.cursor()
+            cursor.execute(query)
+            cols = [c[0] for c in cursor.description]
+            rows = [dict(zip(cols, row)) for row in cursor.fetchall()]
+            cursor.close()
+            conn.close()
+            return rows
 
-                results = await loop.run_in_executor(None, _run_query)
-                content = self._format_sql_script(artifact_name, results)
-                content_bytes = content.encode("utf-8")
-
-                blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/schema/{artifact_name}"
-
-                result = await shard.upload_blob(
-                    container_name=container,
-                    blob_path=blob_path,
-                    content=content_bytes,
-                    metadata={"content_type": "sql-schema", "artifact_type": artifact_name},
+        # ── Per-table CREATE statements from INFORMATION_SCHEMA.COLUMNS.
+        try:
+            tbls = await loop.run_in_executor(None, _fetch_rows, """
+                SELECT TABLE_SCHEMA, TABLE_NAME
+                FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_TYPE = 'BASE TABLE'
+                ORDER BY TABLE_SCHEMA, TABLE_NAME
+            """)
+            for tr in tbls:
+                ts, tn = tr["TABLE_SCHEMA"], tr["TABLE_NAME"]
+                cols = await loop.run_in_executor(None, _fetch_rows, f"""
+                    SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
+                           IS_NULLABLE, COLUMN_DEFAULT, NUMERIC_PRECISION, NUMERIC_SCALE
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = '{ts}' AND TABLE_NAME = '{tn}'
+                    ORDER BY ORDINAL_POSITION
+                """)
+                lines = [f"-- Table: [{ts}].[{tn}]",
+                         f"CREATE TABLE [{ts}].[{tn}] ("]
+                col_defs = []
+                for c in cols:
+                    dtype = (c["DATA_TYPE"] or "").upper()
+                    maxlen = c.get("CHARACTER_MAXIMUM_LENGTH")
+                    prec = c.get("NUMERIC_PRECISION")
+                    scale = c.get("NUMERIC_SCALE")
+                    if maxlen is not None:
+                        if maxlen == -1:
+                            dtype += "(MAX)"
+                        else:
+                            dtype += f"({maxlen})"
+                    elif prec is not None and dtype in ("DECIMAL", "NUMERIC"):
+                        dtype += f"({prec},{scale or 0})"
+                    nullable = " NULL" if c.get("IS_NULLABLE") == "YES" else " NOT NULL"
+                    default = f" DEFAULT {c['COLUMN_DEFAULT']}" if c.get("COLUMN_DEFAULT") else ""
+                    col_defs.append(f'    [{c["COLUMN_NAME"]}] {dtype}{nullable}{default}')
+                lines.append(",\n".join(col_defs))
+                lines.append(");\n")
+                await _upload_artifact(
+                    rel_path=f"sql/{ts}/Tables/{tn}",
+                    name=tn, folder_path=f"sql/{ts}/Tables",
+                    content="\n".join(lines),
                 )
+        except Exception as e:
+            self._log(f"  Warning: per-table capture failed: {e}", "WARNING")
 
-                schema_size += len(content_bytes)
-                schema_artifacts.append({
-                    "name": artifact_name,
-                    "size_bytes": len(content_bytes),
-                    "blob_path": blob_path,
-                })
+        # ── Per-view CREATE statements (object_definition gives the body).
+        try:
+            views = await loop.run_in_executor(None, _fetch_rows, """
+                SELECT s.name AS schema_name, v.name AS view_name,
+                       OBJECT_DEFINITION(v.object_id) AS body
+                FROM sys.views v
+                JOIN sys.schemas s ON s.schema_id = v.schema_id
+                ORDER BY s.name, v.name
+            """)
+            for vr in views:
+                body = vr.get("body") or f"-- View [{vr['schema_name']}].[{vr['view_name']}] body unavailable"
+                await _upload_artifact(
+                    rel_path=f"sql/{vr['schema_name']}/Views/{vr['view_name']}",
+                    name=vr["view_name"], folder_path=f"sql/{vr['schema_name']}/Views",
+                    content=body,
+                )
+        except Exception as e:
+            self._log(f"  Warning: per-view capture failed: {e}", "WARNING")
+
+        # ── Per-procedure + per-function (sys.sql_modules covers both).
+        try:
+            procs = await loop.run_in_executor(None, _fetch_rows, """
+                SELECT s.name AS schema_name, o.name AS obj_name, o.type AS obj_type,
+                       OBJECT_DEFINITION(o.object_id) AS body
+                FROM sys.objects o
+                JOIN sys.schemas s ON s.schema_id = o.schema_id
+                WHERE o.type IN ('P','PC','FN','IF','TF','FS','FT')
+                ORDER BY s.name, o.name
+            """)
+            for pr in procs:
+                ot = (pr.get("obj_type") or "").strip()
+                folder = "Procedures" if ot in ("P", "PC") else "Functions"
+                body = pr.get("body") or f"-- {folder[:-1]} [{pr['schema_name']}].[{pr['obj_name']}] body unavailable"
+                await _upload_artifact(
+                    rel_path=f"sql/{pr['schema_name']}/{folder}/{pr['obj_name']}",
+                    name=pr["obj_name"], folder_path=f"sql/{pr['schema_name']}/{folder}",
+                    content=body,
+                )
+        except Exception as e:
+            self._log(f"  Warning: per-proc/function capture failed: {e}", "WARNING")
+
+        # ── Aggregate files under sql/Other/ — indexes, FKs, grants.
+        #    These stay as one-file-per-kind because they're cross-object
+        #    lists, not per-object definitions.
+        for aggregate in (
+            {"query": self._QUERY_INDEXES, "name": "indexes"},
+            {"query": self._QUERY_FK, "name": "foreign_keys"},
+            {"query": self._QUERY_USERS, "name": "users_permissions"},
+        ):
+            try:
+                rows = await loop.run_in_executor(None, _fetch_rows, aggregate["query"])
+                body = self._format_sql_script(aggregate["name"], rows)
+                await _upload_artifact(
+                    rel_path=f"sql/Other/{aggregate['name']}",
+                    name=aggregate["name"], folder_path="sql/Other",
+                    content=body,
+                )
             except Exception as e:
-                self._log(f"  Warning: Failed to capture {artifact_name}: {e}", "WARNING")
+                self._log(f"  Warning: Failed to capture {aggregate['name']}: {e}", "WARNING")
 
-        # .dacpac metadata
+        # ── dacpac metadata stays at db root.
         dacpac_metadata = {
             "dacpac_version": "2.0",
             "database_name": db_name,
@@ -500,7 +649,7 @@ class SqlBackupHandler:
             "source_resource_group": rg,
         }
 
-        dacpac_blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/schema/{db_name}.dacpac.metadata.json"
+        dacpac_blob_path = f"{schema_prefix}/{db_name}.dacpac.metadata.json"
         dacpac_content = json.dumps(dacpac_metadata, indent=2, default=str).encode()
         await shard.upload_blob(
             container_name=container,
@@ -509,17 +658,18 @@ class SqlBackupHandler:
             metadata={"content_type": "dacpac-metadata"},
         )
         schema_size += len(dacpac_content)
-        schema_artifacts.append({
+        artifacts.append({
             "name": f"{db_name}.dacpac.metadata.json",
-            "size_bytes": len(dacpac_content),
+            "folder_path": "",
             "blob_path": dacpac_blob_path,
+            "size_bytes": len(dacpac_content),
         })
 
-        self._log(f"  ✓ Schema captured: {len(schema_artifacts)} artifacts, {schema_size / 1024:.1f} KB")
+        self._log(f"  ✓ Schema captured: {len(artifacts)} artifacts, {schema_size / 1024:.1f} KB")
         return {
-            "blob_path": f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/schema/",
+            "blob_path": f"{schema_prefix}/",
             "size_bytes": schema_size,
-            "artifacts": schema_artifacts,
+            "artifacts": artifacts,
         }
 
     # ==================== Phase 3: Capture Configuration ====================
@@ -534,7 +684,11 @@ class SqlBackupHandler:
         Shape mirrors the Postgres handler so the shared AzureDbConfiguration
         React component can render both without branching per server type.
         """
-        container = azure_storage_manager.get_container_name(str(tenant.id), "azure-sql")
+        # Must match RESOURCE_TYPE_TO_WORKLOADS["AZURE_SQL_DB"] = ("azure-sql-db",)
+        # so the snapshot-service read path and the backup-worker write path
+        # agree on the container. Writing "azure-sql" made /azure-db/table
+        # look in "backup-azure-sql-db-*" (empty) and return zero rows.
+        container = azure_storage_manager.get_container_name(str(tenant.id), "azure-sql-db")
         shard = azure_storage_manager.get_default_shard()
 
         self._log(f"  Phase 3: Capturing configuration for {db_name}...")
@@ -666,8 +820,43 @@ class SqlBackupHandler:
             config["backup_storage_redundancy"] = str(cbsr or rbsr or "")
 
             # availabilityZone lives on the database, not the server
-            # (values observed: "NoPreference", "1", "2", "3").
+            # (values observed: "NoPreference", "1", "2", "3"). The
+            # azure-mgmt-sql SDK version in this image doesn't expose it
+            # as a typed attribute, so dig it out of as_dict() first and
+            # fall back to a raw ARM REST call if as_dict() strips it.
             az_val = getattr(db, "availability_zone", None)
+            if not az_val:
+                try:
+                    raw_db = db.as_dict() if hasattr(db, "as_dict") else {}
+                    az_val = (
+                        (raw_db.get("properties") or {}).get("availabilityZone")
+                        or raw_db.get("availabilityZone")
+                        or raw_db.get("availability_zone")
+                    )
+                except Exception:
+                    az_val = None
+            if not az_val:
+                try:
+                    import httpx as _httpx
+                    from azure.identity.aio import ClientSecretCredential
+                    cred = ClientSecretCredential(
+                        client_id=settings.EFFECTIVE_ARM_CLIENT_ID,
+                        client_secret=settings.EFFECTIVE_ARM_CLIENT_SECRET,
+                        tenant_id=settings.EFFECTIVE_ARM_TENANT_ID,
+                    )
+                    tok = await cred.get_token("https://management.azure.com/.default")
+                    await cred.close()
+                    arm_url = (
+                        f"https://management.azure.com/subscriptions/{resource.azure_subscription_id}"
+                        f"/resourceGroups/{rg}/providers/Microsoft.Sql/servers/{server_name}"
+                        f"/databases/{db_name}?api-version=2023-08-01-preview"
+                    )
+                    async with _httpx.AsyncClient(timeout=15.0) as _c:
+                        _r = await _c.get(arm_url, headers={"Authorization": f"Bearer {tok.token}"})
+                        if _r.status_code == 200:
+                            az_val = (_r.json().get("properties") or {}).get("availabilityZone")
+                except Exception as aze:
+                    self._log(f"availability_zone REST fallback failed: {aze}", "WARNING")
             if not az_val:
                 az_val = "Zone redundant" if bool(getattr(db, "zone_redundant", False)) else ""
             config["availability_zone"] = str(az_val) if az_val else ""
@@ -835,18 +1024,23 @@ class SqlBackupHandler:
             },
         ))
 
-        # Schema artifacts — flat list under <db>/ so the Schema tab's
-        # tree renderer shows them at root. We keep extensions in the
-        # name field (tables.sql, indexes.sql, etc.).
+        # Schema artifacts — each artifact carries a folder_path
+        # relative to the db (e.g. "sql/dbo/Tables"). Prefix with the
+        # db name so the frontend tree renders it under the selected
+        # database. Root-level artifacts (dacpac) come through with
+        # folder_path == "".
         for art in (schema_result.get("artifacts") or []):
+            rel_folder = (art.get("folder_path") or "").strip("/")
+            folder = f"{db_name}/{rel_folder}" if rel_folder else db_name
+            art_name = art.get("name") or "schema.sql"
             rows.append(SnapshotItem(
                 id=_uuid.uuid4(),
                 snapshot_id=snapshot.id,
                 tenant_id=tenant.id,
-                external_id=f"{server_name}:{db_name}:schema:{art.get('name')}",
+                external_id=f"{server_name}:{db_name}:schema:{folder}/{art_name}",
                 item_type="AZURE_DB_SCHEMA_FILE",
-                name=art.get("name") or "schema.sql",
-                folder_path=db_name,
+                name=art_name,
+                folder_path=folder,
                 content_size=int(art.get("size_bytes") or 0),
                 content_hash=None,
                 content_checksum=None,
@@ -880,6 +1074,8 @@ class SqlBackupHandler:
                     "schema": schema,
                     "table": table,
                     "row_count": int(t.get("row_count") or 0),
+                    "columns": t.get("columns") or [],
+                    "rows_blob_path": t.get("rows_blob_path"),
                     "server_type": "AZURE_SQL",
                 },
             ))
