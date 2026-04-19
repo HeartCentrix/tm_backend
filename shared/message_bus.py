@@ -67,6 +67,13 @@ class MessageBus:
                 await self._declare_queue("restore.urgent", routing_key="restore.urgent")
                 await self._declare_queue("restore.normal", routing_key="restore.normal")
                 await self._declare_queue("restore.low", routing_key="restore.low")
+                # Heavy restore pool — gated by HEAVY_EXPORT_ENABLED but
+                # the queue must exist either way so restore-worker-heavy
+                # can bind to it on startup without passive=True failing.
+                await self._declare_queue(
+                    settings.HEAVY_EXPORT_QUEUE,
+                    routing_key=settings.HEAVY_EXPORT_QUEUE,
+                )
                 await self._declare_queue("discovery.m365", routing_key="discovery.m365")
                 await self._declare_queue("discovery.azure", routing_key="discovery.azure")
                 await self._declare_queue("notification", routing_key="notification")
