@@ -270,11 +270,27 @@ class GraphClient:
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Streaming variant of _get: yields each page as it arrives.
 
+        Branches on GRAPH_HARDENING_ENABLED: legacy path preserved for the
+        kill-switch, hardened path adds per-page pacing + sticky app
+        rotation with failover.
+
         Overlaps downstream work (upload/DB) with Graph pagination — callers
         can fire upload tasks per page and continue pulling instead of waiting
         for the full response to materialize in RAM. Preserves 429 Retry-After
         + timeout retry semantics.
         """
+        from shared.config import settings as _s
+        if _s.GRAPH_HARDENING_ENABLED:
+            async for p in self._iter_pages_hardened(url, params):
+                yield p
+            return
+        async for p in self._iter_pages_legacy(url, params):
+            yield p
+
+    async def _iter_pages_legacy(
+        self, url: str, params: Optional[Dict] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Pre-hardening _iter_pages — preserved verbatim as the kill-switch path."""
         next_url = url
         max_retries = 5
         retry_count = 0
@@ -323,6 +339,112 @@ class GraphClient:
                     await asyncio.sleep(wait)
                     continue
                 raise
+
+    async def _iter_pages_hardened(
+        self, url: str, params: Optional[Dict] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Policy-paced page iteration with sticky app rotation.
+
+        Stream starts pinned to self.client_id. On 429, the policy reports
+        throttle + marks the app in multi_app_manager. The stream migrates
+        to the next healthy app and stays on the failover for
+        GRAPH_STICKY_PAGES_BEFORE_RETURN pages; after that window, checks
+        is_app_throttled(original) and returns if clean, else stays put.
+
+        Captures @odata.deltaLink on the terminal page into self._last_delta_link
+        so callers that want the cursor (chats / mail / onedrive delta) can
+        read it post-iteration.
+        """
+        from shared.config import settings as s
+        from shared.multi_app_manager import multi_app_manager
+        policy = self._policy
+        original_app = self.client_id
+        current_app = original_app
+        pages_on_failover = 0
+        next_url: Optional[str] = url
+        token = await self._get_token()
+        self._last_delta_link: Optional[str] = None
+
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            while next_url:
+                await policy.stream_bucket.acquire()
+                await multi_app_manager.acquire_app_token(current_app)
+                if params and params.get("$count") == "true":
+                    headers = {"Authorization": f"Bearer {token}",
+                               "ConsistencyLevel": "eventual"}
+                else:
+                    headers = {"Authorization": f"Bearer {token}"}
+                try:
+                    resp = await client.get(
+                        next_url, headers=headers,
+                        params=params if not next_url.startswith("http") else None,
+                    )
+                except (httpx.ReadTimeout, httpx.ConnectTimeout,
+                        httpx.RemoteProtocolError) as exc:
+                    action = policy.decide_transient_error()
+                    if action.exhausted:
+                        raise GraphRetryExhaustedError(
+                            f"transient cap hit on {next_url}: {type(exc).__name__}"
+                        )
+                    print(f"[GraphClient/hardened iter] transient "
+                          f"{type(exc).__name__}; sleep {action.sleep_seconds:.1f}s")
+                    await asyncio.sleep(action.sleep_seconds)
+                    token = await self._get_token()
+                    continue
+
+                if resp.status_code in (429, 503):
+                    action = policy.decide(
+                        status_code=resp.status_code,
+                        retry_after=resp.headers.get("Retry-After"),
+                    )
+                    if action.exhausted:
+                        raise GraphRetryExhaustedError(
+                            f"cumulative cap hit on {next_url}: {action.reason}"
+                        )
+                    multi_app_manager.mark_throttled(
+                        current_app, int(action.sleep_seconds),
+                    )
+                    # Migrate to next healthy app.
+                    try:
+                        pick = multi_app_manager.get_next_app()
+                        if pick and pick.client_id != current_app:
+                            current_app = pick.client_id
+                            pages_on_failover = 0
+                            print(f"[GraphClient/hardened iter] migrating "
+                                  f"{resp.status_code} -> app={current_app}")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(action.sleep_seconds)
+                    if s.GRAPH_POST_THROTTLE_BRAKE_MS > 0:
+                        await asyncio.sleep(
+                            s.GRAPH_POST_THROTTLE_BRAKE_MS / 1000.0
+                        )
+                    continue
+
+                resp.raise_for_status()
+                policy.reset_on_success()
+                data = resp.json() or {}
+                yield data
+
+                next_url = data.get("@odata.nextLink")
+                params = None
+                if "@odata.deltaLink" in data:
+                    self._last_delta_link = data["@odata.deltaLink"]
+                    if not next_url:
+                        break
+
+                # Sticky-return check: if on failover for long enough and
+                # the original app has cooled down, switch back.
+                if current_app != original_app:
+                    pages_on_failover += 1
+                    if pages_on_failover >= s.GRAPH_STICKY_PAGES_BEFORE_RETURN:
+                        if not multi_app_manager.is_app_throttled(original_app):
+                            current_app = original_app
+                            pages_on_failover = 0
+                            print(f"[GraphClient/hardened iter] returning "
+                                  f"to original app={original_app}")
+                        else:
+                            pages_on_failover = 0
 
     async def _post(self, url: str, payload: Dict[str, Any], headers: Optional[Dict] = None) -> Dict[str, Any]:
         """Make authenticated POST request"""
