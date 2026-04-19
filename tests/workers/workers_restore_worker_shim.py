@@ -16,3 +16,16 @@ spec.loader.exec_module(mod)
 FolderExportTask = mod.FolderExportTask
 FolderExportResult = mod.FolderExportResult
 MailExportOrchestrator = mod.MailExportOrchestrator
+
+# Load file_export — same pattern to bridge the hyphenated `restore-worker` dir.
+_file_target = os.path.abspath(
+    os.path.join(_here, "..", "..", "workers", "restore-worker", "file_export.py")
+)
+_file_spec = importlib.util.spec_from_file_location("file_export", _file_target)
+_file_mod = importlib.util.module_from_spec(_file_spec)
+sys.modules["file_export"] = _file_mod
+_file_spec.loader.exec_module(_file_mod)
+
+FileExportOrchestrator = _file_mod.FileExportOrchestrator
+FileFolderExportTask = _file_mod.FileFolderExportTask
+FileFolderExportResult = _file_mod.FileFolderExportResult
