@@ -57,6 +57,23 @@ services:
     networks:
       - tm-network
 
+  # Azurite — local Azure Storage emulator used for unit-integration tests.
+  # Started only under the `test` profile: `docker-compose --profile test up -d azurite`.
+  # Prod tests run against real Azure via AZURE_TEST_CONNECTION_STRING env var.
+  # One op (stage_block_from_url) is not implemented by Azurite 3.29.0 — the
+  # corresponding test is skipped when the connection string points to Azurite.
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.29.0
+    container_name: tm_vault_azurite
+    command: "azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck"
+    ports:
+      - "10000:10000"
+    volumes:
+      - azurite_data:/data
+    profiles:
+      - test
+    restart: unless-stopped
+
   api-gateway:
     build:
       context: .
@@ -385,6 +402,7 @@ services:
       dockerfile: workers/restore-worker/Dockerfile
     env_file: .env
     environment:
+      PYTHONUNBUFFERED: "1"
       DB_HOST: postgres
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
@@ -413,8 +431,62 @@ services:
     restart: unless-stopped
     networks:
       - tm-network
+    mem_limit: 4g
     deploy:
       replicas: ${RESTORE_WORKER_REPLICAS:-2}
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+  restore-worker-heavy:
+    build:
+      context: .
+      dockerfile: workers/restore-worker/Dockerfile
+    container_name: tm_vault_restore_worker_heavy
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      RABBITMQ_ENABLED: "true"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
+      AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
+      # Multi-app registration
+      APP_1_CLIENT_ID: ${APP_1_CLIENT_ID}
+      APP_1_CLIENT_SECRET: ${APP_1_CLIENT_SECRET}
+      APP_1_TENANT_ID: ${APP_1_TENANT_ID}
+      APP_2_CLIENT_ID: ${APP_2_CLIENT_ID:-}
+      APP_2_CLIENT_SECRET: ${APP_2_CLIENT_SECRET:-}
+      APP_2_TENANT_ID: ${APP_2_TENANT_ID:-}
+      APP_3_CLIENT_ID: ${APP_3_CLIENT_ID:-}
+      APP_3_CLIENT_SECRET: ${APP_3_CLIENT_SECRET:-}
+      APP_3_TENANT_ID: ${APP_3_TENANT_ID:-}
+      AZURE_AD_CLIENT_ID: ${AZURE_AD_CLIENT_ID}
+      AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
+      RESTORE_WORKER_QUEUE: restore.heavy
+      MAX_CONCURRENT_EXPORTS_PER_WORKER: 1
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 16G
+        reservations:
+          memory: 4G
+    mem_limit: 16g
+    profiles:
+      - heavy
+    restart: unless-stopped
+    networks:
+      - tm-network
 
   # search-service removed — see note above graph-proxy/delta-token. Gateway
   # routes /resources/search to resource-service; this service had no callers.
@@ -485,6 +557,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  azurite_data:
 
 networks:
   tm-network:

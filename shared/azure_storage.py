@@ -336,6 +336,160 @@ class AzureStorageShard:
         except ResourceNotFoundError:
             return None
 
+    @classmethod
+    def from_connection_string(cls, connection_string: str, shard_index: int = 0):
+        """Construct a shard from an Azure connection string (used by tests + Azurite)."""
+        instance = cls.__new__(cls)
+        instance.shard_index = shard_index
+        instance._async_client = AsyncBlobServiceClient.from_connection_string(connection_string)
+        instance._sync_client = None
+        instance.account_name = "devstoreaccount1"
+        return instance
+
+    async def ensure_container(self, container_name: str) -> None:
+        """Create container if it does not exist. Idempotent. Public alias for _ensure_container."""
+        await self._ensure_container(container_name)
+
+    async def close(self) -> None:
+        """Dispose the async Azure client."""
+        if getattr(self, "_async_client", None):
+            await self._async_client.close()
+            self._async_client = None
+
+    async def download_blob_stream(
+        self,
+        container_name: str,
+        blob_path: str,
+        chunk_size: int = 4 * 1024 * 1024,
+    ):
+        """Stream a blob's bytes as async chunks. Yields nothing if blob missing.
+
+        Used by mail-export to pipe attachment bytes into the MIME base64 encoder
+        without loading the full attachment into RAM. Essential for production-grade
+        export — a single referenceAttachment can be 150 MB and we'd OOM with readall.
+        """
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        try:
+            stream = await blob_client.download_blob()
+        except ResourceNotFoundError:
+            return
+        async for chunk in stream.chunks():
+            if len(chunk) <= chunk_size:
+                yield chunk
+            else:
+                for i in range(0, len(chunk), chunk_size):
+                    yield chunk[i : i + chunk_size]
+
+    async def stage_block(
+        self,
+        container_name: str,
+        blob_path: str,
+        block_id: str,
+        data: bytes,
+    ) -> None:
+        """Stage a single block for a BlockBlob. Block IDs must be base64-encoded
+        strings of equal length — we accept the plain string and let the SDK encode."""
+        import base64
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        encoded = base64.b64encode(block_id.encode("ascii").ljust(16, b"=")).decode("ascii")
+        await blob_client.stage_block(block_id=encoded, data=data)
+
+    async def commit_block_list_manual(
+        self,
+        container_name: str,
+        blob_path: str,
+        block_ids: list,
+        metadata: dict = None,
+    ) -> None:
+        """Commit previously-staged blocks in the given order."""
+        import base64
+        from azure.storage.blob import BlobBlock
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        blocks = [
+            BlobBlock(block_id=base64.b64encode(bid.encode("ascii").ljust(16, b"=")).decode("ascii"))
+            for bid in block_ids
+        ]
+        await blob_client.commit_block_list(blocks, metadata=metadata)
+
+    async def put_block_from_url(
+        self,
+        container_name: str,
+        blob_path: str,
+        block_id: str,
+        source_url: str,
+    ) -> None:
+        """Stage a block by copying bytes server-side from another blob URL.
+        Zero bytes traverse the worker. Used for final ZIP assembly to stitch
+        per-folder MBOX blobs without re-downloading."""
+        import base64
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        encoded = base64.b64encode(block_id.encode("ascii").ljust(16, b"=")).decode("ascii")
+        await blob_client.stage_block_from_url(block_id=encoded, source_url=source_url)
+
+    async def get_blob_url(self, container_name: str, blob_path: str) -> str:
+        """Return a full URL for a blob. Used as source_url input to put_block_from_url.
+        In Azurite + account-key mode the raw URL is authenticated by shared-key
+        headers on the server side; SAS-authenticated URLs come from a dedicated
+        helper added later (Task 27)."""
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        return blob_client.url
+
+    async def list_blobs(self, container_name: str):
+        """Yield blob names in the container. Async generator — safe to
+        iterate large containers without buffering."""
+        async_client = self.get_async_client()
+        container = async_client.get_container_client(container_name)
+        async for b in container.list_blobs():
+            yield b.name
+
+    async def list_blobs_with_properties(self, container_name: str):
+        """Yield (name, {last_modified, size}) tuples. Used by retention cleanup."""
+        async_client = self.get_async_client()
+        container = async_client.get_container_client(container_name)
+        async for b in container.list_blobs():
+            yield b.name, {"last_modified": b.last_modified, "size": b.size}
+
+    async def get_blob_sas_url(self, container_name: str, blob_path: str, valid_for_hours: int = 6) -> str:
+        """Return a URL with a short-lived SAS token. Needed for cross-shard
+        put_block_from_url — destination shard must authenticate to read the
+        source. Falls back to the plain URL when the shard uses an account key
+        directly (sufficient in same-account scenarios)."""
+        from datetime import datetime, timedelta, timezone
+        from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+
+        account_key = getattr(self, "_account_key", None) or getattr(self, "account_key", None)
+        if not account_key:
+            return blob_client.url
+
+        try:
+            sas = generate_blob_sas(
+                account_name=self.account_name,
+                container_name=container_name,
+                blob_name=blob_path,
+                account_key=account_key,
+                permission=BlobSasPermissions(read=True),
+                expiry=datetime.now(timezone.utc) + timedelta(hours=valid_for_hours),
+            )
+            return f"{blob_client.url}?{sas}"
+        except Exception:
+            return blob_client.url
+
+    async def delete_blob(self, container_name: str, blob_path: str) -> None:
+        """Idempotent delete. Swallows missing-blob errors."""
+        async_client = self.get_async_client()
+        blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
+        try:
+            await blob_client.delete_blob()
+        except Exception:
+            pass
+
     async def get_blob_properties(self, container_name: str, blob_path: str) -> Optional[Dict]:
         """Get blob properties including copy status"""
         try:
@@ -448,6 +602,15 @@ class AzureStorageManager:
         if not self.shards:
             raise RuntimeError("No storage shards configured — set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY")
         return self.shards[0]
+
+    def get_shard_for_item(self, item) -> AzureStorageShard:
+        """Resolve the shard that owns the source data for the given item.
+        Delegates to get_shard_for_resource with the item's tenant + resource
+        IDs. Falls back to the default shard when attributes are missing."""
+        try:
+            return self.get_shard_for_resource(str(item.resource_id), str(item.tenant_id))
+        except Exception:
+            return self.get_default_shard()
     
     def get_container_name(self, tenant_id: str, resource_type: str) -> str:
         """

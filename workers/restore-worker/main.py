@@ -54,6 +54,10 @@ class RestoreWorker:
         self.graph_clients: Dict[str, GraphClient] = {}
         self.blob_service_client: Optional[BlobServiceClient] = None
         self.semaphore = asyncio.Semaphore(30)  # Max 30 concurrent restores
+        # M1 — cap simultaneous export jobs per worker. Beyond this, additional export
+        # messages wait on this semaphore. See docs/superpowers/specs/2026-04-19-mbox-mail-export-design.md §8.
+        from shared.config import settings as _s
+        self._export_semaphore = asyncio.Semaphore(_s.MAX_CONCURRENT_EXPORTS_PER_WORKER)
 
     async def initialize(self):
         """Initialize connections and clients"""
@@ -88,9 +92,11 @@ class RestoreWorker:
                     print(f"[{self.worker_id}] Failed to connect to RabbitMQ after {max_retries} attempts")
                     raise
 
+        from shared.config import settings as _s
+        queue_name = _s.RESTORE_WORKER_QUEUE
         queues = [
             ("restore.urgent", 10),
-            ("restore.normal", 30),
+            (queue_name, 30),
             ("restore.low", 50),
         ]
 
@@ -103,37 +109,52 @@ class RestoreWorker:
         await asyncio.gather(*tasks)
 
     async def consume_queue(self, queue_name: str, prefetch_count: int):
-        """Consume messages from a specific queue"""
+        """Consume messages from a specific queue.
+
+        Uses the explicit iterator context manager — plain `async for msg in queue:`
+        can silently fail to register a consumer under aio-pika's RobustQueue,
+        leaving messages stuck in the `unacknowledged` state indefinitely.
+        """
         if not message_bus.channel:
             return
 
         queue = await message_bus.channel.get_queue(queue_name)
+        print(f"[{self.worker_id}] Subscribed to queue '{queue_name}' (prefetch={prefetch_count})", flush=True)
 
-        async for message in queue:
-            async with message.process():
-                try:
-                    body = json.loads(message.body.decode())
-                    await self.process_restore_message(body)
-                except Exception as e:
-                    print(f"[{self.worker_id}] Error processing restore message: {e}")
+        async with queue.iterator() as queue_iter:
+            async for message in queue_iter:
+                print(f"[{self.worker_id}] Received message on '{queue_name}' (delivery_tag={message.delivery_tag})", flush=True)
+                async with message.process():
+                    try:
+                        body = json.loads(message.body.decode())
+                        await self.process_restore_message(body)
+                    except Exception as e:
+                        print(f"[{self.worker_id}] Error processing restore message: {e}", flush=True)
+                        import traceback
+                        traceback.print_exc()
 
     async def process_restore_message(self, message: Dict[str, Any]):
         """Process a single restore job message"""
         job_id = uuid.UUID(message["jobId"])
         restore_type = message.get("restoreType", "IN_PLACE")
         spec = message.get("spec", {})
+        print(f"[{self.worker_id}] process_restore_message ENTER job={job_id} type={restore_type}", flush=True)
 
         async with self.semaphore:
+            print(f"[{self.worker_id}] semaphore acquired job={job_id}", flush=True)
             async with async_session_factory() as session:
+                print(f"[{self.worker_id}] DB session opened job={job_id}", flush=True)
                 try:
                     # Update job status
                     await self.update_job_status(session, job_id, JobStatus.RUNNING)
+                    print(f"[{self.worker_id}] job status RUNNING job={job_id}", flush=True)
 
                     # Fetch snapshot items to restore
                     snapshot_ids = message.get("snapshotIds", [])
                     item_ids = message.get("itemIds", [])
 
                     items_to_restore = await self.fetch_snapshot_items(session, snapshot_ids, item_ids)
+                    print(f"[{self.worker_id}] fetched {len(items_to_restore)} snapshot items job={job_id}", flush=True)
 
                     # Workload filter (from RestoreModal checkboxes). When spec.workloads is
                     # None, skip filtering — back-compat for jobs submitted without the field
@@ -164,7 +185,9 @@ class RestoreWorker:
                     }
 
                     handler = handlers.get(restore_type, self.export_download)
+                    print(f"[{self.worker_id}] invoking handler={handler.__name__} job={job_id}", flush=True)
                     result = await handler(session, items_to_restore, message, spec)
+                    print(f"[{self.worker_id}] handler returned job={job_id}", flush=True)
 
                     # Update job as completed
                     await self.update_job_status(session, job_id, JobStatus.COMPLETED, result)
@@ -499,6 +522,183 @@ class RestoreWorker:
         spec: Dict
     ) -> Dict:
         """Export items as downloadable ZIP file"""
+        print(f"[{self.worker_id}] export_as_zip ENTER items={len(items)}", flush=True)
+        # v2 mail export — feature-flagged. Accepts mixed EMAIL + EMAIL_ATTACHMENT
+        # selections (e.g. "Download all" with workloads=["Mail"] pulls both
+        # types). EMAIL_ATTACHMENT rows are skipped — their bytes already get
+        # inlined into the parent EML via _build_eml_for_item.
+        from shared.config import settings as _mail_export_settings
+        _MAIL_V2_TYPES = {"EMAIL", "EMAIL_ATTACHMENT"}
+        _email_items = [it for it in items if getattr(it, "item_type", None) == "EMAIL"]
+        if (
+            _mail_export_settings.EXPORT_MAIL_V2_ENABLED
+            and _email_items
+            and all(getattr(it, "item_type", None) in _MAIL_V2_TYPES for it in items)
+        ):
+            # Drop attachment rows — they're handled inline by the orchestrator.
+            items = _email_items
+            from mail_export import MailExportOrchestrator
+            from shared.azure_storage import azure_storage_manager
+
+            _spec = spec or {}
+            fmt = (_spec.get("exportFormat") or (message or {}).get("exportFormat") or "EML").upper()
+            include_attachments = bool(_spec.get("includeAttachments", True))
+            snapshot_ids = [
+                str(s) for s in (
+                    (message or {}).get("snapshotIds")
+                    or _spec.get("snapshot_ids")
+                    or []
+                )
+            ]
+            job_id = str((message or {}).get("jobId") or (message or {}).get("job_id") or "unknown")
+
+            # Task 24 — resumable exports: pull prior checkpoint from Job.result
+            # and install a persister that writes back after each folder completes.
+            import uuid as _uuid
+            from shared.models import Job as _Job
+
+            async def _load_checkpoint():
+                async with async_session_factory() as s:
+                    j = await s.get(_Job, _uuid.UUID(job_id))
+                    if j and isinstance(j.result, dict):
+                        return j.result.get("checkpoint")
+                    return None
+
+            async def _persist_cp(cp_dict):
+                async with async_session_factory() as s:
+                    j = await s.get(_Job, _uuid.UUID(job_id))
+                    if j:
+                        r = dict(j.result or {})
+                        r["checkpoint"] = cp_dict
+                        j.result = r
+                        await s.commit()
+
+            print(f"[{self.worker_id}] v2 path: loading checkpoint", flush=True)
+            prior_checkpoint = await _load_checkpoint()
+            print(f"[{self.worker_id}] v2 path: checkpoint loaded (exists={prior_checkpoint is not None})", flush=True)
+
+            # Annotate items with the shard index that holds their source data
+            # so the orchestrator can group by (folder, shard) — Task 27 (M8).
+            for it in items:
+                try:
+                    s = azure_storage_manager.get_shard_for_resource(
+                        str(getattr(it, "resource_id", "") or ""),
+                        str(getattr(it, "tenant_id", "") or ""),
+                    )
+                    it.shard_index = getattr(s, "shard_index", 0)
+                except Exception:
+                    it.shard_index = 0
+
+            # Container naming follows backup-worker's convention:
+            # `backup-{workload}-{tenant_hash}`. Backup-worker's Tier-2 user-mail
+            # path (the one the UI uses) writes under workload="email"
+            # (backup-worker/main.py:966). Legacy MAILBOX resource path uses
+            # "mailbox" (line 1993) — `_fetch_message` falls back to that too.
+            tenant_id_for_containers = str(getattr(items[0], "tenant_id", "") or "") if items else ""
+            source_container = (
+                azure_storage_manager.get_container_name(tenant_id_for_containers, "email")
+                if tenant_id_for_containers else "mailbox"
+            )
+            mailbox_fallback_container = (
+                azure_storage_manager.get_container_name(tenant_id_for_containers, "mailbox")
+                if tenant_id_for_containers else None
+            )
+            dest_container = (
+                azure_storage_manager.get_container_name(tenant_id_for_containers, "exports")
+                if tenant_id_for_containers else "exports"
+            )
+            print(f"[{self.worker_id}] v2 path: source_container={source_container} fallback={mailbox_fallback_container} dest_container={dest_container}", flush=True)
+
+            # Ensure dest container exists.
+            try:
+                _default_shard = azure_storage_manager.get_default_shard()
+                await _default_shard.ensure_container(dest_container)
+            except Exception as _ensure_err:
+                print(f"[{self.worker_id}] v2 path: ensure_container({dest_container}) failed (non-fatal): {_ensure_err}", flush=True)
+
+            # Stash fallback container on each item so _fetch_message can retry.
+            for it in items:
+                it._mailbox_fallback_container = mailbox_fallback_container
+
+            orch = MailExportOrchestrator(
+                job_id=job_id,
+                snapshot_ids=snapshot_ids,
+                items=items,
+                shard_manager=azure_storage_manager,
+                source_container=source_container,
+                dest_container=dest_container,
+                parallelism=_mail_export_settings.EXPORT_PARALLELISM,
+                split_bytes=_mail_export_settings.EXPORT_MBOX_SPLIT_BYTES,
+                block_size=_mail_export_settings.EXPORT_BLOCK_SIZE_BYTES,
+                fetch_batch_size=_mail_export_settings.EXPORT_FETCH_BATCH_SIZE,
+                queue_maxsize=_mail_export_settings.EXPORT_FOLDER_QUEUE_MAXSIZE,
+                format=fmt,
+                include_attachments=include_attachments,
+                manifest=None,
+                checkpoint=prior_checkpoint,
+                persist_checkpoint=_persist_cp,
+                mbox_inline_limit_bytes=_mail_export_settings.EXPORT_MBOX_INLINE_LIMIT_BYTES,
+            )
+            import time as _time
+            _started = _time.monotonic()
+            print(f"[{self.worker_id}] v2 path: acquiring export semaphore", flush=True)
+            async with self._export_semaphore:
+                print(f"[{self.worker_id}] v2 path: starting orch.run()", flush=True)
+                result = await orch.run()
+                print(f"[{self.worker_id}] v2 path: orch.run() finished exported={result.get('exported_count')}", flush=True)
+            _duration = int(_time.monotonic() - _started)
+
+            # Task 25 — user notification on non-trivial or non-clean exports.
+            if _duration >= 60 or result.get("status", "COMPLETED") != "COMPLETED":
+                try:
+                    import httpx as _httpx
+                    from shared.config import settings as _cfg_ns
+
+                    user_email, user_display_name = "", "User"
+                    uid = (message or {}).get("userId") or (message or {}).get("user_id")
+                    if uid:
+                        try:
+                            from shared.models import PlatformUser as _PlatformUser
+                            async with async_session_factory() as _s2:
+                                u = await _s2.get(_PlatformUser, __import__("uuid").UUID(str(uid)))
+                                if u:
+                                    user_email = getattr(u, "email", "") or ""
+                                    user_display_name = (
+                                        getattr(u, "display_name", None)
+                                        or getattr(u, "name", None)
+                                        or user_email
+                                        or "User"
+                                    )
+                        except Exception:
+                            pass
+
+                    download_url = f"{_cfg_ns.FRONTEND_URL}/recovery?job={job_id}"
+                    async with _httpx.AsyncClient(timeout=10.0) as _c:
+                        await _c.post(
+                            f"{_cfg_ns.ALERT_SERVICE_URL}/api/v1/alerts/notify/export-completed",
+                            json={
+                                "user_email": user_email,
+                                "user_display_name": user_display_name,
+                                "job_id": job_id,
+                                "status": result.get("status", "COMPLETED"),
+                                "download_url": download_url,
+                                "exported_count": result.get("exported_count", 0),
+                                "failed_count": result.get("failed_count", 0),
+                                "duration_seconds": _duration,
+                                "size_bytes": 0,
+                            },
+                        )
+                except Exception as _notify_err:
+                    print(f"[restore-worker] export-completed notify failed (non-fatal): {_notify_err}")
+
+            return {
+                "exported_count": result["exported_count"],
+                "failed_count": result["failed_count"],
+                "export_type": fmt,
+                "blob_path": result["blob_path"],
+                "manifest": result.get("manifest"),
+            }
+
         zip_buffer = io.BytesIO()
         exported_count = 0
 

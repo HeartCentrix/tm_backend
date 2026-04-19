@@ -8,3 +8,6 @@ aio-pika==9.4.0
 pydantic==2.5.3
 pydantic-settings==2.1.0
 python-dotenv==1.0.0
+# Download endpoint streams export ZIPs straight from Azure — need the SDK + async transport.
+azure-storage-blob>=12.19.0
+aiohttp>=3.9.0

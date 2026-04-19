@@ -759,20 +759,56 @@ async def get_restore_history(page: int = 1, size: int = 50, db: AsyncSession = 
 
 @app.post("/api/v1/jobs/export")
 async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
-    """Queue an export job. Creates the DB row AND publishes to
-    RabbitMQ so the restore-worker picks it up — previously the handler
-    only did the DB insert, which left the job stuck in QUEUED forever
-    (no consumer on export.normal and no publish to restore.*)."""
-    job = Job(id=uuid4(), type=JobType.EXPORT, status=JobStatus.QUEUED, priority=5, spec=request)
-    db.add(job)
-    await db.flush()
+    """Queue an export job: persist the Job row, publish to RabbitMQ so
+    the restore-worker picks it up, and fire an EXPORT_TRIGGERED audit.
 
-    restore_type = str(request.get("restoreType") or "EXPORT_ZIP")
-    snapshot_ids = request.get("snapshotIds") or []
-    item_ids = request.get("itemIds") or []
-    resource_id = request.get("resourceId")
-    tenant_id = request.get("tenantId")
-    resource_type = request.get("resourceType")
+    Scope fields (tenant_id / resource_id / resource_type) are derived by
+    walking snapshot → resource in the DB rather than trusting whatever
+    the frontend happened to send on the request body — gives us reliable
+    audit scoping even when the caller omits those fields."""
+    restore_type = request.get("restoreType", "EXPORT_ZIP")
+    snapshot_ids = request.get("snapshotIds", [])
+    item_ids = request.get("itemIds", [])
+
+    tenant_id = None
+    resource_id = None
+    resource_type = None
+    snapshot = None
+    if snapshot_ids:
+        snapshot = (await db.execute(
+            select(Snapshot).where(Snapshot.id == UUID(snapshot_ids[0]))
+        )).scalar_one_or_none()
+    if not snapshot and item_ids:
+        first_item = (await db.execute(
+            select(SnapshotItem).where(SnapshotItem.id == UUID(item_ids[0]))
+        )).scalar_one_or_none()
+        if first_item:
+            snapshot = await db.get(Snapshot, first_item.snapshot_id)
+            if snapshot and not snapshot_ids:
+                snapshot_ids = [str(snapshot.id)]
+    if snapshot:
+        resource_id = str(snapshot.resource_id)
+        resource = await db.get(Resource, snapshot.resource_id)
+        if resource:
+            tenant_id = str(resource.tenant_id)
+            resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+
+    job = Job(
+        id=uuid4(),
+        type=JobType.EXPORT,
+        tenant_id=UUID(tenant_id) if tenant_id else None,
+        resource_id=UUID(resource_id) if resource_id else None,
+        status=JobStatus.QUEUED,
+        priority=5,
+        spec={
+            "restore_type": restore_type,
+            "snapshot_ids": snapshot_ids,
+            "item_ids": item_ids,
+            **request,
+        },
+    )
+    db.add(job)
+    await db.commit()  # commit before publish so worker finds job
 
     if settings.RABBITMQ_ENABLED:
         # Reuse the restore pipeline: restore-worker already has EXPORT_ZIP,
@@ -789,8 +825,32 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
             spec=request,
             resource_type=resource_type,
         )
-        queue = restore_message.get("queue", "restore.normal")
+
+        # Total bytes for M5 preflight + Task 23 heavy pool routing.
+        from sqlalchemy import func as sa_func, select as sa_select
+        total_bytes = 0
+        try:
+            if item_ids:
+                q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
+                    SnapshotItem.id.in_([uuid.UUID(x) for x in item_ids])
+                )
+                total_bytes = int((await db.execute(q)).scalar() or 0)
+            elif snapshot_ids:
+                q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
+                    SnapshotItem.snapshot_id.in_([uuid.UUID(x) for x in snapshot_ids])
+                )
+                total_bytes = int((await db.execute(q)).scalar() or 0)
+        except Exception:
+            total_bytes = 0
+
+        from shared.export_routing import pick_export_queue
+        queue = pick_export_queue(
+            total_bytes=total_bytes,
+            include_attachments=bool(request.get("includeAttachments", True)),
+        )
         await message_bus.publish(queue, restore_message, priority=restore_message.get("priority", 5))
+    else:
+        print(f"[JOB_SERVICE] RabbitMQ not enabled, export job {job.id} will stay QUEUED")
 
     # Audit: EXPORT_TRIGGERED — captures who exported what, when, and which
     # items/snapshots are in scope so the trail is reconstructable for
@@ -859,15 +919,39 @@ async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Job completed but no blob_path recorded")
 
     # Reuse the same shard the workers use so credentials line up.
-    try:
-        from shared.azure_storage import azure_storage_manager
-        shard = azure_storage_manager.get_default_shard()
-        content = await shard.download_blob("exports", blob_path)
-    except Exception as exc:
-        print(f"[JOB_SERVICE] export download failed for job {job_id}: {exc}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch export blob: {exc}")
+    # Container naming mirrors backup-worker / restore-worker:
+    # `backup-exports-{tenant_hash}`. Fallbacks: literal "exports" (legacy) and
+    # Job.result.container (if the worker recorded it explicitly).
+    from shared.azure_storage import azure_storage_manager
+    shard = azure_storage_manager.get_default_shard()
+    candidate_containers: list = []
+    if result.get("container"):
+        candidate_containers.append(str(result["container"]))
+    if job.tenant_id:
+        candidate_containers.append(azure_storage_manager.get_container_name(str(job.tenant_id), "exports"))
+    candidate_containers.append("exports")
+    # dedupe preserving order
+    seen = set(); _uniq = []
+    for c in candidate_containers:
+        if c and c not in seen:
+            seen.add(c); _uniq.append(c)
+    candidate_containers = _uniq
+
+    content = None
+    last_err: Exception | None = None
+    for cand in candidate_containers:
+        try:
+            content = await shard.download_blob(cand, blob_path)
+            if content is not None:
+                print(f"[JOB_SERVICE] export download: found in container={cand}")
+                break
+        except Exception as exc:
+            last_err = exc
+            print(f"[JOB_SERVICE] container={cand} download failed: {exc}")
     if content is None:
-        raise HTTPException(status_code=404, detail="Export blob not found in storage")
+        if last_err:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch export blob: {last_err}")
+        raise HTTPException(status_code=404, detail=f"Export blob not found in any of: {candidate_containers}")
 
     fname = blob_path.rsplit("/", 1)[-1] or f"export_{job_id}.zip"
 
