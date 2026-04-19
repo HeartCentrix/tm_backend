@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import mimetypes
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
-from shared.models import SnapshotItem, Snapshot
+from shared.models import SnapshotItem, Snapshot, Resource
 
 
 @dataclass
@@ -28,10 +28,18 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
     Sn = aliased(Snapshot)
     CHAT_TYPES = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
 
+    # Accept parent ENTRA_USER or child USER_CHATS id interchangeably.
+    child_ids = [
+        r[0] for r in (await sess.execute(
+            select(Resource.id).where(Resource.parent_resource_id == resource_id)
+        ))
+    ]
+    resource_ids = [resource_id, *child_ids]
+
     if thread_path:
         q = (select(SnapshotItem)
              .join(Sn, Sn.id == SnapshotItem.snapshot_id)
-             .where(Sn.resource_id == resource_id)
+             .where(Sn.resource_id.in_(resource_ids))
              .where(SnapshotItem.snapshot_id.in_(snapshot_ids))
              .where(SnapshotItem.item_type.in_(CHAT_TYPES))
              .where(SnapshotItem.folder_path == thread_path)
@@ -42,7 +50,7 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
     else:
         q = (select(SnapshotItem)
              .join(Sn, Sn.id == SnapshotItem.snapshot_id)
-             .where(Sn.resource_id == resource_id)
+             .where(Sn.resource_id.in_(resource_ids))
              .where(SnapshotItem.id.in_(item_ids))
              .order_by(SnapshotItem.created_at.asc()))
         msgs = list((await sess.execute(q)).scalars())

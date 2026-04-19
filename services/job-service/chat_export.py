@@ -108,6 +108,10 @@ async def _resolve_counts(
     thread_path: str | None,
     item_ids: list[str],
 ):
+    import logging as _lg
+    _dbg = _lg.getLogger("chat-export.scope")
+    _dbg.warning("resolve thread_path=%r item_ids=%r resource_id=%s snapshots=%s",
+                 thread_path, item_ids, resource_id, snapshot_ids)
     if thread_path and item_ids:
         raise HTTPException(400, detail={"error": "INVALID_SELECTION"})
     if not thread_path and not item_ids:
@@ -117,12 +121,18 @@ async def _resolve_counts(
     snapshot_uuids = [uuid.UUID(s) for s in snapshot_ids] if snapshot_ids else []
     item_uuids = [uuid.UUID(i) for i in item_ids] if item_ids else []
 
+    # Frontend may send the parent ENTRA_USER id or the child USER_CHATS id
+    # interchangeably — expand to both so the snapshot JOIN matches either.
+    child_q = select(Resource.id).where(Resource.parent_resource_id == resource_uuid)
+    child_ids = [r[0] for r in (await sess.execute(child_q))]
+    resource_uuids = [resource_uuid, *child_ids]
+
     Sn = aliased(Snapshot)
     base = (
         select(func.count(), func.coalesce(func.sum(SnapshotItem.content_size), 0))
         .select_from(SnapshotItem)
         .join(Sn, Sn.id == SnapshotItem.snapshot_id)
-        .where(Sn.resource_id == resource_uuid)
+        .where(Sn.resource_id.in_(resource_uuids))
     )
     if thread_path:
         if not snapshot_uuids:
@@ -140,7 +150,7 @@ async def _resolve_counts(
         paths_q = (
             select(SnapshotItem.folder_path)
             .join(Sn, Sn.id == SnapshotItem.snapshot_id)
-            .where(Sn.resource_id == resource_uuid)
+            .where(Sn.resource_id.in_(resource_uuids))
             .where(SnapshotItem.id.in_(item_uuids))
             .distinct()
         )
@@ -159,7 +169,7 @@ async def _resolve_counts(
     ext_ids_q = (
         select(SnapshotItem.external_id)
         .join(Sn, Sn.id == SnapshotItem.snapshot_id)
-        .where(Sn.resource_id == resource_uuid)
+        .where(Sn.resource_id.in_(resource_uuids))
     )
     if thread_path:
         ext_ids_q = ext_ids_q.where(SnapshotItem.folder_path == thread_path).where(
