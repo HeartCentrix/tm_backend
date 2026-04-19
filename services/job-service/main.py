@@ -436,6 +436,17 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
         resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
         routing_key = AZURE_WORKLOAD_QUEUES.get(resource_type, "backup.urgent")
 
+        # Heavy-pool routing: oversized OneDrive drives go to backup.heavy so
+        # a single 500 GB drive can't block the shared backup.normal queue.
+        # Non-OneDrive types keep their existing routing (urgent / Azure queues).
+        if resource_type == "USER_ONEDRIVE":
+            from shared.export_routing import pick_backup_queue
+            drive_bytes_estimate = int((resource.extra_data or {}).get("drive_quota_used", 0))
+            routing_key = pick_backup_queue(
+                drive_bytes_estimate=drive_bytes_estimate,
+                resource_type=resource_type,
+            )
+
         msg = create_backup_message(
             job_id=str(job.id), resource_id=request.resourceId,
             tenant_id=str(resource.tenant_id), full_backup=effective_full_backup

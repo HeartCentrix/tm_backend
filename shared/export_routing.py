@@ -16,3 +16,16 @@ def pick_export_queue(*, total_bytes: int, include_attachments: bool) -> str:
     if include_attachments and total_bytes >= settings.HEAVY_EXPORT_THRESHOLD_BYTES:
         return settings.HEAVY_EXPORT_QUEUE
     return "restore.normal"
+
+
+def pick_backup_queue(*, drive_bytes_estimate: int, resource_type: str) -> str:
+    """Return the RabbitMQ queue for a backup job. OneDrive drives above
+    BACKUP_HEAVY_THRESHOLD_BYTES go to the dedicated heavy pool so regular
+    backup-worker replicas aren't blocked by a single monster drive."""
+    if not settings.BACKUP_HEAVY_ENABLED:
+        return settings.BACKUP_WORKER_QUEUE
+    if resource_type != "USER_ONEDRIVE":
+        return settings.BACKUP_WORKER_QUEUE
+    if drive_bytes_estimate >= settings.BACKUP_HEAVY_THRESHOLD_BYTES:
+        return settings.BACKUP_HEAVY_QUEUE
+    return settings.BACKUP_WORKER_QUEUE
