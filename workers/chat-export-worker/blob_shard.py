@@ -19,7 +19,9 @@ def shard_account(idx: int, accounts: Sequence[str] | None = None) -> str:
 
 
 def _sas_sig(**kw) -> str:
-    return "sig=" + generate_blob_sas(**kw)
+    # Azure SDK returns the full SAS query string (se=…&sp=…&sv=…&sr=b&sig=…),
+    # not just the signature value. Don't prepend "sig=".
+    return generate_blob_sas(**kw)
 
 
 def sign_download_url(*, account: str, container: str, blob_path: str,
@@ -28,7 +30,7 @@ def sign_download_url(*, account: str, container: str, blob_path: str,
     key = (getattr(settings, "AZURE_STORAGE_ACCOUNT_KEY", None)
            or os.environ.get(f"CHAT_EXPORT_KEY_{account.upper()}", ""))
     expiry = datetime.now(timezone.utc) + timedelta(hours=ttl)
-    sig = _sas_sig(account_name=account, container_name=container, blob_name=blob_path,
-                   account_key=key, permission=BlobSasPermissions(read=True),
-                   expiry=expiry, protocol="https")
-    return f"https://{account}.blob.core.windows.net/{container}/{blob_path}?{sig}"
+    sas_qs = _sas_sig(account_name=account, container_name=container, blob_name=blob_path,
+                      account_key=key, permission=BlobSasPermissions(read=True),
+                      expiry=expiry, protocol="https")
+    return f"https://{account}.blob.core.windows.net/{container}/{blob_path}?{sas_qs}"
