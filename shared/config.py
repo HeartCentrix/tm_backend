@@ -166,7 +166,7 @@ class Settings:
         # ── Graph API throttle hardening ──
         # Spec: docs/superpowers/specs/2026-04-19-graph-api-throttle-hardening-design.md
         self.GRAPH_HARDENING_ENABLED = os.getenv(
-            "GRAPH_HARDENING_ENABLED", "false"
+            "GRAPH_HARDENING_ENABLED", "true"
         ).lower() in ("true", "1", "yes")
         # Per-(app, tenant) sustained rate cap. Half of OneDrive's published
         # 5 rps floor so we're invisible to any tenant admin's throttle alerts.

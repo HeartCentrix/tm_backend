@@ -23,7 +23,7 @@ import hashlib
 import logging
 import os
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 from typing import Dict, List, Any, Optional, Tuple
 import aio_pika
@@ -228,6 +228,7 @@ class BackupWorker:
         "ENTRA_USER": "backup_entra_single", "ENTRA_GROUP": "backup_entra_single",
         "M365_GROUP": "backup_entra_single", "ENTRA_APP": "backup_entra_single",
         "ENTRA_DEVICE": "backup_entra_single", "ENTRA_SERVICE_PRINCIPAL": "backup_entra_single",
+        "ENTRA_DIRECTORY": "backup_entra_directory",
         "ENTRA_CONDITIONAL_ACCESS": "backup_conditional_access",
         "ENTRA_BITLOCKER_KEY": "backup_bitlocker_key",
         "PLANNER": "_backup_metadata_only", "TODO": "_backup_metadata_only",
@@ -594,36 +595,202 @@ class BackupWorker:
                     return out
 
                 if kind == "USER_CONTACTS":
+                    # `/users/{id}/contacts` returns ONLY the root Contacts
+                    # folder. To cover every folder (Skype-synced contacts,
+                    # mobile-device folders, custom folders) we first list
+                    # contactFolders and then fetch per-folder contacts.
+                    # Root folder's items are also included via the direct
+                    # /contacts call so nothing slips through if the folder
+                    # list is truncated.
                     folder_map: Dict[str, str] = {}
+                    folder_ids: List[str] = []
                     try:
                         f_page = await graph_client._get(
                             f"{graph_client.GRAPH_URL}/users/{user_id}/contactFolders",
                             params={"$top": "100", "$select": "id,displayName"},
                         )
                         for f in (f_page or {}).get("value", []) or []:
-                            folder_map[f.get("id")] = f.get("displayName") or ""
+                            fid = f.get("id")
+                            if fid:
+                                folder_map[fid] = f.get("displayName") or ""
+                                folder_ids.append(fid)
                     except Exception:
                         pass
-                    page = await graph_client._get(
-                        f"{graph_client.GRAPH_URL}/users/{user_id}/contacts",
-                        params={"$top": str(ITEM_LIMIT), "$select": "id,displayName,givenName,surname,companyName,jobTitle,emailAddresses,businessPhones,parentFolderId"},
-                    )
-                    return [
+
+                    select_fields = "id,displayName,givenName,surname,companyName,jobTitle,emailAddresses,businessPhones,mobilePhone,homePhones,parentFolderId,categories,imAddresses,personalNotes,birthday"
+
+                    async def _fetch_contacts(url: str) -> List[Dict[str, Any]]:
+                        all_rows: List[Dict[str, Any]] = []
+                        next_url: Optional[str] = url
+                        params: Optional[Dict[str, str]] = {"$top": str(ITEM_LIMIT), "$select": select_fields}
+                        pages = 0
+                        while next_url and pages < 50:
+                            try:
+                                page_data = await graph_client._get(next_url, params=params)
+                            except Exception as exc:
+                                logger.warning("[%s] Contact fetch failed on %s: %s", self.worker_id, next_url, exc)
+                                break
+                            all_rows.extend(page_data.get("value", []) or [])
+                            next_url = page_data.get("@odata.nextLink")
+                            params = None
+                            pages += 1
+                        return all_rows
+
+                    aggregated: Dict[str, Dict[str, Any]] = {}
+                    # 1) Root-folder direct fetch.
+                    for c in await _fetch_contacts(f"{graph_client.GRAPH_URL}/users/{user_id}/contacts"):
+                        cid = c.get("id")
+                        if cid and cid not in aggregated:
+                            aggregated[cid] = c
+                    # 2) Every enumerated contactFolder.
+                    for fid in folder_ids:
+                        url = f"{graph_client.GRAPH_URL}/users/{user_id}/contactFolders/{fid}/contacts"
+                        for c in await _fetch_contacts(url):
+                            cid = c.get("id")
+                            if cid and cid not in aggregated:
+                                aggregated[cid] = c
+
+                    out_rows = [
                         ("USER_CONTACT",
-                         c.get("displayName") or "(unnamed)",
+                         c.get("displayName") or (c.get("emailAddresses") or [{}])[0].get("address") or "(unnamed)",
                          c.get("id"),
                          {"raw": c},
                          folder_map.get(c.get("parentFolderId")) or "Contacts")
-                        for c in page.get("value", [])
+                        for c in aggregated.values()
                     ]
+                    print(f"[{self.worker_id}]   [USER_CONTACTS] {user_id}: {len(folder_ids)} folders, {len(out_rows)} contacts aggregated")
+                    return out_rows
 
                 if kind == "USER_CALENDAR":
-                    page = await graph_client._get(
-                        f"{graph_client.GRAPH_URL}/users/{user_id}/events",
-                        params={"$top": str(ITEM_LIMIT)},
-                    )
-                    return [("CALENDAR_EVENT", e.get("subject") or "(no subject)", e.get("id"), {"raw": e}, "Calendar")
-                            for e in page.get("value", [])]
+                    # AFI-parity calendar backup:
+                    #   • Enumerate every calendar under /users/{id}/calendars
+                    #     (default + shared + secondary) so we're not limited
+                    #     to the main calendar.
+                    #   • For each calendar, use /calendarView/delta with a
+                    #     sliding 2-year-back / 1-year-forward window, which
+                    #     EXPANDS every recurring series into one row per
+                    #     occurrence (a daily standup becomes ~750 rows,
+                    #     not 1). First run walks the window; subsequent
+                    #     runs resume from the saved @odata.deltaLink.
+                    #   • Per-calendar delta tokens live in
+                    #     resource.extra_data["calendar_delta_tokens"]:
+                    #       { calendarId: "<full deltaLink URL>" }
+                    from datetime import timedelta as _td
+                    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+                    win_start = (now_utc - _td(days=365 * 2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    win_end   = (now_utc + _td(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                    # Current delta-token map (per calendar).
+                    cal_delta_map: Dict[str, str] = dict((resource.extra_data or {}).get("calendar_delta_tokens") or {})
+                    new_delta_map: Dict[str, str] = {}
+
+                    # 1) Enumerate calendars owned by the user.
+                    try:
+                        cal_page = await graph_client._get(
+                            f"{graph_client.GRAPH_URL}/users/{user_id}/calendars",
+                            params={"$top": "100", "$select": "id,name,color,owner,canEdit,isDefaultCalendar"},
+                        )
+                        calendars = (cal_page or {}).get("value", []) or []
+                    except Exception as _e:
+                        # Fallback: at least hit the default calendar so we
+                        # don't return zero events on a permissions blip.
+                        logger.warning("[%s] Calendars enumeration failed for %s: %s", self.worker_id, user_id, _e)
+                        calendars = [{"id": "default", "name": "Calendar", "isDefaultCalendar": True}]
+
+                    out_rows: List[tuple] = []
+                    for cal in calendars:
+                        cal_id = cal.get("id") or "default"
+                        cal_name = cal.get("name") or "Calendar"
+                        is_default = bool(cal.get("isDefaultCalendar"))
+                        # Resume from saved deltaLink if we have one for this
+                        # calendar; otherwise start a fresh window.
+                        #
+                        # Graph supports /calendarView/delta only on the
+                        # DEFAULT calendar (/users/{id}/calendarView/delta).
+                        # Secondary calendars (US Holidays, Birthdays, shared,
+                        # group calendars) 400 on the delta variant — we fall
+                        # back to non-delta /calendars/{cid}/calendarView which
+                        # still expands recurring series but has no delta
+                        # token (so it's a full re-pull each run — acceptable
+                        # because sub-calendars rarely have daily change volume).
+                        # NB: _iter_pages treats URLs starting with "http" as
+                        # already-complete (nextLink-style) and drops the
+                        # params dict, so we inline startDateTime/endDateTime
+                        # into the URL directly. This matches what Graph
+                        # actually needs on the very first request.
+                        saved_delta = cal_delta_map.get(cal_id)
+                        if saved_delta and is_default:
+                            stream_url = saved_delta
+                            stream_params: Optional[Dict[str, str]] = None
+                            print(f"[{self.worker_id}]   [USER_CALENDAR] resuming delta for {cal_name} ({user_id})")
+                        elif is_default:
+                            stream_url = (
+                                f"{graph_client.GRAPH_URL}/users/{user_id}"
+                                f"/calendarView/delta"
+                                f"?startDateTime={win_start}&endDateTime={win_end}"
+                            )
+                            stream_params = None
+                        else:
+                            stream_url = (
+                                f"{graph_client.GRAPH_URL}/users/{user_id}"
+                                f"/calendars/{cal_id}/calendarView"
+                                f"?startDateTime={win_start}&endDateTime={win_end}&$top=999"
+                            )
+                            stream_params = None
+
+                        # Drain the stream. _iter_pages captures the terminal
+                        # @odata.deltaLink into self._last_delta_link — we
+                        # grab it per-calendar and stash into the new map.
+                        try:
+                            async for page in graph_client._iter_pages(stream_url, params=stream_params):
+                                for e in page.get("value", []) or []:
+                                    # calendarView/delta emits `@removed` blobs
+                                    # when an event is deleted from the window;
+                                    # skip those — they don't carry a subject.
+                                    if "@removed" in e or not e.get("id"):
+                                        continue
+                                    out_rows.append((
+                                        "CALENDAR_EVENT",
+                                        e.get("subject") or "(no subject)",
+                                        e.get("id"),
+                                        {
+                                            "raw": e,
+                                            "calendarId": cal_id,
+                                            "calendarName": cal_name,
+                                            "seriesMasterId": e.get("seriesMasterId"),
+                                            "type": e.get("type"),
+                                        },
+                                        # folder_path groups events per
+                                        # calendar so the Recovery left rail
+                                        # can show "Calendar / <name>".
+                                        f"Calendar/{cal_name}",
+                                    ))
+                        except Exception as _e:
+                            print(f"[{self.worker_id}]   [USER_CALENDAR] stream aborted for {cal_name}: {type(_e).__name__}: {_e}")
+
+                        cap = getattr(graph_client, "_last_delta_link", None)
+                        if cap:
+                            new_delta_map[cal_id] = cap
+
+                    # Persist the per-calendar delta tokens for next run. We
+                    # merge with existing map so a failed calendar doesn't
+                    # wipe tokens we still hold for others.
+                    if new_delta_map:
+                        try:
+                            async with async_session_factory() as _s:
+                                r = await _s.get(Resource, resource.id)
+                                if r is not None:
+                                    ed = dict(r.extra_data or {})
+                                    merged = dict(ed.get("calendar_delta_tokens") or {})
+                                    merged.update(new_delta_map)
+                                    ed["calendar_delta_tokens"] = merged
+                                    r.extra_data = ed
+                                    await _s.commit()
+                        except Exception as _e:
+                            print(f"[{self.worker_id}]   [USER_CALENDAR] delta persist failed: {_e}")
+
+                    print(f"[{self.worker_id}]   [USER_CALENDAR] {user_id}: {len(calendars)} calendar(s), {len(out_rows)} event occurrence(s)")
+                    return out_rows
 
                 if kind == "USER_CHATS":
                     # Per-chat metadata map: chat_id → {displayName, chatType,
@@ -721,6 +888,10 @@ class BackupWorker:
                         })
 
                     out: List = []
+                    # Log label for this stream — resource.display_name like
+                    # "Chats — Akshat Verma" is fine; fall back to the user
+                    # id if the resource row had no display_name captured.
+                    user_label = resource.display_name or user_id
                     # Route through GraphClient._iter_pages so pacing,
                     # multi-app rotation, Retry-After, cumulative-cap, and
                     # sticky failover all apply automatically. The hardened
@@ -4619,6 +4790,187 @@ class BackupWorker:
                                   tenant: Tenant, message: Dict) -> Dict:
         """Single-resource Entra ID backup (matches handler signature)"""
         return await self._backup_entra_resource(resource, tenant, snapshot, graph_client, None, message)
+
+    async def backup_entra_directory(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
+                                     tenant: Tenant, message: Dict) -> Dict:
+        """Back up the whole Microsoft Entra directory as one snapshot.
+        Mirrors AFI's office_directory model — eight content categories
+        persisted under this single resource so the Recovery view can
+        render tabs: Users / Groups / Roles / Security / Audit /
+        Applications / Intune / Administrative Units.
+
+        Each category is best-effort: a 403 on one endpoint (e.g. Intune
+        requires DeviceManagementManagedDevices.Read.All, audit logs
+        require AuditLog.Read.All) is swallowed so a single missing
+        permission doesn't fail the whole snapshot.
+        """
+        print(f"[{self.worker_id}] [ENTRA_DIR START] {resource.display_name}")
+        total_items = 0
+        total_bytes = 0
+
+        # One-off helper: persist a batch of items keyed by item_type.
+        async def _persist_batch(item_type: str, category_label: str, items: List[Dict[str, Any]]) -> int:
+            nonlocal total_items, total_bytes
+            if not items:
+                return 0
+            rows: List[SnapshotItem] = []
+            for obj in items:
+                ext_id = str(obj.get("id") or obj.get("roleTemplateId") or obj.get("appId") or uuid.uuid4())
+                display = (
+                    obj.get("displayName")
+                    or obj.get("userPrincipalName")
+                    or obj.get("mail")
+                    or obj.get("activityDisplayName")
+                    or obj.get("category")
+                    or ext_id
+                )
+                raw_bytes = json.dumps(obj, default=str).encode()
+                rows.append(SnapshotItem(
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    external_id=ext_id[:255],
+                    item_type=item_type,
+                    name=str(display)[:255],
+                    folder_path=category_label,
+                    content_size=len(raw_bytes),
+                    content_hash=hashlib.sha256(raw_bytes).hexdigest(),
+                    content_checksum=None,
+                    extra_data={"raw": obj, "category": category_label},
+                ))
+                total_bytes += len(raw_bytes)
+            async with async_session_factory() as sess:
+                sess.add_all(rows)
+                await sess.commit()
+            total_items += len(rows)
+            print(f"[{self.worker_id}]   [ENTRA_DIR] {category_label}: captured {len(rows)} row(s)")
+            return len(rows)
+
+        async def _safe_fetch(url: str, params: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+            try:
+                data = await graph_client._get(url, params=params)
+                return data.get("value") or []
+            except Exception as exc:
+                logger.warning("[%s] [ENTRA_DIR] %s → %s", self.worker_id, url, exc)
+                return []
+
+        base = graph_client.GRAPH_URL
+
+        # 1) Users — pull the field set the Recovery "Users" view needs
+        #    (UPN, mail, proxyAddresses for "Other emails", userType +
+        #    externalUserState for Guest/External flags, Object ID = id).
+        users = await _safe_fetch(f"{base}/users", {
+            "$top": "999",
+            "$select": "id,displayName,userPrincipalName,mail,proxyAddresses,otherMails,userType,externalUserState,accountEnabled,jobTitle,department,createdDateTime,givenName,surname,mobilePhone,businessPhones",
+        })
+        await _persist_batch("ENTRA_DIR_USER", "Users", users)
+
+        # 2) Groups — with ownership + membership for the detail panel.
+        #    Also fetch per-group owners + first-page members so the
+        #    Recovery right-pane can render them without N×M refetches.
+        groups = await _safe_fetch(f"{base}/groups", {"$top": "999", "$select": "id,displayName,mail,description,groupTypes,securityEnabled,mailEnabled,visibility,membershipRule,createdDateTime"})
+        for g in groups:
+            gid = g.get("id")
+            if not gid:
+                continue
+            owners = await _safe_fetch(f"{base}/groups/{gid}/owners", {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"})
+            members = await _safe_fetch(f"{base}/groups/{gid}/members", {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"})
+            g["_owners"] = owners
+            g["_members"] = members
+            g["_memberCount"] = len(members)
+        await _persist_batch("ENTRA_DIR_GROUP", "Groups", groups)
+
+        # 3) Roles — $expand=rolePermissions so the right pane's
+        #    Privileges list is captured. directoryRoles (activated) is
+        #    kept in addition to roleDefinitions for parity with AFI.
+        roles_active = await _safe_fetch(f"{base}/directoryRoles")
+        roles_catalog = await _safe_fetch(f"{base}/roleManagement/directory/roleDefinitions", {"$top": "999", "$expand": "rolePermissions"})
+        await _persist_batch("ENTRA_DIR_ROLE", "Roles", roles_active + roles_catalog)
+
+        # 4) Security — AFI shows 5 buckets: Conditional Access,
+        #    Authentication Contexts, Authentication Strengths, Named
+        #    Locations, Policies. Each item carries a `_sec_bucket`
+        #    field so the frontend can split them in the left rail.
+        sec_items: List[Dict[str, Any]] = []
+        for bucket, url in [
+            ("Conditional Access", f"{base}/identity/conditionalAccess/policies"),
+            ("Authentication Contexts", f"{base}/identity/conditionalAccess/authenticationContextClassReferences"),
+            ("Authentication Strengths", f"{base}/identity/conditionalAccess/authenticationStrength/policies"),
+            ("Named Locations", f"{base}/identity/conditionalAccess/namedLocations"),
+            ("Policies", f"{base}/policies/identitySecurityDefaultsEnforcementPolicy"),
+        ]:
+            data = await _safe_fetch(url, {"$top": "500"})
+            # identitySecurityDefaultsEnforcementPolicy returns a single
+            # object, not a list — wrap it so _persist_batch sees a row.
+            if not data and bucket == "Policies":
+                try:
+                    single = await graph_client._get(url)
+                    if single and isinstance(single, dict) and single.get("id"):
+                        data = [single]
+                except Exception:
+                    data = []
+            for d in data:
+                d["_sec_bucket"] = bucket
+            sec_items.extend(data)
+        # Risky users + security alerts complement the above.
+        risky_users = await _safe_fetch(f"{base}/identityProtection/riskyUsers", {"$top": "500"})
+        for r in risky_users:
+            r["_sec_bucket"] = "Risky Users"
+        alerts = await _safe_fetch(f"{base}/security/alerts_v2", {"$top": "500"})
+        for a in alerts:
+            a["_sec_bucket"] = "Alerts"
+        sec_items.extend(risky_users + alerts)
+        await _persist_batch("ENTRA_DIR_SECURITY", "Security", sec_items)
+
+        # 5) Audit — directory audit + sign-in logs. Tag each row so
+        #    the frontend can split into Audit Logs vs Sign-In Logs.
+        dir_audits = await _safe_fetch(f"{base}/auditLogs/directoryAudits", {"$top": "500"})
+        for a in dir_audits:
+            a["_audit_bucket"] = "Audit Logs"
+        signins = await _safe_fetch(f"{base}/auditLogs/signIns", {"$top": "500"})
+        for s in signins:
+            s["_audit_bucket"] = "Sign-In Logs"
+        await _persist_batch("ENTRA_DIR_AUDIT", "Audit", dir_audits + signins)
+
+        # 6) Applications — split into App Registrations vs Enterprise
+        #    Applications via `_app_bucket`. Capture requiredResourceAccess
+        #    on /applications so the Permissions block renders.
+        apps = await _safe_fetch(f"{base}/applications", {"$top": "999", "$select": "id,appId,displayName,createdDateTime,requiredResourceAccess,signInAudience,identifierUris,publisherDomain"})
+        for a in apps:
+            a["_app_bucket"] = "App Registrations"
+        sps = await _safe_fetch(f"{base}/servicePrincipals", {"$top": "999", "$select": "id,appId,displayName,servicePrincipalType,appRoles,oauth2PermissionScopes,createdDateTime"})
+        for s in sps:
+            s["_app_bucket"] = "Enterprise Applications"
+        await _persist_batch("ENTRA_DIR_APPLICATION", "Applications", apps + sps)
+
+        # 7) Intune — AFI's "Devices" bucket matches /devices (Entra AD
+        #    devices) rather than Intune /managedDevices (which needs a
+        #    separate license). Compliance + Configuration policies
+        #    still come from Intune and may 400 without the license.
+        entra_devices = await _safe_fetch(f"{base}/devices", {"$top": "500", "$select": "id,displayName,accountEnabled,operatingSystem,operatingSystemVersion,trustType,registrationDateTime,isCompliant,isManaged"})
+        for d in entra_devices:
+            d["_intune_bucket"] = "Devices"
+            # Owner lookup — first registered user per device.
+            try:
+                owners = await _safe_fetch(f"{base}/devices/{d.get('id')}/registeredOwners", {"$top": "1", "$select": "id,displayName,userPrincipalName"})
+                if owners:
+                    d["_owner_display"] = owners[0].get("displayName")
+                    d["_owner_upn"] = owners[0].get("userPrincipalName")
+            except Exception:
+                pass
+        comp_policies = await _safe_fetch(f"{base}/deviceManagement/deviceCompliancePolicies", {"$top": "500"})
+        for c in comp_policies:
+            c["_intune_bucket"] = "Compliance Policies"
+        conf_policies = await _safe_fetch(f"{base}/deviceManagement/deviceConfigurations", {"$top": "500"})
+        for c in conf_policies:
+            c["_intune_bucket"] = "Configuration Profiles"
+        await _persist_batch("ENTRA_DIR_INTUNE", "Intune", entra_devices + comp_policies + conf_policies)
+
+        # 8) Administrative Units.
+        admin_units = await _safe_fetch(f"{base}/directory/administrativeUnits", {"$top": "500"})
+        await _persist_batch("ENTRA_DIR_ADMIN_UNIT", "Administrative Units", admin_units)
+
+        print(f"[{self.worker_id}] [ENTRA_DIR COMPLETE] {resource.display_name} — {total_items} items, {total_bytes} bytes")
+        return {"item_count": total_items, "bytes_added": total_bytes}
 
     async def backup_conditional_access(
         self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
