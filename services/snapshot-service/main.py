@@ -152,9 +152,21 @@ async def list_snapshots(
     resource_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1),
+    include_children: bool = Query(False, description="Also include snapshots of child resources (Tier 2 USER_MAIL/ONEDRIVE/etc. under an ENTRA_USER parent). Needed so the Recovery sparkline can plot the actual content bytes instead of the parent's tiny metadata row."),
     db: AsyncSession = Depends(get_db),
 ):
-    filters = [Snapshot.resource_id == UUID(resource_id)]
+    # Build the set of resource IDs whose snapshots we want. By default
+    # just the requested resource; with include_children=true we also
+    # pull the children linked via parent_resource_id (the Tier 2 fan-out
+    # from ENTRA_USER).
+    target_ids = [UUID(resource_id)]
+    if include_children:
+        child_rows = (await db.execute(
+            select(Resource.id).where(Resource.parent_resource_id == UUID(resource_id))
+        )).all()
+        target_ids.extend(r[0] for r in child_rows)
+
+    filters = [Snapshot.resource_id.in_(target_ids)]
     total = (await db.execute(select(func.count(Snapshot.id)).where(*filters))).scalar() or 0
     stmt = select(Snapshot).where(*filters).order_by(Snapshot.created_at.desc()).offset((page-1)*size).limit(size)
     result = await db.execute(stmt)
@@ -1142,6 +1154,42 @@ async def list_onedrive_ids_by_prefix(
         ]
     rows = (await db.execute(select(SnapshotItem.id).where(*filters))).all()
     return {"ids": [str(r[0]) for r in rows], "count": len(rows)}
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/files")
+async def list_snapshot_files(
+    snapshot_id: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(200, ge=1),
+    search: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return EVERY item in a snapshot as a uniform 'file' row.
+
+    Used by the Recovery page for resource kinds that don't fit the five
+    fixed tabs (Power BI workspaces, SharePoint sites, Azure resources,
+    etc.) — one flat list of items with name / size / captured-at /
+    blob-path so the frontend can render a simple files table.
+
+    No item_type filter — whatever is in the snapshot shows up. Mail /
+    OneDrive / Contacts / Calendar / Chats have their own dedicated
+    endpoints that filter by type; this one is intentionally broad."""
+    filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
+    if search:
+        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
+    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
+    items = (await db.execute(
+        select(SnapshotItem).where(*filters)
+        .order_by(func.lower(SnapshotItem.name).asc())
+        .offset((page - 1) * size).limit(size)
+    )).scalars().all()
+    return {
+        "content": [_item_to_response(i) for i in items],
+        "totalElements": total,
+        "totalPages": max(1, (total + size - 1) // size),
+        "size": size,
+        "number": page,
+    }
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/contacts")
