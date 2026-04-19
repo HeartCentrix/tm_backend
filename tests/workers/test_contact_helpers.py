@@ -1,15 +1,30 @@
 """Pure-function tests for vCard 3.0 + CSV contact helpers."""
-import importlib
+import importlib.util
 import sys
 from pathlib import Path
 
-# Add restore-worker to import path (worker dirs aren't packages)
-WORKER_DIR = Path(__file__).resolve().parents[2] / "workers" / "restore-worker"
-sys.path.insert(0, str(WORKER_DIR))
 
-main = importlib.import_module("main")
-_contact_to_vcard = main._contact_to_vcard
-_contact_to_csv_row = main._contact_to_csv_row
+def _load_module(name: str, path: Path):
+    """Load a worker's main.py under a stable, collision-free module name."""
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    # Ensure the worker dir is on sys.path so its sibling modules import.
+    if str(path.parent) not in sys.path:
+        sys.path.insert(0, str(path.parent))
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_RESTORE_MAIN = _load_module(
+    "restore_worker_main",
+    Path(__file__).resolve().parents[2] / "workers" / "restore-worker" / "main.py",
+)
+
+_contact_to_vcard = _RESTORE_MAIN._contact_to_vcard
+_contact_to_csv_row = _RESTORE_MAIN._contact_to_csv_row
 
 
 def test_vcard_minimum_required_fields():

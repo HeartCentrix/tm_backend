@@ -1,4 +1,5 @@
 """Integration tests for USER_CONTACT branch in export_as_zip."""
+import importlib.util
 import io
 import sys
 import zipfile
@@ -6,8 +7,23 @@ from pathlib import Path
 from types import SimpleNamespace
 import pytest
 
-WORKER_DIR = Path(__file__).resolve().parents[2] / "workers" / "restore-worker"
-sys.path.insert(0, str(WORKER_DIR))
+
+def _load_module(name: str, path: Path):
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    if str(path.parent) not in sys.path:
+        sys.path.insert(0, str(path.parent))
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_RESTORE_MAIN = _load_module(
+    "restore_worker_main",
+    Path(__file__).resolve().parents[2] / "workers" / "restore-worker" / "main.py",
+)
 
 
 def _make_item(item_id, name, folder, raw):
@@ -27,7 +43,7 @@ def _make_item(item_id, name, folder, raw):
 @pytest.fixture
 def worker():
     """Build a RestoreWorker with the loaders stubbed to return the item's raw dict."""
-    import main
+    main = _RESTORE_MAIN
     w = main.RestoreWorker.__new__(main.RestoreWorker)
     w.worker_id = "test"
     w._calendar_csv_rows = []
@@ -62,7 +78,7 @@ def _run_export(worker, items, fmt, contact_folders=None):
 
     Mirrors the production code path exactly so the test catches breakage
     in either the production branch or the helpers it composes."""
-    import main as _m
+    _m = _RESTORE_MAIN
     spec = {"exportFormat": fmt}
     if contact_folders is not None:
         spec["contactFolders"] = contact_folders

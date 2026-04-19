@@ -102,6 +102,124 @@ def _message_to_contact_shape(msg: dict) -> dict:
     return shape
 
 
+async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int = 999):
+    """Aggregate a user's contacts from /contactFolders + (optionally)
+    Deleted Items + Recoverable Items folders.
+
+    Returns row tuples in the shape the caller previously built inline:
+    (item_type, name, external_id, payload_dict, folder_name)
+    """
+    from shared.config import settings
+
+    select_fields = (
+        "id,displayName,givenName,surname,companyName,jobTitle,emailAddresses,"
+        "businessPhones,mobilePhone,homePhones,parentFolderId,categories,"
+        "imAddresses,personalNotes,birthday"
+    )
+
+    folder_map: dict = {}
+    folder_ids: list = []
+    try:
+        f_page = await graph_client._get(
+            f"{graph_client.GRAPH_URL}/users/{user_id}/contactFolders",
+            params={"$top": "100", "$select": "id,displayName"},
+        )
+        for f in (f_page or {}).get("value", []) or []:
+            fid = f.get("id")
+            if fid:
+                folder_map[fid] = f.get("displayName") or ""
+                folder_ids.append(fid)
+    except Exception:
+        pass
+
+    async def _fetch_contacts(url):
+        all_rows = []
+        next_url = url
+        params = {"$top": str(item_limit), "$select": select_fields}
+        pages = 0
+        while next_url and pages < 50:
+            try:
+                page_data = await graph_client._get(next_url, params=params)
+            except Exception as exc:
+                logger.warning("Contact fetch failed on %s: %s", next_url, exc)
+                break
+            all_rows.extend(page_data.get("value", []) or [])
+            next_url = page_data.get("@odata.nextLink")
+            params = None
+            pages += 1
+        return all_rows
+
+    async def _fetch_messages(url):
+        all_rows = []
+        next_url = url
+        pages = 0
+        while next_url and pages < 50:
+            try:
+                page_data = await graph_client._get(next_url)
+            except Exception as exc:
+                logger.warning("Deleted-contact fetch failed on %s: %s", next_url, exc)
+                break
+            all_rows.extend(page_data.get("value", []) or [])
+            next_url = page_data.get("@odata.nextLink")
+            pages += 1
+        return all_rows
+
+    aggregated: dict = {}
+    folder_override: dict = {}
+
+    for c in await _fetch_contacts(f"{graph_client.GRAPH_URL}/users/{user_id}/contacts"):
+        cid = c.get("id")
+        if cid and cid not in aggregated:
+            aggregated[cid] = c
+    for fid in folder_ids:
+        url = f"{graph_client.GRAPH_URL}/users/{user_id}/contactFolders/{fid}/contacts"
+        for c in await _fetch_contacts(url):
+            cid = c.get("id")
+            if cid and cid not in aggregated:
+                aggregated[cid] = c
+
+    if settings.BACKUP_CONTACTS_INCLUDE_DELETED:
+        del_url = (
+            f"{graph_client.GRAPH_URL}/users/{user_id}"
+            f"/mailFolders('deleteditems')/messages"
+            f"?$filter=startswith(itemClass,'IPM.Contact')&$top={item_limit}"
+        )
+        for msg in await _fetch_messages(del_url):
+            shape = _message_to_contact_shape(msg)
+            cid = shape.get("id")
+            if cid and cid not in aggregated:
+                aggregated[cid] = shape
+                folder_override[cid] = "Deleted Items"
+
+    if settings.BACKUP_CONTACTS_INCLUDE_RECOVERABLE:
+        rec_url = (
+            f"{graph_client.GRAPH_URL}/users/{user_id}"
+            f"/mailFolders('recoverableitemsdeletions')/messages"
+            f"?$filter=startswith(itemClass,'IPM.Contact')&$top={item_limit}"
+        )
+        for msg in await _fetch_messages(rec_url):
+            shape = _message_to_contact_shape(msg)
+            cid = shape.get("id")
+            if cid and cid not in aggregated:
+                aggregated[cid] = shape
+                folder_override[cid] = "Recoverable Items"
+
+    out_rows = []
+    for cid, c in aggregated.items():
+        folder_name = (
+            folder_override.get(cid)
+            or folder_map.get(c.get("parentFolderId"))
+            or "Contacts"
+        )
+        name = (
+            c.get("displayName")
+            or (c.get("emailAddresses") or [{}])[0].get("address")
+            or "(unnamed)"
+        )
+        out_rows.append(("USER_CONTACT", name, cid, {"raw": c}, folder_name))
+    return out_rows
+
+
 class AuditLogger:
     """Logs backup events via HTTP POST and RabbitMQ"""
 
@@ -636,70 +754,14 @@ class BackupWorker:
                     return out
 
                 if kind == "USER_CONTACTS":
-                    # `/users/{id}/contacts` returns ONLY the root Contacts
-                    # folder. To cover every folder (Skype-synced contacts,
-                    # mobile-device folders, custom folders) we first list
-                    # contactFolders and then fetch per-folder contacts.
-                    # Root folder's items are also included via the direct
-                    # /contacts call so nothing slips through if the folder
-                    # list is truncated.
-                    folder_map: Dict[str, str] = {}
-                    folder_ids: List[str] = []
-                    try:
-                        f_page = await graph_client._get(
-                            f"{graph_client.GRAPH_URL}/users/{user_id}/contactFolders",
-                            params={"$top": "100", "$select": "id,displayName"},
-                        )
-                        for f in (f_page or {}).get("value", []) or []:
-                            fid = f.get("id")
-                            if fid:
-                                folder_map[fid] = f.get("displayName") or ""
-                                folder_ids.append(fid)
-                    except Exception:
-                        pass
-
-                    select_fields = "id,displayName,givenName,surname,companyName,jobTitle,emailAddresses,businessPhones,mobilePhone,homePhones,parentFolderId,categories,imAddresses,personalNotes,birthday"
-
-                    async def _fetch_contacts(url: str) -> List[Dict[str, Any]]:
-                        all_rows: List[Dict[str, Any]] = []
-                        next_url: Optional[str] = url
-                        params: Optional[Dict[str, str]] = {"$top": str(ITEM_LIMIT), "$select": select_fields}
-                        pages = 0
-                        while next_url and pages < 50:
-                            try:
-                                page_data = await graph_client._get(next_url, params=params)
-                            except Exception as exc:
-                                logger.warning("[%s] Contact fetch failed on %s: %s", self.worker_id, next_url, exc)
-                                break
-                            all_rows.extend(page_data.get("value", []) or [])
-                            next_url = page_data.get("@odata.nextLink")
-                            params = None
-                            pages += 1
-                        return all_rows
-
-                    aggregated: Dict[str, Dict[str, Any]] = {}
-                    # 1) Root-folder direct fetch.
-                    for c in await _fetch_contacts(f"{graph_client.GRAPH_URL}/users/{user_id}/contacts"):
-                        cid = c.get("id")
-                        if cid and cid not in aggregated:
-                            aggregated[cid] = c
-                    # 2) Every enumerated contactFolder.
-                    for fid in folder_ids:
-                        url = f"{graph_client.GRAPH_URL}/users/{user_id}/contactFolders/{fid}/contacts"
-                        for c in await _fetch_contacts(url):
-                            cid = c.get("id")
-                            if cid and cid not in aggregated:
-                                aggregated[cid] = c
-
-                    out_rows = [
-                        ("USER_CONTACT",
-                         c.get("displayName") or (c.get("emailAddresses") or [{}])[0].get("address") or "(unnamed)",
-                         c.get("id"),
-                         {"raw": c},
-                         folder_map.get(c.get("parentFolderId")) or "Contacts")
-                        for c in aggregated.values()
-                    ]
-                    print(f"[{self.worker_id}]   [USER_CONTACTS] {user_id}: {len(folder_ids)} folders, {len(out_rows)} contacts aggregated")
+                    out_rows = await _backup_contacts_for_user(
+                        graph_client, user_id, item_limit=ITEM_LIMIT
+                    )
+                    folder_names = sorted({r[4] for r in out_rows})
+                    print(
+                        f"[{self.worker_id}]   [USER_CONTACTS] {user_id}: "
+                        f"{len(out_rows)} contacts, folders={folder_names}"
+                    )
                     return out_rows
 
                 if kind == "USER_CALENDAR":
