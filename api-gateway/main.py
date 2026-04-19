@@ -45,6 +45,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Content-Disposition carries the server-chosen filename for raw-single
+    # OneDrive exports (e.g. Report.xlsx). Without exposing it, fetch()
+    # in the browser can't read the header and falls back to a.download
+    # which would force a .zip suffix.
+    expose_headers=["Content-Disposition", "Content-Length"],
 )
 
 

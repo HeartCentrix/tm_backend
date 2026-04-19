@@ -3,7 +3,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev && rm -rf /var/lib/apt/lists/*
 COPY shared/ /app/shared/
 COPY services/resource-service/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --default-timeout=300 --retries 5 --no-cache-dir -r requirements.txt
 COPY services/resource-service/ .
 ENV PORT=8003
 EXPOSE ${PORT}

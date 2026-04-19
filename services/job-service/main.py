@@ -436,6 +436,17 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
         resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
         routing_key = AZURE_WORKLOAD_QUEUES.get(resource_type, "backup.urgent")
 
+        # Heavy-pool routing: oversized OneDrive drives go to backup.heavy so
+        # a single 500 GB drive can't block the shared backup.normal queue.
+        # Non-OneDrive types keep their existing routing (urgent / Azure queues).
+        if resource_type == "USER_ONEDRIVE":
+            from shared.export_routing import pick_backup_queue
+            drive_bytes_estimate = int((resource.extra_data or {}).get("drive_quota_used", 0))
+            routing_key = pick_backup_queue(
+                drive_bytes_estimate=drive_bytes_estimate,
+                resource_type=resource_type,
+            )
+
         msg = create_backup_message(
             job_id=str(job.id), resource_id=request.resourceId,
             tenant_id=str(resource.tenant_id), full_backup=effective_full_backup
@@ -914,6 +925,33 @@ async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
 
     # Worker persists upload metadata in Job.result (not Job.spec).
     result = job.result or {}
+    output_mode = result.get("output_mode", "zip")
+
+    from shared.azure_storage import azure_storage_manager
+    shard = azure_storage_manager.get_default_shard()
+
+    # Raw single-file shortcut — OneDrive export v2 writes output_mode='raw_single'
+    # when exactly one file is exported in ORIGINAL format. Skip ZIP wrapper and
+    # stream the source blob bytes directly with the original Content-Type +
+    # filename so the browser saves it as the user expects.
+    if output_mode == "raw_single":
+        src_container = result.get("source_container")
+        src_blob_path = result.get("source_blob_path")
+        if not src_container or not src_blob_path:
+            raise HTTPException(status_code=500, detail="raw_single job missing source blob info")
+        content_type = result.get("content_type") or "application/octet-stream"
+        original_name = result.get("original_name") or f"export_{job_id}.bin"
+        size_bytes = int(result.get("size_bytes") or 0)
+
+        async def _iter_raw():
+            async for chunk in shard.download_blob_stream(src_container, src_blob_path):
+                yield chunk
+
+        raw_headers = {"Content-Disposition": f'attachment; filename="{original_name}"'}
+        if size_bytes:
+            raw_headers["Content-Length"] = str(size_bytes)
+        return StreamingResponse(_iter_raw(), media_type=content_type, headers=raw_headers)
+
     blob_path = result.get("blob_path") or result.get("blobPath")
     if not blob_path:
         raise HTTPException(status_code=500, detail="Job completed but no blob_path recorded")
@@ -922,8 +960,6 @@ async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
     # Container naming mirrors backup-worker / restore-worker:
     # `backup-exports-{tenant_hash}`. Fallbacks: literal "exports" (legacy) and
     # Job.result.container (if the worker recorded it explicitly).
-    from shared.azure_storage import azure_storage_manager
-    shard = azure_storage_manager.get_default_shard()
     candidate_containers: list = []
     if result.get("container"):
         candidate_containers.append(str(result["container"]))

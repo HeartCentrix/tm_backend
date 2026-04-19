@@ -350,6 +350,69 @@ services:
       # env var if a specific workload genuinely needs more parallelism.
       replicas: ${BACKUP_WORKER_REPLICAS:-1}
 
+  # Heavy-pool backup worker for oversized OneDrive drives (>100 GB default
+  # via BACKUP_HEAVY_THRESHOLD_BYTES). Consumes backup.heavy so regular
+  # backup-worker replicas aren't blocked for hours by a single monster drive.
+  # Gated by the 'heavy' compose profile — prod brings it up with
+  # `docker-compose --profile heavy up -d`; local dev leaves it idle.
+  backup-worker-heavy:
+    build:
+      context: .
+      dockerfile: workers/backup-worker/Dockerfile
+    container_name: tm_vault_backup_worker_heavy
+    env_file: .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: postgres
+      RABBITMQ_ENABLED: "true"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      REDIS_ENABLED: "true"
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
+      AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
+      APP_1_CLIENT_ID: ${APP_1_CLIENT_ID}
+      APP_1_CLIENT_SECRET: ${APP_1_CLIENT_SECRET}
+      APP_1_TENANT_ID: ${APP_1_TENANT_ID}
+      APP_2_CLIENT_ID: ${APP_2_CLIENT_ID:-}
+      APP_2_CLIENT_SECRET: ${APP_2_CLIENT_SECRET:-}
+      APP_2_TENANT_ID: ${APP_2_TENANT_ID:-}
+      APP_3_CLIENT_ID: ${APP_3_CLIENT_ID:-}
+      APP_3_CLIENT_SECRET: ${APP_3_CLIENT_SECRET:-}
+      APP_3_TENANT_ID: ${APP_3_TENANT_ID:-}
+      AZURE_AD_CLIENT_ID: ${AZURE_AD_CLIENT_ID}
+      AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
+      SHAREPOINT_CERT_PATH: ${SHAREPOINT_CERT_PATH:-/app/secrets/sharepoint_auth.pem}
+      SHAREPOINT_CERT_THUMBPRINT: ${SHAREPOINT_CERT_THUMBPRINT:-}
+      # Heavy-pool knobs.
+      BACKUP_WORKER_QUEUE: backup.heavy
+      MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER: "1"
+    volumes:
+      - ../secrets:/app/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 16G
+        reservations:
+          memory: 4G
+    mem_limit: 16g
+    profiles:
+      - heavy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
   # graph-proxy, delta-token, search-service: retired as of the services audit.
   # - graph-proxy: zero callers; GraphClient talks to Microsoft Graph directly
   # - delta-token: zero callers; delta tokens live on snapshots.delta_token column

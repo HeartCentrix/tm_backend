@@ -699,6 +699,91 @@ class RestoreWorker:
                 "manifest": result.get("manifest"),
             }
 
+        # v2 file export — feature-flagged. When EXPORT_ONEDRIVE_V2_ENABLED is on
+        # and the selected items are all file-like types, route to
+        # FileExportOrchestrator. Supports single-file ORIGINAL raw-stream via
+        # the orchestrator's output_mode="raw_single" shortcut.
+        _FILE_V2_TYPES = {"FILE", "ONEDRIVE_FILE", "SHAREPOINT_FILE", "FILE_VERSION"}
+        _file_items = [it for it in items if getattr(it, "item_type", None) in _FILE_V2_TYPES]
+        if (
+            _mail_export_settings.EXPORT_ONEDRIVE_V2_ENABLED
+            and _file_items
+            and all(getattr(it, "item_type", None) in _FILE_V2_TYPES for it in items)
+        ):
+            items = _file_items
+            from file_export import FileExportOrchestrator
+            from shared.azure_storage import azure_storage_manager
+
+            _spec = spec or {}
+            fmt = (_spec.get("exportFormat") or (message or {}).get("exportFormat") or "ZIP").upper()
+            snapshot_ids = [
+                str(s) for s in (
+                    (message or {}).get("snapshotIds")
+                    or _spec.get("snapshot_ids")
+                    or []
+                )
+            ]
+            job_id = str((message or {}).get("jobId") or (message or {}).get("job_id") or "unknown")
+
+            tenant_id_for_containers = str(getattr(items[0], "tenant_id", "") or "") if items else ""
+            source_container = (
+                azure_storage_manager.get_container_name(tenant_id_for_containers, "files")
+                if tenant_id_for_containers else "files"
+            )
+            dest_container = (
+                azure_storage_manager.get_container_name(tenant_id_for_containers, "exports")
+                if tenant_id_for_containers else "exports"
+            )
+            try:
+                _default_shard = azure_storage_manager.get_default_shard()
+                await _default_shard.ensure_container(dest_container)
+            except Exception as _ensure_err:
+                print(f"[{self.worker_id}] v2 file path: ensure_container({dest_container}) failed (non-fatal): {_ensure_err}", flush=True)
+
+            # Annotate items with shard index (M8).
+            for it in items:
+                try:
+                    s = azure_storage_manager.get_shard_for_resource(
+                        str(getattr(it, "resource_id", "") or ""),
+                        str(getattr(it, "tenant_id", "") or ""),
+                    )
+                    it.shard_index = getattr(s, "shard_index", 0)
+                except Exception:
+                    it.shard_index = 0
+
+            orch = FileExportOrchestrator(
+                job_id=job_id,
+                snapshot_ids=snapshot_ids,
+                items=items,
+                shard_manager=azure_storage_manager,
+                source_container=source_container,
+                dest_container=dest_container,
+                parallelism=_mail_export_settings.EXPORT_PARALLELISM,
+                block_size=_mail_export_settings.EXPORT_BLOCK_SIZE_BYTES,
+                fetch_batch_size=_mail_export_settings.EXPORT_FETCH_BATCH_SIZE,
+                export_format=fmt,
+                missing_policy=_mail_export_settings.EXPORT_ONEDRIVE_MISSING_POLICY,
+                max_file_bytes=_mail_export_settings.EXPORT_ONEDRIVE_MAX_FILE_BYTES,
+                path_max_len=_mail_export_settings.EXPORT_ONEDRIVE_PATH_MAX_LEN,
+                sanitize_chars=_mail_export_settings.EXPORT_ONEDRIVE_SANITIZE_CHARS,
+            )
+            async with self._export_semaphore:
+                result = await orch.run()
+            return {
+                "output_mode": result.get("output_mode"),
+                "exported_count": result["exported_count"],
+                "failed_count": result["failed_count"],
+                "export_format": fmt,
+                "blob_path": result.get("blob_path"),
+                "container": result.get("container"),
+                "source_container": result.get("source_container"),
+                "source_blob_path": result.get("source_blob_path"),
+                "original_name": result.get("original_name"),
+                "content_type": result.get("content_type"),
+                "size_bytes": result.get("size_bytes"),
+                "manifest": result.get("manifest"),
+            }
+
         zip_buffer = io.BytesIO()
         exported_count = 0
 

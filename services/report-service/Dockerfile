@@ -3,7 +3,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 COPY requirements.base.txt .
-RUN pip install --no-cache-dir -r requirements.base.txt
+RUN pip install --default-timeout=300 --retries 5 --no-cache-dir -r requirements.base.txt
 
 COPY shared/ ./shared/
 COPY services/report-service/ ./services/report-service/

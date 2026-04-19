@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY shared /app/shared
 COPY services/dr-replication-worker /app/services/dr-replication-worker
 
-RUN pip install --no-cache-dir --prefer-binary -r /app/services/dr-replication-worker/requirements.txt
+RUN pip install --default-timeout=300 --retries 5 --no-cache-dir --prefer-binary -r /app/services/dr-replication-worker/requirements.txt
 
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1

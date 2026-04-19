@@ -116,6 +116,18 @@ class BackupWorker:
         # Concurrency controls
         self.backup_semaphore = asyncio.Semaphore(8)  # 8 concurrent file streams per worker NIC
         self.copy_semaphore = asyncio.Semaphore(20)  # Azure Storage account ingress limit
+        # v2: cap simultaneous USER_ONEDRIVE backup jobs per worker. An uncapped
+        # run can take hours; without this a single worker would accept every
+        # redelivered OneDrive message and thrash. Heavy-pool workers
+        # (backup-worker-heavy) set MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER
+        # to 1 so they finish one monster drive before touching the next.
+        self._onedrive_backup_semaphore = asyncio.Semaphore(
+            settings.MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER
+        )
+        # Which normal-priority queue this instance consumes. Default
+        # replicas read backup.normal; backup-worker-heavy sets
+        # BACKUP_WORKER_QUEUE=backup.heavy via compose env.
+        self._backup_queue_name = settings.BACKUP_WORKER_QUEUE
 
     async def initialize(self):
         await message_bus.connect()
@@ -147,7 +159,7 @@ class BackupWorker:
         queues = [
             ("backup.urgent", 1),
             ("backup.high", 5),
-            ("backup.normal", 20),
+            (self._backup_queue_name, 20),
             ("backup.low", 50),
         ]
 
@@ -502,47 +514,27 @@ class BackupWorker:
                         print(f"[{self.worker_id}] [USER_MAIL] folder tree fetch failed for {user_id}: {e}")
                         folder_tree = {}
 
-                    # Direct httpx — do NOT use graph_client._get, which
-                    # follows @odata.nextLink internally. If any one page
-                    # raises (504 timeouts on `$skip=N` are common on large
-                    # mailboxes), the entire fetch bails and we drop all
-                    # messages already retrieved. Here we page manually,
-                    # break on the first failure, and return whatever was
-                    # fetched successfully — a partial capture beats zero.
-                    import httpx as _httpx
-                    mail_token = await graph_client._get_token()
-                    PAGE_SIZE = 50
-                    # Unbounded pagination — follow @odata.nextLink until
-                    # Graph returns no more. Huge-but-finite `MAX_PAGES`
-                    # is an emergency-brake against a Graph bug that
-                    # might keep handing out nextLinks indefinitely.
-                    MAX_PAGES = 10000
-                    out = []
-                    next_url = f"{graph_client.GRAPH_URL}/users/{user_id}/messages"
-                    params = {
-                        "$top": str(PAGE_SIZE),
+                    # Route through GraphClient._iter_pages so pacing,
+                    # multi-app rotation, Retry-After, cumulative-cap, and
+                    # sticky failover all apply automatically (behind
+                    # GRAPH_HARDENING_ENABLED — legacy path unchanged when
+                    # the flag is off). Partial captures still land in out[]
+                    # so cap-exhaustion surfaces as partial snapshot, not
+                    # failed job.
+                    out: List = []
+                    mail_url = f"{graph_client.GRAPH_URL}/users/{user_id}/messages"
+                    mail_params = {
+                        "$top": "50",
                         # NOTE: `parentFolderName` is NOT a Graph message
                         # property — requesting it returns HTTP 400. Folder
                         # NAMES come from the folder_tree lookup via
                         # parentFolderId below.
                         "$select": "id,subject,from,toRecipients,ccRecipients,sentDateTime,receivedDateTime,bodyPreview,body,hasAttachments,parentFolderId",
                     }
-                    pages_done = 0
-                    async with _httpx.AsyncClient(timeout=60.0) as _c:
-                        while next_url and pages_done < MAX_PAGES:
-                            try:
-                                r = await _c.get(
-                                    next_url,
-                                    headers={"Authorization": f"Bearer {mail_token}"},
-                                    params=params if pages_done == 0 else None,
-                                )
-                                if r.status_code != 200:
-                                    print(f"[{self.worker_id}] [USER_MAIL] page {pages_done} HTTP {r.status_code} — stopping (kept {len(out)} messages)")
-                                    break
-                                page = r.json() or {}
-                            except Exception as e:
-                                print(f"[{self.worker_id}] [USER_MAIL] page {pages_done} fetch failed: {type(e).__name__}: {e} — stopping (kept {len(out)} messages)")
-                                break
+                    try:
+                        async for page in graph_client._iter_pages(
+                            mail_url, params=mail_params,
+                        ):
                             for m in page.get("value", []):
                                 path = (
                                     folder_tree.get(m.get("parentFolderId"))
@@ -556,8 +548,12 @@ class BackupWorker:
                                     {"raw": m},
                                     path,
                                 ))
-                            next_url = page.get("@odata.nextLink")
-                            pages_done += 1
+                    except Exception as e:
+                        print(
+                            f"[{self.worker_id}] [USER_MAIL] stream aborted "
+                            f"for {user_id}: {type(e).__name__}: {e} "
+                            f"(kept {len(out)} messages)"
+                        )
                     return out
 
                 if kind == "USER_ONEDRIVE":
@@ -647,27 +643,35 @@ class BackupWorker:
                         print(f"[{self.worker_id}] [USER_CHATS] chats list failed for {user_id}: {e}")
                         chats_raw = []
 
-                    member_sem = asyncio.Semaphore(8)
-
-                    async def _fetch_members(cid: str):
-                        async with member_sem:
-                            try:
-                                m_page = await graph_client._get(
-                                    f"{graph_client.GRAPH_URL}/chats/{cid}/members"
-                                )
-                                emails = []
-                                names = []
-                                for m in (m_page or {}).get("value", []) or []:
-                                    if m.get("email"):
-                                        emails.append(m["email"])
-                                    if m.get("displayName"):
-                                        names.append(m["displayName"])
-                                return cid, emails, names
-                            except Exception:
-                                return cid, [], []
-
-                    member_results = await asyncio.gather(*[_fetch_members(c.get("id")) for c in chats_raw if c.get("id")])
-                    member_lookup = {cid: (emails, names) for cid, emails, names in member_results}
+                    # Batch /chats/{id}/members via /v1.0/$batch — one HTTP
+                    # call per 20 chats instead of 200 individual _get's.
+                    # Cuts throttle cost ~20× vs the old 8-way gather.
+                    from shared.graph_batch import BatchRequest
+                    batch_reqs = [
+                        BatchRequest(
+                            id=c["id"], method="GET",
+                            url=f"/chats/{c['id']}/members",
+                        )
+                        for c in chats_raw if c.get("id")
+                    ]
+                    member_lookup: Dict[str, Tuple[List[str], List[str]]] = {}
+                    if batch_reqs:
+                        try:
+                            batch_result = await graph_client.batch(batch_reqs)
+                        except Exception as e:
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] members "
+                                f"batch failed: {type(e).__name__}: {e}"
+                            )
+                            batch_result = {}
+                        for cid, resp in batch_result.items():
+                            if resp.status == 200:
+                                value = (resp.body or {}).get("value", []) or []
+                                emails = [m.get("email") for m in value if m.get("email")]
+                                names = [m.get("displayName") for m in value if m.get("displayName")]
+                                member_lookup[cid] = (emails, names)
+                            else:
+                                member_lookup[cid] = ([], [])
 
                     for ch in chats_raw:
                         cid = ch.get("id")
@@ -717,56 +721,54 @@ class BackupWorker:
                         })
 
                     out: List = []
-                    # Direct httpx call (not graph_client._get) so we DON'T
-                    # follow @odata.nextLink — the wrapper would paginate
-                    # the entire chat history for every chat, blowing up
-                    # this Tier 2 quick-look backup. Cap at 50 messages per
-                    # chat for the first slice; full history can come from
-                    # a follow-up "deep" backup if/when we add one.
-                    import httpx as _httpx
-                    # Switch to the tenant-wide getAllMessages endpoint:
-                    # `/chats/{id}/messages` only returns the first page
-                    # under app-only auth in most tenants (no nextLink), so
-                    # per-chat pagination caps at ~50 messages per chat.
-                    # `/users/{id}/chats/getAllMessages` returns messages
-                    # across ALL the user's chats with real pagination —
-                    # we bucket by chatId client-side using chat_meta.
-                    chat_token = await graph_client._get_token()
-                    # Unbounded: follow @odata.nextLink until Graph stops
-                    # handing out a nextLink. No intentional message cap —
-                    # the huge-but-finite MAX_PAGES is just a runaway
-                    # guard against a Graph bug that could otherwise keep
-                    # paginating forever. 10k × 50 = 500k, which is
-                    # comfortably more than any real user will have.
-                    PAGE_SIZE = 50
-                    MAX_PAGES = 10000
+                    # Route through GraphClient._iter_pages so pacing,
+                    # multi-app rotation, Retry-After, cumulative-cap, and
+                    # sticky failover all apply automatically. The hardened
+                    # iter captures @odata.deltaLink into _last_delta_link
+                    # so we can persist it for incremental resume.
                     all_msgs: List[Dict[str, Any]] = []
-                    next_url: Optional[str] = (
-                        f"{graph_client.GRAPH_URL}/users/{user_id}/chats/getAllMessages"
+                    chat_delta = (resource.extra_data or {}).get("chat_delta_token")
+                    if chat_delta:
+                        chat_url = chat_delta  # resume from saved deltaLink
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] resuming from "
+                            f"saved delta ({user_label})"
+                        )
+                    else:
+                        chat_url = (
+                            f"{graph_client.GRAPH_URL}/users/{user_id}"
+                            f"/chats/getAllMessages/delta"
+                        )
+                    try:
+                        async for page in graph_client._iter_pages(
+                            chat_url, params={"$top": "50"},
+                        ):
+                            all_msgs.extend(page.get("value", []))
+                    except Exception as e:
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] stream aborted "
+                            f"for {user_label}: {type(e).__name__}: {e} "
+                            f"(kept {len(all_msgs)})"
+                        )
+                    new_delta_link = getattr(graph_client, "_last_delta_link", None)
+                    print(
+                        f"[{self.worker_id}] [USER_CHATS] fetched "
+                        f"{len(all_msgs)} messages"
                     )
-                    first_page = True
-                    pages_done = 0
-                    async with _httpx.AsyncClient(timeout=60.0) as _c:
-                        while next_url and pages_done < MAX_PAGES:
-                            try:
-                                _resp = await _c.get(
-                                    next_url,
-                                    headers={"Authorization": f"Bearer {chat_token}"},
-                                    params={"$top": str(PAGE_SIZE)} if first_page else None,
-                                )
-                            except Exception as e:
-                                print(f"[{self.worker_id}] [USER_CHATS] getAllMessages page {pages_done} fetch error: {type(e).__name__}: {e} — stopping (kept {len(all_msgs)})")
-                                break
-                            if _resp.status_code != 200:
-                                print(f"[{self.worker_id}] [USER_CHATS] getAllMessages page {pages_done} HTTP {_resp.status_code} — stopping (kept {len(all_msgs)})")
-                                break
-                            data = _resp.json() or {}
-                            batch = data.get("value", []) or []
-                            all_msgs.extend(batch)
-                            next_url = data.get("@odata.nextLink")
-                            first_page = False
-                            pages_done += 1
-                    print(f"[{self.worker_id}] [USER_CHATS] fetched {len(all_msgs)} messages across {pages_done} page(s)")
+
+                    # Persist the delta link so subsequent USER_CHATS runs
+                    # only fetch what's new.
+                    if new_delta_link:
+                        try:
+                            async with async_session_factory() as _s:
+                                r = await _s.get(Resource, resource.id)
+                                if r is not None:
+                                    ed = dict(r.extra_data or {})
+                                    ed["chat_delta_token"] = new_delta_link
+                                    r.extra_data = ed
+                                    await _s.commit()
+                        except Exception as _e:
+                            print(f"[{self.worker_id}] [USER_CHATS] delta persist failed: {_e}")
 
                     # Bucket the flat message list into per-chat rows using
                     # the pre-computed chat_meta for display name / type.
@@ -895,9 +897,15 @@ class BackupWorker:
                         # captures the REAL file bytes uploaded to blob so
                         # the snapshot's bytes_total reflects actual storage
                         # consumed, not just the JSON metadata footprint.
-                        _uploaded, att_bytes = await self._useronedrive_backup_files(
-                            graph_client, resource, snapshot, tenant, drive_id, file_items,
-                        )
+                        #
+                        # The per-worker semaphore caps how many simultaneous
+                        # OneDrive drives one worker replica runs — without it,
+                        # an uncapped v2 run lets a single worker pick up
+                        # every redelivered drive and thrash under memory.
+                        async with self._onedrive_backup_semaphore:
+                            _uploaded, att_bytes = await self._useronedrive_backup_files(
+                                graph_client, resource, snapshot, tenant, drive_id, file_items,
+                            )
 
                 if att_items:
                     async with async_session_factory() as session:
@@ -1239,12 +1247,13 @@ class BackupWorker:
         return all_items, total_bytes
 
     # ==================== Tier 2 USER_ONEDRIVE file-bytes capture ====================
-
-    # Initial-slice cap for USER_ONEDRIVE. Keeps a single backup run bounded
-    # so a 500k-file drive doesn't block the queue forever — remaining files
-    # pick up on the next run via the delta token. Either bound trips first.
-    USER_ONEDRIVE_MAX_FILES = 50
-    USER_ONEDRIVE_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
+    #
+    # v2: uncapped. The legacy MAX_FILES / MAX_BYTES knobs are off by default —
+    # a user's full drive captures in one run. Concurrency + checkpoint +
+    # heavy-pool routing keep it bounded. Legacy caps stay active when
+    # ONEDRIVE_BACKUP_V2_ENABLED is false (rollback safety).
+    LEGACY_USER_ONEDRIVE_MAX_FILES = 50
+    LEGACY_USER_ONEDRIVE_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
 
     async def _useronedrive_backup_files(
         self,
@@ -1255,20 +1264,31 @@ class BackupWorker:
         drive_id: str,
         file_items: List[Dict[str, Any]],
     ) -> Tuple[int, int]:
-        """Download a capped slice of OneDrive files to blob and update the
-        already-persisted ONEDRIVE_FILE snapshot-item rows with blob_path +
-        real content_size + sha256.
+        """Download OneDrive files to blob and update the already-persisted
+        ONEDRIVE_FILE snapshot-item rows with blob_path + real content_size
+        + sha256.
 
-        Returns (uploaded_count, bytes_uploaded). Files skipped by the cap
-        still have their metadata row; their blob_path stays NULL so the
-        Recovery UI can show "not yet downloaded" while future runs catch
-        up via the delta token.
+        v2 path (ONEDRIVE_BACKUP_V2_ENABLED=true): no per-run cap. Downloads
+        run under a semaphore of ONEDRIVE_BACKUP_FILE_CONCURRENCY. A
+        BackupCheckpoint commits to Job.result.backup_checkpoint every N
+        files / M bytes so a worker crash resumes from the last commit.
+
+        Legacy path: retains the 50-file / 500-MB slice from the v1
+        implementation — partial-backup semantics pick remaining files up
+        on the next run via the delta token.
         """
         from sqlalchemy import update as sa_update
+        from shared.backup_checkpoint import BackupCheckpoint
+        from shared.models import Job as _Job
 
-        # Sort smallest-first so the cap captures the most files per run —
-        # a single 400 MB blob would otherwise exhaust the byte budget on
-        # one item. Graph's 'size' is authoritative; missing → treat as 0.
+        v2_enabled = settings.ONEDRIVE_BACKUP_V2_ENABLED
+        max_files = None if v2_enabled else self.LEGACY_USER_ONEDRIVE_MAX_FILES
+        max_bytes = None if v2_enabled else self.LEGACY_USER_ONEDRIVE_MAX_BYTES
+        per_file_timeout = settings.ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS
+        file_concurrency = settings.ONEDRIVE_BACKUP_FILE_CONCURRENCY if v2_enabled else 1
+
+        # Sort smallest-first so the legacy cap captures the most files per
+        # run; in v2 ordering is cosmetic (everything downloads).
         ordered = sorted(
             (f for f in file_items if f.get("id")),
             key=lambda f: int(f.get("size") or 0),
@@ -1277,92 +1297,128 @@ class BackupWorker:
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "files")
 
-        uploaded_count = 0
-        bytes_uploaded = 0
-        # Per-file updates we'll apply in a single transaction at the end,
-        # keyed by external_id so the UPDATE targets exactly one row.
+        # Load existing checkpoint (resume path).
+        cp_payload = None
+        if snapshot.job_id:
+            async with async_session_factory() as _s0:
+                snap_job = await _s0.get(_Job, snapshot.job_id)
+                if snap_job and isinstance(snap_job.result, dict):
+                    cp_payload = snap_job.result.get("backup_checkpoint")
+        checkpoint = (
+            BackupCheckpoint.from_dict(cp_payload)
+            if cp_payload
+            else BackupCheckpoint.empty(resource_id=str(resource.id), drive_id=drive_id)
+        )
+
+        file_sem = asyncio.Semaphore(file_concurrency)
+        state = {"uploaded_count": 0, "bytes_uploaded": 0}
         updates: List[Tuple[str, str, int, str, Dict[str, Any]]] = []
+        state_lock = asyncio.Lock()
 
-        for f in ordered:
-            if uploaded_count >= self.USER_ONEDRIVE_MAX_FILES:
-                break
-            if bytes_uploaded >= self.USER_ONEDRIVE_MAX_BYTES:
-                break
-
+        async def _process_one(f: Dict[str, Any]):
             file_id = f.get("id")
+            if not file_id or checkpoint.is_done(file_id):
+                return
             file_name = f.get("name") or "(unnamed)"
             size_hint = int(f.get("size") or 0)
-
-            # Skip zero-byte files — nothing to download, but leave the
-            # metadata row so it still shows up in the file listing.
             if size_hint == 0:
-                continue
+                return
 
-            # Would-overflow check: don't start a file that alone blows
-            # the byte budget (unless it's the first one, so we make at
-            # least some forward progress on huge-file drives).
-            if uploaded_count > 0 and (bytes_uploaded + size_hint) > self.USER_ONEDRIVE_MAX_BYTES:
-                continue
+            # Enforce legacy caps pre-flight; v2 skips this entirely.
+            if max_files is not None or max_bytes is not None:
+                async with state_lock:
+                    if max_files is not None and state["uploaded_count"] >= max_files:
+                        return
+                    if max_bytes is not None and state["bytes_uploaded"] >= max_bytes:
+                        return
+                    if (
+                        max_bytes is not None
+                        and state["uploaded_count"] > 0
+                        and (state["bytes_uploaded"] + size_hint) > max_bytes
+                    ):
+                        return
 
             blob_path = azure_storage_manager.build_blob_path(
                 str(tenant.id), str(resource.id), str(snapshot.id), file_id,
             )
 
-            try:
-                download_url, real_size, qxh = await graph_client.get_download_url(drive_id, file_id)
-            except RuntimeError as e:
-                # Whiteboards, OneNote pages, cloud-native objects etc.
-                # have a 'file' facet but aren't downloadable. Skip
-                # silently — the metadata row is already persisted.
-                if "downloadurl" in str(e).lower() or "download url" in str(e).lower():
-                    continue
-                print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {e}")
-                continue
-            except Exception as e:
-                print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {type(e).__name__}: {e}")
-                continue
+            async with file_sem:
+                try:
+                    download_url, real_size, qxh = await graph_client.get_download_url(drive_id, file_id)
+                except RuntimeError as e:
+                    # Whiteboards, OneNote pages, cloud-native objects have a
+                    # 'file' facet but aren't downloadable — skip silently.
+                    if "downloadurl" in str(e).lower() or "download url" in str(e).lower():
+                        return
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {e}")
+                    return
+                except Exception as e:
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {type(e).__name__}: {e}")
+                    return
 
-            tmp_path = None
-            try:
-                async with self.backup_semaphore:
-                    tmp_path, sha256 = await self._download_to_temp_resumable(
-                        download_url=download_url, expected_size=real_size, file_name=file_name,
-                    )
-                    upload_result = await upload_blob_with_retry_from_file(
-                        container_name=container, blob_path=blob_path,
-                        file_path=tmp_path, shard=shard, file_size=real_size,
-                        metadata={
-                            "source_item_id": file_id,
-                            "source_drive_id": drive_id,
-                            "original-name": file_name,
-                            "sha256": sha256,
-                        },
-                    )
-            except Exception as e:
-                print(f"[{self.worker_id}] [USER_ONEDRIVE] download/upload failed for {file_name}: {type(e).__name__}: {e}")
-                continue
-            finally:
-                if tmp_path:
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
+                tmp_path = None
+                try:
+                    async def _download_and_upload():
+                        nonlocal tmp_path
+                        tmp_path, sha256 = await self._download_to_temp_resumable(
+                            download_url=download_url, expected_size=real_size, file_name=file_name,
+                        )
+                        upload_result = await upload_blob_with_retry_from_file(
+                            container_name=container, blob_path=blob_path,
+                            file_path=tmp_path, shard=shard, file_size=real_size,
+                            metadata={
+                                "source_item_id": file_id,
+                                "source_drive_id": drive_id,
+                                "original-name": file_name,
+                                "sha256": sha256,
+                            },
+                        )
+                        return upload_result, sha256
 
-            if not upload_result.get("success"):
-                print(f"[{self.worker_id}] [USER_ONEDRIVE] blob upload failed for {file_name}: {upload_result.get('error')}")
-                continue
+                    if per_file_timeout > 0:
+                        upload_result, sha256 = await asyncio.wait_for(
+                            _download_and_upload(), timeout=per_file_timeout
+                        )
+                    else:
+                        upload_result, sha256 = await _download_and_upload()
+                except asyncio.TimeoutError:
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] timeout for {file_name} (>{per_file_timeout}s); skipping")
+                    return
+                except Exception as e:
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] download/upload failed for {file_name}: {type(e).__name__}: {e}")
+                    return
+                finally:
+                    if tmp_path:
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
 
-            # Enrich the existing row's extra_data with dedup + provenance
-            # hints without clobbering the raw Graph object already there.
-            extra_patch = {
-                "raw": f,
-                "sha256": sha256,
-                "quickxor": qxh,
-                "blobbed_at": datetime.utcnow().isoformat() + "Z",
-            }
-            updates.append((file_id, blob_path, real_size, sha256, extra_patch))
-            uploaded_count += 1
-            bytes_uploaded += real_size
+                if not upload_result.get("success"):
+                    print(f"[{self.worker_id}] [USER_ONEDRIVE] blob upload failed for {file_name}: {upload_result.get('error')}")
+                    return
+
+                extra_patch = {
+                    "raw": f,
+                    "sha256": sha256,
+                    "quickxor": qxh,
+                    "blobbed_at": datetime.utcnow().isoformat() + "Z",
+                }
+                async with state_lock:
+                    state["uploaded_count"] += 1
+                    state["bytes_uploaded"] += real_size
+                    updates.append((file_id, blob_path, real_size, sha256, extra_patch))
+                    checkpoint.record_file_done(external_id=file_id, size=real_size)
+
+                    if v2_enabled and checkpoint.should_commit(
+                        every_files=settings.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES,
+                        every_bytes=settings.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES,
+                    ):
+                        # Commit outside the lock would need a copy; keep it
+                        # inline — commit only needs one DB round-trip.
+                        await self._commit_backup_checkpoint(snapshot.job_id, checkpoint)
+
+        await asyncio.gather(*(_process_one(f) for f in ordered))
 
         if updates:
             async with async_session_factory() as session:
@@ -1383,8 +1439,28 @@ class BackupWorker:
                     )
                 await session.commit()
 
-        print(f"[{self.worker_id}] [USER_ONEDRIVE] blobbed {uploaded_count}/{len(ordered)} files ({bytes_uploaded} bytes)")
-        return uploaded_count, bytes_uploaded
+        if v2_enabled:
+            await self._commit_backup_checkpoint(snapshot.job_id, checkpoint)
+
+        print(
+            f"[{self.worker_id}] [USER_ONEDRIVE] blobbed {state['uploaded_count']}/{len(ordered)} files "
+            f"({state['bytes_uploaded']} bytes, v2={v2_enabled}, concurrency={file_concurrency})"
+        )
+        return state["uploaded_count"], state["bytes_uploaded"]
+
+    async def _commit_backup_checkpoint(self, job_id, checkpoint) -> None:
+        """Merge the current BackupCheckpoint into Job.result.backup_checkpoint."""
+        if not job_id:
+            return
+        from shared.models import Job as _Job
+        async with async_session_factory() as s:
+            j = await s.get(_Job, job_id)
+            if j is not None:
+                r = dict(j.result or {})
+                r["backup_checkpoint"] = checkpoint.to_dict()
+                j.result = r
+                await s.commit()
+                checkpoint.mark_committed()
 
     # ==================== Server-Side Copy for Files ====================
 

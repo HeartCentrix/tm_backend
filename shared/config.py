@@ -137,6 +137,79 @@ class Settings:
         # ZIP assembly re-reads). Default 100 MiB.
         self.EXPORT_MBOX_INLINE_LIMIT_BYTES = int(os.getenv("EXPORT_MBOX_INLINE_LIMIT_BYTES", str(100 * 1024 * 1024)))
 
+        # ── OneDrive export v2 (see 2026-04-19-onedrive-export-and-backup-uncap-design.md) ──
+        self.EXPORT_ONEDRIVE_V2_ENABLED = os.getenv("EXPORT_ONEDRIVE_V2_ENABLED", "false").lower() in ("true", "1", "yes")
+        self.EXPORT_ONEDRIVE_MISSING_POLICY = os.getenv("EXPORT_ONEDRIVE_MISSING_POLICY", "skip").lower()
+        self.EXPORT_ONEDRIVE_INCLUDE_VERSIONS = os.getenv("EXPORT_ONEDRIVE_INCLUDE_VERSIONS", "false").lower() in ("true", "1", "yes")
+        self.EXPORT_ONEDRIVE_MAX_FILE_BYTES = int(os.getenv("EXPORT_ONEDRIVE_MAX_FILE_BYTES", str(200 * 1024 * 1024 * 1024)))
+        self.EXPORT_ONEDRIVE_PATH_MAX_LEN = int(os.getenv("EXPORT_ONEDRIVE_PATH_MAX_LEN", "260"))
+        self.EXPORT_ONEDRIVE_SANITIZE_CHARS = os.getenv("EXPORT_ONEDRIVE_SANITIZE_CHARS", '<>:"/\\|?*')
+
+        # ── OneDrive backup uncap ──
+        self.ONEDRIVE_BACKUP_V2_ENABLED = os.getenv("ONEDRIVE_BACKUP_V2_ENABLED", "false").lower() in ("true", "1", "yes")
+        self.ONEDRIVE_BACKUP_FILE_CONCURRENCY = int(os.getenv("ONEDRIVE_BACKUP_FILE_CONCURRENCY", "16"))
+        self.MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER = int(os.getenv("MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER", "4"))
+        self.ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS = int(os.getenv("ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS", "21600"))
+        self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES", "500"))
+        self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES", str(1024 * 1024 * 1024)))
+
+        # ── Heavy backup pool ──
+        self.BACKUP_HEAVY_ENABLED = os.getenv("BACKUP_HEAVY_ENABLED", "false").lower() in ("true", "1", "yes")
+        self.BACKUP_HEAVY_THRESHOLD_BYTES = int(os.getenv("BACKUP_HEAVY_THRESHOLD_BYTES", str(100 * 1024 * 1024 * 1024)))
+        self.BACKUP_HEAVY_QUEUE = os.getenv("BACKUP_HEAVY_QUEUE", "backup.heavy")
+        self.BACKUP_WORKER_QUEUE = os.getenv("BACKUP_WORKER_QUEUE", "backup.normal")
+
+        # ── RabbitMQ long-run safety ──
+        self.RABBITMQ_CONSUMER_HEARTBEAT_SECONDS = int(os.getenv("RABBITMQ_CONSUMER_HEARTBEAT_SECONDS", str(7 * 24 * 3600)))
+        self.RABBITMQ_CONSUMER_TIMEOUT_MS = int(os.getenv("RABBITMQ_CONSUMER_TIMEOUT_MS", str(7 * 24 * 3600 * 1000)))
+
+        # ── Graph API throttle hardening ──
+        # Spec: docs/superpowers/specs/2026-04-19-graph-api-throttle-hardening-design.md
+        self.GRAPH_HARDENING_ENABLED = os.getenv(
+            "GRAPH_HARDENING_ENABLED", "false"
+        ).lower() in ("true", "1", "yes")
+        # Per-(app, tenant) sustained rate cap. Half of OneDrive's published
+        # 5 rps floor so we're invisible to any tenant admin's throttle alerts.
+        self.GRAPH_APP_PACE_REQS_PER_SEC = float(
+            os.getenv("GRAPH_APP_PACE_REQS_PER_SEC", "2.5")
+        )
+        # Per-stream (= per concurrent backup) sustained rate cap.
+        self.GRAPH_STREAM_PACE_REQS_PER_SEC = float(
+            os.getenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "1.0")
+        )
+        self.GRAPH_MAX_RETRIES = int(os.getenv("GRAPH_MAX_RETRIES", "5"))
+        # Sequence walked when 429/503 arrives without a Retry-After header.
+        # Loops back to the start on exhaustion; the real ceiling is the
+        # cumulative-wait cap below.
+        self.GRAPH_THROTTLE_BACKOFF_SECONDS = [
+            int(x) for x in os.getenv(
+                "GRAPH_THROTTLE_BACKOFF_SECONDS", "60,120,240,480,600"
+            ).split(",") if x.strip()
+        ]
+        # Sequence for transient network errors (not throttle).
+        self.GRAPH_TRANSIENT_BACKOFF_SECONDS = [
+            int(x) for x in os.getenv(
+                "GRAPH_TRANSIENT_BACKOFF_SECONDS", "2,4,8,16,32"
+            ).split(",") if x.strip()
+        ]
+        self.GRAPH_JITTER_RATIO = float(os.getenv("GRAPH_JITTER_RATIO", "0.2"))
+        self.GRAPH_POST_THROTTLE_BRAKE_MS = int(
+            os.getenv("GRAPH_POST_THROTTLE_BRAKE_MS", "500")
+        )
+        # Hard cap on total wait time per stream. After this, raise and let
+        # RabbitMQ redeliver (resume from last checkpoint).
+        self.GRAPH_MAX_CUMULATIVE_WAIT_SECONDS = int(
+            os.getenv("GRAPH_MAX_CUMULATIVE_WAIT_SECONDS", "14400")
+        )
+        # Clamp on the all-apps-throttled wait.
+        self.GRAPH_MAX_THROTTLE_WAIT_SECONDS = int(
+            os.getenv("GRAPH_MAX_THROTTLE_WAIT_SECONDS", "1800")
+        )
+        self.GRAPH_STICKY_PAGES_BEFORE_RETURN = int(
+            os.getenv("GRAPH_STICKY_PAGES_BEFORE_RETURN", "50")
+        )
+        self.GRAPH_BATCH_MAX_SIZE = int(os.getenv("GRAPH_BATCH_MAX_SIZE", "20"))
+
         # Heavy export pool — routes >100 GB-with-attachments exports to a dedicated
         # worker set with a larger memory budget. See spec §13 promoted scope.
         self.HEAVY_EXPORT_THRESHOLD_BYTES = int(os.getenv(
@@ -210,7 +283,7 @@ class Settings:
     def _parse_graph_apps(self) -> List[dict]:
         """Parse multiple Graph app registrations from env vars."""
         apps = []
-        for i in range(1, 11):  # Support up to 10 app registrations
+        for i in range(1, 17):  # Support up to 16 app registrations
             # Only use fallback for APP_1 (legacy single-app mode)
             if i == 1:
                 client_id = os.getenv(f"APP_{i}_CLIENT_ID") or os.getenv("AZURE_AD_CLIENT_ID", "")

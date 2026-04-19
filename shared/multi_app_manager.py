@@ -6,6 +6,7 @@ import threading
 import hashlib
 from typing import Dict, List, Optional
 from shared.config import settings
+from shared.graph_ratelimit import AsyncTokenBucket
 
 
 class AppRegistry:
@@ -18,6 +19,14 @@ class AppRegistry:
         self.request_count = 0
         self.last_request_time = 0.0
         self.throttled_until = 0.0
+        # Per-app token bucket — aggregate rate cap per (app, tenant).
+        # Gates every Graph call so no single app blows past
+        # GRAPH_APP_PACE_REQS_PER_SEC regardless of how many streams
+        # pile on. rate=0 disables pacing (kill switch).
+        self.bucket = AsyncTokenBucket(
+            rate_per_sec=settings.GRAPH_APP_PACE_REQS_PER_SEC,
+            capacity=1,
+        )
 
     @property
     def is_throttled(self) -> bool:
@@ -87,6 +96,20 @@ class MultiAppManager:
             app = self._app_map.get(client_id)
             if app:
                 app.throttled_until = 0.0
+
+    def is_app_throttled(self, client_id: str) -> bool:
+        """Public throttle-check by client_id for sticky-rotation callers."""
+        app = self._app_map.get(client_id)
+        return bool(app and app.is_throttled)
+
+    async def acquire_app_token(self, client_id: str, cost: float = 1.0) -> None:
+        """Block on this app's per-app pace bucket until a token is available.
+        Unknown client_id is a silent no-op so fallback / legacy paths keep
+        working."""
+        app = self._app_map.get(client_id)
+        if app is None:
+            return
+        await app.bucket.acquire(cost)
 
     def get_stats(self) -> List[dict]:
         """Get usage stats for all apps"""

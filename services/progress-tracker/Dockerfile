@@ -5,7 +5,7 @@ WORKDIR /app
 COPY shared /app/shared
 COPY services/progress-tracker /app/services/progress-tracker
 
-RUN pip install --no-cache-dir -r /app/services/progress-tracker/requirements.txt
+RUN pip install --default-timeout=300 --retries 5 --no-cache-dir -r /app/services/progress-tracker/requirements.txt
 
 ENV PYTHONPATH=/app
 ENV PORT=8011
