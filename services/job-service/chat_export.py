@@ -382,8 +382,11 @@ async def status_or_sse(
     job = (await sess.execute(select(Job).where(Job.id == jid))).scalar_one_or_none()
     if not job:
         raise HTTPException(404, detail={"error": "JOB_NOT_FOUND"})
-    if job.tenant_id != _user_tenant_id(user):
+    user_tenant = _user_tenant_id(user)
+    if user_tenant is not None and job.tenant_id != user_tenant and not _is_admin(user):
         raise HTTPException(403, detail={"error": "AUTH_DENIED"})
+    if not user.get("id"):
+        raise HTTPException(401, detail={"error": "AUTH_REQUIRED"})
 
     # Accept header switches JSON snapshot vs SSE stream. Frontend polling
     # uses JSON; the live progress bar subscribes over SSE.
@@ -448,8 +451,11 @@ async def cancel(
     job = (await sess.execute(select(Job).where(Job.id == jid))).scalar_one_or_none()
     if not job:
         raise HTTPException(404, detail={"error": "JOB_NOT_FOUND"})
-    if job.tenant_id != _user_tenant_id(user):
+    user_tenant = _user_tenant_id(user)
+    if user_tenant is not None and job.tenant_id != user_tenant and not _is_admin(user):
         raise HTTPException(403, detail={"error": "AUTH_DENIED"})
+    if not user.get("id"):
+        raise HTTPException(401, detail={"error": "AUTH_REQUIRED"})
     # Only flip transient states. Terminal jobs (COMPLETED/FAILED/CANCELLED)
     # are left alone so we don't overwrite a legit final state.
     if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):

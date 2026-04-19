@@ -172,10 +172,13 @@ async def consume_thread(message: aio_pika.IncomingMessage) -> None:
             container = "exports"
             blob_path = f"{job_id}/export.zip"
             buf.seek(0)
-            await upload_blob_with_retry(
+            shard = azure_storage_manager.get_default_shard()
+            up_result = await upload_blob_with_retry(
                 container, blob_path, buf.getvalue(),
-                shard_index=0, max_retries=3,
+                shard=shard, max_retries=3,
             )
+            if not up_result.get("success"):
+                raise RuntimeError(f"blob upload failed: {up_result.get('error')}")
             url = sign_download_url(
                 account=account, container=container, blob_path=blob_path,
             )

@@ -46,18 +46,27 @@ async def main() -> None:
     )
     channel = await conn.channel()
     await channel.set_qos(prefetch_count=1)
+    # Bind to the shared tm.exchange (DIRECT) used by message_bus.publish so
+    # messages routed with key=Q_THREAD land in our queue.
+    exchange = await channel.declare_exchange(
+        "tm.exchange", aio_pika.ExchangeType.DIRECT, durable=True,
+    )
     dlq_rk = f"dlq.{Q_THREAD.split('.', 1)[1]}"
     queue = await channel.declare_queue(
         Q_THREAD,
         durable=True,
         arguments={
-            "x-dead-letter-exchange": "",
+            "x-dead-letter-exchange": "tm.exchange",
             "x-dead-letter-routing-key": dlq_rk,
         },
     )
-    await channel.declare_queue(dlq_rk, durable=True)
-    await channel.declare_queue("q.export.chat.parent", durable=True)
-    await channel.declare_queue("q.export.chat.merge", durable=True)
+    await queue.bind(exchange, routing_key=Q_THREAD)
+    dlq = await channel.declare_queue(dlq_rk, durable=True)
+    await dlq.bind(exchange, routing_key=dlq_rk)
+    parent_q = await channel.declare_queue("q.export.chat.parent", durable=True)
+    await parent_q.bind(exchange, routing_key="q.export.chat.parent")
+    merge_q = await channel.declare_queue("q.export.chat.merge", durable=True)
+    await merge_q.bind(exchange, routing_key="q.export.chat.merge")
 
     log.info("worker started queue=%s", Q_THREAD)
     stop = asyncio.Event()

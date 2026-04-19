@@ -181,7 +181,14 @@ def normalize_messages(
         return getattr(item, key, default)
 
     for it in items:
-        meta = g(it, "metadata") or {}
+        # ORM rows expose the metadata JSONB column as `extra_data` (Python attr);
+        # test-fixture dicts still use the key "metadata". Prefer extra_data.
+        meta = None
+        if isinstance(it, dict):
+            meta = it.get("metadata") or it.get("extra_data")
+        else:
+            meta = getattr(it, "extra_data", None)
+        meta = meta or {}
         raw = meta.get("raw") or {}
         body_raw = (raw.get("body") or {}).get("content") or meta.get("body", {}).get("content_preview") or ""
         body_is_html = (raw.get("body") or {}).get("contentType") == "html" or meta.get("body", {}).get("content_type") == "html"
