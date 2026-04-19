@@ -88,8 +88,14 @@ async def test_folder_export_writes_valid_mbox(tmp_path):
     )
     result = await task.run()
 
-    assert len(result.produced_blobs) == 1
-    produced = await shard.download_blob("exports", result.produced_blobs[0])
+    # Tiered storage (Task from mail-v2 MBOX optimization): small folders go
+    # inline into produced_inline_members; large ones to produced_blobs. This
+    # test's fixture is well under the 100 MB inline cap.
+    assert len(result.produced_inline_members) + len(result.produced_blobs) == 1
+    if result.produced_inline_members:
+        produced = result.produced_inline_members[0][1]
+    else:
+        produced = await shard.download_blob("exports", result.produced_blobs[0])
     fp = tmp_path / "Inbox.mbox"
     fp.write_bytes(produced)
     mbox = mailbox.mbox(str(fp))
