@@ -713,91 +713,40 @@ class BackupWorker:
                         })
 
                     out: List = []
-                    # Direct httpx call (not graph_client._get) so we DON'T
-                    # follow @odata.nextLink — the wrapper would paginate
-                    # the entire chat history for every chat, blowing up
-                    # this Tier 2 quick-look backup. Switched to the
-                    # tenant-wide getAllMessages endpoint:
-                    # `/users/{id}/chats/getAllMessages` returns messages
-                    # across ALL the user's chats with real pagination —
-                    # we bucket by chatId client-side using chat_meta.
-                    #
-                    # Optimizations (parity with backup_teams_chat_export):
-                    #  - /delta endpoint + saved delta_link (chat_delta_token
-                    #    on ENTRA_USER.extra_data) so incremental runs skip
-                    #    already-captured pages.
-                    #  - Per-page read timeout bumped 60s → 300s; heavy chat
-                    #    users legitimately need >60s on a single Graph page.
-                    #  - Retry-After / 429 throttle handling: honor the
-                    #    server's hint when present, otherwise exponential
-                    #    backoff. Never silently stops on throttle.
-                    #  - Resume across transient errors: retry the same
-                    #    next_url up to 3 times before giving up.
-                    import httpx as _httpx
-                    import asyncio as _asyncio
-                    chat_token = await graph_client._get_token()
-                    PAGE_SIZE = 50
-                    MAX_PAGES = 10000
-                    PAGE_TIMEOUT_S = 300.0   # was 60s — page 56 ReadTimeout fix
-                    MAX_RETRIES_PER_PAGE = 3
+                    # Route through GraphClient._iter_pages so pacing,
+                    # multi-app rotation, Retry-After, cumulative-cap, and
+                    # sticky failover all apply automatically. The hardened
+                    # iter captures @odata.deltaLink into _last_delta_link
+                    # so we can persist it for incremental resume.
                     all_msgs: List[Dict[str, Any]] = []
                     chat_delta = (resource.extra_data or {}).get("chat_delta_token")
                     if chat_delta:
-                        # Incremental: pick up where the last run left off.
-                        next_url = chat_delta
-                        print(f"[{self.worker_id}] [USER_CHATS] resuming from saved delta ({user_label})")
+                        chat_url = chat_delta  # resume from saved deltaLink
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] resuming from "
+                            f"saved delta ({user_label})"
+                        )
                     else:
-                        next_url = f"{graph_client.GRAPH_URL}/users/{user_id}/chats/getAllMessages/delta"
-                    first_page = True
-                    pages_done = 0
-                    new_delta_link: Optional[str] = None
-                    async with _httpx.AsyncClient(timeout=PAGE_TIMEOUT_S) as _c:
-                        while next_url and pages_done < MAX_PAGES:
-                            _resp = None
-                            for attempt in range(1, MAX_RETRIES_PER_PAGE + 1):
-                                try:
-                                    _resp = await _c.get(
-                                        next_url,
-                                        headers={"Authorization": f"Bearer {chat_token}"},
-                                        params={"$top": str(PAGE_SIZE)} if first_page else None,
-                                    )
-                                except Exception as e:
-                                    if attempt >= MAX_RETRIES_PER_PAGE:
-                                        print(f"[{self.worker_id}] [USER_CHATS] getAllMessages page {pages_done} fetch error after {attempt} tries: {type(e).__name__}: {e} — stopping (kept {len(all_msgs)})")
-                                        _resp = None
-                                        break
-                                    backoff = min(30.0, 2 ** attempt)
-                                    print(f"[{self.worker_id}] [USER_CHATS] page {pages_done} transient fetch err (attempt {attempt}/{MAX_RETRIES_PER_PAGE}): {type(e).__name__}: {e}; retry in {backoff:.0f}s")
-                                    await _asyncio.sleep(backoff)
-                                    continue
-
-                                # Honor 429 / 503 Retry-After with exponential fallback.
-                                if _resp.status_code in (429, 503):
-                                    ra = _resp.headers.get("Retry-After")
-                                    try:
-                                        wait = float(ra) if ra else min(60.0, 2 ** attempt)
-                                    except ValueError:
-                                        wait = min(60.0, 2 ** attempt)
-                                    print(f"[{self.worker_id}] [USER_CHATS] page {pages_done} HTTP {_resp.status_code} throttled; sleeping {wait:.0f}s (attempt {attempt}/{MAX_RETRIES_PER_PAGE})")
-                                    await _asyncio.sleep(wait)
-                                    continue
-                                break  # non-throttle response
-
-                            if _resp is None or _resp.status_code != 200:
-                                code = _resp.status_code if _resp is not None else "NONE"
-                                print(f"[{self.worker_id}] [USER_CHATS] getAllMessages page {pages_done} final status {code} — stopping (kept {len(all_msgs)})")
-                                break
-                            data = _resp.json() or {}
-                            batch = data.get("value", []) or []
-                            all_msgs.extend(batch)
-                            next_url = data.get("@odata.nextLink")
-                            # Capture the deltaLink on the terminal page so
-                            # the next run can start incremental.
-                            if not next_url:
-                                new_delta_link = data.get("@odata.deltaLink") or new_delta_link
-                            first_page = False
-                            pages_done += 1
-                    print(f"[{self.worker_id}] [USER_CHATS] fetched {len(all_msgs)} messages across {pages_done} page(s)")
+                        chat_url = (
+                            f"{graph_client.GRAPH_URL}/users/{user_id}"
+                            f"/chats/getAllMessages/delta"
+                        )
+                    try:
+                        async for page in graph_client._iter_pages(
+                            chat_url, params={"$top": "50"},
+                        ):
+                            all_msgs.extend(page.get("value", []))
+                    except Exception as e:
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] stream aborted "
+                            f"for {user_label}: {type(e).__name__}: {e} "
+                            f"(kept {len(all_msgs)})"
+                        )
+                    new_delta_link = getattr(graph_client, "_last_delta_link", None)
+                    print(
+                        f"[{self.worker_id}] [USER_CHATS] fetched "
+                        f"{len(all_msgs)} messages"
+                    )
 
                     # Persist the delta link so subsequent USER_CHATS runs
                     # only fetch what's new.
