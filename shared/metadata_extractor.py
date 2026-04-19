@@ -7,6 +7,59 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 
 
+_EVENT_KIND_MAP = {
+    "#microsoft.graph.callStartedEventMessageDetail":         "call_started",
+    "#microsoft.graph.callEndedEventMessageDetail":           "call_ended",
+    "#microsoft.graph.callRecordingEventMessageDetail":       "call_recording_ended",
+    "#microsoft.graph.membersAddedEventMessageDetail":        "members_added",
+    "#microsoft.graph.membersDeletedEventMessageDetail":      "members_removed",
+    "#microsoft.graph.chatRenamedEventMessageDetail":         "chat_renamed",
+    "#microsoft.graph.teamsAppInstalledEventMessageDetail":   "teams_app_installed",
+    "#microsoft.graph.teamsAppRemovedEventMessageDetail":     "teams_app_removed",
+}
+
+
+def _map_event_kind(odata_type: str) -> str:
+    return _EVENT_KIND_MAP.get(odata_type, "unknown")
+
+
+def _extract_user(container: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Graph initiator/member shapes vary — sometimes {user:{...}}, sometimes flat."""
+    if not container:
+        return None
+    user = container.get("user") or container
+    return {
+        "user_id": user.get("id"),
+        "display_name": user.get("displayName"),
+        "email": user.get("email") or user.get("userPrincipalName"),
+    }
+
+
+def _build_event_detail(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if message.get("messageType") != "systemEventMessage":
+        return None
+    ed = message.get("eventDetail") or {}
+    if not ed:
+        return None
+    odata_type = ed.get("@odata.type") or ""
+    return {
+        "raw_odata_type": odata_type,
+        "kind": _map_event_kind(odata_type),
+        "initiator": _extract_user(ed.get("initiator")),
+        "members": [
+            _extract_user({"user": m}) for m in (ed.get("members") or [])
+        ],
+        "participants": [
+            _extract_user({"user": p.get("participant", p).get("user", p.get("participant", p))})
+            for p in (ed.get("callParticipants") or [])
+        ],
+        "call_duration": ed.get("callDuration"),
+        "call_event_type": ed.get("callEventType"),
+        "new_chat_name": ed.get("chatDisplayName"),
+        "reason": ed.get("reason"),
+    }
+
+
 class MetadataExtractor:
     """Extract structured metadata from Graph API responses for backup items"""
 
@@ -96,12 +149,15 @@ class MetadataExtractor:
     def extract_teams_message_metadata(message: Dict[str, Any], is_reply: bool = False) -> Dict[str, Any]:
         """Extract Teams message metadata with thread structure"""
         body = message.get("body", {})
-        from_info = message.get("from", {})
-        user = from_info.get("user", {})
+        from_info = message.get("from") or {}
+        user = from_info.get("user") or {}
 
         # Extract attachments/hosted content info
         attachments = message.get("attachments", [])
         hosted_contents = message.get("hostedContents", [])
+
+        event_detail = _build_event_detail(message)
+        hosted_content_ids = [hc.get("id") for hc in (message.get("hostedContents") or []) if hc.get("id")]
 
         # Extract mentions
         mentions = message.get("mentions", [])
@@ -169,6 +225,8 @@ class MetadataExtractor:
                 }
                 for reaction in reactions
             ],
+            "event_detail": event_detail,
+            "hosted_content_ids": hosted_content_ids,
         }
 
     @staticmethod
@@ -191,8 +249,11 @@ class MetadataExtractor:
     def extract_teams_chat_message_metadata(message: Dict[str, Any]) -> Dict[str, Any]:
         """Extract Teams chat message metadata"""
         body = message.get("body", {})
-        from_info = message.get("from", {})
-        user = from_info.get("user", {})
+        from_info = message.get("from") or {}
+        user = from_info.get("user") or {}
+
+        event_detail = _build_event_detail(message)
+        hosted_content_ids = [hc.get("id") for hc in (message.get("hostedContents") or []) if hc.get("id")]
 
         return {
             "type": "teams_chat_message",
@@ -226,6 +287,8 @@ class MetadataExtractor:
             ],
             "channel_identity": message.get("channelIdentity"),
             "policy_violation": message.get("policyViolation"),
+            "event_detail": event_detail,
+            "hosted_content_ids": hosted_content_ids,
         }
 
     # ==================== Entra ID Metadata ====================
