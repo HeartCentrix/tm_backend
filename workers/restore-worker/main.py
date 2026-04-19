@@ -1044,6 +1044,9 @@ class RestoreWorker:
             or ""
         ).upper()
 
+        # Optional folder filter for USER_CONTACT items. Empty/missing = include all.
+        contact_folder_filter = set(_zip_spec.get("contactFolders") or [])
+
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for item in items:
                 try:
@@ -1098,6 +1101,26 @@ class RestoreWorker:
                             zip_file.writestr(
                                 f"calendar/{item.external_id}.json",
                                 json.dumps(raw_data, indent=2),
+                            )
+                    elif item.item_type == "USER_CONTACT":
+                        folder = (
+                            (metadata.get("structured") or {}).get("parentFolderName")
+                            or "Contacts"
+                        )
+                        if contact_folder_filter and folder not in contact_folder_filter:
+                            continue
+                        if fmt == "CSV":
+                            if not hasattr(self, "_contacts_csv_rows"):
+                                self._contacts_csv_rows = []
+                            self._contacts_csv_rows.append(
+                                _contact_to_csv_row(raw_data, folder)
+                            )
+                        else:
+                            safe_folder = _safe_name(folder)
+                            safe_name = _safe_name(item.name or item.external_id)
+                            zip_file.writestr(
+                                f"contacts/{safe_folder}/{safe_name}.vcf",
+                                _contact_to_vcard(raw_data, folder=folder),
                             )
                     elif item.item_type in ("TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY", "TEAMS_CHAT_MESSAGE"):
                         # Export Teams message as JSON
@@ -1157,6 +1180,27 @@ class RestoreWorker:
                     writer.writerow(row)
                 zip_file.writestr("calendar/calendar.csv", buf.getvalue())
                 self._calendar_csv_rows = []
+
+            # Flush accumulated contact rows as a single contacts.csv.
+            contacts_csv_rows = getattr(self, "_contacts_csv_rows", None)
+            if contacts_csv_rows:
+                import io as _io2
+                import csv as _csv2
+                buf2 = _io2.StringIO()
+                writer2 = _csv2.DictWriter(
+                    buf2,
+                    fieldnames=[
+                        "displayName", "givenName", "surname", "companyName", "jobTitle",
+                        "emails", "businessPhones", "mobilePhone", "homePhones",
+                        "imAddresses", "categories", "personalNotes", "birthday", "folder",
+                    ],
+                    extrasaction="ignore",
+                )
+                writer2.writeheader()
+                for row in contacts_csv_rows:
+                    writer2.writerow(row)
+                zip_file.writestr("contacts/contacts.csv", buf2.getvalue())
+                self._contacts_csv_rows = []
 
         zip_buffer.seek(0)
         zip_bytes = zip_buffer.getvalue()
