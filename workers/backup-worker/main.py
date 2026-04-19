@@ -228,6 +228,7 @@ class BackupWorker:
         "ENTRA_USER": "backup_entra_single", "ENTRA_GROUP": "backup_entra_single",
         "M365_GROUP": "backup_entra_single", "ENTRA_APP": "backup_entra_single",
         "ENTRA_DEVICE": "backup_entra_single", "ENTRA_SERVICE_PRINCIPAL": "backup_entra_single",
+        "ENTRA_DIRECTORY": "backup_entra_directory",
         "ENTRA_CONDITIONAL_ACCESS": "backup_conditional_access",
         "ENTRA_BITLOCKER_KEY": "backup_bitlocker_key",
         "PLANNER": "_backup_metadata_only", "TODO": "_backup_metadata_only",
@@ -4619,6 +4620,187 @@ class BackupWorker:
                                   tenant: Tenant, message: Dict) -> Dict:
         """Single-resource Entra ID backup (matches handler signature)"""
         return await self._backup_entra_resource(resource, tenant, snapshot, graph_client, None, message)
+
+    async def backup_entra_directory(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
+                                     tenant: Tenant, message: Dict) -> Dict:
+        """Back up the whole Microsoft Entra directory as one snapshot.
+        Mirrors AFI's office_directory model — eight content categories
+        persisted under this single resource so the Recovery view can
+        render tabs: Users / Groups / Roles / Security / Audit /
+        Applications / Intune / Administrative Units.
+
+        Each category is best-effort: a 403 on one endpoint (e.g. Intune
+        requires DeviceManagementManagedDevices.Read.All, audit logs
+        require AuditLog.Read.All) is swallowed so a single missing
+        permission doesn't fail the whole snapshot.
+        """
+        print(f"[{self.worker_id}] [ENTRA_DIR START] {resource.display_name}")
+        total_items = 0
+        total_bytes = 0
+
+        # One-off helper: persist a batch of items keyed by item_type.
+        async def _persist_batch(item_type: str, category_label: str, items: List[Dict[str, Any]]) -> int:
+            nonlocal total_items, total_bytes
+            if not items:
+                return 0
+            rows: List[SnapshotItem] = []
+            for obj in items:
+                ext_id = str(obj.get("id") or obj.get("roleTemplateId") or obj.get("appId") or uuid.uuid4())
+                display = (
+                    obj.get("displayName")
+                    or obj.get("userPrincipalName")
+                    or obj.get("mail")
+                    or obj.get("activityDisplayName")
+                    or obj.get("category")
+                    or ext_id
+                )
+                raw_bytes = json.dumps(obj, default=str).encode()
+                rows.append(SnapshotItem(
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    external_id=ext_id[:255],
+                    item_type=item_type,
+                    name=str(display)[:255],
+                    folder_path=category_label,
+                    content_size=len(raw_bytes),
+                    content_hash=hashlib.sha256(raw_bytes).hexdigest(),
+                    content_checksum=None,
+                    extra_data={"raw": obj, "category": category_label},
+                ))
+                total_bytes += len(raw_bytes)
+            async with async_session_factory() as sess:
+                sess.add_all(rows)
+                await sess.commit()
+            total_items += len(rows)
+            print(f"[{self.worker_id}]   [ENTRA_DIR] {category_label}: captured {len(rows)} row(s)")
+            return len(rows)
+
+        async def _safe_fetch(url: str, params: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+            try:
+                data = await graph_client._get(url, params=params)
+                return data.get("value") or []
+            except Exception as exc:
+                logger.warning("[%s] [ENTRA_DIR] %s → %s", self.worker_id, url, exc)
+                return []
+
+        base = graph_client.GRAPH_URL
+
+        # 1) Users — pull the field set the Recovery "Users" view needs
+        #    (UPN, mail, proxyAddresses for "Other emails", userType +
+        #    externalUserState for Guest/External flags, Object ID = id).
+        users = await _safe_fetch(f"{base}/users", {
+            "$top": "999",
+            "$select": "id,displayName,userPrincipalName,mail,proxyAddresses,otherMails,userType,externalUserState,accountEnabled,jobTitle,department,createdDateTime,givenName,surname,mobilePhone,businessPhones",
+        })
+        await _persist_batch("ENTRA_DIR_USER", "Users", users)
+
+        # 2) Groups — with ownership + membership for the detail panel.
+        #    Also fetch per-group owners + first-page members so the
+        #    Recovery right-pane can render them without N×M refetches.
+        groups = await _safe_fetch(f"{base}/groups", {"$top": "999", "$select": "id,displayName,mail,description,groupTypes,securityEnabled,mailEnabled,visibility,membershipRule,createdDateTime"})
+        for g in groups:
+            gid = g.get("id")
+            if not gid:
+                continue
+            owners = await _safe_fetch(f"{base}/groups/{gid}/owners", {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"})
+            members = await _safe_fetch(f"{base}/groups/{gid}/members", {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"})
+            g["_owners"] = owners
+            g["_members"] = members
+            g["_memberCount"] = len(members)
+        await _persist_batch("ENTRA_DIR_GROUP", "Groups", groups)
+
+        # 3) Roles — $expand=rolePermissions so the right pane's
+        #    Privileges list is captured. directoryRoles (activated) is
+        #    kept in addition to roleDefinitions for parity with AFI.
+        roles_active = await _safe_fetch(f"{base}/directoryRoles")
+        roles_catalog = await _safe_fetch(f"{base}/roleManagement/directory/roleDefinitions", {"$top": "999", "$expand": "rolePermissions"})
+        await _persist_batch("ENTRA_DIR_ROLE", "Roles", roles_active + roles_catalog)
+
+        # 4) Security — AFI shows 5 buckets: Conditional Access,
+        #    Authentication Contexts, Authentication Strengths, Named
+        #    Locations, Policies. Each item carries a `_sec_bucket`
+        #    field so the frontend can split them in the left rail.
+        sec_items: List[Dict[str, Any]] = []
+        for bucket, url in [
+            ("Conditional Access", f"{base}/identity/conditionalAccess/policies"),
+            ("Authentication Contexts", f"{base}/identity/conditionalAccess/authenticationContextClassReferences"),
+            ("Authentication Strengths", f"{base}/identity/conditionalAccess/authenticationStrength/policies"),
+            ("Named Locations", f"{base}/identity/conditionalAccess/namedLocations"),
+            ("Policies", f"{base}/policies/identitySecurityDefaultsEnforcementPolicy"),
+        ]:
+            data = await _safe_fetch(url, {"$top": "500"})
+            # identitySecurityDefaultsEnforcementPolicy returns a single
+            # object, not a list — wrap it so _persist_batch sees a row.
+            if not data and bucket == "Policies":
+                try:
+                    single = await graph_client._get(url)
+                    if single and isinstance(single, dict) and single.get("id"):
+                        data = [single]
+                except Exception:
+                    data = []
+            for d in data:
+                d["_sec_bucket"] = bucket
+            sec_items.extend(data)
+        # Risky users + security alerts complement the above.
+        risky_users = await _safe_fetch(f"{base}/identityProtection/riskyUsers", {"$top": "500"})
+        for r in risky_users:
+            r["_sec_bucket"] = "Risky Users"
+        alerts = await _safe_fetch(f"{base}/security/alerts_v2", {"$top": "500"})
+        for a in alerts:
+            a["_sec_bucket"] = "Alerts"
+        sec_items.extend(risky_users + alerts)
+        await _persist_batch("ENTRA_DIR_SECURITY", "Security", sec_items)
+
+        # 5) Audit — directory audit + sign-in logs. Tag each row so
+        #    the frontend can split into Audit Logs vs Sign-In Logs.
+        dir_audits = await _safe_fetch(f"{base}/auditLogs/directoryAudits", {"$top": "500"})
+        for a in dir_audits:
+            a["_audit_bucket"] = "Audit Logs"
+        signins = await _safe_fetch(f"{base}/auditLogs/signIns", {"$top": "500"})
+        for s in signins:
+            s["_audit_bucket"] = "Sign-In Logs"
+        await _persist_batch("ENTRA_DIR_AUDIT", "Audit", dir_audits + signins)
+
+        # 6) Applications — split into App Registrations vs Enterprise
+        #    Applications via `_app_bucket`. Capture requiredResourceAccess
+        #    on /applications so the Permissions block renders.
+        apps = await _safe_fetch(f"{base}/applications", {"$top": "999", "$select": "id,appId,displayName,createdDateTime,requiredResourceAccess,signInAudience,identifierUris,publisherDomain"})
+        for a in apps:
+            a["_app_bucket"] = "App Registrations"
+        sps = await _safe_fetch(f"{base}/servicePrincipals", {"$top": "999", "$select": "id,appId,displayName,servicePrincipalType,appRoles,oauth2PermissionScopes,createdDateTime"})
+        for s in sps:
+            s["_app_bucket"] = "Enterprise Applications"
+        await _persist_batch("ENTRA_DIR_APPLICATION", "Applications", apps + sps)
+
+        # 7) Intune — AFI's "Devices" bucket matches /devices (Entra AD
+        #    devices) rather than Intune /managedDevices (which needs a
+        #    separate license). Compliance + Configuration policies
+        #    still come from Intune and may 400 without the license.
+        entra_devices = await _safe_fetch(f"{base}/devices", {"$top": "500", "$select": "id,displayName,accountEnabled,operatingSystem,operatingSystemVersion,trustType,registrationDateTime,isCompliant,isManaged"})
+        for d in entra_devices:
+            d["_intune_bucket"] = "Devices"
+            # Owner lookup — first registered user per device.
+            try:
+                owners = await _safe_fetch(f"{base}/devices/{d.get('id')}/registeredOwners", {"$top": "1", "$select": "id,displayName,userPrincipalName"})
+                if owners:
+                    d["_owner_display"] = owners[0].get("displayName")
+                    d["_owner_upn"] = owners[0].get("userPrincipalName")
+            except Exception:
+                pass
+        comp_policies = await _safe_fetch(f"{base}/deviceManagement/deviceCompliancePolicies", {"$top": "500"})
+        for c in comp_policies:
+            c["_intune_bucket"] = "Compliance Policies"
+        conf_policies = await _safe_fetch(f"{base}/deviceManagement/deviceConfigurations", {"$top": "500"})
+        for c in conf_policies:
+            c["_intune_bucket"] = "Configuration Profiles"
+        await _persist_batch("ENTRA_DIR_INTUNE", "Intune", entra_devices + comp_policies + conf_policies)
+
+        # 8) Administrative Units.
+        admin_units = await _safe_fetch(f"{base}/directory/administrativeUnits", {"$top": "500"})
+        await _persist_batch("ENTRA_DIR_ADMIN_UNIT", "Administrative Units", admin_units)
+
+        print(f"[{self.worker_id}] [ENTRA_DIR COMPLETE] {resource.display_name} — {total_items} items, {total_bytes} bytes")
+        return {"item_count": total_items, "bytes_added": total_bytes}
 
     async def backup_conditional_access(
         self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,

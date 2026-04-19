@@ -187,6 +187,8 @@ async def _ensure_enum_values() -> None:
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'USER_CONTACTS';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'USER_CALENDAR';",
         "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'USER_CHATS';",
+        # Singleton per-tenant "Azure Active Directory" resource.
+        "ALTER TYPE resourcetype ADD VALUE IF NOT EXISTS 'ENTRA_DIRECTORY';",
         "ALTER TYPE tenantstatus ADD VALUE IF NOT EXISTS 'PENDING_DISCOVERY';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'QUEUED';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'RUNNING';",

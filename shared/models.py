@@ -52,6 +52,11 @@ class ResourceType(str, enum.Enum):
     TEAMS_CHANNEL = "TEAMS_CHANNEL"
     TEAMS_CHAT = "TEAMS_CHAT"
     TEAMS_CHAT_EXPORT = "TEAMS_CHAT_EXPORT"
+    # Singleton per-tenant "Azure Active Directory" resource — matches
+    # AFI's `office_directory` kind. Stores the 8 Entra-wide content
+    # categories (users, groups, roles, security, audit, applications,
+    # intune, admin units) as snapshot items under this one resource.
+    ENTRA_DIRECTORY = "ENTRA_DIRECTORY"
     ENTRA_USER = "ENTRA_USER"
     ENTRA_GROUP = "ENTRA_GROUP"
     M365_GROUP = "M365_GROUP"  # Unified (modern) group — links group mailbox + SP site + (optional) Team
