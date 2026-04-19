@@ -219,6 +219,56 @@ class Settings:
         self.HEAVY_EXPORT_ENABLED = os.getenv("HEAVY_EXPORT_ENABLED", "false").lower() in ("true", "1", "yes")
         self.RESTORE_WORKER_QUEUE = os.getenv("RESTORE_WORKER_QUEUE", "restore.normal")
 
+        # --- Chat export (v1) ---
+        # See docs/superpowers/specs/2026-04-19-teams-chat-download-design.md §11.
+        self.chat_export_tenant_concurrent_min: int = int(
+            os.getenv("CHAT_EXPORT_TENANT_CONCURRENT_MIN", "200")
+        )
+        self.chat_export_tenant_concurrent_per_user: float = float(
+            os.getenv("CHAT_EXPORT_TENANT_CONCURRENT_PER_USER", "0.5")
+        )
+        self.chat_export_blob_account_shards: int = int(
+            os.getenv("CHAT_EXPORT_BLOB_ACCOUNT_SHARDS", "4")
+        )
+        _chat_export_blob_accounts = os.getenv("CHAT_EXPORT_BLOB_ACCOUNTS", "").strip()
+        self.chat_export_blob_accounts: list[str] = (
+            [s.strip() for s in _chat_export_blob_accounts.split(",") if s.strip()]
+            if _chat_export_blob_accounts
+            else ["stexport1", "stexport2", "stexport3", "stexport4"]
+        )
+        # "sse" | "poll"
+        self.chat_export_progress_transport: str = os.getenv(
+            "CHAT_EXPORT_PROGRESS_TRANSPORT", "sse"
+        )
+        # 20 GB
+        self.chat_export_size_soft_cap_bytes: int = int(
+            os.getenv("CHAT_EXPORT_SIZE_SOFT_CAP_BYTES", str(21_474_836_480))
+        )
+        # 1 TiB
+        self.chat_export_size_hard_cap_bytes: int = int(
+            os.getenv("CHAT_EXPORT_SIZE_HARD_CAP_BYTES", str(1_099_511_627_776))
+        )
+        self.chat_export_blob_ttl_hours: int = int(
+            os.getenv("CHAT_EXPORT_BLOB_TTL_HOURS", "168")
+        )
+        self.chat_export_sas_ttl_hours: int = int(
+            os.getenv("CHAT_EXPORT_SAS_TTL_HOURS", "168")
+        )
+        self.chat_export_hot_tier_hours: int = int(
+            os.getenv("CHAT_EXPORT_HOT_TIER_HOURS", "24")
+        )
+        self.chat_export_dynamic_prefetch: bool = os.getenv(
+            "CHAT_EXPORT_DYNAMIC_PREFETCH", "true"
+        ).lower() in ("true", "1", "yes")
+
+        # --- hostedContents capture (backup-worker) ---
+        self.chat_hosted_content_concurrency: int = int(
+            os.getenv("CHAT_HOSTED_CONTENT_CONCURRENCY", "8")
+        )
+        self.chat_hosted_content_max_bytes: int = int(
+            os.getenv("CHAT_HOSTED_CONTENT_MAX_BYTES", str(25_000_000))
+        )
+
         self.ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
         self.ELASTICSEARCH_ENABLED = False
         origins = os.getenv("CORS_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:4200,http://localhost:3000,http://localhost:5173")
