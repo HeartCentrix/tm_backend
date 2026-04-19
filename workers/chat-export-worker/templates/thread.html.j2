@@ -1,0 +1,20 @@
+{% import '_macros.html.j2' as m %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ thread_name }} — TMvault chat export</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="container">
+  <header class="thread-header">
+    <h1>{{ thread_name }}</h1>
+    <div class="meta">{{ messages|length }} messages · exported {{ exported_at }}</div>
+  </header>
+  {% for msg in messages %}
+    {{ m.bubble(msg) }}
+  {% endfor %}
+</div>
+</body>
+</html>
