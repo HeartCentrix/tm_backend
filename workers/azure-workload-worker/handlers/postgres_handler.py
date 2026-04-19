@@ -26,6 +26,7 @@ import hashlib as _hashlib
 import uuid as _uuid
 from shared.azure_storage import azure_storage_manager
 from shared.config import settings
+from handlers._progress import update_job_pct
 
 
 # Timestamp column names to detect for incremental backup
@@ -110,6 +111,18 @@ class PostgresBackupHandler:
 
         self._log(f"Starting PostgreSQL {server_type} backup on server {server_name} (RG={rg}) — {len(all_dbs)} database(s): {', '.join(all_dbs)}")
 
+        # Extract the job id the worker handed us so we can write live
+        # progress to jobs.progress_pct during the multi-database loop.
+        job_id = None
+        try:
+            jid = (msg or {}).get("jobId")
+            if jid:
+                job_id = _uuid.UUID(jid)
+        except Exception:
+            job_id = None
+
+        await update_job_pct(job_id, 10)  # enumerated databases
+
         try:
             # Phase 3 — capture server-level configuration once (no DB
             # scope). Done up front because it doesn't need a live
@@ -155,6 +168,11 @@ class PostgresBackupHandler:
                 total_tables += data_result.get("tables_count", 0)
                 total_rows += data_result.get("rows_count", 0)
                 total_data_bytes += data_result.get("total_bytes", 0)
+
+                # Live progress: 10% after enumerate, +80% spread across
+                # databases, remaining 10% for persist/finalize.
+                done = len(per_db_results)
+                await update_job_pct(job_id, 10 + int(80 * done / max(1, len(all_dbs))))
 
             # Persist one batch of SnapshotItem rows covering every DB.
             try:

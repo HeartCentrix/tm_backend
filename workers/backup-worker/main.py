@@ -26,6 +26,35 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 import time
 from typing import Dict, List, Any, Optional, Tuple
+
+
+async def _update_job_pct(job_id, pct: int) -> None:
+    """Write live `jobs.progress_pct` on a short-lived session so the
+    Protection / Activity UI can animate during long M365 backups. Best-
+    effort — a DB hiccup never interrupts the running backup. Matches
+    the Azure worker's `handlers._progress.update_job_pct` pattern."""
+    if job_id is None:
+        return
+    try:
+        if isinstance(job_id, str):
+            job_id = uuid.UUID(job_id)
+    except Exception:
+        return
+    clamped = max(0, min(100, int(pct)))
+    try:
+        from shared.database import async_session_factory as _f
+        from shared.models import Job as _J
+        async with _f() as _s:
+            _j = await _s.get(_J, job_id)
+            if not _j:
+                return
+            status_val = _j.status.name if hasattr(_j.status, "name") else str(_j.status)
+            if status_val not in ("RUNNING", "QUEUED"):
+                return
+            _j.progress_pct = clamped
+            await _s.commit()
+    except Exception:
+        pass
 import aio_pika
 from aio_pika import IncomingMessage
 import httpx
@@ -285,6 +314,8 @@ class BackupWorker:
 
         # create_snapshot opens + closes its own short-lived session.
         snapshot = await self.create_snapshot(resource, message, job_id)
+        # Live-progress tick — snapshot row now exists, handler about to run.
+        await _update_job_pct(job_id, 15)
 
         handler_name = self._HANDLER_TABLE.get(resource_type)
         if not handler_name:
@@ -301,6 +332,8 @@ class BackupWorker:
         try:
             print(f"[{self.worker_id}] Calling handler for {resource_type}: {resource.display_name}")
             result = await handler(graph_client, resource, snapshot, tenant, message)
+            # Handler finished — finalize phase ahead (DB writes + audit).
+            await _update_job_pct(job_id, 95)
         except Exception as e:
             error_str = str(e).lower()
             is_inaccessible = any(kw in error_str for kw in [
@@ -378,6 +411,7 @@ class BackupWorker:
                 return
 
             job.status = JobStatus.RUNNING
+            job.progress_pct = 5  # worker picked up the message
             await session.commit()
 
         # Fetch all resources and their tenants in one session
