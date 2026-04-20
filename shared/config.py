@@ -143,6 +143,14 @@ class Settings:
         # Small-attachment threshold. >= this size uses Graph's upload-session
         # endpoint (chunked PUT). Units = megabytes.
         self.MAIL_RESTORE_ATTACH_LARGE_MB = int(os.getenv("MAIL_RESTORE_ATTACH_LARGE_MB", "3"))
+        # ---- OneDrive Restore engine ----
+        # Streams files back via Graph upload-session for ≥ 4 MB, simple PUT
+        # otherwise. Flag off → legacy _restore_file_to_onedrive shim (still
+        # delegates to the engine — the flag is an emergency escape hatch).
+        self.ONEDRIVE_RESTORE_ENGINE_ENABLED = os.getenv("ONEDRIVE_RESTORE_ENGINE_ENABLED", "true").lower() == "true"
+        self.ONEDRIVE_RESTORE_CONCURRENCY = int(os.getenv("ONEDRIVE_RESTORE_CONCURRENCY", "16"))
+        self.ONEDRIVE_RESTORE_CHUNK_BYTES = int(os.getenv("ONEDRIVE_RESTORE_CHUNK_BYTES", str(10 * 1024 * 1024)))
+        self.ONEDRIVE_RESTORE_PER_TARGET_USER_CAP = int(os.getenv("ONEDRIVE_RESTORE_PER_TARGET_USER_CAP", "5"))
         # ---- Entra Restore v2 ----
         # Default on; set to "false" in env to disable EntraRestoreEngine
         # + EntraExportPipeline and fall back to the legacy PATCH-only
