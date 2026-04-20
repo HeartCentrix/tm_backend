@@ -74,6 +74,31 @@ SECTION_SPECS: Dict[str, SectionSpec] = {
 }
 
 
+# PATCH-scope field sets. Narrower than MUTABLE_FIELDS by design:
+# Graph's PATCH endpoints reject unknown fields, so we project each
+# object onto the fields Graph will actually accept for its own kind.
+# The fingerprint in entra_fingerprint.py uses the UNION across buckets
+# for drift detection; these PATCH-scope sets are enforced at Graph
+# call time. Keeping both explicitly separate — don't collapse.
+_APPLICATION_PATCH_FIELDS = frozenset({
+    "displayName", "signInAudience", "tags", "identifierUris",
+    "requiredResourceAccess", "web", "api", "appRoles",
+})
+_CA_POLICY_PATCH_FIELDS = frozenset({
+    "displayName", "state", "conditions", "grantControls", "sessionControls",
+})
+_INTUNE_PATCH_FIELDS = frozenset({
+    "displayName", "description", "scheduledActionsForRule",
+    "settings", "roleScopeTagIds",
+})
+_INTUNE_CREATE_FIELDS = frozenset({
+    "displayName", "description", "@odata.type", "settings", "roleScopeTagIds",
+})
+_ROLE_DEFINITION_PATCH_FIELDS = frozenset({
+    "displayName", "description", "isEnabled", "rolePermissions", "resourceScopes",
+})
+
+
 # ---- Sieve (existence check) ----
 
 async def sieve_existence(
@@ -254,11 +279,7 @@ async def set_admin_unit_members(
 # ---- Applications / Service Principals ----
 
 async def patch_application(graph_client: Any, app_object_id: str, raw: Dict[str, Any]) -> None:
-    app_fields = {
-        "displayName", "signInAudience", "tags", "identifierUris",
-        "requiredResourceAccess", "web", "api", "appRoles",
-    }
-    payload = _project(raw, app_fields)
+    payload = _project(raw, _APPLICATION_PATCH_FIELDS)
     if not payload:
         return
     await graph_client._patch(
@@ -267,11 +288,7 @@ async def patch_application(graph_client: Any, app_object_id: str, raw: Dict[str
 
 
 async def create_application(graph_client: Any, raw: Dict[str, Any]) -> Optional[str]:
-    app_fields = {
-        "displayName", "signInAudience", "tags", "identifierUris",
-        "requiredResourceAccess", "web", "api", "appRoles",
-    }
-    payload = _project(raw, app_fields)
+    payload = _project(raw, _APPLICATION_PATCH_FIELDS)
     if "displayName" not in payload:
         return None
     resp = await graph_client._post(f"{graph_client.GRAPH_URL}/applications", payload)
@@ -281,8 +298,7 @@ async def create_application(graph_client: Any, raw: Dict[str, Any]) -> Optional
 # ---- Conditional Access / Named Locations / Auth Strengths / Auth Contexts ----
 
 async def patch_ca_policy(graph_client: Any, policy_id: str, raw: Dict[str, Any]) -> None:
-    ca_fields = {"displayName", "state", "conditions", "grantControls", "sessionControls"}
-    payload = _project(raw, ca_fields)
+    payload = _project(raw, _CA_POLICY_PATCH_FIELDS)
     if not payload:
         return
     await graph_client._patch(
@@ -291,8 +307,7 @@ async def patch_ca_policy(graph_client: Any, policy_id: str, raw: Dict[str, Any]
 
 
 async def create_ca_policy(graph_client: Any, raw: Dict[str, Any]) -> Optional[str]:
-    ca_fields = {"displayName", "state", "conditions", "grantControls", "sessionControls"}
-    payload = _project(raw, ca_fields)
+    payload = _project(raw, _CA_POLICY_PATCH_FIELDS)
     if "displayName" not in payload:
         return None
     resp = await graph_client._post(
@@ -311,9 +326,7 @@ async def patch_intune_policy(graph_client: Any, policy_id: str, raw: Dict[str, 
         base = f"{graph_client.GRAPH_URL}/deviceManagement/deviceCompliancePolicies"
     else:
         base = f"{graph_client.GRAPH_URL}/deviceManagement/deviceConfigurations"
-    fields = {"displayName", "description", "scheduledActionsForRule",
-              "settings", "roleScopeTagIds"}
-    payload = _project(raw, fields)
+    payload = _project(raw, _INTUNE_PATCH_FIELDS)
     if not payload:
         return
     await graph_client._patch(f"{base}/{policy_id}", payload)
@@ -325,8 +338,7 @@ async def create_intune_policy(graph_client: Any, raw: Dict[str, Any]) -> Option
         base = f"{graph_client.GRAPH_URL}/deviceManagement/deviceCompliancePolicies"
     else:
         base = f"{graph_client.GRAPH_URL}/deviceManagement/deviceConfigurations"
-    fields = {"displayName", "description", "@odata.type", "settings", "roleScopeTagIds"}
-    payload = _project(raw, fields)
+    payload = _project(raw, _INTUNE_CREATE_FIELDS)
     if "displayName" not in payload:
         return None
     resp = await graph_client._post(base, payload)
@@ -338,8 +350,7 @@ async def create_intune_policy(graph_client: Any, raw: Dict[str, Any]) -> Option
 async def patch_role_definition(graph_client: Any, role_id: str, raw: Dict[str, Any]) -> None:
     if raw.get("isBuiltIn"):
         return  # built-in roles are immutable
-    fields = {"displayName", "description", "isEnabled", "rolePermissions", "resourceScopes"}
-    payload = _project(raw, fields)
+    payload = _project(raw, _ROLE_DEFINITION_PATCH_FIELDS)
     if not payload:
         return
     await graph_client._patch(
@@ -350,8 +361,7 @@ async def patch_role_definition(graph_client: Any, role_id: str, raw: Dict[str, 
 async def create_role_definition(graph_client: Any, raw: Dict[str, Any]) -> Optional[str]:
     if raw.get("isBuiltIn"):
         return None
-    fields = {"displayName", "description", "isEnabled", "rolePermissions", "resourceScopes"}
-    payload = _project(raw, fields)
+    payload = _project(raw, _ROLE_DEFINITION_PATCH_FIELDS)
     if "displayName" not in payload:
         return None
     resp = await graph_client._post(
