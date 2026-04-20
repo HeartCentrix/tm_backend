@@ -38,7 +38,17 @@ async def lifespan(app: FastAPI):
 # TEAMS_CHAT_EXPORT is a backup-scheduler-internal per-user shard that carries the
 # Graph delta token for the whole-user chat export; TEAMS_CHAT rows remain the
 # user-facing entity.
-UI_HIDDEN_TYPES: set[str] = {"TEAMS_CHAT_EXPORT"}
+# USER_MAIL / USER_ONEDRIVE / USER_CONTACTS / USER_CALENDAR / USER_CHATS are
+# Tier 2 per-content-category children under an ENTRA_USER parent. The parent
+# row already rolls up their storage_bytes and last-backup timestamps, so
+# surfacing them in Protection creates five dupes per user (Mail, OneDrive,
+# Calendar, Contacts, Chats) each needing their own SLA policy — which isn't
+# how protection actually works. Recovery reads them via snapshots, not the
+# resource listing, so hiding them here is safe.
+UI_HIDDEN_TYPES: set[str] = {
+    "TEAMS_CHAT_EXPORT",
+    "USER_MAIL", "USER_ONEDRIVE", "USER_CONTACTS", "USER_CALENDAR", "USER_CHATS",
+}
 
 
 def format_bytes(bytes_val: int) -> str:
