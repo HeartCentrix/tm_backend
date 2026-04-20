@@ -3222,6 +3222,59 @@ class BackupWorker:
                     item_count += r[0]
                     bytes_added += r[1]
 
+            # A TEAMS_CHANNEL row's external_id is the team (M365 group) id.
+            # Fan out to the group mailbox + the team's SharePoint site so
+            # the Recovery view's Site + Mail tabs have data alongside the
+            # channel messages. Each sub-backup guards its own exceptions
+            # so a single-permission-denied step doesn't abort the rest.
+            #
+            # Group mailbox.
+            try:
+                mbx_items, mbx_bytes = await self.backup_group_mailbox_content(
+                    resource, tenant, snapshot, graph_client,
+                )
+                if mbx_items:
+                    async with async_session_factory() as session:
+                        session.add_all(mbx_items)
+                        await session.commit()
+                    item_count += len(mbx_items)
+                bytes_added += mbx_bytes
+            except Exception as mbx_exc:
+                logger.warning(
+                    "[%s] Team group-mailbox backup skipped for %s: %s",
+                    self.worker_id, resource.display_name, mbx_exc,
+                )
+
+            # SharePoint team-site content (incl. subsites — backup_sharepoint
+            # enumerates them internally).
+            try:
+                site_resp = await graph_client._get(
+                    f"{graph_client.GRAPH_URL}/groups/{team_id}/sites/root",
+                )
+                raw_site_id = site_resp.get("id", "")
+                if raw_site_id:
+                    site_ext_id = raw_site_id.replace(",", "/")
+                    from types import SimpleNamespace as _SN
+                    site_proxy = _SN(
+                        id=resource.id,
+                        tenant_id=resource.tenant_id,
+                        type=_SN(value="SHAREPOINT_SITE"),
+                        display_name=f"{resource.display_name} (team site)",
+                        external_id=site_ext_id,
+                        extra_data=(resource.extra_data or {}),
+                        sla_policy_id=resource.sla_policy_id,
+                    )
+                    sp_result = await self.backup_sharepoint(
+                        graph_client, site_proxy, snapshot, tenant, message,
+                    )
+                    bytes_added += int(sp_result.get("bytes_added", 0))
+                    item_count += int(sp_result.get("item_count", 0))
+            except Exception as sp_exc:
+                logger.warning(
+                    "[%s] Team site SP backup skipped for %s: %s",
+                    self.worker_id, resource.display_name, sp_exc,
+                )
+
         elif resource.type.value == "TEAMS_CHAT":
             item_count, bytes_added = await self._backup_single_chat(resource, tenant, snapshot, graph_client)
 
