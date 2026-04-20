@@ -990,9 +990,17 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
 
 # Workloads that share the folder_path column and can be mutually
 # cross-restored. Teams = the team's backing SharePoint site drive;
-# Group = the group's backing SharePoint drive. Adding a new family
-# member means verifying its backup populates folder_path.
-_FILES_FAMILY = {"ONEDRIVE", "SHAREPOINT", "TEAMS", "GROUP"}
+# M365_GROUP carries the group's backing SharePoint drive under the
+# same snapshot. USER_ONEDRIVE is the Tier-2 child under a discovered
+# user. Adding a new family member means verifying its backup populates
+# folder_path.
+_FILES_FAMILY = {
+    "ONEDRIVE",
+    "USER_ONEDRIVE",
+    "SHAREPOINT_SITE",
+    "TEAMS_CHANNEL",
+    "M365_GROUP",
+}
 
 
 def _resource_family(resource_type: str) -> str:
