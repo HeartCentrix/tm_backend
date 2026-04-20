@@ -708,6 +708,12 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         "preserveTree": bool(request.get("preserveTree", False)),
         "targetFolder": request.get("targetFolder"),
         "overwrite": request.get("overwrite", False),
+        "entraSections": request.get("entraSections"),
+        "format": request.get("format"),
+        "includeNestedDetail": bool(request.get("includeNestedDetail", False)),
+        "recoverMode": request.get("recoverMode"),
+        "includeGroupMembership": bool(request.get("includeGroupMembership", True)),
+        "includeAuMembership": bool(request.get("includeAuMembership", True)),
         # RestoreModal sends labels like ["Mail","OneDrive","Contacts","Calendar","Chats"].
         # None / missing = restore everything (back-compat). Restore-worker maps each
         # label to the matching item_type values and skips anything else in the snapshot.

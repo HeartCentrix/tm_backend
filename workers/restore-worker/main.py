@@ -462,18 +462,79 @@ class RestoreWorker:
         snapshot_ids: List[str],
         item_ids: List[str]
     ) -> List[SnapshotItem]:
-        """Fetch snapshot items to restore"""
-        stmt = select(SnapshotItem)
+        """Resolve the SnapshotItems a restore job should process.
 
+        Two modes:
+          * ``item_ids`` given → strict lookup by id. The user picked
+            specific items in the UI; restore exactly those.
+          * only ``snapshot_ids`` given → point-in-time fan-out. Because
+            M365 backups are delta-based, a single INCREMENTAL snapshot
+            holds only rows that changed since the prior run. Restoring
+            just that one snapshot would replay the delta alone and leave
+            the target mailbox / drive missing every item captured in an
+            earlier snapshot but untouched in this one.
+
+            Fix: for each picked snapshot, resolve every sibling snapshot
+            of the same resource with ``created_at <= picked.created_at``
+            and union them. Then dedupe by ``external_id`` with newest-
+            wins semantics via ``DISTINCT ON``. An item edited or moved
+            in a later snapshot gets its newest captured state; untouched
+            items come through from the original FULL snapshot.
+
+            Mirrors ``_resolve_sibling_snapshot_ids`` in snapshot-service
+            so the restore matches what the Recovery UI was showing.
+        """
         if item_ids:
-            stmt = stmt.where(SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids]))
-        elif snapshot_ids:
-            stmt = stmt.where(SnapshotItem.snapshot_id.in_([uuid.UUID(sid) for sid in snapshot_ids]))
-        else:
+            stmt = select(SnapshotItem).where(
+                SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids])
+            )
+            return (await session.execute(stmt)).scalars().all()
+
+        if not snapshot_ids:
             return []
 
-        result = await session.execute(stmt)
-        return result.scalars().all()
+        picked_uuids = [uuid.UUID(sid) for sid in snapshot_ids]
+        picked_rows = (
+            await session.execute(
+                select(Snapshot).where(Snapshot.id.in_(picked_uuids))
+            )
+        ).scalars().all()
+        if not picked_rows:
+            # Unknown ids — fall back to strict behaviour so we don't
+            # silently turn a bad id into an empty restore.
+            stmt = select(SnapshotItem).where(
+                SnapshotItem.snapshot_id.in_(picked_uuids)
+            )
+            return (await session.execute(stmt)).scalars().all()
+
+        sibling_ids: set = set()
+        for picked in picked_rows:
+            rows = (
+                await session.execute(
+                    select(Snapshot.id).where(
+                        Snapshot.resource_id == picked.resource_id,
+                        Snapshot.created_at <= picked.created_at,
+                    )
+                )
+            ).all()
+            sibling_ids.update(r[0] for r in rows)
+
+        if not sibling_ids:
+            sibling_ids = set(picked_uuids)
+
+        # DISTINCT ON (external_id) + ORDER BY external_id, Snapshot
+        # created_at DESC → one row per logical item, newest captured
+        # version wins. Join Snapshot to rank by the snapshot's own
+        # timestamp — SnapshotItem.created_at can drift within a
+        # snapshot and isn't the right clock to order on.
+        stmt = (
+            select(SnapshotItem)
+            .join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id)
+            .where(SnapshotItem.snapshot_id.in_(sibling_ids))
+            .order_by(SnapshotItem.external_id, Snapshot.created_at.desc())
+            .distinct(SnapshotItem.external_id)
+        )
+        return (await session.execute(stmt)).scalars().all()
 
     # ==================== Restore Handlers ====================
 
@@ -913,6 +974,17 @@ class RestoreWorker:
     ) -> Dict:
         """Export items as downloadable ZIP file"""
         print(f"[{self.worker_id}] export_as_zip ENTER items={len(items)}", flush=True)
+        # Entra export v2 fast-path — new section-scoped ZIP pipeline.
+        if (
+            settings.ENTRA_EXPORT_V2_ENABLED
+            and spec.get("entraSections")
+            and any(
+                it.item_type and it.item_type.startswith("ENTRA_DIR_")
+                for it in items
+            )
+        ):
+            return await self._export_entra_zip(session, items, message, spec)
+        # ... legacy body continues below unchanged
         # v2 mail export — feature-flagged. Accepts mixed EMAIL + EMAIL_ATTACHMENT
         # selections (e.g. "Download all" with workloads=["Mail"] pulls both
         # types). EMAIL_ATTACHMENT rows are skipped — their bytes already get
@@ -1396,6 +1468,129 @@ class RestoreWorker:
             "blob_path": blob_name,
             "file_size": zip_size,
         }
+
+    async def _export_entra_zip(self, session, items, message, spec) -> Dict:
+        """Section-grouped Entra ZIP export. Groups items by UI section
+        label (splitting multi-bucket item_types into per-file labels),
+        runs EntraExportPipeline, uploads the resulting ZIP to the same
+        export blob path everything else uses. Returns the job result
+        dict with manifest + download url."""
+        from entra_export import EntraExportPipeline
+
+        snapshot_id = (message.get("snapshotIds") or [""])[0]
+        fmt = (spec.get("format") or "json").lower()
+        include_nested = bool(spec.get("includeNestedDetail", False))
+        sections = spec.get("entraSections") or []
+
+        # Map item_type + bucket to the UI section file label used in
+        # EntraExportPipeline._CSV_COLUMNS / ZIP filenames.
+        label_of_item_type = {
+            "ENTRA_DIR_USER": "users",
+            "ENTRA_DIR_GROUP": "groups",
+            "ENTRA_DIR_ROLE": "roles",
+            "ENTRA_DIR_APPLICATION": "applications",   # split by _app_bucket below
+            "ENTRA_DIR_SECURITY": "conditional_access_policies",  # split by _sec_bucket
+            "ENTRA_DIR_ADMIN_UNIT": "admin_units",
+            "ENTRA_DIR_INTUNE": "intune_compliance",   # split by _intune_bucket
+            "ENTRA_DIR_AUDIT": "audit_logs",           # split by _audit_bucket
+        }
+        section_items: Dict[str, List[SnapshotItem]] = {}
+        for it in items:
+            if not (it.item_type and it.item_type.startswith("ENTRA_DIR_")):
+                continue
+            ed = it.extra_data or {}
+            if it.item_type == "ENTRA_DIR_APPLICATION":
+                bucket = ed.get("_app_bucket")
+                label = "service_principals" if bucket == "Enterprise Applications" else "applications"
+            elif it.item_type == "ENTRA_DIR_SECURITY":
+                b = ed.get("_sec_bucket") or ""
+                label = {
+                    "Conditional Access": "conditional_access_policies",
+                    "Authentication Contexts": "auth_contexts",
+                    "Authentication Strengths": "auth_strengths",
+                    "Named Locations": "named_locations",
+                    "Policies": "security_defaults",
+                    "Risky Users": "risky_users",
+                    "Alerts": "security_alerts",
+                }.get(b, "conditional_access_policies")
+            elif it.item_type == "ENTRA_DIR_INTUNE":
+                b = ed.get("_intune_bucket") or ""
+                label = {
+                    "Devices": "intune_devices",
+                    "Compliance Policies": "intune_compliance",
+                    "Configuration Profiles": "intune_configuration",
+                }.get(b, "intune_compliance")
+            elif it.item_type == "ENTRA_DIR_AUDIT":
+                b = ed.get("_audit_bucket") or ""
+                label = "sign_in_logs" if b == "Sign-In Logs" else "audit_logs"
+            else:
+                label = label_of_item_type.get(it.item_type, "other")
+            if sections and not self._entra_section_matches(label, sections):
+                continue
+            section_items.setdefault(label, []).append(it)
+
+        pipeline = EntraExportPipeline(
+            snapshot_id=snapshot_id, format=fmt, include_nested_detail=include_nested,
+        )
+        buf = io.BytesIO()
+        manifest = pipeline.build_zip(buf, section_items)
+        zip_bytes = buf.getvalue()
+
+        # Upload using the same path the legacy export uses.
+        download_url = await self._publish_entra_zip(session, message, zip_bytes)
+        return {
+            "exported_count": sum(manifest["counts"].values()),
+            "export_type": "ZIP",
+            "entra": True,
+            "manifest": manifest,
+            "download_url": download_url,
+        }
+
+    @staticmethod
+    def _entra_section_matches(file_label: str, ui_sections: List[str]) -> bool:
+        """True when a section's output file_label falls under one of
+        the top-level UI sections the user selected."""
+        ui = {s.lower() for s in ui_sections}
+        groups = {
+            "users": {"users"},
+            "groups": {"groups"},
+            "roles": {"roles"},
+            "applications": {"applications", "service_principals"},
+            "security": {
+                "conditional_access_policies", "auth_contexts",
+                "auth_strengths", "named_locations", "security_defaults",
+                "risky_users", "security_alerts",
+            },
+            "adminunits": {"admin_units"},
+            "intune": {"intune_devices", "intune_compliance", "intune_configuration"},
+            "audit": {"audit_logs", "sign_in_logs"},
+        }
+        for top in ui:
+            if file_label in groups.get(top, set()):
+                return True
+        return False
+
+    async def _publish_entra_zip(self, session, message, zip_bytes: bytes) -> str:
+        """Write the Entra export ZIP into blob storage and return a
+        download URL. Reuses the same container + upload_blob pattern
+        the legacy export_as_zip body uses."""
+        container_name = "exports"
+        job_id = str(message.get("jobId") or uuid.uuid4())
+        blob_name = f"{job_id}/entra_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+        try:
+            shard = azure_storage_manager.get_default_shard()
+            upload_result = await shard.upload_blob(
+                container_name, blob_name, zip_bytes,
+                metadata={"job_id": job_id, "entra_export": "true"},
+            )
+            if not (isinstance(upload_result, dict) and upload_result.get("success")):
+                err = (upload_result or {}).get("error", "unknown") if isinstance(upload_result, dict) else upload_result
+                print(f"[{self.worker_id}] [ENTRA-EXPORT] upload failed: {err}")
+                return ""
+        except Exception as e:
+            print(f"[{self.worker_id}] [ENTRA-EXPORT] upload failed: {type(e).__name__}: {e}")
+            return ""
+        return f"/api/v1/jobs/export/{job_id}/download"
 
     async def export_download(
         self,
