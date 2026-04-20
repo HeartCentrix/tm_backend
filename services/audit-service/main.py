@@ -241,10 +241,31 @@ async def list_activities(
         if status and status in status_map:
             filters.append(Job.status == status_map[status])
         if service_key and service_resource_types:
+            # A job shows under the service panel when ANY of:
+            #  - Its single resource_id points at a resource of this service.
+            #  - triggered_by == MANUAL_DATASOURCE_{M365|AZURE}.
+            #  - It's a bulk backup (resource_id IS NULL) whose
+            #    batch_resource_ids contain at least one resource of this
+            #    service. Without this, MANUAL_BATCH bulks Protection
+            #    triggers disappear from the service's Recent Activity.
+            svc_types = list(service_type_values or [])
+            batch_match = text(
+                "jobs.batch_resource_ids IS NOT NULL AND EXISTS ("
+                " SELECT 1 FROM resources r"
+                " WHERE r.id = ANY(jobs.batch_resource_ids)"
+                " AND r.type::text = ANY(:svc_types)"
+                ")"
+            ).bindparams(svc_types=svc_types)
             filters.append(
                 or_(
                     and_(Job.resource_id.is_not(None), Resource.type.in_(service_resource_types)),
-                    and_(Job.resource_id.is_(None), func.json_extract_path_text(Job.spec, "triggered_by") == f"MANUAL_DATASOURCE_{service_key.upper()}"),
+                    and_(
+                        Job.resource_id.is_(None),
+                        or_(
+                            func.json_extract_path_text(Job.spec, "triggered_by") == f"MANUAL_DATASOURCE_{service_key.upper()}",
+                            batch_match,
+                        ),
+                    ),
                 )
             )
 
@@ -514,10 +535,27 @@ async def export_activity_csv(
         if status and status in status_map:
             filters.append(Job.status == status_map[status])
         if service_key and service_resource_types:
+            # Mirror the /activity filter so CSV exports include bulk
+            # MANUAL_BATCH jobs whose batched resources belong to this
+            # service. See list_activities for the rationale.
+            svc_types = [rt.value if hasattr(rt, "value") else str(rt) for rt in service_resource_types]
+            batch_match = text(
+                "jobs.batch_resource_ids IS NOT NULL AND EXISTS ("
+                " SELECT 1 FROM resources r"
+                " WHERE r.id = ANY(jobs.batch_resource_ids)"
+                " AND r.type::text = ANY(:svc_types)"
+                ")"
+            ).bindparams(svc_types=svc_types)
             filters.append(
                 or_(
                     and_(Job.resource_id.is_not(None), Resource.type.in_(service_resource_types)),
-                    and_(Job.resource_id.is_(None), func.json_extract_path_text(Job.spec, "triggered_by") == f"MANUAL_DATASOURCE_{service_key.upper()}"),
+                    and_(
+                        Job.resource_id.is_(None),
+                        or_(
+                            func.json_extract_path_text(Job.spec, "triggered_by") == f"MANUAL_DATASOURCE_{service_key.upper()}",
+                            batch_match,
+                        ),
+                    ),
                 )
             )
 
