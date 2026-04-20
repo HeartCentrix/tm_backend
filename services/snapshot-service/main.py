@@ -414,10 +414,22 @@ async def list_resources_with_backups(
     Tier 2 children (parent_resource_id IS NOT NULL) are hidden from the
     Recovery list — their snapshot counts and item totals roll up under the
     parent resource so the user sees one row per backed-up identity rather
-    than one row per content category."""
+    than one row per content category.
+
+    TEAMS_CHANNEL + Tier 2 USER_* resource types mirror the resource-
+    service's UI_HIDDEN_TYPES exclusion so Recovery doesn't show a second
+    card for the same team / user content that M365_GROUP (or the user's
+    ENTRA_USER parent) already covers."""
+    # Keep in sync with resource-service/main.py::UI_HIDDEN_TYPES.
+    _HIDDEN_RECOVERY_TYPES = {
+        "TEAMS_CHAT_EXPORT",
+        "USER_MAIL", "USER_ONEDRIVE", "USER_CONTACTS", "USER_CALENDAR", "USER_CHATS",
+        "TEAMS_CHANNEL",
+    }
     resources_stmt = (
         select(Resource)
         .where(Resource.tenant_id == UUID(tenantId))
+        .where(~Resource.type.in_([ResourceType[t] for t in _HIDDEN_RECOVERY_TYPES if hasattr(ResourceType, t)]))
         .order_by(Resource.display_name)
     )
     resources_result = await db.execute(resources_stmt)
