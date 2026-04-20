@@ -966,7 +966,7 @@ class RestoreWorker:
             od_engine = OneDriveRestoreEngine(
                 graph_client=graph_client,
                 source_resource=source_resource_for_blobs,
-                target_drive_user_id=target_resource.external_id,
+                target_drive_user_id=self._graph_drive_id_for(target_resource),
                 tenant_id=str(target_resource.tenant_id),
                 mode=OdMode.OVERWRITE if spec.get("overwrite") else OdMode.SEPARATE_FOLDER,
                 separate_folder_root=spec.get("targetFolder"),
@@ -1893,30 +1893,45 @@ class RestoreWorker:
             return f"Restored by TM/{datetime.utcnow().strftime('%Y-%m-%d')}/"
         return ""
 
+    @staticmethod
+    def _graph_drive_id_for(resource: Resource) -> str:
+        """Resolve the real Graph drive id for a OneDrive-like resource.
+
+        USER_ONEDRIVE rows store the drive id in ``extra_data.drive_id``
+        and keep ``external_id`` as a composite ``{userId}:onedrive``
+        scoped to this product (see GraphClient.discover per-user OneDrive).
+        ONEDRIVE rows have ``external_id`` already set to the Graph drive
+        id. We fall back to ``external_id`` when metadata is absent so
+        either shape works.
+        """
+        md = getattr(resource, "extra_data", None) or {}
+        drive_id = md.get("drive_id") if isinstance(md, dict) else None
+        return drive_id or resource.external_id
+
     async def _resolve_onedrive_target_user(
         self,
         session: AsyncSession,
         source_resource: Resource,
         spec: Dict,
     ) -> tuple[str, bool]:
-        """Return (target_user_graph_id, is_cross_user) for a OneDrive
+        """Return (target_drive_id, is_cross_user) for a OneDrive
         restore. ``spec.targetUserId`` is the DB UUID of the target
-        OneDrive resource row (not a Graph user id). Unset → restore
-        into the source's own drive. Cross-tenant targets raise."""
+        OneDrive resource row. Unset → restore into the source's own
+        drive. Cross-tenant targets raise."""
         target_uuid = spec.get("targetUserId")
         if not target_uuid:
-            return source_resource.external_id, False
+            return self._graph_drive_id_for(source_resource), False
         target_res = await session.get(Resource, uuid.UUID(str(target_uuid)))
         if not target_res:
             raise ValueError(f"targetUserId {target_uuid} not found")
         target_type = target_res.type.value if hasattr(target_res.type, "value") else str(target_res.type)
-        if target_type != "ONEDRIVE":
+        if target_type not in ("ONEDRIVE", "USER_ONEDRIVE"):
             raise ValueError(
                 f"targetUserId {target_uuid} is not a OneDrive resource (got {target_type})"
             )
         if target_res.tenant_id != source_resource.tenant_id:
             raise ValueError("Cross-tenant restore is not supported")
-        return target_res.external_id, (target_res.id != source_resource.id)
+        return self._graph_drive_id_for(target_res), (target_res.id != source_resource.id)
 
     async def _restore_file_to_onedrive(
         self,
@@ -1935,7 +1950,7 @@ class RestoreWorker:
         engine = OneDriveRestoreEngine(
             graph_client=graph_client,
             source_resource=resource,
-            target_drive_user_id=resource.external_id,
+            target_drive_user_id=self._graph_drive_id_for(resource),
             tenant_id=str(resource.tenant_id),
             mode=OdMode.OVERWRITE if conflict_mode == "OVERWRITE" else OdMode.SEPARATE_FOLDER,
             separate_folder_root=(
