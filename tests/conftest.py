@@ -26,6 +26,7 @@ def _register_hyphenated_worker_aliases() -> None:
 
     aliases = {
         "workers.chat_export_worker": root / "workers" / "chat-export-worker",
+        "workers.restore_worker": root / "workers" / "restore-worker",
     }
     for mod_name, disk_path in aliases.items():
         if not disk_path.is_dir():
