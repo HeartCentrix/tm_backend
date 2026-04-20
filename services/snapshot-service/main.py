@@ -1917,3 +1917,342 @@ async def get_item_attachments(
         }
 
     return [fmt(r) for r in rows]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Azure VM live detail — enrich a SnapshotItem with its current ARM
+# state so the Recovery detail panels render the same fields the
+# Azure Portal shows (IOPS, disk tier, security type, etc.) instead
+# of just the shallow subset captured at backup time.
+# ──────────────────────────────────────────────────────────────────────
+
+import httpx as _httpx
+import time as _t
+
+_VM_DETAIL_CACHE: dict[str, tuple[dict, float]] = {}
+_VM_DETAIL_TTL = 60
+
+async def _arm_token_for_tenant(tenant_external_id: str) -> Optional[str]:
+    cid = settings.EFFECTIVE_ARM_CLIENT_ID or settings.MICROSOFT_CLIENT_ID
+    csec = settings.EFFECTIVE_ARM_CLIENT_SECRET or settings.MICROSOFT_CLIENT_SECRET
+    if not (cid and csec and tenant_external_id):
+        return None
+    try:
+        async with _httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(
+                f"https://login.microsoftonline.com/{tenant_external_id}/oauth2/v2.0/token",
+                data={"client_id": cid, "client_secret": csec,
+                      "scope": "https://management.azure.com/.default",
+                      "grant_type": "client_credentials"},
+            )
+            if r.status_code != 200:
+                return None
+            return r.json().get("access_token")
+    except Exception:
+        return None
+
+
+async def _arm_get_json(token: str, url: str) -> Optional[dict]:
+    try:
+        async with _httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(url, headers={"Authorization": f"Bearer {token}"})
+            if r.status_code != 200:
+                return None
+            return r.json()
+    except Exception:
+        return None
+
+
+@app.get("/api/v1/snapshot-items/{item_id}/azure-vm-detail")
+async def azure_vm_item_live_detail(item_id: str, db: AsyncSession = Depends(get_db)):
+    """Return the current Azure ARM state for a VM-flavored SnapshotItem.
+    item_type dictates which ARM resource we look up:
+      AZURE_VM_CONFIG  → /virtualMachines/{vm}?$expand=instanceView
+      AZURE_VM_DISK    → /disks/{disk}
+      AZURE_VM_NIC     → /networkInterfaces/{nic}
+      AZURE_VM_PUBLIC_IP → /publicIPAddresses/{pip}
+      AZURE_VM_VOLUME  → mirrored from the parent disk (volume isn't a
+                         real Azure resource).
+    The response is the raw ARM payload — the UI renders the fields
+    it knows about and ignores the rest."""
+    from shared.models import Tenant
+
+    cached = _VM_DETAIL_CACHE.get(item_id)
+    import time as _t
+    if cached and cached[1] > _t.time():
+        return cached[0]
+
+    item = await db.get(SnapshotItem, UUID(item_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Snapshot item not found")
+    snapshot = await db.get(Snapshot, item.snapshot_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Parent snapshot not found")
+    resource = await db.get(Resource, snapshot.resource_id)
+    if not resource:
+        raise HTTPException(status_code=404, detail="Source resource not found")
+    tenant = await db.get(Tenant, resource.tenant_id)
+    if not tenant or not tenant.external_tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant missing external_tenant_id")
+
+    sub = resource.azure_subscription_id
+    rg = resource.azure_resource_group
+    vm_name = resource.external_id
+    if not (sub and rg and vm_name):
+        raise HTTPException(status_code=400, detail="Resource missing subscription/RG/name")
+
+    token = await _arm_token_for_tenant(tenant.external_tenant_id)
+    if not token:
+        raise HTTPException(status_code=502, detail="Failed to acquire ARM token")
+
+    base = f"https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}"
+    item_type = (item.item_type or "").upper()
+    meta = item.extra_data or {}
+
+    # Prefer the full ARM id stashed in metadata over a name-based
+    # lookup — the name we persist (e.g. "vm-demo-os-disk") is a
+    # synthetic display label, not the real Azure resource name.
+    def _arm_url_from_id(arm_id: str, api: str) -> str:
+        return f"https://management.azure.com{arm_id}?api-version={api}"
+
+    url: Optional[str] = None
+    if item_type == "AZURE_VM_CONFIG":
+        url = f"{base}/providers/Microsoft.Compute/virtualMachines/{vm_name}?$expand=instanceView&api-version=2024-03-01"
+    elif item_type == "AZURE_VM_DISK":
+        arm_id = meta.get("disk_arm_id") or meta.get("id") or ""
+        if arm_id:
+            url = _arm_url_from_id(arm_id, "2023-10-02")
+        else:
+            # Legacy rows store a synthetic name like "vm-demo-os-disk"
+            # that doesn't match the real Azure resource. Fall back to
+            # listing the RG's disks and matching on `managedBy` + lun.
+            list_url = f"{base}/providers/Microsoft.Compute/disks?api-version=2023-10-02"
+            listed = await _arm_get_json(token, list_url)
+            match = None
+            for d in (listed or {}).get("value", []) or []:
+                mb = (d.get("managedBy") or "").lower()
+                if mb.endswith(f"/virtualmachines/{vm_name.lower()}"):
+                    if (meta.get("os_type") or "").lower() in ("windows", "linux"):
+                        if d.get("properties", {}).get("osType"):
+                            match = d; break
+                    else:
+                        if not d.get("properties", {}).get("osType"):
+                            match = d; break
+            if not match:
+                disk_name = meta.get("disk_name") or item.name
+                url = f"{base}/providers/Microsoft.Compute/disks/{disk_name}?api-version=2023-10-02"
+            else:
+                url = _arm_url_from_id(match["id"], "2023-10-02")
+    elif item_type == "AZURE_VM_NIC":
+        arm_id = meta.get("id") or ""
+        if arm_id:
+            url = _arm_url_from_id(arm_id, "2023-11-01")
+        else:
+            nic_name = meta.get("nic_name") or item.name
+            url = f"{base}/providers/Microsoft.Network/networkInterfaces/{nic_name}?api-version=2023-11-01"
+    elif item_type == "AZURE_VM_PUBLIC_IP":
+        arm_id = meta.get("id") or ""
+        if arm_id:
+            url = _arm_url_from_id(arm_id, "2023-11-01")
+        else:
+            pip_name = meta.get("public_ip_name") or item.name
+            url = f"{base}/providers/Microsoft.Network/publicIPAddresses/{pip_name}?api-version=2023-11-01"
+    elif item_type == "AZURE_VM_VOLUME":
+        # Volumes mirror their underlying disk — reuse the disk fetch.
+        arm_id = meta.get("disk_arm_id") or ""
+        if arm_id:
+            url = _arm_url_from_id(arm_id, "2023-10-02")
+        else:
+            disk_name = meta.get("disk_name") or (item.name or "").replace(" (volume)", "")
+            url = f"{base}/providers/Microsoft.Compute/disks/{disk_name}?api-version=2023-10-02"
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported item_type: {item_type}")
+
+    payload = await _arm_get_json(token, url)
+    if payload is None:
+        raise HTTPException(status_code=502, detail="Azure ARM lookup failed")
+
+    # The ARM payload nests real fields under `properties`. Flatten
+    # those into the top level so the UI can read them without a
+    # double-hop, while keeping the raw payload around for fields we
+    # didn't explicitly surface.
+    result = {
+        "id": payload.get("id"),
+        "name": payload.get("name"),
+        "type": payload.get("type"),
+        "location": payload.get("location"),
+        "zones": payload.get("zones") or [],
+        "tags": payload.get("tags") or {},
+        "sku": payload.get("sku") or {},
+        "managed_by": payload.get("managedBy"),
+        "properties": payload.get("properties") or {},
+        "raw": payload,
+    }
+    _VM_DETAIL_CACHE[item_id] = (result, _t.time() + _VM_DETAIL_TTL)
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────
+# VM volume file browsing — executes Get-ChildItem / ls on the source
+# VM via Azure Run Command and parses the output. Requires the VM to
+# be running and the Microsoft RunCommand agent to be installed (it
+# is by default on Azure-provisioned VMs). Used by the Volumes tab's
+# right-hand file browser; "Raw block device" rows always return an
+# empty list so the UI can render the "not detected" placeholder.
+# ──────────────────────────────────────────────────────────────────────
+
+_VM_FILES_CACHE: dict[str, tuple[dict, float]] = {}
+_VM_FILES_TTL = 30
+
+import re as _re
+import json as _json
+
+
+async def _run_command_on_vm(
+    token: str, sub: str, rg: str, vm_name: str, script_lines: list[str],
+    is_windows: bool,
+) -> Optional[str]:
+    """POST to Azure Run Command, poll until completed, return stdout."""
+    command_id = "RunPowerShellScript" if is_windows else "RunShellScript"
+    url = (
+        f"https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}"
+        f"/providers/Microsoft.Compute/virtualMachines/{vm_name}/runCommand"
+        f"?api-version=2024-03-01"
+    )
+    body = {"commandId": command_id, "script": script_lines}
+    try:
+        async with _httpx.AsyncClient(timeout=90) as c:
+            r = await c.post(url, json=body, headers={"Authorization": f"Bearer {token}"})
+            if r.status_code not in (200, 201, 202):
+                return None
+            # Run Command is async — Azure returns 202 + Azure-AsyncOperation header.
+            status_url = r.headers.get("azure-asyncoperation") or r.headers.get("location")
+            if not status_url:
+                # 200 with inline body (rare) — try to read it
+                try:
+                    data = r.json()
+                    return (data.get("value") or [{}])[0].get("message", "")
+                except Exception:
+                    return None
+            for _ in range(45):   # ≈90s
+                await asyncio.sleep(2)
+                poll = await c.get(status_url, headers={"Authorization": f"Bearer {token}"})
+                if poll.status_code != 200:
+                    continue
+                body = poll.json()
+                status = (body.get("status") or "").lower()
+                if status in ("succeeded", "failed", "canceled"):
+                    val = body.get("properties", {}).get("output", {}).get("value") or body.get("value") or []
+                    if val and isinstance(val, list):
+                        return val[0].get("message", "")
+                    return None
+            return None
+    except Exception:
+        return None
+
+
+@app.get("/api/v1/snapshot-items/{item_id}/vm-volume-files")
+async def azure_vm_volume_files(
+    item_id: str,
+    path: str = Query("", description="Guest-OS path to list (defaults to C:\\ or /)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """List files/folders inside a volume at `path`. Returns empty when
+    the volume is a Raw block device (no filesystem detected)."""
+    from shared.models import Tenant
+
+    item = await db.get(SnapshotItem, UUID(item_id))
+    if not item or (item.item_type or "").upper() != "AZURE_VM_VOLUME":
+        raise HTTPException(status_code=404, detail="Volume item not found")
+
+    meta = item.extra_data or {}
+    os_type = (meta.get("os_type") or "").lower()
+    # Legacy rows don't carry `volume_kind`. Treat OS disks as filesystem
+    # volumes so the user can still browse files on old backups.
+    is_fs = meta.get("volume_kind") == "filesystem" or os_type in ("windows", "linux")
+    if not is_fs:
+        return {"detected": False, "items": [], "path": path}
+
+    snapshot = await db.get(Snapshot, item.snapshot_id)
+    resource = await db.get(Resource, snapshot.resource_id)
+    tenant = await db.get(Tenant, resource.tenant_id)
+    if not tenant or not tenant.external_tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant missing external_tenant_id")
+
+    sub = resource.azure_subscription_id
+    rg = resource.azure_resource_group
+    vm_name = resource.external_id
+    if not (sub and rg and vm_name):
+        raise HTTPException(status_code=400, detail="Resource missing subscription/RG/name")
+
+    fs_hint = (meta.get("file_system") or "").upper()
+    is_windows = fs_hint == "NTFS" or (not fs_hint and os_type == "windows")
+    default_mount = meta.get("mount_point") or ("C:\\" if is_windows else "/")
+    target = path or default_mount
+
+    cache_key = f"{item_id}|{target}"
+    cached = _VM_FILES_CACHE.get(cache_key)
+    if cached and cached[1] > _t.time():
+        return cached[0]
+
+    token = await _arm_token_for_tenant(tenant.external_tenant_id)
+    if not token:
+        raise HTTPException(status_code=502, detail="Failed to acquire ARM token")
+
+    if is_windows:
+        # Emit a JSON array so we don't have to scrape formatted output.
+        # -Force to include hidden items; errors suppressed so a locked
+        # folder still returns what it can.
+        safe = target.replace("'", "''")
+        script = [
+            f"$items = Get-ChildItem -Force -LiteralPath '{safe}' -ErrorAction SilentlyContinue | "
+            "Select-Object Name, @{n='IsDirectory';e={$_.PSIsContainer}}, Length, "
+            "@{n='LastWriteTime';e={$_.LastWriteTime.ToString('o')}}; "
+            "$items | ConvertTo-Json -Compress"
+        ]
+        stdout = await _run_command_on_vm(token, sub, rg, vm_name, script, is_windows=True)
+    else:
+        safe = target.replace("'", "'\\''")
+        script = [
+            f"ls -la --time-style=full-iso '{safe}' 2>/dev/null | awk '"
+            "NR>1 {type=substr($1,1,1); size=$5; t=$6\" \"$7; "
+            "name=\"\"; for(i=9;i<=NF;i++) name=name\" \"$i; sub(/^ /,\"\",name); "
+            "printf \"%s\\t%s\\t%s\\t%s\\n\", (type==\"d\"?\"D\":\"F\"), size, t, name}'"
+        ]
+        stdout = await _run_command_on_vm(token, sub, rg, vm_name, script, is_windows=False)
+
+    if stdout is None:
+        return {"detected": True, "items": [], "path": target, "error": "VM not reachable (may be stopped)"}
+
+    items: list[dict] = []
+    if is_windows:
+        # Strip the PSHostRunCommand header lines; JSON is the last chunk.
+        m = _re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", stdout)
+        if m:
+            try:
+                parsed = _json.loads(m.group(1))
+                if isinstance(parsed, dict):  # single-entry directories return a dict
+                    parsed = [parsed]
+                for e in parsed:
+                    items.append({
+                        "name": e.get("Name", ""),
+                        "isDirectory": bool(e.get("IsDirectory")),
+                        "size": int(e.get("Length") or 0),
+                        "modified": e.get("LastWriteTime", ""),
+                    })
+            except Exception:
+                pass
+    else:
+        for line in stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 4 and parts[3].strip() not in (".", ".."):
+                items.append({
+                    "name": parts[3].strip(),
+                    "isDirectory": parts[0] == "D",
+                    "size": int(parts[1] or 0),
+                    "modified": parts[2],
+                })
+
+    result = {"detected": True, "items": items, "path": target}
+    _VM_FILES_CACHE[cache_key] = (result, _t.time() + _VM_FILES_TTL)
+    return result

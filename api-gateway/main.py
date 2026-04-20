@@ -304,6 +304,11 @@ async def snapshot_folders(request: Request):
 @app.get("/api/v1/resources/{resource_id}/snapshots/changes")
 # Recovery: search snapshot items
 @app.get("/api/v1/resources/{resource_id}/snapshots/search")
+# Azure VM live detail — hits ARM on-demand to enrich a SnapshotItem
+# with the same fields the Azure Portal shows (IOPS, disk tier, etc).
+@app.get("/api/v1/snapshot-items/{item_id}/azure-vm-detail")
+# Volumes tab — live file listing via Azure Run Command on the VM.
+@app.get("/api/v1/snapshot-items/{item_id}/vm-volume-files")
 async def snapshot(request: Request):
     return await proxy_request("snapshot", request.url.path, request)
 
