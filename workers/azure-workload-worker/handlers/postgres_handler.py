@@ -199,6 +199,21 @@ class PostgresBackupHandler:
             # primary db dir for back-compat.
             snapshot.blob_path = f"{server_name}/{primary_db}/{snapshot.id.hex[:12]}/"
 
+            # Per-database blob locations so the restore handler can
+            # look up the right schema dump and data folder for whichever
+            # source DB the user picks. Without these the restorer falls
+            # back to "primary_db" and can't restore any other DB the
+            # snapshot covers.
+            schema_blobs = {
+                db: r["schema"].get("blob_path", "")
+                for db, r in per_db_results.items()
+                if r["schema"].get("blob_path")
+            }
+            data_prefixes = {
+                db: f"{server_name}/{db}/{snapshot.id.hex[:12]}/"
+                for db in per_db_results.keys()
+            }
+
             snapshot.extra_data = {
                 **(snapshot.extra_data or {}),
                 "mode": "AFI_STREAMING",
@@ -209,6 +224,8 @@ class PostgresBackupHandler:
                 "databases_count": len(per_db_results),
                 "databases": list(per_db_results.keys()),
                 "config_blob": config_result.get("blob_path", ""),
+                "schema_blobs": schema_blobs,
+                "data_prefixes": data_prefixes,
                 "server_name": server_name,
                 "database_name": primary_db,
                 "resource_group": rg,

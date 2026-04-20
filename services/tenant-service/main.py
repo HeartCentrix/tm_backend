@@ -953,9 +953,77 @@ import httpx
 _TENANT_DOMAIN_CACHE: dict[str, tuple[str, float]] = {}
 _TENANT_DOMAIN_TTL = 3600
 
-# in-process cache — { (external_tenant_id, dbType): (payload, expires_at_unix) }
-_AZURE_OPTIONS_CACHE: dict[tuple[str, str], tuple[dict, float]] = {}
+# Caches keyed on the full filter combination so each cascading step
+# only re-fetches what's actually changed.
+_AZURE_OPTIONS_CACHE: dict[tuple, tuple[dict, float]] = {}
 _AZURE_OPTIONS_TTL = 60
+
+# Static Azure region catalogue, extracted from
+# https://learn.microsoft.com/en-us/azure/reliability/regions-list
+# Used for the Location dropdown so the user can pick any region the
+# subscription is eligible for, not just regions that currently host a
+# server. Sorted alphabetically by displayName at endpoint time.
+AZURE_REGIONS: list[dict] = [
+    {"name": "eastus",             "displayName": "East US"},
+    {"name": "eastus2",            "displayName": "East US 2"},
+    {"name": "westus",             "displayName": "West US"},
+    {"name": "westus2",            "displayName": "West US 2"},
+    {"name": "westus3",            "displayName": "West US 3"},
+    {"name": "centralus",          "displayName": "Central US"},
+    {"name": "northcentralus",     "displayName": "North Central US"},
+    {"name": "southcentralus",     "displayName": "South Central US"},
+    {"name": "westcentralus",      "displayName": "West Central US"},
+    {"name": "canadacentral",      "displayName": "Canada Central"},
+    {"name": "canadaeast",         "displayName": "Canada East"},
+    {"name": "brazilsouth",        "displayName": "Brazil South"},
+    {"name": "brazilsoutheast",    "displayName": "Brazil Southeast"},
+    {"name": "mexicocentral",      "displayName": "Mexico Central"},
+    {"name": "chilecentral",       "displayName": "Chile Central"},
+    {"name": "northeurope",        "displayName": "North Europe"},
+    {"name": "westeurope",         "displayName": "West Europe"},
+    {"name": "uksouth",            "displayName": "UK South"},
+    {"name": "ukwest",             "displayName": "UK West"},
+    {"name": "francecentral",      "displayName": "France Central"},
+    {"name": "francesouth",        "displayName": "France South"},
+    {"name": "germanywestcentral", "displayName": "Germany West Central"},
+    {"name": "germanynorth",       "displayName": "Germany North"},
+    {"name": "switzerlandnorth",   "displayName": "Switzerland North"},
+    {"name": "switzerlandwest",    "displayName": "Switzerland West"},
+    {"name": "norwayeast",         "displayName": "Norway East"},
+    {"name": "norwaywest",         "displayName": "Norway West"},
+    {"name": "swedencentral",      "displayName": "Sweden Central"},
+    {"name": "polandcentral",      "displayName": "Poland Central"},
+    {"name": "italynorth",         "displayName": "Italy North"},
+    {"name": "spaincentral",       "displayName": "Spain Central"},
+    {"name": "austriaeast",        "displayName": "Austria East"},
+    {"name": "belgiumcentral",     "displayName": "Belgium Central"},
+    {"name": "denmarkeast",        "displayName": "Denmark East"},
+    {"name": "uaenorth",           "displayName": "UAE North"},
+    {"name": "uaecentral",         "displayName": "UAE Central"},
+    {"name": "qatarcentral",       "displayName": "Qatar Central"},
+    {"name": "israelcentral",      "displayName": "Israel Central"},
+    {"name": "southafricanorth",   "displayName": "South Africa North"},
+    {"name": "southafricawest",    "displayName": "South Africa West"},
+    {"name": "centralindia",       "displayName": "Central India"},
+    {"name": "southindia",         "displayName": "South India"},
+    {"name": "westindia",          "displayName": "West India"},
+    {"name": "jioindiacentral",    "displayName": "Jio India Central"},
+    {"name": "jioindiawest",       "displayName": "Jio India West"},
+    {"name": "eastasia",           "displayName": "East Asia"},
+    {"name": "southeastasia",      "displayName": "Southeast Asia"},
+    {"name": "japaneast",          "displayName": "Japan East"},
+    {"name": "japanwest",          "displayName": "Japan West"},
+    {"name": "koreacentral",       "displayName": "Korea Central"},
+    {"name": "koreasouth",         "displayName": "Korea South"},
+    {"name": "australiaeast",      "displayName": "Australia East"},
+    {"name": "australiasoutheast", "displayName": "Australia Southeast"},
+    {"name": "australiacentral",   "displayName": "Australia Central"},
+    {"name": "australiacentral2",  "displayName": "Australia Central 2"},
+    {"name": "newzealandnorth",    "displayName": "New Zealand North"},
+    {"name": "indonesiacentral",   "displayName": "Indonesia Central"},
+    {"name": "malaysiawest",       "displayName": "Malaysia West"},
+    {"name": "taiwannorth",        "displayName": "Taiwan North"},
+]
 
 
 async def _acquire_token(tenant_external_id: str, scope: str) -> Optional[str]:
@@ -1066,6 +1134,9 @@ def _rg_from_id(arm_id: str) -> str:
 async def azure_restore_options(
     tenant_id: str,
     dbType: Optional[str] = Query(None, description="sql | postgresql — filter the server list"),
+    subscription: Optional[str] = Query(None, description="Filter RGs / servers to this subscription"),
+    resourceGroup: Optional[str] = Query(None, description="Filter servers to this RG (requires subscription)"),
+    location: Optional[str] = Query(None, description="Filter servers to this Azure region"),
     db: AsyncSession = Depends(get_db),
 ):
     """Live discovery against Azure ARM for the destination dropdowns.
@@ -1078,7 +1149,11 @@ async def azure_restore_options(
     if not tenant.external_tenant_id:
         raise HTTPException(status_code=400, detail="Tenant missing external_tenant_id")
 
-    cache_key = (tenant.external_tenant_id, dbType or "all")
+    sub_filter = (subscription or "").strip()
+    rg_filter = (resourceGroup or "").strip()
+    loc_filter = (location or "").strip().lower()
+
+    cache_key = (tenant.external_tenant_id, dbType or "all", sub_filter, rg_filter, loc_filter)
     cached = _AZURE_OPTIONS_CACHE.get(cache_key)
     if cached and cached[1] > time.time():
         return cached[0]
@@ -1087,9 +1162,9 @@ async def azure_restore_options(
     if not token:
         raise HTTPException(status_code=502, detail="Failed to acquire ARM token for tenant")
 
-    # 1) subscriptions visible to the SP. ARM gives us the billing-plan
-    #    displayName ("Azure subscription 1", "Pay-As-You-Go" etc) — that
-    #    is what the Recover modal actually shows; the GUID is the value.
+    # Subscriptions: always the full list visible to the SP — never
+    # filtered, since the user uses this dropdown to pick which sub to
+    # restore into.
     subs_payload = await _arm_get(token, "https://management.azure.com/subscriptions?api-version=2022-12-01")
     raw_subs = (subs_payload or {}).get("value", []) or []
     subs_out: list[dict] = []
@@ -1101,9 +1176,24 @@ async def azure_restore_options(
         seen_sub_ids.add(sid)
         subs_out.append({"id": sid, "displayName": s.get("displayName") or sid})
     subs_out.sort(key=lambda x: (x["displayName"] or "").lower())
-    sub_ids = [s["id"] for s in subs_out]
+    all_sub_ids = [s["id"] for s in subs_out]
+    sub_ids = [sub_filter] if sub_filter else all_sub_ids
 
-    # 2) which provider paths to enumerate per dbType
+    # Resource groups: when a subscription is provided we list the sub's
+    # actual RGs straight from ARM (so empty RGs are still selectable).
+    # Without a subscription we fall back to the union of RGs that
+    # currently host a matching server — better than returning nothing.
+    rgs: set[str] = set()
+    if sub_filter:
+        rg_payload = await _arm_get(
+            token,
+            f"https://management.azure.com/subscriptions/{sub_filter}/resourcegroups?api-version=2021-04-01",
+        )
+        for rg in (rg_payload or {}).get("value", []) or []:
+            if rg.get("name"):
+                rgs.add(rg["name"])
+
+    # Server provider paths per dbType.
     if dbType == "sql":
         provider_paths = [("Microsoft.Sql/servers", "2023-08-01-preview")]
     elif dbType == "postgresql":
@@ -1118,63 +1208,47 @@ async def azure_restore_options(
             ("Microsoft.DBforPostgreSQL/servers", "2017-12-01"),
         ]
 
-    async def _list_servers(sub: str, provider: str, api: str) -> list[dict]:
+    async def _list_servers_in_sub(sub: str, provider: str, api: str) -> list[dict]:
         url = f"https://management.azure.com/subscriptions/{sub}/providers/{provider}?api-version={api}"
         data = await _arm_get(token, url)
         return (data or {}).get("value", []) or []
 
-    async def _list_locations(sub: str) -> list[dict]:
-        url = f"https://management.azure.com/subscriptions/{sub}/locations?api-version=2022-12-01"
-        data = await _arm_get(token, url)
-        return (data or {}).get("value", []) or []
+    server_tasks = [
+        _list_servers_in_sub(sub, p, api)
+        for sub in sub_ids for (p, api) in provider_paths
+    ]
+    server_lists = await asyncio.gather(*server_tasks, return_exceptions=True)
 
-    server_tasks = [_list_servers(sub, p, api) for sub in sub_ids for (p, api) in provider_paths]
-    location_tasks = [_list_locations(sub) for sub in sub_ids]
-    server_lists, location_lists = await asyncio.gather(
-        asyncio.gather(*server_tasks, return_exceptions=True),
-        asyncio.gather(*location_tasks, return_exceptions=True),
-    )
-
-    # Build the full list of Azure regions the tenant's subscriptions
-    # can deploy into — straight from `/subscriptions/{sub}/locations`.
-    # The dropdown is for picking where a NEW database lands, so we
-    # surface every region the tenant is eligible for, not just ones
-    # that currently host a server.
-    region_label: dict[str, str] = {}
-    for payload in location_lists:
+    servers: set[str] = set()
+    # Track which RGs ANY server lives in too, so the union-fallback
+    # case still returns something usable when no sub is selected.
+    rgs_from_servers: set[str] = set()
+    for payload in server_lists:
         if isinstance(payload, Exception) or not payload:
             continue
-        for loc in payload:
-            name = (loc.get("name") or "").lower()
-            if name and name not in region_label:
-                region_label[name] = loc.get("displayName") or name
-
-    rgs: set[str] = set()
-    servers: set[str] = set()
-
-    idx = 0
-    for _sub in sub_ids:
-        for _ in provider_paths:
-            payload = server_lists[idx]
-            idx += 1
-            if isinstance(payload, Exception) or not payload:
+        for srv in payload:
+            srv_id = srv.get("id", "")
+            srv_rg = _rg_from_id(srv_id).lower()
+            srv_loc = (srv.get("location") or "").lower()
+            # Filter by RG / location when the user has narrowed.
+            if rg_filter and srv_rg != rg_filter.lower():
                 continue
-            for srv in payload:
-                if srv.get("name"):
-                    servers.add(srv["name"])
-                rg = _rg_from_id(srv.get("id", ""))
-                if rg:
-                    rgs.add(rg)
-
-    locations_out = sorted(
-        [{"name": c, "displayName": lbl} for c, lbl in region_label.items()],
-        key=lambda x: x["displayName"].lower(),
-    )
+            if loc_filter and srv_loc != loc_filter:
+                continue
+            if srv.get("name"):
+                servers.add(srv["name"])
+            if srv_rg:
+                rgs_from_servers.add(_rg_from_id(srv_id))
+    if not sub_filter:
+        rgs = rgs_from_servers
 
     result = {
         "subscriptions": subs_out,
         "resourceGroups": sorted(rgs),
-        "locations": locations_out,
+        # Locations are the full Azure catalogue — independent of which
+        # regions currently host a server, since the user is creating a
+        # NEW database and could land it anywhere their sub allows.
+        "locations": sorted(AZURE_REGIONS, key=lambda x: x["displayName"].lower()),
         "servers": sorted(servers),
     }
     _AZURE_OPTIONS_CACHE[cache_key] = (result, time.time() + _AZURE_OPTIONS_TTL)

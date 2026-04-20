@@ -372,9 +372,17 @@ class RestoreWorker:
             async with async_session_factory() as session:
                 print(f"[{self.worker_id}] DB session opened job={job_id}", flush=True)
                 try:
-                    # Update job status
+                    # Update job status — flip to RUNNING and seed
+                    # progress=5 so the Activity bar moves the moment
+                    # the worker accepts the message.
                     await self.update_job_status(session, job_id, JobStatus.RUNNING)
+                    job = await session.get(Job, job_id)
+                    if job:
+                        job.progress_pct = 5
                     print(f"[{self.worker_id}] job status RUNNING job={job_id}", flush=True)
+                    await self.log_audit_event(
+                        job_id, message, {}, action="RESTORE_RUNNING", outcome="IN_PROGRESS",
+                    )
 
                     # Fetch snapshot items to restore
                     snapshot_ids = message.get("snapshotIds", [])
@@ -421,13 +429,21 @@ class RestoreWorker:
                     await session.commit()
 
                     # Log audit event
-                    await self.log_audit_event(job_id, message, result)
+                    await self.log_audit_event(
+                        job_id, message, result, action="RESTORE_COMPLETED", outcome="SUCCESS",
+                    )
 
                     print(f"[{self.worker_id}] Restore job {job_id} completed: {restore_type}")
 
                 except Exception as e:
                     await session.rollback()
                     await self.handle_restore_failure(session, job_id, e)
+                    # Failure audit so the Audit feed shows the FAILED
+                    # transition alongside the original TRIGGERED event.
+                    await self.log_audit_event(
+                        job_id, message, {"error": str(e)[:500]},
+                        action="RESTORE_FAILED", outcome="FAILURE",
+                    )
                     print(f"[{self.worker_id}] Restore job {job_id} failed: {e}")
                     raise
 
@@ -2648,23 +2664,29 @@ class RestoreWorker:
             else:
                 job.status = JobStatus.RETRYING
 
-    async def log_audit_event(self, job_id: uuid.UUID, message: Dict, result: Dict):
-        """Log restore audit event"""
+    async def log_audit_event(
+        self, job_id: uuid.UUID, message: Dict, result: Dict,
+        action: str = "RESTORE_COMPLETED", outcome: str = "SUCCESS",
+    ):
+        """Best-effort audit emission for any restore lifecycle event.
+        Defaults preserve the old "completed/success" behaviour for any
+        existing call sites that don't pass action/outcome explicitly."""
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 await client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
-                    "action": "RESTORE_COMPLETED",
+                    "action": action,
                     "tenant_id": message.get("tenantId"),
                     "org_id": None,
                     "actor_type": "WORKER",
                     "resource_id": message.get("resourceId"),
                     "resource_type": message.get("resourceType"),
-                    "outcome": "SUCCESS",
+                    "outcome": outcome,
                     "job_id": str(job_id),
                     "details": {
                         "restore_type": message.get("restoreType", "IN_PLACE"),
                         "restored_count": result.get("restored_count", result.get("exported_count", 0)),
                         "failed_count": result.get("failed_count", 0),
+                        **({"error": result["error"]} if result.get("error") else {}),
                     },
                 })
         except Exception as e:

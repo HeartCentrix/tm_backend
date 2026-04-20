@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
 from azure.mgmt.sql.aio import SqlManagementClient
+from handlers._progress import update_job_pct
 from azure.mgmt.compute.aio import ComputeManagementClient
 from azure.mgmt.network.aio import NetworkManagementClient
 from azure.core.exceptions import HttpResponseError
@@ -73,6 +74,11 @@ class SqlRestoreHandler:
 
         self._log(f"Starting full SQL restore to {target_db} on {target_server}/{target_rg}")
 
+        # Live progress so the Activity bar moves during the multi-
+        # minute BACPAC import instead of jumping 5% → 100%.
+        job_id = restore_params.get("job_id")
+        await update_job_pct(job_id, 10)
+
         added_firewall_rule: Optional[str] = None
         try:
             # Step 1: Get BACPAC blob info
@@ -83,12 +89,14 @@ class SqlRestoreHandler:
             container = azure_storage_manager.get_container_name(str(tenant.id), "azure-sql")
             shard = azure_storage_manager.get_default_shard()
             blob_uri = f"https://{shard.account_name}.blob.core.windows.net/{container}/{bacpac_blob}"
+            await update_job_pct(job_id, 20)
 
             # Step 2: Open Azure-services firewall rule so the BACPAC import control
             # plane can reach the SQL engine. Rule is named per-job and torn down in
             # finally so we don't leave the server open after the restore.
             if configure_firewall:
                 added_firewall_rule = await self._configure_firewall_for_restore(sql, target_rg, target_server)
+                await update_job_pct(job_id, 30)
 
             # Step 3: Import BACPAC
             admin_user, admin_password = self._get_sql_credentials(tenant)
@@ -114,6 +122,7 @@ class SqlRestoreHandler:
                 timeout_seconds=14400,  # 4 hours
                 poll_interval=60,
             )
+            await update_job_pct(job_id, 90)
 
             # Step 4: Verify import
             db = await sql.databases.get(

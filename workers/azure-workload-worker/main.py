@@ -16,7 +16,7 @@ import json
 import logging
 import uuid
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import aio_pika
 from sqlalchemy import select
@@ -187,12 +187,28 @@ class AzureWorkloadWorker:
                 return
 
             job.status = JobStatus.RUNNING
+            # Initial progress so the Activity bar moves the moment the
+            # worker accepts the message — without this the row sits at
+            # 0% until the handler returns 100%.
+            job.progress_pct = 5
             await session.commit()
 
             logger.info("[%s] Restore start: job=%s resource=%s type=%s mode=%s queue=%s",
                         self.worker_id, job_id, resource.display_name, resource_type, mode, queue_name)
 
+            # Audit trail — RUNNING transition. Lets the Audit feed
+            # show the moment a worker actually started the restore,
+            # distinct from the QUEUED moment captured by trigger_restore.
+            await self._audit_restore_event(
+                action="RESTORE_RUNNING", outcome="IN_PROGRESS",
+                tenant=tenant, resource=resource, job_id=str(job_id), restore_params=restore_params,
+            )
+
             try:
+                # Pass job_id into the handlers so they can emit live
+                # progress ticks via shared._progress.update_job_pct().
+                restore_params = {**restore_params, "job_id": str(job_id)}
+
                 if queue_name == "azure.restore.vm":
                     if mode == "DISK":
                         disk_name = restore_params.get("disk_name") or restore_params.get("target_disk_name")
@@ -234,11 +250,54 @@ class AzureWorkloadWorker:
                             "completed" if result.get("success") else "failed",
                             job_id, result)
 
+                await self._audit_restore_event(
+                    action="RESTORE_COMPLETED" if result.get("success") else "RESTORE_FAILED",
+                    outcome="SUCCESS" if result.get("success") else "FAILURE",
+                    tenant=tenant, resource=resource, job_id=str(job_id),
+                    restore_params=restore_params, result=result,
+                )
+
             except Exception as e:
                 logger.exception("[%s] Restore job %s crashed: %s", self.worker_id, job_id, e)
                 job.status = JobStatus.FAILED
                 job.error_message = str(e)[:1000]
+                job.progress_pct = 100
                 await session.commit()
+                await self._audit_restore_event(
+                    action="RESTORE_FAILED", outcome="FAILURE",
+                    tenant=tenant, resource=resource, job_id=str(job_id),
+                    restore_params=restore_params, result={"error": str(e)[:500]},
+                )
+
+    async def _audit_restore_event(
+        self, *, action: str, outcome: str, tenant, resource, job_id: str,
+        restore_params: Dict, result: Optional[Dict] = None,
+    ) -> None:
+        """Best-effort audit emission for a restore lifecycle event.
+        Audit-service downtime never blocks the restore."""
+        try:
+            import httpx as _httpx
+            from shared.config import settings as _settings
+            payload = {
+                "action": action,
+                "tenant_id": str(tenant.id) if tenant else None,
+                "actor_type": "WORKER",
+                "resource_id": str(resource.id) if resource else None,
+                "resource_type": (resource.type.value if hasattr(resource.type, "value")
+                                  else str(resource.type)) if resource else None,
+                "outcome": outcome,
+                "job_id": job_id,
+                "details": {
+                    "target_server": restore_params.get("target_server_name") or restore_params.get("server"),
+                    "target_database": restore_params.get("target_database_name") or restore_params.get("targetDatabaseName"),
+                    "source_database": restore_params.get("source_database_name") or restore_params.get("sourceDatabase"),
+                    **({"error": str(result.get("error"))[:500]} if result and result.get("error") else {}),
+                },
+            }
+            async with _httpx.AsyncClient(timeout=5.0) as _client:
+                await _client.post(f"{_settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload)
+        except Exception:
+            pass
 
     async def process_backup_message(self, message: Dict[str, Any]):
         """Process a single Azure workload backup message."""

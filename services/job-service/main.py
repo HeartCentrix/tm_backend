@@ -355,6 +355,24 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
 
     await db.flush()
 
+    # Audit trail — emit a CANCELLED event whose action mirrors the
+    # job kind so the Audit feed groups restore vs backup correctly.
+    try:
+        import httpx as _httpx
+        action = "RESTORE_CANCELLED" if job.type == JobType.RESTORE else "BACKUP_CANCELLED"
+        async with _httpx.AsyncClient(timeout=5.0) as _client:
+            await _client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
+                "action": action,
+                "tenant_id": str(job.tenant_id) if job.tenant_id else None,
+                "actor_type": "USER",
+                "resource_id": str(job.resource_id) if job.resource_id else None,
+                "outcome": "CANCELLED",
+                "job_id": str(job.id),
+                "details": {"resource_count": len(resource_ids)},
+            })
+    except Exception:
+        pass
+
 
 @app.post("/api/v1/jobs/{job_id}/retry", response_model=JobResponse)
 async def retry_job(job_id: str, db: AsyncSession = Depends(get_db)):
@@ -706,12 +724,12 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
     resource_id = None
     snapshot = None
     if snapshot_ids:
-        stmt = sa_select(Snapshot).where(Snapshot.id == uuid.UUID(snapshot_ids[0]))
+        stmt = sa_select(Snapshot).where(Snapshot.id == UUID(snapshot_ids[0]))
         snapshot = (await db.execute(stmt)).scalar_one_or_none()
     if not snapshot and item_ids:
         # Item-driven restore — derive snapshot from the first item, then
         # snapshot.resource_id gives us the source resource.
-        item_stmt = sa_select(SnapshotItem).where(SnapshotItem.id == uuid.UUID(item_ids[0]))
+        item_stmt = sa_select(SnapshotItem).where(SnapshotItem.id == UUID(item_ids[0]))
         first_item = (await db.execute(item_stmt)).scalar_one_or_none()
         if first_item:
             snapshot = await db.get(Snapshot, first_item.snapshot_id)
@@ -730,8 +748,8 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
     job = Job(
         id=uuid4(),
         type=JobType.RESTORE,
-        tenant_id=uuid.UUID(tenant_id) if tenant_id else None,
-        resource_id=uuid.UUID(resource_id) if resource_id else None,
+        tenant_id=UUID(tenant_id) if tenant_id else None,
+        resource_id=UUID(resource_id) if resource_id else None,
         status=JobStatus.QUEUED,
         priority=1,
         spec={
@@ -743,6 +761,10 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
     )
     db.add(job)
     await db.flush()
+    # Commit BEFORE publishing — the worker can pick the message up
+    # within milliseconds and SELECT for the job; without an explicit
+    # commit it sees an empty result and aborts with "job not found".
+    await db.commit()
 
     # Publish to RabbitMQ
     if settings.RABBITMQ_ENABLED:
@@ -758,6 +780,31 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         )
         queue = restore_message.get("queue", "restore.normal")
         await message_bus.publish(queue, restore_message, priority=restore_message.get("priority", 5))
+
+    # Audit trail — RESTORE_TRIGGERED. Mirrors the BACKUP_TRIGGERED
+    # emission so the audit feed and the activity page have matching
+    # lifecycle entries for restore jobs. Non-blocking: if audit-service
+    # is down we don't fail the restore.
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=5.0) as _client:
+            await _client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
+                "action": "RESTORE_TRIGGERED",
+                "tenant_id": tenant_id,
+                "actor_type": "USER",
+                "resource_id": resource_id,
+                "resource_type": resource_type,
+                "outcome": "PENDING",
+                "job_id": str(job.id),
+                "details": {
+                    "restore_type": restore_type,
+                    "snapshot_count": len(snapshot_ids),
+                    "item_count": len(item_ids),
+                    "azure_restore_mode": spec.get("azureRestoreMode"),
+                },
+            })
+    except Exception:
+        pass
 
     return {
         "jobId": str(job.id),
@@ -861,12 +908,12 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
         try:
             if item_ids:
                 q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
-                    SnapshotItem.id.in_([uuid.UUID(x) for x in item_ids])
+                    SnapshotItem.id.in_([UUID(x) for x in item_ids])
                 )
                 total_bytes = int((await db.execute(q)).scalar() or 0)
             elif snapshot_ids:
                 q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
-                    SnapshotItem.snapshot_id.in_([uuid.UUID(x) for x in snapshot_ids])
+                    SnapshotItem.snapshot_id.in_([UUID(x) for x in snapshot_ids])
                 )
                 total_bytes = int((await db.execute(q)).scalar() or 0)
         except Exception:
