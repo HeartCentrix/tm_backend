@@ -3617,9 +3617,14 @@ class GraphClient:
         Returns the created driveItem dict.
         """
         from urllib.parse import quote as _q
+        # URL-escape each path segment (spaces / unicode / `#` are valid
+        # in OneDrive filenames but break Graph routing unescaped). Keep
+        # `/` as a literal separator by quoting each segment then
+        # rejoining.
+        quoted_path = "/".join(_q(seg, safe="") for seg in drive_path.split("/") if seg)
         url = (
             f"{self.GRAPH_URL}/drives/{drive_id}/root:/"
-            f"{drive_path}:/content"
+            f"{quoted_path}:/content"
             f"?@microsoft.graph.conflictBehavior={_q(conflict_behavior)}"
         )
         token = await self._get_token()
@@ -3634,7 +3639,8 @@ class GraphClient:
                 resp = await c.put(url, headers=headers, content=body)
             if resp.status_code >= 400:
                 raise RuntimeError(
-                    f"upload_small_file_to_drive {resp.status_code}: {resp.text[:300]}"
+                    f"upload_small_file_to_drive {resp.status_code}: "
+                    f"{resp.text[:300]} · url={url}"
                 )
             return resp.json()
 
@@ -3658,9 +3664,11 @@ class GraphClient:
         uploadSession URL stays valid so retries never re-upload earlier
         chunks on a mid-file failure.
         """
+        from urllib.parse import quote as _qseg
+        quoted_path_lg = "/".join(_qseg(seg, safe="") for seg in drive_path.split("/") if seg)
         create_url = (
             f"{self.GRAPH_URL}/drives/{drive_id}/root:/"
-            f"{drive_path}:/createUploadSession"
+            f"{quoted_path_lg}:/createUploadSession"
         )
         token = await self._get_token()
         create_headers = {
