@@ -405,7 +405,11 @@ class RestoreWorker:
                     snapshot_ids = message.get("snapshotIds", [])
                     item_ids = message.get("itemIds", [])
 
-                    items_to_restore = await self.fetch_snapshot_items(session, snapshot_ids, item_ids)
+                    items_to_restore = await self.fetch_snapshot_items(
+                        session, snapshot_ids, item_ids,
+                        folder_paths=spec.get("folderPaths") or [],
+                        excluded_item_ids=spec.get("excludedItemIds") or [],
+                    )
                     print(f"[{self.worker_id}] fetched {len(items_to_restore)} snapshot items job={job_id}", flush=True)
 
                     # Workload filter (from RestoreModal checkboxes). When spec.workloads is
@@ -460,11 +464,20 @@ class RestoreWorker:
         self,
         session: AsyncSession,
         snapshot_ids: List[str],
-        item_ids: List[str]
+        item_ids: List[str],
+        folder_paths: Optional[List[str]] = None,
+        excluded_item_ids: Optional[List[str]] = None,
     ) -> List[SnapshotItem]:
         """Resolve the SnapshotItems a restore job should process.
 
-        Two modes:
+        Three modes, in priority order:
+
+          * ``folder_paths`` OR ``excluded_item_ids`` given → delegate to
+            ``shared.folder_resolver.resolve_selection`` which handles
+            id ∪ folder-prefix ∪ exact-folder-match in one indexed SQL
+            round-trip. Single snapshot id (first of ``snapshot_ids``)
+            is used — the Files folder-select v2 payload is
+            single-snapshot by contract.
           * ``item_ids`` given → strict lookup by id. The user picked
             specific items in the UI; restore exactly those.
           * only ``snapshot_ids`` given → point-in-time fan-out. Because
@@ -484,6 +497,21 @@ class RestoreWorker:
             Mirrors ``_resolve_sibling_snapshot_ids`` in snapshot-service
             so the restore matches what the Recovery UI was showing.
         """
+        folder_paths = folder_paths or []
+        excluded_item_ids = excluded_item_ids or []
+
+        if folder_paths or excluded_item_ids:
+            from shared.folder_resolver import resolve_selection
+            if not snapshot_ids:
+                return []
+            return await resolve_selection(
+                session,
+                snapshot_id=snapshot_ids[0],
+                item_ids=item_ids,
+                folder_paths=folder_paths,
+                excluded_item_ids=excluded_item_ids,
+            )
+
         if item_ids:
             stmt = select(SnapshotItem).where(
                 SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids])
