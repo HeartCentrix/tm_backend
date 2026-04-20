@@ -51,6 +51,7 @@ REQUIRED_COLUMNS = {
         "retention_mode",
     ),
     "resources": ("resource_hash",),
+    "snapshot_items": ("parent_external_id",),
     "resource_discovery_staging": (
         "azure_subscription_id",
         "azure_resource_group",
@@ -196,6 +197,10 @@ async def _ensure_enum_values() -> None:
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'FAILED';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'CANCELLED';",
         "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'RETRYING';",
+        # Chat export v1 — PENDING is the queued-but-idempotency-safe state,
+        # CANCELLING is the transient state while the worker wraps up.
+        "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'PENDING';",
+        "ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'CANCELLING';",
         "ALTER TYPE snapshottype ADD VALUE IF NOT EXISTS 'FULL';",
         "ALTER TYPE snapshottype ADD VALUE IF NOT EXISTS 'INCREMENTAL';",
         "ALTER TYPE snapshottype ADD VALUE IF NOT EXISTS 'PREEMPTIVE';",
@@ -748,9 +753,26 @@ async def init_db() -> None:
         # index scan instead of full table scan.
         "CREATE INDEX IF NOT EXISTS idx_snapshot_items_snap_type_ext "
         "ON snapshot_items (snapshot_id, item_type, external_id)",
+        # Chat export v1 — scope resolution + attachment joins + concurrency cap.
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_items_folder_type "
+        "ON snapshot_items (folder_path, item_type)",
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_items_parent_ext "
+        "ON snapshot_items (parent_external_id) "
+        "WHERE item_type IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT')",
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_items_snapshot_type "
+        "ON snapshot_items (snapshot_id, item_type)",
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_items_chat_created "
+        "ON snapshot_items (snapshot_id, folder_path, created_at) "
+        "WHERE item_type IN ('TEAMS_CHAT_MESSAGE','TEAMS_MESSAGE','TEAMS_MESSAGE_REPLY')",
+        # idx_jobs_tenant_type_status is intentionally NOT here — it depends
+        # on jobs.status having already been converted from VARCHAR to the
+        # jobstatus enum. It's created in post_alter_index_statements below.
     ]
 
     add_column_statements = [
+        # Chat export v1 — link CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT rows to
+        # their parent message without scanning the metadata JSONB.
+        "ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS parent_external_id VARCHAR;",
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS customer_id VARCHAR;",
         "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_subscription_id VARCHAR;",
         "ALTER TABLE resources ADD COLUMN IF NOT EXISTS azure_resource_group VARCHAR;",
@@ -817,6 +839,16 @@ async def init_db() -> None:
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS auto_apply_to_matching BOOLEAN DEFAULT FALSE NOT NULL;",
     ]
 
+    # Indexes that must be created AFTER alter_statements runs, because they
+    # reference enum-typed columns (e.g. jobs.status after it's been converted
+    # from VARCHAR to the jobstatus enum). Creating them earlier would block
+    # the ALTER COLUMN TYPE conversion.
+    post_alter_index_statements = [
+        "CREATE INDEX IF NOT EXISTS idx_jobs_tenant_type_status "
+        "ON jobs (tenant_id, type, status) "
+        "WHERE status IN ('QUEUED'::jobstatus,'PENDING'::jobstatus,'RUNNING'::jobstatus)",
+    ]
+
     alter_statements = [
         """ALTER TABLE tenants ALTER COLUMN type DROP DEFAULT, ALTER COLUMN type TYPE tenanttype USING type::tenanttype, ALTER COLUMN type SET DEFAULT 'M365'::tenanttype;""",
         """ALTER TABLE tenants ALTER COLUMN status DROP DEFAULT, ALTER COLUMN status TYPE tenantstatus USING status::tenantstatus, ALTER COLUMN status SET DEFAULT 'PENDING'::tenantstatus;""",
@@ -877,7 +909,12 @@ async def init_db() -> None:
 
             await conn.run_sync(Base.metadata.create_all)
 
+        # Enum value additions (e.g. jobstatus PENDING/CANCELLING) must run
+        # OUTSIDE a transaction. Chat-export indexes that reference those
+        # values then go in their own transaction.
         await _ensure_enum_values()
+        async with engine.begin() as conn:
+            await _execute_batch(conn, post_alter_index_statements)
         await _seed_preset_policies_for_existing_tenants()
     except Exception as exc:
         logger.warning("[DB INIT] Schema sync phase failed: %s", exc)

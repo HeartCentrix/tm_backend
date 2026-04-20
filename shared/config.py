@@ -127,6 +127,21 @@ class Settings:
         self.EXPORT_BLOCK_SIZE_BYTES = int(os.getenv("EXPORT_BLOCK_SIZE_BYTES", str(4 * 1024 * 1024)))
         self.EXPORT_FOLDER_QUEUE_MAXSIZE = int(os.getenv("EXPORT_FOLDER_QUEUE_MAXSIZE", "20"))
         self.MAX_CONCURRENT_EXPORTS_PER_WORKER = int(os.getenv("MAX_CONCURRENT_EXPORTS_PER_WORKER", "2"))
+        # Mail Restore v2 — AFI-parity pipeline. Off by default; flip to
+        # "true" in env to route EMAIL items through MailRestoreEngine.
+        self.MAIL_RESTORE_V2_ENABLED = os.getenv("MAIL_RESTORE_V2_ENABLED", "false").lower() == "true"
+        # Per-worker global cap on concurrent mail-restore tasks across all
+        # in-flight jobs. Keeps Graph traffic bounded even if many jobs run at once.
+        self.MAIL_RESTORE_GLOBAL_POOL = int(os.getenv("MAIL_RESTORE_GLOBAL_POOL", "32"))
+        # Per-target-mailbox concurrency cap. Graph throttles per-mailbox
+        # at ~4 concurrent requests; exceeding this triggers 429s faster
+        # than the retry loop can absorb them.
+        self.MAIL_RESTORE_PER_MAILBOX = int(os.getenv("MAIL_RESTORE_PER_MAILBOX", "4"))
+        # Max retries per item on 429 / 5xx before marking it failed.
+        self.MAIL_RESTORE_MAX_RETRIES = int(os.getenv("MAIL_RESTORE_MAX_RETRIES", "5"))
+        # Small-attachment threshold. >= this size uses Graph's upload-session
+        # endpoint (chunked PUT). Units = megabytes.
+        self.MAIL_RESTORE_ATTACH_LARGE_MB = int(os.getenv("MAIL_RESTORE_ATTACH_LARGE_MB", "3"))
         self.EXPORT_FETCH_BATCH_SIZE = int(os.getenv("EXPORT_FETCH_BATCH_SIZE", "50"))
         self.EXPORT_MEMORY_SOFT_LIMIT_PCT = int(os.getenv("EXPORT_MEMORY_SOFT_LIMIT_PCT", "80"))
         self.EXPORT_MEMORY_KILL_GRACE_SECONDS = int(os.getenv("EXPORT_MEMORY_KILL_GRACE_SECONDS", "60"))
@@ -158,6 +173,18 @@ class Settings:
         self.BACKUP_HEAVY_THRESHOLD_BYTES = int(os.getenv("BACKUP_HEAVY_THRESHOLD_BYTES", str(100 * 1024 * 1024 * 1024)))
         self.BACKUP_HEAVY_QUEUE = os.getenv("BACKUP_HEAVY_QUEUE", "backup.heavy")
         self.BACKUP_WORKER_QUEUE = os.getenv("BACKUP_WORKER_QUEUE", "backup.normal")
+
+        # ── Contact backup expansion ──
+        # Capture IPM.Contact items from Deleted Items + Recoverable Items
+        # mail folders in addition to /contactFolders. Default on so backups
+        # cover the full mailbox-side contact estate. Disable per tenant if
+        # Graph perms are restricted.
+        self.BACKUP_CONTACTS_INCLUDE_DELETED = os.getenv(
+            "BACKUP_CONTACTS_INCLUDE_DELETED", "true"
+        ).lower() in ("true", "1", "yes")
+        self.BACKUP_CONTACTS_INCLUDE_RECOVERABLE = os.getenv(
+            "BACKUP_CONTACTS_INCLUDE_RECOVERABLE", "true"
+        ).lower() in ("true", "1", "yes")
 
         # ── RabbitMQ long-run safety ──
         self.RABBITMQ_CONSUMER_HEARTBEAT_SECONDS = int(os.getenv("RABBITMQ_CONSUMER_HEARTBEAT_SECONDS", str(7 * 24 * 3600)))

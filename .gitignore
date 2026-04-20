@@ -10,6 +10,8 @@ build/
 *.whl
 *.pyc
 *.pyo
+secrets/
+.env.bak
 
 
 # Virtual environments

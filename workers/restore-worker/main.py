@@ -33,6 +33,7 @@ from shared.multi_app_manager import multi_app_manager
 from shared.power_bi_client import PowerBIClient
 from shared.power_platform_client import PowerPlatformClient
 from shared.azure_storage import azure_storage_manager
+from mail_restore import MailRestoreEngine, MODE_OVERWRITE, MODE_SEPARATE
 
 
 def _safe_name(name: str) -> str:
@@ -134,6 +135,109 @@ def _event_to_ics(event: dict) -> str:
     lines.append("END:VEVENT")
     lines.append("END:VCALENDAR")
     return "\r\n".join(lines) + "\r\n"
+
+
+def _vcard_escape(value: str) -> str:
+    """Escape per RFC 6350 §3.4: comma, semicolon, backslash, newline."""
+    if value is None:
+        return ""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "")
+        .replace(",", "\\,")
+        .replace(";", "\\;")
+    )
+
+
+def _contact_to_vcard(raw: dict, folder: str = "") -> str:
+    """vCard 3.0 representation of a Microsoft Graph contact resource.
+    Outlook + Google + Apple all import 3.0 reliably; 4.0 has Outlook quirks."""
+    if not isinstance(raw, dict):
+        raw = {}
+    lines = ["BEGIN:VCARD", "VERSION:3.0"]
+
+    fn = raw.get("displayName") or (
+        (raw.get("emailAddresses") or [{}])[0].get("address") or "(unnamed)"
+    )
+    lines.append(f"FN:{_vcard_escape(fn)}")
+
+    given = _vcard_escape(raw.get("givenName") or "")
+    surname = _vcard_escape(raw.get("surname") or "")
+    if given or surname:
+        lines.append(f"N:{surname};{given};;;")
+
+    if raw.get("companyName"):
+        lines.append(f"ORG:{_vcard_escape(raw['companyName'])}")
+    if raw.get("jobTitle"):
+        lines.append(f"TITLE:{_vcard_escape(raw['jobTitle'])}")
+
+    for email in raw.get("emailAddresses") or []:
+        addr = (email or {}).get("address") if isinstance(email, dict) else None
+        if addr:
+            lines.append(f"EMAIL;TYPE=INTERNET:{_vcard_escape(addr)}")
+
+    for phone in raw.get("businessPhones") or []:
+        if phone:
+            lines.append(f"TEL;TYPE=WORK,VOICE:{_vcard_escape(phone)}")
+    if raw.get("mobilePhone"):
+        lines.append(f"TEL;TYPE=CELL,VOICE:{_vcard_escape(raw['mobilePhone'])}")
+    for phone in raw.get("homePhones") or []:
+        if phone:
+            lines.append(f"TEL;TYPE=HOME,VOICE:{_vcard_escape(phone)}")
+
+    for im in raw.get("imAddresses") or []:
+        if im:
+            lines.append(f"IMPP:{_vcard_escape(im)}")
+
+    if raw.get("birthday"):
+        bday = str(raw["birthday"])[:10].replace("-", "")
+        if len(bday) == 8 and bday.isdigit():
+            lines.append(f"BDAY:{bday}")
+
+    if raw.get("personalNotes"):
+        lines.append(f"NOTE:{_vcard_escape(raw['personalNotes'])}")
+
+    cats = [c for c in (raw.get("categories") or []) if c]
+    if cats:
+        lines.append("CATEGORIES:" + ",".join(_vcard_escape(c) for c in cats))
+
+    if folder:
+        lines.append(f"X-MS-OL-DESIGN:folder={_vcard_escape(folder)}")
+
+    lines.append("END:VCARD")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _contact_to_csv_row(raw: dict, folder: str) -> dict:
+    """Flatten a Graph contact into one CSV row. All values are strings."""
+    if not isinstance(raw, dict):
+        raw = {}
+    emails = ";".join(
+        ((e or {}).get("address") or "")
+        for e in (raw.get("emailAddresses") or [])
+        if isinstance(e, dict) and (e or {}).get("address")
+    )
+    bday = ""
+    if raw.get("birthday"):
+        bday = str(raw["birthday"])[:10]
+    return {
+        "displayName": raw.get("displayName") or "",
+        "givenName": raw.get("givenName") or "",
+        "surname": raw.get("surname") or "",
+        "companyName": raw.get("companyName") or "",
+        "jobTitle": raw.get("jobTitle") or "",
+        "emails": emails,
+        "businessPhones": ";".join(p for p in (raw.get("businessPhones") or []) if p),
+        "mobilePhone": raw.get("mobilePhone") or "",
+        "homePhones": ";".join(p for p in (raw.get("homePhones") or []) if p),
+        "imAddresses": ";".join(p for p in (raw.get("imAddresses") or []) if p),
+        "categories": ";".join(c for c in (raw.get("categories") or []) if c),
+        "personalNotes": raw.get("personalNotes") or "",
+        "birthday": bday,
+        "folder": folder or "",
+    }
 
 
 def _event_to_csv_row(event: dict) -> dict:
@@ -434,8 +538,53 @@ class RestoreWorker:
             if conflict_mode not in ("SEPARATE_FOLDER", "OVERWRITE"):
                 conflict_mode = "SEPARATE_FOLDER"
 
+            # SharePoint recovery target: original site (default), a different
+            # existing site (CROSS_RESOURCE via spec.targetResourceId), or a
+            # freshly-provisioned site (spec.newSiteName). Resolved once per
+            # resource group so we don't create the site per-file.
+            sp_target_site_id: Optional[str] = None
+            if resource_type == "SHAREPOINT":
+                sp_target_site_id = await self._resolve_sharepoint_target_site(
+                    session, graph_client, resource, tenant, spec,
+                )
+
             # Route by item type
             teams_skipped = 0  # per-resource counter; rolled into total_teams_skipped
+
+            # Mail restore v2 fast-path. When the flag is on and this
+            # resource is a mailbox flavor, route EMAIL + EMAIL_ATTACHMENT
+            # items through MailRestoreEngine (folder-preserving, dedup,
+            # attachment replay). Items are removed from the legacy loop
+            # so we don't double-process them.
+            mail_items: List[SnapshotItem] = []
+            if settings.MAIL_RESTORE_V2_ENABLED and resource_type in (
+                "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX"
+            ):
+                remaining: List[SnapshotItem] = []
+                for it in resource_items:
+                    if it.item_type in ("EMAIL", "EMAIL_ATTACHMENT"):
+                        mail_items.append(it)
+                    else:
+                        remaining.append(it)
+                resource_items = remaining
+
+            if mail_items:
+                # Resolve overwrite-vs-separate from either signal the
+                # frontend sends: legacy `conflictMode: "OVERWRITE"`
+                # string OR the RestoreModal's `overwrite: bool`. Either
+                # one true → OVERWRITE mode.
+                mail_overwrite = conflict_mode == "OVERWRITE" or bool(spec.get("overwrite"))
+                engine = MailRestoreEngine(
+                    graph_client,
+                    resource,
+                    MODE_OVERWRITE if mail_overwrite else MODE_SEPARATE,
+                    separate_folder_root=spec.get("targetFolder"),
+                    worker_id=self.worker_id,
+                )
+                mail_summary = await engine.run(mail_items)
+                restored_count += mail_summary["created"] + mail_summary["updated"]
+                failed_count += mail_summary["failed"]
+
             for item in resource_items:
                 try:
                     if item.item_type in ("EMAIL",):
@@ -443,7 +592,11 @@ class RestoreWorker:
                     elif item.item_type in ("FILE", "ONEDRIVE_FILE"):
                         await self._restore_file_to_onedrive(graph_client, resource, item, conflict_mode=conflict_mode)
                     elif item.item_type in ("SHAREPOINT_FILE", "SHAREPOINT_LIST_ITEM"):
-                        await self._restore_file_to_sharepoint(graph_client, resource, item, conflict_mode=conflict_mode)
+                        await self._restore_file_to_sharepoint(
+                            graph_client, resource, item,
+                            conflict_mode=conflict_mode,
+                            target_site_id=sp_target_site_id,
+                        )
                     elif item.item_type == "CALENDAR_EVENT":
                         await self._restore_event_to_calendar(session, graph_client, resource, item)
                     elif item.item_type == "USER_CONTACT":
@@ -548,6 +701,30 @@ class RestoreWorker:
         target_resource_type = target_resource.type.value if hasattr(target_resource.type, "value") else str(target_resource.type)
         if target_resource_type == "POWER_BI":
             return await self._restore_power_bi_items(session, target_resource, items, tenant)
+
+        target_type = target_resource.type.value if hasattr(target_resource.type, "value") else str(target_resource.type)
+        mail_items: List[SnapshotItem] = []
+        if settings.MAIL_RESTORE_V2_ENABLED and target_type in ("MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX"):
+            remaining: List[SnapshotItem] = []
+            for it in items:
+                if it.item_type in ("EMAIL", "EMAIL_ATTACHMENT"):
+                    mail_items.append(it)
+                else:
+                    remaining.append(it)
+            items = remaining
+
+        if mail_items:
+            overwrite = bool(spec.get("overwrite"))
+            engine = MailRestoreEngine(
+                graph_client,
+                target_resource,
+                MODE_OVERWRITE if overwrite else MODE_SEPARATE,
+                separate_folder_root=spec.get("targetFolder"),
+                worker_id=self.worker_id,
+            )
+            mail_summary = await engine.run(mail_items)
+            restored_count += mail_summary["created"] + mail_summary["updated"]
+            failed_count += mail_summary["failed"]
 
         for item in items:
             try:
@@ -941,6 +1118,9 @@ class RestoreWorker:
             or ""
         ).upper()
 
+        # Optional folder filter for USER_CONTACT items. Empty/missing = include all.
+        contact_folder_filter = set(_zip_spec.get("contactFolders") or [])
+
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for item in items:
                 try:
@@ -995,6 +1175,26 @@ class RestoreWorker:
                             zip_file.writestr(
                                 f"calendar/{item.external_id}.json",
                                 json.dumps(raw_data, indent=2),
+                            )
+                    elif item.item_type == "USER_CONTACT":
+                        folder = (
+                            (metadata.get("structured") or {}).get("parentFolderName")
+                            or "Contacts"
+                        )
+                        if contact_folder_filter and folder not in contact_folder_filter:
+                            continue
+                        if fmt == "CSV":
+                            if not hasattr(self, "_contacts_csv_rows"):
+                                self._contacts_csv_rows = []
+                            self._contacts_csv_rows.append(
+                                _contact_to_csv_row(raw_data, folder)
+                            )
+                        else:
+                            safe_folder = _safe_name(folder)
+                            safe_name = _safe_name(item.name or item.external_id)
+                            zip_file.writestr(
+                                f"contacts/{safe_folder}/{safe_name}.vcf",
+                                _contact_to_vcard(raw_data, folder=folder),
                             )
                     elif item.item_type in ("TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY", "TEAMS_CHAT_MESSAGE"):
                         # Export Teams message as JSON
@@ -1054,6 +1254,27 @@ class RestoreWorker:
                     writer.writerow(row)
                 zip_file.writestr("calendar/calendar.csv", buf.getvalue())
                 self._calendar_csv_rows = []
+
+            # Flush accumulated contact rows as a single contacts.csv.
+            contacts_csv_rows = getattr(self, "_contacts_csv_rows", None)
+            if contacts_csv_rows:
+                import io as _io2
+                import csv as _csv2
+                buf2 = _io2.StringIO()
+                writer2 = _csv2.DictWriter(
+                    buf2,
+                    fieldnames=[
+                        "displayName", "givenName", "surname", "companyName", "jobTitle",
+                        "emails", "businessPhones", "mobilePhone", "homePhones",
+                        "imAddresses", "categories", "personalNotes", "birthday", "folder",
+                    ],
+                    extrasaction="ignore",
+                )
+                writer2.writeheader()
+                for row in contacts_csv_rows:
+                    writer2.writerow(row)
+                zip_file.writestr("contacts/contacts.csv", buf2.getvalue())
+                self._contacts_csv_rows = []
 
         zip_buffer.seek(0)
         zip_bytes = zip_buffer.getvalue()
@@ -1196,17 +1417,35 @@ class RestoreWorker:
         resource: Resource,
         item: SnapshotItem,
         conflict_mode: str = "SEPARATE_FOLDER",
+        target_site_id: Optional[str] = None,
     ):
-        """Restore file to SharePoint site via Graph API."""
+        """Restore file to SharePoint site via Graph API.
+
+        Preserves the captured folder structure (``item.folder_path``) so
+        restored files land in their original location instead of the drive
+        root. ``target_site_id`` overrides the source site — used by the
+        cross-resource and new-site restore modes.
+        """
         metadata = self._get_item_metadata(item)
         raw_data = metadata.get("raw", {})
 
-        site_id = resource.external_id
+        site_id = target_site_id or resource.external_id
         file_content = raw_data.get("content", "")
         file_name = raw_data.get("name", item.name or f"restored_{item.external_id}")
 
+        # Preserve the original folder tree. folder_path for SharePoint
+        # items is captured as ``{site_label}/lists/{list}/sub/folders`` or
+        # the Graph ``parentReference.path`` (e.g. ``/drive/root:/Docs/2024``).
+        # Strip the Graph anchor so we land inside the target drive's root.
+        raw_folder = (getattr(item, "folder_path", None) or "").strip()
+        folder_trail = raw_folder
+        if folder_trail.startswith("/drive/root:"):
+            folder_trail = folder_trail.split(":", 1)[1]
+        folder_trail = folder_trail.strip("/")
+
         prefix = self._conflict_path_prefix(conflict_mode)
-        target_path = f"{prefix}{file_name}"
+        parts = [p for p in (prefix.strip("/"), folder_trail, file_name) if p]
+        target_path = "/".join(parts)
         url = f"{graph_client.GRAPH_URL}/sites/{site_id}/drive/root:/{target_path}:/content"
 
         result = await graph_client._put(
@@ -1217,6 +1456,52 @@ class RestoreWorker:
 
         # Round 1.1 — replay captured ACLs onto the restored item.
         await self._replay_file_permissions(graph_client, item, result)
+
+    async def _resolve_sharepoint_target_site(
+        self,
+        session: AsyncSession,
+        graph_client: GraphClient,
+        source_resource: Resource,
+        tenant: Tenant,
+        spec: Dict,
+    ) -> Optional[str]:
+        """Resolve the SharePoint site id to restore into.
+
+        Three modes, picked from spec (in order of precedence):
+          * ``spec.newSiteName`` → create a fresh communication site via
+            SPO REST and use its id. Optional ``spec.newSiteAlias`` /
+            ``spec.newSiteOwnerEmail`` override defaults.
+          * ``spec.targetResourceId`` → cross-resource restore; look up the
+            target SharePoint Resource and use its external_id.
+          * neither → ``None`` (caller falls back to the source site).
+
+        Errors surface as exceptions — the caller wraps per-item so a bad
+        target doesn't silently drop the whole restore.
+        """
+        new_site_name = spec.get("newSiteName")
+        if new_site_name:
+            owner_email = spec.get("newSiteOwnerEmail") or (tenant.admin_email if hasattr(tenant, "admin_email") else None)
+            alias = spec.get("newSiteAlias") or new_site_name.replace(" ", "-").lower()[:40]
+            print(f"[{self.worker_id}] Provisioning new SharePoint site '{new_site_name}' (alias={alias})")
+            new_site_id = await graph_client.create_communication_site(
+                title=new_site_name,
+                alias=alias,
+                owner_email=owner_email,
+            )
+            print(f"[{self.worker_id}] Created SharePoint site {new_site_id}")
+            return new_site_id
+
+        target_resource_id = spec.get("targetResourceId")
+        if target_resource_id and str(target_resource_id) != str(source_resource.id):
+            target = await session.get(Resource, uuid.UUID(str(target_resource_id)))
+            if not target:
+                raise ValueError(f"targetResourceId {target_resource_id} not found")
+            target_type = target.type.value if hasattr(target.type, "value") else str(target.type)
+            if target_type != "SHAREPOINT":
+                raise ValueError(f"targetResourceId {target_resource_id} is not a SharePoint resource (got {target_type})")
+            return target.external_id
+
+        return None
 
     async def _restore_event_to_calendar(
         self,

@@ -267,7 +267,7 @@ async def get_snapshot_folders(
             WITH latest AS (
               SELECT DISTINCT ON (external_id)
                      external_id, COALESCE(folder_path, '') AS path
-              FROM tm_vault.snapshot_items
+              FROM snapshot_items
               WHERE snapshot_id = ANY(:snaps)
                 {type_filter}
               ORDER BY external_id, created_at DESC
@@ -1047,6 +1047,41 @@ async def list_snapshot_messages(
     return {"content": list(results), "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
 
 
+WELL_KNOWN_CONTACT_FOLDERS = [
+    "Contacts", "Recipient Cache", "Deleted Items", "Recoverable Items",
+]
+
+
+@app.get("/api/v1/resources/snapshots/{snapshot_id}/contact-folders")
+async def list_snapshot_contact_folders(
+    snapshot_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Distinct folder_path values for USER_CONTACT items in a snapshot.
+    Powers the folder-grain checkbox subgroup in the Download modal.
+
+    Sort order: well-known folders (Contacts, Recipient Cache, Deleted
+    Items, Recoverable Items) first in canonical order, then any custom
+    folders alphabetically."""
+    try:
+        sid = UUID(snapshot_id)
+    except ValueError:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="invalid snapshot_id")
+
+    stmt = (
+        select(distinct(SnapshotItem.folder_path))
+        .where(SnapshotItem.snapshot_id == sid)
+        .where(SnapshotItem.item_type == "USER_CONTACT")
+        .where(SnapshotItem.folder_path.isnot(None))
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    seen = {f for f in rows if f}
+    well_known = [f for f in WELL_KNOWN_CONTACT_FOLDERS if f in seen]
+    others = sorted(seen - set(WELL_KNOWN_CONTACT_FOLDERS))
+    return {"folders": well_known + others}
+
+
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/chats/groups")
 async def list_snapshot_chat_groups(
     snapshot_id: str,
@@ -1775,7 +1810,13 @@ async def get_item_content(
                 import urllib.parse as _urlp
                 fname = (item.name or f"item-{item.id}").strip()
                 safe = _urlp.quote(fname)
-                headers["Content-Disposition"] = f"attachment; filename=\"{fname}\"; filename*=UTF-8''{safe}"
+                # HTTP headers are latin-1 only. Graph-sourced filenames often
+                # carry chars like U+202F (narrow no-break space) that break
+                # Response() header encoding. Strip to ASCII for the plain
+                # filename fallback; filename* keeps the UTF-8 original for
+                # RFC 5987-aware clients.
+                ascii_fname = fname.encode("ascii", "replace").decode("ascii").replace('"', "'")
+                headers["Content-Disposition"] = f"attachment; filename=\"{ascii_fname}\"; filename*=UTF-8''{safe}"
 
                 # Audit: FILE_DOWNLOADED — one row per single-file download
                 # (distinct from bulk EXPORT_DOWNLOADED which bundles many
