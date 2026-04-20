@@ -136,14 +136,26 @@ async def _create_batch_backup_jobs(
             detail=f"Resources must have SLA policies assigned. {len(resources_without_sla)} resource(s) missing policy: {', '.join(resources_without_sla[:5])}"
         )
 
-    tenant_groups: Dict[UUID, List[str]] = {}
+    # Partition by (tenant, queue). Oversized OneDrive children land in a
+    # separate (tenant, backup.heavy) bucket so they don't get stuck
+    # behind light resources on the shared urgent queue, and vice-versa
+    # so small resources don't wait behind a 500 GB drive scan.
+    from shared.export_routing import pick_backup_queue
+    tenant_queue_groups: Dict[tuple, List[str]] = {}
     for rid, res in resources_map.items():
-        tenant_groups.setdefault(res.tenant_id, []).append(rid)
+        res_type = res.type.value if hasattr(res.type, "value") else str(res.type)
+        drive_bytes = int((res.extra_data or {}).get("drive_quota_used", 0))
+        routing_key = pick_backup_queue(
+            drive_bytes_estimate=drive_bytes,
+            resource_type=res_type,
+            default_queue="backup.urgent",
+        )
+        tenant_queue_groups.setdefault((res.tenant_id, routing_key), []).append(rid)
 
     jobs_created = []
-    pending_publishes = []
+    pending_publishes: List[tuple] = []   # (routing_key, msg)
 
-    for tenant_id, resource_ids in tenant_groups.items():
+    for (tenant_id, routing_key), resource_ids in tenant_queue_groups.items():
         has_previous_backup = any(resources_map[rid].last_backup_at is not None for rid in resource_ids)
         effective_full_backup = (full_backup or False) and not has_previous_backup
 
@@ -159,6 +171,7 @@ async def _create_batch_backup_jobs(
                 "resource_count": len(resource_ids),
                 "fullBackup": effective_full_backup,
                 "note": note,
+                "queue": routing_key,
             },
         )
         db.add(job)
@@ -167,25 +180,27 @@ async def _create_batch_backup_jobs(
             "status": "QUEUED",
             "resourceId": "BATCH",
             "resourceCount": len(resource_ids),
+            "queue": routing_key,
         })
 
         if settings.RABBITMQ_ENABLED:
             from shared.message_bus import create_mass_backup_message
             first_res = resources_map[resource_ids[0]]
             resource_type = first_res.type.value if hasattr(first_res.type, 'value') else str(first_res.type)
-            pending_publishes.append(create_mass_backup_message(
+            pending_publishes.append((routing_key, create_mass_backup_message(
                 job_id=str(job.id),
                 tenant_id=str(tenant_id),
                 resource_type=resource_type,
                 resource_ids=resource_ids,
                 sla_policy_id=None,
                 full_backup=effective_full_backup,
-            ))
+            )))
 
     await db.commit()
 
-    for msg in pending_publishes:
-        await message_bus.publish("backup.urgent", msg, priority=priority)
+    for routing_key, msg in pending_publishes:
+        print(f"[JOB_SERVICE] batch backup → {routing_key} ({len(msg.get('resource_ids', []))} resources)")
+        await message_bus.publish(routing_key, msg, priority=priority)
 
     try:
         import httpx
@@ -451,6 +466,10 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
             routing_key = pick_backup_queue(
                 drive_bytes_estimate=drive_bytes_estimate,
                 resource_type=resource_type,
+                # Preserve user-initiated urgency for below-threshold
+                # drives; previously this leaked into BACKUP_WORKER_QUEUE
+                # (scheduled-backup queue), delaying interactive backups.
+                default_queue=routing_key,
             )
 
         msg = create_backup_message(
@@ -568,7 +587,19 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
         await db.commit()  # commit before publish so worker finds the job
 
         if settings.RABBITMQ_ENABLED:
-            await message_bus.publish("backup.urgent", create_backup_message(
+            # Heavy-pool routing for oversized OneDrive drives (Tier 2
+            # USER_ONEDRIVE children). Everything else keeps the
+            # user-initiated urgent queue.
+            from shared.export_routing import pick_backup_queue
+            res_type = res.type.value if hasattr(res.type, "value") else str(res.type)
+            drive_bytes = int((res.extra_data or {}).get("drive_quota_used", 0))
+            routing_key = pick_backup_queue(
+                drive_bytes_estimate=drive_bytes,
+                resource_type=res_type,
+                default_queue="backup.urgent",
+            )
+            print(f"[JOB_SERVICE] trigger-user {resource_id} type={res_type} bytes={drive_bytes} → {routing_key}")
+            await message_bus.publish(routing_key, create_backup_message(
                 job_id=str(job.id), resource_id=resource_id,
                 tenant_id=str(res.tenant_id), full_backup=effective_full_backup
             ), priority=1)
