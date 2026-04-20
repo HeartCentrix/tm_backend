@@ -816,3 +816,366 @@ async def download_usage_report(tenant_id: str, db: AsyncSession = Depends(get_d
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Tenant Secrets — reusable credentials + KMS-key references
+# ──────────────────────────────────────────────────────────────────────
+#
+# UI surfaces that consume these:
+#   • Azure DB Recover modal — picks a SQL_SERVER_LOGIN / POSTGRESQL_LOGIN
+#     secret as the destination server credential.
+#   • Settings → Secrets — manages AES_256_KEY / external-KMS references
+#     for backup-data encryption.
+#
+# Encrypted payload (password / key material) is stored via
+# shared.security.encrypt_secret and never returned to the frontend —
+# the list endpoint only exposes non-sensitive metadata + hints.
+import base64 as _b64
+import json as _json
+from shared.models import TenantSecret
+from shared.security import encrypt_secret
+
+
+def _secret_to_response(s: TenantSecret) -> dict:
+    """Shape returned to the UI — hides the encrypted payload."""
+    return {
+        "id": str(s.id),
+        "tenantId": str(s.tenant_id),
+        "type": s.type,
+        "name": s.name,
+        "description": s.description or "",
+        "metadata": s.metadata_hints or {},
+        "isDefault": bool(s.is_default),
+        "createdAt": s.created_at.isoformat() if s.created_at else None,
+        "updatedAt": s.updated_at.isoformat() if s.updated_at else None,
+    }
+
+
+@app.get("/api/v1/tenants/{tenant_id}/secrets")
+async def list_tenant_secrets(
+    tenant_id: str,
+    type: Optional[str] = Query(None, description="Filter by secret type"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return every secret for a tenant (optionally filtered by type)."""
+    tenant_uuid = UUID(tenant_id)
+    stmt = select(TenantSecret).where(TenantSecret.tenant_id == tenant_uuid)
+    if type:
+        stmt = stmt.where(TenantSecret.type == type)
+    stmt = stmt.order_by(TenantSecret.created_at.desc())
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"items": [_secret_to_response(s) for s in rows]}
+
+
+@app.post("/api/v1/tenants/{tenant_id}/secrets")
+async def create_tenant_secret(
+    tenant_id: str,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new tenant secret. `payload` is encrypted before persist."""
+    tenant_uuid = UUID(tenant_id)
+    stype = (body.get("type") or "").strip()
+    if not stype:
+        raise HTTPException(status_code=400, detail="`type` is required")
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="`name` is required")
+
+    payload = body.get("payload") or {}
+    enc_blob = None
+    if payload:
+        raw = _json.dumps(payload, default=str)
+        enc_blob = _b64.b64encode(encrypt_secret(raw)).decode("ascii")
+
+    # Single-default-per-type invariant.
+    if bool(body.get("isDefault")):
+        await db.execute(
+            TenantSecret.__table__.update()
+            .where(TenantSecret.tenant_id == tenant_uuid)
+            .where(TenantSecret.type == stype)
+            .values(is_default=False)
+        )
+
+    row = TenantSecret(
+        tenant_id=tenant_uuid,
+        type=stype,
+        name=name,
+        description=(body.get("description") or None),
+        metadata_hints=(body.get("metadata") or {}),
+        encrypted_payload=enc_blob,
+        is_default=bool(body.get("isDefault")),
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return _secret_to_response(row)
+
+
+@app.get("/api/v1/tenants/{tenant_id}/secrets/{secret_id}")
+async def get_tenant_secret(
+    tenant_id: str, secret_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    row = await db.get(TenantSecret, UUID(secret_id))
+    if not row or str(row.tenant_id) != tenant_id:
+        raise HTTPException(status_code=404, detail="Secret not found")
+    return _secret_to_response(row)
+
+
+@app.delete("/api/v1/tenants/{tenant_id}/secrets/{secret_id}", status_code=204)
+async def delete_tenant_secret(
+    tenant_id: str, secret_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    row = await db.get(TenantSecret, UUID(secret_id))
+    if not row or str(row.tenant_id) != tenant_id:
+        raise HTTPException(status_code=404, detail="Secret not found")
+    await db.delete(row)
+    await db.commit()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Azure restore options — feed the destination dropdowns in the Azure
+# DB Recover modal. Both the tenant domain and the cascading
+# subscription/RG/location/server lists are discovered LIVE from
+# Microsoft Graph + Azure ARM each time the modal opens. Nothing is
+# persisted in the DB. Per-process caches (60s) keep modal opens
+# snappy while still reflecting fresh state.
+# ──────────────────────────────────────────────────────────────────────
+
+import asyncio
+import time
+import httpx
+
+# in-process cache — { external_tenant_id: (domain, expires_at_unix) }
+_TENANT_DOMAIN_CACHE: dict[str, tuple[str, float]] = {}
+_TENANT_DOMAIN_TTL = 3600
+
+# in-process cache — { (external_tenant_id, dbType): (payload, expires_at_unix) }
+_AZURE_OPTIONS_CACHE: dict[tuple[str, str], tuple[dict, float]] = {}
+_AZURE_OPTIONS_TTL = 60
+
+
+async def _acquire_token(tenant_external_id: str, scope: str) -> Optional[str]:
+    """OAuth2 client_credentials against the customer's Azure AD tenant
+    using the platform's multi-tenant SP. Returns None on any failure
+    so callers can degrade gracefully."""
+    client_id = settings.EFFECTIVE_ARM_CLIENT_ID or settings.MICROSOFT_CLIENT_ID
+    client_secret = settings.EFFECTIVE_ARM_CLIENT_SECRET or settings.MICROSOFT_CLIENT_SECRET
+    if not (client_id and client_secret and tenant_external_id):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as cli:
+            r = await cli.post(
+                f"https://login.microsoftonline.com/{tenant_external_id}/oauth2/v2.0/token",
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "scope": scope,
+                    "grant_type": "client_credentials",
+                },
+            )
+            if r.status_code != 200:
+                return None
+            return r.json().get("access_token")
+    except Exception:
+        return None
+
+
+async def _fetch_tenant_domain(tenant_external_id: str) -> str:
+    """Default verified domain via Graph /organization. Empty string on
+    failure so the UI can fall back to the tenant GUID."""
+    if not tenant_external_id:
+        return ""
+    cached = _TENANT_DOMAIN_CACHE.get(tenant_external_id)
+    if cached and cached[1] > time.time():
+        return cached[0]
+
+    token = await _acquire_token(tenant_external_id, "https://graph.microsoft.com/.default")
+    if not token:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=10) as cli:
+            r = await cli.get(
+                "https://graph.microsoft.com/v1.0/organization",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if r.status_code != 200:
+                return ""
+            orgs = r.json().get("value", [])
+            if not orgs:
+                return ""
+            domains = orgs[0].get("verifiedDomains", [])
+            default = next((d.get("name") for d in domains if d.get("isDefault")), None)
+            domain = default or (domains[0].get("name") if domains else "")
+            _TENANT_DOMAIN_CACHE[tenant_external_id] = (domain or "", time.time() + _TENANT_DOMAIN_TTL)
+            return domain or ""
+    except Exception:
+        return ""
+
+
+@app.get("/api/v1/azure/tenants")
+async def list_azure_tenants(db: AsyncSession = Depends(get_db)):
+    """Every AZURE tenant the user can restore into, with the verified
+    default domain discovered live from Graph (cached 1h)."""
+    stmt = select(Tenant).where(Tenant.type == TenantType.AZURE)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    domains = await asyncio.gather(
+        *[_fetch_tenant_domain(t.external_tenant_id or "") for t in rows],
+        return_exceptions=False,
+    )
+
+    return {
+        "items": [
+            {
+                "id": str(t.id),
+                "externalTenantId": t.external_tenant_id or "",
+                "displayName": t.display_name,
+                "domain": dom,
+            }
+            for t, dom in zip(rows, domains)
+        ]
+    }
+
+
+async def _arm_get(token: str, url: str) -> Optional[dict]:
+    try:
+        async with httpx.AsyncClient(timeout=15) as cli:
+            r = await cli.get(url, headers={"Authorization": f"Bearer {token}"})
+            if r.status_code != 200:
+                return None
+            return r.json()
+    except Exception:
+        return None
+
+
+def _rg_from_id(arm_id: str) -> str:
+    # /subscriptions/<sub>/resourceGroups/<rg>/providers/...
+    parts = (arm_id or "").split("/")
+    try:
+        i = parts.index("resourceGroups")
+        return parts[i + 1]
+    except (ValueError, IndexError):
+        return ""
+
+
+@app.get("/api/v1/azure/tenants/{tenant_id}/options")
+async def azure_restore_options(
+    tenant_id: str,
+    dbType: Optional[str] = Query(None, description="sql | postgresql — filter the server list"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Live discovery against Azure ARM for the destination dropdowns.
+    Lists every subscription the platform SP can see in the tenant,
+    then enumerates SQL or PostgreSQL servers across them and projects
+    the (subscription, resourceGroup, location, server) tuples."""
+    tenant = await db.get(Tenant, UUID(tenant_id))
+    if not tenant or tenant.type != TenantType.AZURE:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    if not tenant.external_tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant missing external_tenant_id")
+
+    cache_key = (tenant.external_tenant_id, dbType or "all")
+    cached = _AZURE_OPTIONS_CACHE.get(cache_key)
+    if cached and cached[1] > time.time():
+        return cached[0]
+
+    token = await _acquire_token(tenant.external_tenant_id, "https://management.azure.com/.default")
+    if not token:
+        raise HTTPException(status_code=502, detail="Failed to acquire ARM token for tenant")
+
+    # 1) subscriptions visible to the SP. ARM gives us the billing-plan
+    #    displayName ("Azure subscription 1", "Pay-As-You-Go" etc) — that
+    #    is what the Recover modal actually shows; the GUID is the value.
+    subs_payload = await _arm_get(token, "https://management.azure.com/subscriptions?api-version=2022-12-01")
+    raw_subs = (subs_payload or {}).get("value", []) or []
+    subs_out: list[dict] = []
+    seen_sub_ids: set[str] = set()
+    for s in raw_subs:
+        sid = s.get("subscriptionId")
+        if not sid or sid in seen_sub_ids:
+            continue
+        seen_sub_ids.add(sid)
+        subs_out.append({"id": sid, "displayName": s.get("displayName") or sid})
+    subs_out.sort(key=lambda x: (x["displayName"] or "").lower())
+    sub_ids = [s["id"] for s in subs_out]
+
+    # 2) which provider paths to enumerate per dbType
+    if dbType == "sql":
+        provider_paths = [("Microsoft.Sql/servers", "2023-08-01-preview")]
+    elif dbType == "postgresql":
+        provider_paths = [
+            ("Microsoft.DBforPostgreSQL/flexibleServers", "2023-06-01-preview"),
+            ("Microsoft.DBforPostgreSQL/servers", "2017-12-01"),
+        ]
+    else:
+        provider_paths = [
+            ("Microsoft.Sql/servers", "2023-08-01-preview"),
+            ("Microsoft.DBforPostgreSQL/flexibleServers", "2023-06-01-preview"),
+            ("Microsoft.DBforPostgreSQL/servers", "2017-12-01"),
+        ]
+
+    async def _list_servers(sub: str, provider: str, api: str) -> list[dict]:
+        url = f"https://management.azure.com/subscriptions/{sub}/providers/{provider}?api-version={api}"
+        data = await _arm_get(token, url)
+        return (data or {}).get("value", []) or []
+
+    async def _list_locations(sub: str) -> list[dict]:
+        url = f"https://management.azure.com/subscriptions/{sub}/locations?api-version=2022-12-01"
+        data = await _arm_get(token, url)
+        return (data or {}).get("value", []) or []
+
+    server_tasks = [_list_servers(sub, p, api) for sub in sub_ids for (p, api) in provider_paths]
+    location_tasks = [_list_locations(sub) for sub in sub_ids]
+    server_lists, location_lists = await asyncio.gather(
+        asyncio.gather(*server_tasks, return_exceptions=True),
+        asyncio.gather(*location_tasks, return_exceptions=True),
+    )
+
+    # Build the full list of Azure regions the tenant's subscriptions
+    # can deploy into — straight from `/subscriptions/{sub}/locations`.
+    # The dropdown is for picking where a NEW database lands, so we
+    # surface every region the tenant is eligible for, not just ones
+    # that currently host a server.
+    region_label: dict[str, str] = {}
+    for payload in location_lists:
+        if isinstance(payload, Exception) or not payload:
+            continue
+        for loc in payload:
+            name = (loc.get("name") or "").lower()
+            if name and name not in region_label:
+                region_label[name] = loc.get("displayName") or name
+
+    rgs: set[str] = set()
+    servers: set[str] = set()
+
+    idx = 0
+    for _sub in sub_ids:
+        for _ in provider_paths:
+            payload = server_lists[idx]
+            idx += 1
+            if isinstance(payload, Exception) or not payload:
+                continue
+            for srv in payload:
+                if srv.get("name"):
+                    servers.add(srv["name"])
+                rg = _rg_from_id(srv.get("id", ""))
+                if rg:
+                    rgs.add(rg)
+
+    locations_out = sorted(
+        [{"name": c, "displayName": lbl} for c, lbl in region_label.items()],
+        key=lambda x: x["displayName"].lower(),
+    )
+
+    result = {
+        "subscriptions": subs_out,
+        "resourceGroups": sorted(rgs),
+        "locations": locations_out,
+        "servers": sorted(servers),
+    }
+    _AZURE_OPTIONS_CACHE[cache_key] = (result, time.time() + _AZURE_OPTIONS_TTL)
+    return result
