@@ -33,6 +33,7 @@ from shared.multi_app_manager import multi_app_manager
 from shared.power_bi_client import PowerBIClient
 from shared.power_platform_client import PowerPlatformClient
 from shared.azure_storage import azure_storage_manager
+from mail_restore import MailRestoreEngine, MODE_OVERWRITE, MODE_SEPARATE
 
 
 def _safe_name(name: str) -> str:
@@ -537,8 +538,53 @@ class RestoreWorker:
             if conflict_mode not in ("SEPARATE_FOLDER", "OVERWRITE"):
                 conflict_mode = "SEPARATE_FOLDER"
 
+            # SharePoint recovery target: original site (default), a different
+            # existing site (CROSS_RESOURCE via spec.targetResourceId), or a
+            # freshly-provisioned site (spec.newSiteName). Resolved once per
+            # resource group so we don't create the site per-file.
+            sp_target_site_id: Optional[str] = None
+            if resource_type == "SHAREPOINT":
+                sp_target_site_id = await self._resolve_sharepoint_target_site(
+                    session, graph_client, resource, tenant, spec,
+                )
+
             # Route by item type
             teams_skipped = 0  # per-resource counter; rolled into total_teams_skipped
+
+            # Mail restore v2 fast-path. When the flag is on and this
+            # resource is a mailbox flavor, route EMAIL + EMAIL_ATTACHMENT
+            # items through MailRestoreEngine (folder-preserving, dedup,
+            # attachment replay). Items are removed from the legacy loop
+            # so we don't double-process them.
+            mail_items: List[SnapshotItem] = []
+            if settings.MAIL_RESTORE_V2_ENABLED and resource_type in (
+                "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX"
+            ):
+                remaining: List[SnapshotItem] = []
+                for it in resource_items:
+                    if it.item_type in ("EMAIL", "EMAIL_ATTACHMENT"):
+                        mail_items.append(it)
+                    else:
+                        remaining.append(it)
+                resource_items = remaining
+
+            if mail_items:
+                # Resolve overwrite-vs-separate from either signal the
+                # frontend sends: legacy `conflictMode: "OVERWRITE"`
+                # string OR the RestoreModal's `overwrite: bool`. Either
+                # one true → OVERWRITE mode.
+                mail_overwrite = conflict_mode == "OVERWRITE" or bool(spec.get("overwrite"))
+                engine = MailRestoreEngine(
+                    graph_client,
+                    resource,
+                    MODE_OVERWRITE if mail_overwrite else MODE_SEPARATE,
+                    separate_folder_root=spec.get("targetFolder"),
+                    worker_id=self.worker_id,
+                )
+                mail_summary = await engine.run(mail_items)
+                restored_count += mail_summary["created"] + mail_summary["updated"]
+                failed_count += mail_summary["failed"]
+
             for item in resource_items:
                 try:
                     if item.item_type in ("EMAIL",):
@@ -546,7 +592,11 @@ class RestoreWorker:
                     elif item.item_type in ("FILE", "ONEDRIVE_FILE"):
                         await self._restore_file_to_onedrive(graph_client, resource, item, conflict_mode=conflict_mode)
                     elif item.item_type in ("SHAREPOINT_FILE", "SHAREPOINT_LIST_ITEM"):
-                        await self._restore_file_to_sharepoint(graph_client, resource, item, conflict_mode=conflict_mode)
+                        await self._restore_file_to_sharepoint(
+                            graph_client, resource, item,
+                            conflict_mode=conflict_mode,
+                            target_site_id=sp_target_site_id,
+                        )
                     elif item.item_type == "CALENDAR_EVENT":
                         await self._restore_event_to_calendar(session, graph_client, resource, item)
                     elif item.item_type == "USER_CONTACT":
@@ -651,6 +701,30 @@ class RestoreWorker:
         target_resource_type = target_resource.type.value if hasattr(target_resource.type, "value") else str(target_resource.type)
         if target_resource_type == "POWER_BI":
             return await self._restore_power_bi_items(session, target_resource, items, tenant)
+
+        target_type = target_resource.type.value if hasattr(target_resource.type, "value") else str(target_resource.type)
+        mail_items: List[SnapshotItem] = []
+        if settings.MAIL_RESTORE_V2_ENABLED and target_type in ("MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX"):
+            remaining: List[SnapshotItem] = []
+            for it in items:
+                if it.item_type in ("EMAIL", "EMAIL_ATTACHMENT"):
+                    mail_items.append(it)
+                else:
+                    remaining.append(it)
+            items = remaining
+
+        if mail_items:
+            overwrite = bool(spec.get("overwrite"))
+            engine = MailRestoreEngine(
+                graph_client,
+                target_resource,
+                MODE_OVERWRITE if overwrite else MODE_SEPARATE,
+                separate_folder_root=spec.get("targetFolder"),
+                worker_id=self.worker_id,
+            )
+            mail_summary = await engine.run(mail_items)
+            restored_count += mail_summary["created"] + mail_summary["updated"]
+            failed_count += mail_summary["failed"]
 
         for item in items:
             try:
@@ -1343,17 +1417,35 @@ class RestoreWorker:
         resource: Resource,
         item: SnapshotItem,
         conflict_mode: str = "SEPARATE_FOLDER",
+        target_site_id: Optional[str] = None,
     ):
-        """Restore file to SharePoint site via Graph API."""
+        """Restore file to SharePoint site via Graph API.
+
+        Preserves the captured folder structure (``item.folder_path``) so
+        restored files land in their original location instead of the drive
+        root. ``target_site_id`` overrides the source site — used by the
+        cross-resource and new-site restore modes.
+        """
         metadata = self._get_item_metadata(item)
         raw_data = metadata.get("raw", {})
 
-        site_id = resource.external_id
+        site_id = target_site_id or resource.external_id
         file_content = raw_data.get("content", "")
         file_name = raw_data.get("name", item.name or f"restored_{item.external_id}")
 
+        # Preserve the original folder tree. folder_path for SharePoint
+        # items is captured as ``{site_label}/lists/{list}/sub/folders`` or
+        # the Graph ``parentReference.path`` (e.g. ``/drive/root:/Docs/2024``).
+        # Strip the Graph anchor so we land inside the target drive's root.
+        raw_folder = (getattr(item, "folder_path", None) or "").strip()
+        folder_trail = raw_folder
+        if folder_trail.startswith("/drive/root:"):
+            folder_trail = folder_trail.split(":", 1)[1]
+        folder_trail = folder_trail.strip("/")
+
         prefix = self._conflict_path_prefix(conflict_mode)
-        target_path = f"{prefix}{file_name}"
+        parts = [p for p in (prefix.strip("/"), folder_trail, file_name) if p]
+        target_path = "/".join(parts)
         url = f"{graph_client.GRAPH_URL}/sites/{site_id}/drive/root:/{target_path}:/content"
 
         result = await graph_client._put(
@@ -1364,6 +1456,52 @@ class RestoreWorker:
 
         # Round 1.1 — replay captured ACLs onto the restored item.
         await self._replay_file_permissions(graph_client, item, result)
+
+    async def _resolve_sharepoint_target_site(
+        self,
+        session: AsyncSession,
+        graph_client: GraphClient,
+        source_resource: Resource,
+        tenant: Tenant,
+        spec: Dict,
+    ) -> Optional[str]:
+        """Resolve the SharePoint site id to restore into.
+
+        Three modes, picked from spec (in order of precedence):
+          * ``spec.newSiteName`` → create a fresh communication site via
+            SPO REST and use its id. Optional ``spec.newSiteAlias`` /
+            ``spec.newSiteOwnerEmail`` override defaults.
+          * ``spec.targetResourceId`` → cross-resource restore; look up the
+            target SharePoint Resource and use its external_id.
+          * neither → ``None`` (caller falls back to the source site).
+
+        Errors surface as exceptions — the caller wraps per-item so a bad
+        target doesn't silently drop the whole restore.
+        """
+        new_site_name = spec.get("newSiteName")
+        if new_site_name:
+            owner_email = spec.get("newSiteOwnerEmail") or (tenant.admin_email if hasattr(tenant, "admin_email") else None)
+            alias = spec.get("newSiteAlias") or new_site_name.replace(" ", "-").lower()[:40]
+            print(f"[{self.worker_id}] Provisioning new SharePoint site '{new_site_name}' (alias={alias})")
+            new_site_id = await graph_client.create_communication_site(
+                title=new_site_name,
+                alias=alias,
+                owner_email=owner_email,
+            )
+            print(f"[{self.worker_id}] Created SharePoint site {new_site_id}")
+            return new_site_id
+
+        target_resource_id = spec.get("targetResourceId")
+        if target_resource_id and str(target_resource_id) != str(source_resource.id):
+            target = await session.get(Resource, uuid.UUID(str(target_resource_id)))
+            if not target:
+                raise ValueError(f"targetResourceId {target_resource_id} not found")
+            target_type = target.type.value if hasattr(target.type, "value") else str(target.type)
+            if target_type != "SHAREPOINT":
+                raise ValueError(f"targetResourceId {target_resource_id} is not a SharePoint resource (got {target_type})")
+            return target.external_id
+
+        return None
 
     async def _restore_event_to_calendar(
         self,

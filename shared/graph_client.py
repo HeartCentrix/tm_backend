@@ -19,6 +19,28 @@ _DEFAULT_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=10.0)
 _TOKEN_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 
 
+def _parse_retry_after(resp: httpx.Response, default: float = 30.0, cap: float = 120.0) -> float:
+    """Parse Retry-After (seconds or HTTP-date) from a 429/503 response.
+
+    Falls back to ``default`` when the header is missing or unparseable.
+    Clamped to ``cap`` so a hostile Retry-After doesn't stall a worker
+    for hours on a single throttle event.
+    """
+    raw = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+    if not raw:
+        return min(default, cap)
+    try:
+        return min(float(raw), cap)
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(raw)
+            delta = (dt - datetime.utcnow()).total_seconds()
+            return min(max(delta, 1.0), cap)
+        except Exception:
+            return min(default, cap)
+
+
 class GraphClient:
     """Client for Microsoft Graph API calls with multi-app support"""
 
@@ -1821,6 +1843,9 @@ class GraphClient:
         Graph API: GET /sites/{site-id}/drive/root/delta
         site_id format in DB: hostname/site-collection-id/site-id
         Graph API requires: hostname,site-collection-id,site-id
+
+        NOTE: buffers the full drive into memory — only safe for small sites.
+        For enterprise-scale sites, use ``iter_sharepoint_site_drive_items``.
         """
         # Convert slashes to commas for Graph API
         graph_site_id = site_id.replace("/", ",")
@@ -1842,6 +1867,37 @@ class GraphClient:
         result["value"] = all_value
         return result
 
+    async def iter_sharepoint_site_drive_items(
+        self,
+        site_id: str,
+        delta_token: Optional[str] = None,
+        delta_holder: Optional[Dict[str, Optional[str]]] = None,
+    ):
+        """Page-by-page async iterator over drive items of a SharePoint site.
+
+        Yields raw drive-item dicts as each delta page arrives; the final
+        ``@odata.deltaLink`` is written into ``delta_holder['deltaLink']``
+        if provided so callers can persist the checkpoint after consuming
+        the stream. Internal Graph pacing (``self._get``) already handles
+        Retry-After, so we don't duplicate that here.
+        """
+        graph_site_id = site_id.replace("/", ",")
+        url = f"{self.GRAPH_URL}/sites/{graph_site_id}/drive/root/delta"
+        if delta_token:
+            url = delta_token
+        params = {"$top": "999"}
+        while url:
+            page = await self._get(url, params=params)
+            params = None
+            for item in (page.get("value") or []):
+                yield item
+            if "@odata.nextLink" in page:
+                url = page["@odata.nextLink"]
+                continue
+            if delta_holder is not None:
+                delta_holder["deltaLink"] = page.get("@odata.deltaLink")
+            break
+
     async def get_sharepoint_subsites(self, site_id: str) -> Dict[str, Any]:
         """
         Get subsites for a SharePoint site.
@@ -1855,6 +1911,91 @@ class GraphClient:
             all_value.extend(result.get("value", []))
         result["value"] = all_value
         return result
+
+    async def create_communication_site(
+        self,
+        *,
+        title: str,
+        alias: str,
+        owner_email: Optional[str] = None,
+        lcid: int = 1033,
+    ) -> str:
+        """Provision a fresh SharePoint Communication Site and return its
+        Graph site id (``hostname/site-collection-id/site-id``).
+
+        Uses SPO tenant-admin REST ``_api/SPSiteManager/create`` — the same
+        endpoint used by the SharePoint admin UI and SPO CLI. Requires the
+        app to have ``Sites.FullControl.All`` (or a tenant-admin-consented
+        scope). We block on ``SiteStatus=2`` (provisioned); SiteStatus=1 is
+        still creating, SiteStatus=3 is failed.
+        """
+        tenant_host = await self._get_default_sharepoint_hostname()
+        tenant_name = tenant_host.split(".")[0]
+        admin_host = f"{tenant_name}-admin.sharepoint.com"
+        site_url = f"https://{tenant_host}/sites/{alias}"
+
+        token = await self._get_sharepoint_token(admin_host)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json;odata=nometadata",
+            "Content-Type": "application/json;odata=nometadata",
+        }
+        payload: Dict[str, Any] = {
+            "request": {
+                "Title": title,
+                "Url": site_url,
+                "Lcid": lcid,
+                "ShareByEmailEnabled": False,
+                "WebTemplate": "SITEPAGEPUBLISHING#0",
+                # Built-in "Topic" site design — stable GUID documented by MS.
+                "SiteDesignId": "f6cc5403-0d63-442e-96c0-285923709ffc",
+            }
+        }
+        if owner_email:
+            payload["request"]["Owner"] = owner_email
+
+        url = f"https://{admin_host}/_api/SPSiteManager/create"
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            # Wait up to ~5 min for provisioning — communication sites are
+            # usually ready in <60s, but a cold tenant can lag.
+            deadline = time.monotonic() + 300
+            site_status = 0
+            while time.monotonic() < deadline:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code in (429, 503):
+                    await asyncio.sleep(_parse_retry_after(resp))
+                    continue
+                if resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"create_communication_site {resp.status_code}: {resp.text[:300]}"
+                    )
+                body = resp.json()
+                site_status = int(body.get("SiteStatus") or 0)
+                if site_status == 2:
+                    break
+                if site_status == 3:
+                    raise RuntimeError(f"Site provisioning failed: {body}")
+                await asyncio.sleep(5)
+            if site_status != 2:
+                raise RuntimeError(f"Site provisioning timed out after 300s (status={site_status})")
+
+        # Resolve to Graph's composite site id via path lookup.
+        site_meta = await self._get(
+            f"{self.GRAPH_URL}/sites/{tenant_host}:/sites/{alias}"
+        )
+        site_id_raw = site_meta.get("id") or ""
+        return site_id_raw.replace(",", "/")
+
+    async def _get_default_sharepoint_hostname(self) -> str:
+        """Derive the tenant's default SharePoint hostname
+        (``{tenant}.sharepoint.com``) from the root site."""
+        root = await self._get(f"{self.GRAPH_URL}/sites/root")
+        web_url = root.get("webUrl") or ""
+        from urllib.parse import urlparse as _up
+        parsed = _up(web_url)
+        if not parsed.netloc:
+            raise RuntimeError(f"Could not resolve SharePoint hostname from root site: {root}")
+        return parsed.netloc
 
     async def get_sharepoint_site_lists(self, site_id: str) -> Dict[str, Any]:
         """
@@ -2169,18 +2310,31 @@ class GraphClient:
 
     async def get_sharepoint_list_items_via_rest(self, hostname: str, site_web_url: str, list_id: str) -> List[Dict[str, Any]]:
         """Fetch ALL items from a SharePoint list via SP REST.
-        Uses only base list-item fields (no $expand) so the call works
-        on every list shape — libraries, custom lists, system catalogs,
-        galleries. The crucial fields we rely on:
 
-          * FileRef              — server-relative URL of the item or file
-          * FileLeafRef          — the file/folder leaf name (real title)
-          * FileSystemObjectType — 0=list item or file, 1=folder
-          * Title, Created, Modified, ContentTypeId
+        Thin wrapper over ``iter_sharepoint_list_items_via_rest`` for callers
+        that want the materialised list. Enterprise-scale callers (bounded
+        producer/consumer queues) should use the async iterator directly so
+        pagination streams instead of buffering the whole list in memory.
+        """
+        out: List[Dict[str, Any]] = []
+        async for row in self.iter_sharepoint_list_items_via_rest(hostname, site_web_url, list_id):
+            out.append(row)
+        return out
 
-        For file items (FileRef ends in an extension and object type == 0
-        on a library), the caller can download via
-        ``/_api/web/GetFileByServerRelativeUrl``.
+    async def iter_sharepoint_list_items_via_rest(
+        self,
+        hostname: str,
+        site_web_url: str,
+        list_id: str,
+        page_size: int = 1000,
+    ):
+        """Streaming page-by-page iterator over SP REST list items.
+
+        Why: libraries on a heavy tenant can hold millions of rows; the old
+        buffered wrapper kept every row in memory before returning. This
+        iterator yields row-by-row as pages arrive and honours 429 /
+        Retry-After so we cooperate with SP throttling instead of stampeding
+        it on restart.
         """
         token = await self._get_sharepoint_token(hostname)
         url = f"{site_web_url.rstrip('/')}/_api/web/lists(guid'{list_id}')/items"
@@ -2188,24 +2342,42 @@ class GraphClient:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json;odata=nometadata",
         }
-        params = {"$top": "1000"}
-        out: List[Dict[str, Any]] = []
+        params: Optional[Dict[str, str]] = {"$top": str(page_size)}
         next_url: Optional[str] = url
+        backoff = 1.0  # seconds; doubled per consecutive transient failure
         async with httpx.AsyncClient(timeout=120.0) as client:
             while next_url:
-                resp = await client.get(next_url, headers=headers, params=params if next_url == url else None)
+                try:
+                    resp = await client.get(
+                        next_url,
+                        headers=headers,
+                        params=params if next_url == url else None,
+                    )
+                except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
+                    if backoff > 60:
+                        print(f"[GraphClient] SP REST items transport giving up after {backoff}s: {exc}")
+                        return
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60.0)
+                    continue
+
+                if resp.status_code == 429 or resp.status_code == 503:
+                    retry_after = _parse_retry_after(resp)
+                    print(f"[GraphClient] SP REST 429/503 for list {list_id}, sleeping {retry_after:.1f}s")
+                    await asyncio.sleep(retry_after)
+                    continue  # retry same URL
                 if resp.status_code in (401, 403):
                     print(f"[GraphClient] SP REST items denied for list {list_id} ({resp.status_code}): {resp.text[:180]}")
-                    return out
+                    return
                 if resp.status_code >= 400:
                     print(f"[GraphClient] SP REST items {resp.status_code} for list {list_id}: {resp.text[:180]}")
-                    return out
+                    return
+                backoff = 1.0  # reset after a good page
                 data = resp.json()
                 for row in (data.get("value") or []):
-                    out.append(row)
+                    yield row
                 next_url = data.get("odata.nextLink") or data.get("@odata.nextLink")
                 params = None  # next_url already includes query
-        return out
 
     async def get_sharepoint_file_metadata_via_rest(self, hostname: str, site_web_url: str, server_relative_url: str) -> Optional[Dict[str, Any]]:
         """HEAD-style metadata for a SharePoint file (Length, Name,
@@ -2229,9 +2401,12 @@ class GraphClient:
                 return None
 
     async def download_sharepoint_file_via_rest(self, hostname: str, site_web_url: str, server_relative_url: str) -> bytes:
-        """Stream a SharePoint file by its server-relative URL
-        (e.g. /sites/Foo/SitePages/Home.aspx). Used for catalog/system
-        lists where Graph doesn't expose a driveItem.
+        """Buffered download of a SharePoint file by its server-relative URL.
+
+        NOTE: reads the whole body into memory — only safe for small catalog
+        entries. Enterprise-scale callers backing up real document libraries
+        should use ``stream_sharepoint_file_via_rest`` to avoid OOM on large
+        files.
         """
         token = await self._get_sharepoint_token(hostname)
         safe_path = server_relative_url.replace("'", "''")
@@ -2240,6 +2415,45 @@ class GraphClient:
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
             return resp.content
+
+    async def stream_sharepoint_file_via_rest(
+        self,
+        hostname: str,
+        site_web_url: str,
+        server_relative_url: str,
+        chunk_size: int = 1 * 1024 * 1024,
+    ):
+        """Stream a SharePoint file's bytes via SP REST ``$value`` endpoint.
+
+        Yields raw chunks so callers can pipe directly into a temp file /
+        block-blob uploader without buffering the full body. Honours 429 /
+        503 Retry-After by retrying the same URL after the indicated delay.
+        Falls through to a single retry on connection errors.
+        """
+        token = await self._get_sharepoint_token(hostname)
+        safe_path = server_relative_url.replace("'", "''")
+        url = f"{site_web_url.rstrip('/')}/_api/web/GetFileByServerRelativeUrl('{safe_path}')/$value"
+        headers = {"Authorization": f"Bearer {token}"}
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                async with httpx.AsyncClient(timeout=600.0, follow_redirects=True) as client:
+                    async with client.stream("GET", url, headers=headers) as resp:
+                        if resp.status_code in (429, 503):
+                            retry_after = _parse_retry_after(resp)
+                            print(f"[GraphClient] SP REST stream 429/503 for {server_relative_url}, sleeping {retry_after:.1f}s")
+                            await asyncio.sleep(retry_after)
+                            continue
+                        resp.raise_for_status()
+                        async for chunk in resp.aiter_bytes(chunk_size):
+                            if chunk:
+                                yield chunk
+                        return
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
+                if attempt >= 3:
+                    raise
+                await asyncio.sleep(min(2 ** attempt, 30))
 
     async def get_sharepoint_site_list_items(self, site_id: str, list_id: str, delta_token: str = None) -> Dict[str, Any]:
         """
@@ -3076,6 +3290,217 @@ class GraphClient:
         # each subtree (folder trees are usually shallow and bounded).
         await asyncio.gather(*[walk(r, "") for r in roots], return_exceptions=False)
         return tree
+
+    # Tier label → mailFolders well-known root used as the starting
+    # container for path resolution.
+    _MAIL_TIER_ROOTS = {
+        "primary": "mailFolders",
+        "archive": "mailFolders('archive')",
+        "recoverable": "mailFolders('recoverableitemsroot')",
+    }
+
+    async def ensure_mail_folder_path(
+        self,
+        user_id: str,
+        tier: str,
+        path: str,
+    ) -> Optional[str]:
+        """Resolve or create a `/Segment1/Segment2/...` path under the
+        given mailbox tier; return the final folder id. Caches hits for
+        the lifetime of this GraphClient instance.
+
+        Returns None when the tier root itself isn't provisioned on the
+        target mailbox (404 on the first hop). Caller must handle.
+
+        `tier` ∈ {"primary", "archive", "recoverable"}. Unknown tiers
+        fall back to primary so callers that lose the tier label still
+        restore somewhere useful.
+        """
+        if not hasattr(self, "_mail_folder_path_cache") or self._mail_folder_path_cache is None:
+            self._mail_folder_path_cache = {}
+        cache_key = (user_id, tier, path)
+        cached = self._mail_folder_path_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        root_segment = self._MAIL_TIER_ROOTS.get(tier, self._MAIL_TIER_ROOTS["primary"])
+        segments = [s for s in (path or "").split("/") if s]
+        if not segments:
+            # Empty path → return the tier root's id by fetching the
+            # well-known folder descriptor. Cache on its own key.
+            try:
+                resp = await self._get(f"{self.GRAPH_URL}/users/{user_id}/{root_segment}")
+                root_id = resp.get("id") if isinstance(resp, dict) else None
+            except Exception:
+                return None
+            self._mail_folder_path_cache[cache_key] = root_id
+            return root_id
+
+        # Walk segments: at each step look up the child by displayName
+        # under the current parent; create if missing.
+        # For primary tier the root is mailFolders (top-level list endpoint).
+        # For other tiers (archive, recoverable) we need to append /childFolders
+        # to the well-known folder path to list its children.
+        if tier == "primary" or tier not in self._MAIL_TIER_ROOTS:
+            root_list_path = f"/users/{user_id}/{root_segment}"
+        else:
+            root_list_path = f"/users/{user_id}/{root_segment}/childFolders"
+        parent_id: Optional[str] = None
+        for i, name in enumerate(segments):
+            if parent_id is None:
+                lookup_url = f"{self.GRAPH_URL}{root_list_path}"
+            else:
+                lookup_url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{parent_id}/childFolders"
+            # $filter on displayName; Graph matches exactly (case-sensitive).
+            safe_name = name.replace("'", "''")
+            list_url = f"{lookup_url}?$filter=displayName eq '{safe_name}'&$top=1"
+            try:
+                resp = await self._get(list_url)
+            except Exception:
+                return None
+            values = resp.get("value", []) if isinstance(resp, dict) else []
+            if values:
+                parent_id = values[0].get("id")
+            else:
+                # Create under the current parent.
+                create_url = (
+                    f"{self.GRAPH_URL}/users/{user_id}/{root_segment}/childFolders"
+                    if parent_id is None
+                    else f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{parent_id}/childFolders"
+                )
+                created = await self._post(create_url, {"displayName": name})
+                parent_id = created.get("id") if isinstance(created, dict) else None
+                if parent_id is None:
+                    return None
+            # Cache incremental paths so partial overlaps of future calls
+            # get free hits (e.g. /Inbox/A then /Inbox/B).
+            partial = "/" + "/".join(segments[: i + 1])
+            self._mail_folder_path_cache[(user_id, tier, partial)] = parent_id
+        return parent_id
+
+    async def list_folder_internet_message_ids(
+        self,
+        user_id: str,
+        folder_id: str,
+    ) -> Dict[str, str]:
+        """Return `{internetMessageId → graphMessageId}` for every
+        message currently in the folder. Used as the dedup sieve for
+        overwrite-mode restores: if an IMID matches, we PATCH the
+        existing message instead of creating a duplicate.
+
+        Follows @odata.nextLink; skips rows with no internetMessageId.
+        """
+        out: Dict[str, str] = {}
+        url = (
+            f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{folder_id}/messages"
+            f"?$select=id,internetMessageId&$top=1000"
+        )
+        while url:
+            resp = await self._get(url)
+            if not isinstance(resp, dict):
+                break
+            for row in resp.get("value", []) or []:
+                imid = row.get("internetMessageId")
+                gid = row.get("id")
+                if imid and gid:
+                    out[imid] = gid
+            url = resp.get("@odata.nextLink")
+        return out
+
+    async def create_message_in_folder(
+        self,
+        user_id: str,
+        folder_id: str,
+        payload: Dict[str, Any],
+    ) -> Optional[str]:
+        """Create a message inside a specific folder. Returns the new
+        Graph message id, or None if the response didn't include one."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{folder_id}/messages"
+        resp = await self._post(url, payload)
+        return resp.get("id") if isinstance(resp, dict) else None
+
+    # Fields AFI patches on an already-existing matched message. Body,
+    # recipients, subject, and dates are immutable per Graph and AFI
+    # does not attempt them.
+    _PATCHABLE_FIELDS = ("isRead", "flag", "importance", "categories")
+
+    async def patch_message_metadata(
+        self,
+        user_id: str,
+        message_id: str,
+        snapshot_raw: Dict[str, Any],
+    ) -> None:
+        """PATCH mutable metadata from a snapshot payload onto an
+        already-existing message. Silently drops any fields outside the
+        `_PATCHABLE_FIELDS` whitelist."""
+        patch: Dict[str, Any] = {}
+        for field in self._PATCHABLE_FIELDS:
+            if field in snapshot_raw:
+                patch[field] = snapshot_raw[field]
+        if not patch:
+            return
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}"
+        await self._patch(url, patch)
+
+    async def post_small_attachment(
+        self,
+        user_id: str,
+        message_id: str,
+        attachment_payload: Dict[str, Any],
+    ) -> None:
+        """Single POST for attachments < MAIL_RESTORE_ATTACH_LARGE_MB.
+        `attachment_payload` must already carry the `@odata.type`
+        discriminator and `contentBytes` (base64) for fileAttachment or
+        `item` for itemAttachment. Caller shapes the payload."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}/attachments"
+        await self._post(url, attachment_payload)
+
+    async def upload_large_attachment(
+        self,
+        user_id: str,
+        message_id: str,
+        name: str,
+        size: int,
+        content_bytes: bytes,
+        content_type: Optional[str] = None,
+        is_inline: bool = False,
+    ) -> None:
+        """Chunked upload for attachments >= MAIL_RESTORE_ATTACH_LARGE_MB
+        using Graph's uploadSession endpoint."""
+        create_url = (
+            f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}"
+            f"/attachments/createUploadSession"
+        )
+        session = await self._post(create_url, {
+            "AttachmentItem": {
+                "attachmentType": "file",
+                "name": name,
+                "size": size,
+                "contentType": content_type or "application/octet-stream",
+                "isInline": is_inline,
+            }
+        })
+        upload_url = session.get("uploadUrl") if isinstance(session, dict) else None
+        if not upload_url:
+            raise RuntimeError("uploadSession: Graph did not return uploadUrl")
+
+        chunk_size = 4 * 1024 * 1024  # 4 MiB per Microsoft's guidance.
+        total = len(content_bytes)
+        async with httpx.AsyncClient(timeout=120) as client:
+            start = 0
+            while start < total:
+                end = min(start + chunk_size, total) - 1
+                chunk = content_bytes[start:end + 1]
+                headers = {
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {start}-{end}/{total}",
+                }
+                r = await client.put(upload_url, content=chunk, headers=headers)
+                if r.status_code not in (200, 201, 202):
+                    raise RuntimeError(
+                        f"uploadSession chunk failed at {start}-{end}: HTTP {r.status_code}"
+                    )
+                start = end + 1
 
     async def list_messages_in_folder(
         self, user_id: str, folder_id: str, top: int = 999,

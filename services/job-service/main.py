@@ -688,6 +688,12 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         "azureRestoreMode": request.get("azureRestoreMode"),
         # Optional folder filter for USER_CONTACT exports. Empty/missing = all.
         "contactFolders": request.get("contactFolders"),
+        # SharePoint "Recover to new site" mode: restore-worker provisions a
+        # fresh Communication Site before replaying files. Alias / owner are
+        # optional — restore-worker falls back to sensible defaults.
+        "newSiteName": request.get("newSiteName"),
+        "newSiteAlias": request.get("newSiteAlias"),
+        "newSiteOwnerEmail": request.get("newSiteOwnerEmail"),
     }
 
     # Fetch tenant/resource info — try snapshot first, then fall back to item lookup.
@@ -902,6 +908,97 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
         pass
 
     return {"jobId": str(job.id)}
+
+
+@app.post("/api/v1/sharepoint/{resource_id}/download")
+async def sharepoint_download(resource_id: str, request: dict, db: AsyncSession = Depends(get_db)):
+    """Queue a SharePoint download job for one of three scopes.
+
+    Request body:
+      * ``scope``: ``"site"`` | ``"folder"`` | ``"file"``
+      * ``snapshotId``: required for ``site`` — the snapshot to export.
+      * ``folderPath``: required for ``folder`` — restore-worker selects
+        every SnapshotItem whose folder_path starts with this value.
+      * ``itemId``: required for ``file`` — single SnapshotItem id.
+
+    Translates the scope to the existing export pipeline:
+      * ``site``  → snapshotIds=[snap], preserveTree=true, format=ZIP
+      * ``folder``→ itemIds=[items under folder], preserveTree=true, format=ZIP
+      * ``file``  → itemIds=[one], preserveTree=false, format=ORIGINAL
+        (``download_export_zip`` streams the raw blob with the original
+        content-type via ``output_mode=raw_single``)
+
+    Returns ``{jobId}``; poll ``/api/v1/jobs/export/{jobId}/status`` and
+    then GET ``/api/v1/jobs/export/{jobId}/download`` to pull the bytes.
+    """
+    scope = (request.get("scope") or "").lower()
+    if scope not in ("site", "folder", "file"):
+        raise HTTPException(status_code=400, detail="scope must be site, folder, or file")
+
+    resource = await db.get(Resource, UUID(resource_id))
+    if not resource:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+    if resource_type != "SHAREPOINT":
+        raise HTTPException(status_code=400, detail=f"Resource is not SharePoint (got {resource_type})")
+
+    snapshot_ids: List[str] = []
+    item_ids: List[str] = []
+    preserve_tree = True
+    export_format = "ZIP"
+
+    if scope == "site":
+        snap_id = request.get("snapshotId")
+        if not snap_id:
+            # Pick the latest completed snapshot for the site.
+            stmt = select(Snapshot).where(Snapshot.resource_id == resource.id).order_by(Snapshot.created_at.desc()).limit(1)
+            latest = (await db.execute(stmt)).scalar_one_or_none()
+            if not latest:
+                raise HTTPException(status_code=404, detail="No snapshot found for SharePoint site")
+            snap_id = str(latest.id)
+        snapshot_ids = [snap_id]
+
+    elif scope == "folder":
+        folder_path = request.get("folderPath")
+        snap_id = request.get("snapshotId")
+        if not folder_path:
+            raise HTTPException(status_code=400, detail="folderPath required for scope=folder")
+        stmt = select(SnapshotItem).where(
+            SnapshotItem.folder_path.startswith(folder_path),
+        )
+        if snap_id:
+            stmt = stmt.where(SnapshotItem.snapshot_id == UUID(snap_id))
+        else:
+            # Restrict to snapshots of this resource so a bare folderPath
+            # can't bleed across sites.
+            sub = select(Snapshot.id).where(Snapshot.resource_id == resource.id)
+            stmt = stmt.where(SnapshotItem.snapshot_id.in_(sub))
+        items = (await db.execute(stmt)).scalars().all()
+        if not items:
+            raise HTTPException(status_code=404, detail=f"No items under folder {folder_path!r}")
+        item_ids = [str(i.id) for i in items]
+        # preserveTree stays True — a folder download must keep the tree even
+        # if the folder happens to have a single file inside.
+
+    else:  # scope == "file"
+        item_id = request.get("itemId")
+        if not item_id:
+            raise HTTPException(status_code=400, detail="itemId required for scope=file")
+        item_ids = [item_id]
+        preserve_tree = False
+        export_format = "ORIGINAL"
+
+    # Reuse the existing export pipeline — same audit, same worker path,
+    # same download endpoint — so this wrapper doesn't duplicate plumbing.
+    body = {
+        "restoreType": "EXPORT_ZIP",
+        "snapshotIds": snapshot_ids,
+        "itemIds": item_ids,
+        "preserveTree": preserve_tree,
+        "exportFormat": export_format,
+        "scope": scope,
+    }
+    return await trigger_export(body, db)
 
 
 @app.get("/api/v1/jobs/export/{job_id}/status")

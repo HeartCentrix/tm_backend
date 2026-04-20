@@ -2514,9 +2514,23 @@ class BackupWorker:
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
                     delta_token = (resource.extra_data or {}).get("mail_delta_token")
-                    
+
                     messages = await graph_client.get_messages_delta(resource.external_id, delta_token)
                     items = messages.get("value", [])
+
+                    # Resolve parentFolderId → full hierarchical path (e.g.
+                    # "/Inbox/Project X") once per mailbox. MAILBOX /
+                    # SHARED_MAILBOX / ROOM_MAILBOX all come through here;
+                    # without this the left-panel folder list collapses to a
+                    # single "All" bucket because parentFolderName isn't a
+                    # real Graph field.
+                    folder_tree: Dict[str, str] = {}
+                    try:
+                        folder_tree = await graph_client.get_mail_folder_tree(resource.external_id)
+                    except Exception as e:
+                        print(f"[{self.worker_id}] [MAILBOX] folder tree fetch failed for {resource.external_id}: {type(e).__name__}: {e}")
+                    for m in items:
+                        m["_full_folder_path"] = folder_tree.get(m.get("parentFolderId", ""), "")
 
                     # Process ALL messages in parallel batches — complete backup
                     batch_tasks = [
@@ -2586,7 +2600,9 @@ class BackupWorker:
                     snapshot_id=snapshot.id, tenant_id=tenant.id,
                     external_id=msg_id, item_type="EMAIL",
                     name=msg.get("subject", msg_id),
-                    folder_path=msg.get("parentFolderName"),
+                    # Full hierarchical path resolved in
+                    # _backup_mailboxes_parallel via the folder tree.
+                    folder_path=msg.get("_full_folder_path") or None,
                     content_hash=content_hash, content_size=len(content_bytes),
                     blob_path=blob_path, extra_data={"raw": msg}, content_checksum=content_hash,
                 ))
@@ -5756,23 +5772,31 @@ class BackupWorker:
 
     async def backup_sharepoint(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                                 tenant: Tenant, message: Dict) -> Dict:
-        """Backup a single SharePoint site"""
+        """Backup a single SharePoint site at enterprise scale.
+
+        Design notes (see docs — SharePoint v2 bounded-queue backup):
+          * Bounded ``asyncio.Queue`` between streaming producers (delta-API +
+            SP REST list iterators) and a consumer pool. Producers block on
+            queue backpressure → constant memory regardless of site size
+            (works on million-file libraries without OOM).
+          * Drive-item consumers call ``backup_single_file`` which already
+            enforces ``self.backup_semaphore`` (NIC cap 8) and does Range-
+            resume streaming, sha256, eTag idempotency, per-file versions,
+            and inline ACL capture. No per-list row cap, no per-item byte
+            cap — scale is bounded by queue size, not memory.
+          * SP REST list-row consumers use a separate (smaller) pool because
+            SP REST throttles far more aggressively than Graph. The iterator
+            itself honours 429 / Retry-After so the worker never hot-spins
+            on a throttled list.
+        """
         print(f"[{self.worker_id}] [SHAREPOINT START] {resource.display_name} (site: {resource.external_id})")
 
         delta_token = (resource.extra_data or {}).get("delta_token")
         subsite_delta_tokens = ((resource.extra_data or {}).get("subsite_delta_tokens") or {}).copy()
 
-        async def fetch_site_items(site_id: str, site_label: str, site_delta_token: Optional[str]) -> tuple[List[Dict[str, Any]], Optional[str], str]:
-            files = await graph_client.get_sharepoint_site_drives(site_id, site_delta_token)
-            items = files.get("value", [])
-            for item in items:
-                item["_site_label"] = site_label
-            return items, files.get("@odata.deltaLink"), site_id
-
         site_targets: List[tuple[str, str, Optional[str]]] = [
             (resource.external_id, resource.display_name, delta_token)
         ]
-
         try:
             subsites = await graph_client.get_sharepoint_subsites(resource.external_id)
             for subsite in subsites.get("value", []):
@@ -5787,293 +5811,426 @@ class BackupWorker:
         except Exception as exc:
             logger.warning("Failed to enumerate SharePoint subsites for %s: %s", resource.display_name, exc)
 
-        print(f"[{self.worker_id}]   [SP_FILES] Fetching drive items for {len(site_targets)} site targets (root + subsites)...")
-        site_results = await asyncio.gather(
-            *[fetch_site_items(site_id, site_label, token) for site_id, site_label, token in site_targets],
-            return_exceptions=True,
-        )
-
-        items: List[Dict[str, Any]] = []
-        new_delta = None
-        new_subsite_tokens: Dict[str, str] = {}
-        for result in site_results:
-            if isinstance(result, Exception):
-                logger.warning("SharePoint site target fetch failed for %s: %s", resource.display_name, result)
-                continue
-            site_items, site_delta_link, site_id = result
-            items.extend(site_items)
-            if site_id == resource.external_id:
-                new_delta = site_delta_link
-            elif site_delta_link:
-                new_subsite_tokens[site_id] = site_delta_link
-
-        print(f"[{self.worker_id}]   [SP_FILES] Found {len(items)} site files across root and subsites")
-
-        # SLA exclusions — filter before upload
+        # SLA exclusions — applied in the producer so excluded items never
+        # reach the queue (saves memory + Graph/SP REST bandwidth).
         policy = await self.get_sla_policy(resource, message)
         exclusions = await self.get_policy_exclusions(policy.id) if policy else []
-        if exclusions:
-            before = len(items)
-            items = [f for f in items if not self._item_is_excluded("FILE", f, exclusions)]
-            excluded = before - len(items)
-            if excluded:
-                print(f"[{self.worker_id}]   [SP_FILES] Excluded {excluded}/{before} by SLA policy rules")
 
-        file_tasks = [
-            self.backup_single_file(resource, tenant, snapshot, f, graph_client, None)
-            for f in items
-        ]
-        file_results = await asyncio.gather(*file_tasks, return_exceptions=True)
-
-        total_items = sum(1 for r in file_results if isinstance(r, dict) and r.get("success"))
-        total_bytes = sum(r.get("size", 0) for r in file_results if isinstance(r, dict))
-        failed = sum(1 for r in file_results if isinstance(r, Exception) or (isinstance(r, dict) and not r.get("success")))
-
-        # Log per-file failures for debugging
-        for r in file_results:
-            if isinstance(r, Exception):
-                print(f"[{self.worker_id}]   [SP_FILE FAIL] unknown: {type(r).__name__}: {r}")
-            elif isinstance(r, dict) and not r.get("success"):
-                print(f"[{self.worker_id}]   [SP_FILE FAIL] {r.get('file_name','?')}: "
-                      f"method={r.get('method','?')} reason={r.get('reason','no reason')}")
-
-        print(f"[{self.worker_id}]   [SP_FILES] Done — {total_items} uploaded, {failed} failed, {total_bytes} bytes")
-
-        # -----------------------------------------------------------------
-        # SharePoint LISTS pass — libraries, system catalogs, and custom
-        # lists on the site. Drive-items above only cover files in the
-        # default document library; lists like Site Pages, Events,
-        # _catalogs/masterpage, User Information List, TaxonomyHiddenList,
-        # etc. live at /sites/{id}/lists and are invisible to the drive
-        # API. We capture each list as a metadata SnapshotItem so the
-        # Recovery UI can surface the full site inventory.
-        # -----------------------------------------------------------------
-        # Per-list caps to protect against pathological system lists
-        # (e.g. User Information List can hold tens of thousands of rows).
-        PER_LIST_ROW_CAP = 500
-        PER_ITEM_BYTE_CAP = 25 * 1024 * 1024  # 25 MB per single file
-        list_rows_persisted = 0
-        list_files_persisted = 0
-        list_files_bytes = 0
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
-        container = azure_storage_manager.get_container_name(str(tenant.id), "sharepoint")
-        try:
-            for site_id, site_label, _tok in site_targets:
-                try:
-                    lists_resp = await graph_client.get_sharepoint_site_lists(site_id)
-                except Exception as exc:
-                    logger.warning("Failed to fetch lists for site %s: %s", site_id, exc)
-                    continue
+        sp_container = azure_storage_manager.get_container_name(str(tenant.id), "sharepoint")
 
-                # Derive hostname + root web URL once per site so SP REST
-                # calls can hit the right tenant (e.g. "qfion.sharepoint.com"
-                # + "https://qfion.sharepoint.com/sites/Foo"). We pick these
-                # up from any list's webUrl — they all share the same host
-                # and site path.
-                sp_hostname: Optional[str] = None
-                sp_site_web_url: Optional[str] = None
-                for _l in (lists_resp.get("value") or []):
-                    _wu = _l.get("webUrl") or ""
-                    if _wu:
-                        from urllib.parse import urlparse as _up
-                        _p = _up(_wu)
-                        sp_hostname = _p.netloc
-                        _parts = _p.path.strip("/").split("/")
-                        if len(_parts) >= 2 and _parts[0] == "sites":
-                            sp_site_web_url = f"{_p.scheme}://{_p.netloc}/sites/{_parts[1]}"
-                        else:
-                            sp_site_web_url = f"{_p.scheme}://{_p.netloc}"
-                        break
+        # Bounded queues — size tuned so 8 streaming consumers never starve
+        # but producers can't stampede ahead by more than a few thousand
+        # items. At 2048 × ~2KB per drive-item dict that's ~4 MB peak.
+        drive_queue: asyncio.Queue = asyncio.Queue(maxsize=2048)
+        rest_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
 
-                for lst in (lists_resp.get("value") or []):
-                  try:
-                    lst_id = lst.get("id") or ""
-                    if not lst_id:
+        stats = {
+            "drive_ok": 0, "drive_bytes": 0, "drive_fail": 0, "drive_excluded": 0,
+            "rest_rows": 0, "rest_files_ok": 0, "rest_bytes": 0, "rest_fail": 0,
+            "list_folders": 0,
+            "new_delta": None,
+            "new_subsite_tokens": {},
+        }
+
+        # --- Producers ----------------------------------------------------
+        async def drive_producer(site_id: str, site_label: str, site_delta_token: Optional[str]):
+            delta_holder: Dict[str, Optional[str]] = {"deltaLink": None}
+            try:
+                async for item in graph_client.iter_sharepoint_site_drive_items(
+                    site_id, site_delta_token, delta_holder,
+                ):
+                    item["_site_label"] = site_label
+                    if exclusions and self._item_is_excluded("FILE", item, exclusions):
+                        stats["drive_excluded"] += 1
                         continue
-                    display = lst.get("displayName") or lst.get("name") or lst_id
-                    list_meta = lst.get("list") or {}
-                    list_folder_path = f"{site_label}/lists/{display}"
-                    is_library = str(list_meta.get("template") or "").lower() in ("documentlibrary", "masterpagecatalog", "webtemplatecatalog", "webpartcatalog", "themecatalog", "solutioncatalog")
+                    await drive_queue.put(item)
+            except Exception as exc:
+                logger.warning("SharePoint drive producer %s failed: %s", site_label, exc)
+            finally:
+                delta_link = delta_holder.get("deltaLink")
+                if delta_link:
+                    if site_id == resource.external_id:
+                        stats["new_delta"] = delta_link
+                    else:
+                        stats["new_subsite_tokens"][site_id] = delta_link
 
-                    # 1) Persist the list itself as a folder row so the
-                    #    Recovery UI has a container to show items under.
-                    list_row = SnapshotItem(
-                        id=uuid.uuid4(),
-                        snapshot_id=snapshot.id,
-                        tenant_id=tenant.id,
-                        external_id=lst_id,
-                        item_type="SHAREPOINT_LIST",
-                        name=display[:255],
-                        folder_path=f"{site_label}/lists",
-                        content_size=0,
-                        content_hash=None,
-                        content_checksum=None,
-                        extra_data={
-                            "raw": lst,
-                            "site_id": site_id,
-                            "site_label": site_label,
-                            "template": list_meta.get("template"),
-                            "system": bool(lst.get("system")) or bool(list_meta.get("hidden")),
-                            "hidden": bool(list_meta.get("hidden")),
-                            "is_catalog": "_catalogs" in (lst.get("webUrl") or ""),
-                            "is_library": is_library,
-                            "web_url": lst.get("webUrl"),
-                            "last_modified": lst.get("lastModifiedDateTime"),
-                        },
-                    )
+        async def list_producer(site_id: str, site_label: str):
+            try:
+                lists_resp = await graph_client.get_sharepoint_site_lists(site_id)
+            except Exception as exc:
+                logger.warning("Failed to fetch lists for site %s: %s", site_id, exc)
+                return
+
+            # Derive hostname + site web URL once — every list on the site
+            # shares the same tenant host / site path.
+            sp_hostname: Optional[str] = None
+            sp_site_web_url: Optional[str] = None
+            for _l in (lists_resp.get("value") or []):
+                _wu = _l.get("webUrl") or ""
+                if _wu:
+                    from urllib.parse import urlparse as _up
+                    _p = _up(_wu)
+                    sp_hostname = _p.netloc
+                    _parts = _p.path.strip("/").split("/")
+                    if len(_parts) >= 2 and _parts[0] == "sites":
+                        sp_site_web_url = f"{_p.scheme}://{_p.netloc}/sites/{_parts[1]}"
+                    else:
+                        sp_site_web_url = f"{_p.scheme}://{_p.netloc}"
+                    break
+
+            for lst in (lists_resp.get("value") or []):
+                lst_id = lst.get("id") or ""
+                if not lst_id:
+                    continue
+                display = lst.get("displayName") or lst.get("name") or lst_id
+                list_meta = lst.get("list") or {}
+                is_library = str(list_meta.get("template") or "").lower() in (
+                    "documentlibrary", "masterpagecatalog", "webtemplatecatalog",
+                    "webpartcatalog", "themecatalog", "solutioncatalog",
+                )
+
+                # Persist the list folder row immediately (small, bounded by
+                # list count — not file count).
+                list_row = SnapshotItem(
+                    id=uuid.uuid4(),
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    external_id=lst_id,
+                    item_type="SHAREPOINT_LIST",
+                    name=display[:255],
+                    folder_path=f"{site_label}/lists",
+                    content_size=0,
+                    content_hash=None,
+                    content_checksum=None,
+                    extra_data={
+                        "raw": lst,
+                        "site_id": site_id,
+                        "site_label": site_label,
+                        "template": list_meta.get("template"),
+                        "system": bool(lst.get("system")) or bool(list_meta.get("hidden")),
+                        "hidden": bool(list_meta.get("hidden")),
+                        "is_catalog": "_catalogs" in (lst.get("webUrl") or ""),
+                        "is_library": is_library,
+                        "web_url": lst.get("webUrl"),
+                        "last_modified": lst.get("lastModifiedDateTime"),
+                    },
+                )
+                try:
                     async with async_session_factory() as sess:
                         sess.add(list_row)
                         await sess.commit()
-                    list_rows_persisted += 1
+                    stats["list_folders"] += 1
+                except Exception as exc:
+                    logger.warning("list-folder persist failed for %s/%s: %s", site_label, display, exc)
 
-                    # 2) Walk items inside the list via SP REST —
-                    #    gives us real File metadata (ServerRelativeUrl,
-                    #    Length, Name) for every catalog that Graph hides.
-                    if not (sp_hostname and sp_site_web_url):
-                        logger.warning("Cannot derive SP site URL for %s, skipping items", site_label)
-                        continue
-                    try:
-                        raw_items = await graph_client.get_sharepoint_list_items_via_rest(
-                            sp_hostname, sp_site_web_url, lst_id,
-                        )
-                    except Exception as exc:
-                        logger.warning("SP REST items failed for list %s/%s: %s", site_label, display, exc)
-                        continue
-
-                    if len(raw_items) > PER_LIST_ROW_CAP:
-                        print(f"[{self.worker_id}]   [SP_LIST_ITEMS] {site_label}/{display}: {len(raw_items)} rows, capping to {PER_LIST_ROW_CAP}")
-                        raw_items = raw_items[:PER_LIST_ROW_CAP]
-
-                    batch_rows: List[SnapshotItem] = []
-                    for it in raw_items:
-                        it_id = str(it.get("Id") or it.get("ID") or "")
-                        if not it_id:
-                            continue
-                        srv_rel = it.get("FileRef") or ""
-                        leaf = it.get("FileLeafRef") or ""
-                        obj_type = int(it.get("FileSystemObjectType") or 0)
-                        is_folder = (obj_type == 1)
-                        name = leaf or it.get("Title") or (srv_rel.rsplit("/", 1)[-1] if srv_rel else f"Item-{it_id}")
-
-                        # Nest the folder_path by the item's own server-relative
-                        # path so the Recovery tree mirrors the real site layout.
-                        # e.g. "Communication site/lists/Site Pages/Home.aspx"
-                        if srv_rel:
-                            trail = srv_rel.lstrip("/")
-                            # Strip the /sites/<Name>/ prefix if present — site_label
-                            # already covers that scope.
-                            parts = trail.split("/")
-                            if len(parts) >= 2 and parts[0] == "sites":
-                                parts = parts[2:]
-                            # Drop the leaf (file/folder itself) from the path.
-                            path_parts = parts[:-1] if len(parts) > 1 else []
-                            item_folder_path = f"{site_label}/lists/{display}"
-                            if path_parts:
-                                item_folder_path += "/" + "/".join(path_parts)
-                        else:
-                            item_folder_path = list_folder_path
-
-                        blob_path: Optional[str] = None
-                        content_hash: Optional[str] = None
-                        downloaded_bytes = 0
-                        size = 0
-                        file_info: Optional[Dict[str, Any]] = None
-
-                        # Decide if this row is a real file by probing
-                        # SharePoint's /GetFileByServerRelativeUrl endpoint
-                        # — returns 200 + Length for files, 404/400 for
-                        # plain list rows or folders.
-                        if srv_rel and not is_folder:
-                            file_info = await graph_client.get_sharepoint_file_metadata_via_rest(
-                                sp_hostname, sp_site_web_url, srv_rel,
-                            )
-                            if file_info:
-                                size = int(file_info.get("Length") or 0)
-
-                        if file_info and size > 0 and size <= PER_ITEM_BYTE_CAP:
-                            try:
-                                content_bytes = await graph_client.download_sharepoint_file_via_rest(
-                                    sp_hostname, sp_site_web_url, srv_rel,
-                                )
-                                if content_bytes:
-                                    content_hash = hashlib.sha256(content_bytes).hexdigest()
-                                    blob_path = azure_storage_manager.build_blob_path(
-                                        str(tenant.id), str(resource.id), str(snapshot.id),
-                                        f"splist_{lst_id}_{it_id}_{name}",
-                                    )
-                                    upload_result = await upload_blob_with_retry(
-                                        container, blob_path, content_bytes, shard, max_retries=3,
-                                    )
-                                    if not (isinstance(upload_result, dict) and upload_result.get("success")):
-                                        blob_path = None
-                                    else:
-                                        downloaded_bytes = len(content_bytes)
-                            except Exception as exc:
-                                print(f"[{self.worker_id}]   [SP_LIST_ITEM FAIL] {site_label}/{display}/{name}: {type(exc).__name__}: {exc}")
-                                blob_path = None
-
-                        batch_rows.append(SnapshotItem(
-                            id=uuid.uuid4(),
-                            snapshot_id=snapshot.id,
-                            tenant_id=tenant.id,
-                            external_id=f"{lst_id}:{it_id}",
-                            item_type=(
-                                "SHAREPOINT_FILE" if blob_path
-                                else ("SHAREPOINT_FOLDER" if is_folder else "SHAREPOINT_LIST_ITEM")
-                            ),
-                            name=str(name)[:255],
-                            folder_path=item_folder_path,
-                            content_size=downloaded_bytes if blob_path else size,
-                            content_hash=content_hash,
-                            content_checksum=None,
-                            blob_path=blob_path,
-                            extra_data={
-                                "list_id": lst_id,
-                                "list_name": display,
-                                "site_id": site_id,
-                                "site_label": site_label,
-                                "server_relative_url": srv_rel,
-                                "file": file_info,
-                                "is_folder": is_folder,
-                                "title": it.get("Title"),
-                                "created": it.get("Created") or (file_info or {}).get("TimeCreated"),
-                                "modified": it.get("Modified") or (file_info or {}).get("TimeLastModified"),
-                                "version": (file_info or {}).get("UIVersionLabel"),
-                                "source": "sp_rest",
-                            },
-                        ))
-                        if blob_path:
-                            list_files_persisted += 1
-                            list_files_bytes += downloaded_bytes
-
-                    if batch_rows:
-                        async with async_session_factory() as sess:
-                            sess.add_all(batch_rows)
-                            await sess.commit()
-                        list_rows_persisted += len(batch_rows)
-                  except Exception as list_exc:
-                    logger.warning("SP list capture failed for %s on %s: %s", lst.get("displayName") or lst.get("name") or lst.get("id"), site_label, list_exc)
+                if is_library:
+                    # Library files are already picked up by the drive
+                    # producer — re-enqueueing them via SP REST would
+                    # duplicate bytes and double the Graph/SP REST cost.
+                    continue
+                if not (sp_hostname and sp_site_web_url):
+                    logger.warning("Cannot derive SP site URL for %s, skipping list items", site_label)
                     continue
 
-            print(f"[{self.worker_id}]   [SP_LISTS] Persisted {list_rows_persisted} rows, downloaded {list_files_persisted} files ({list_files_bytes} bytes) across {len(site_targets)} site target(s)")
-        except Exception as exc:
-            logger.warning("SP lists capture failed for %s: %s", resource.display_name, exc)
+                try:
+                    async for row in graph_client.iter_sharepoint_list_items_via_rest(
+                        sp_hostname, sp_site_web_url, lst_id,
+                    ):
+                        await rest_queue.put({
+                            "row": row,
+                            "lst_id": lst_id,
+                            "list_display": display,
+                            "site_id": site_id,
+                            "site_label": site_label,
+                            "sp_hostname": sp_hostname,
+                            "sp_site_web_url": sp_site_web_url,
+                        })
+                except Exception as exc:
+                    logger.warning("SP REST stream failed for list %s/%s: %s", site_label, display, exc)
 
-        total_items += list_rows_persisted
-        total_bytes += list_files_bytes
+        # --- Consumers ----------------------------------------------------
+        async def drive_consumer():
+            while True:
+                item = await drive_queue.get()
+                try:
+                    if item is None:
+                        return
+                    try:
+                        r = await self.backup_single_file(
+                            resource, tenant, snapshot, item, graph_client, None,
+                        )
+                    except Exception as exc:
+                        stats["drive_fail"] += 1
+                        print(f"[{self.worker_id}]   [SP_FILE FAIL] {item.get('name','?')}: "
+                              f"{type(exc).__name__}: {exc}")
+                        continue
+                    if isinstance(r, dict):
+                        if r.get("success"):
+                            stats["drive_ok"] += 1
+                            stats["drive_bytes"] += r.get("size", 0)
+                        else:
+                            stats["drive_fail"] += 1
+                            print(f"[{self.worker_id}]   [SP_FILE FAIL] "
+                                  f"{r.get('file_name','?')}: method={r.get('method','?')} "
+                                  f"reason={r.get('reason','no reason')}")
+                finally:
+                    drive_queue.task_done()
 
-        if new_subsite_tokens:
+        async def rest_consumer():
+            while True:
+                work = await rest_queue.get()
+                try:
+                    if work is None:
+                        return
+                    try:
+                        await self._backup_sp_rest_row(
+                            resource=resource,
+                            tenant=tenant,
+                            snapshot=snapshot,
+                            graph_client=graph_client,
+                            shard=shard,
+                            container=sp_container,
+                            work=work,
+                            stats=stats,
+                        )
+                    except Exception as exc:
+                        stats["rest_fail"] += 1
+                        print(f"[{self.worker_id}]   [SP_LIST_ITEM FAIL] "
+                              f"{work.get('site_label','?')}/{work.get('list_display','?')}: "
+                              f"{type(exc).__name__}: {exc}")
+                finally:
+                    rest_queue.task_done()
+
+        # --- Orchestrate --------------------------------------------------
+        # Drive consumers: big pool — each one blocks on self.backup_semaphore
+        # (NIC cap 8) internally so we can safely dispatch settings.BACKUP_CONCURRENCY
+        # workers without saturating the network.
+        num_drive_consumers = max(1, min(settings.BACKUP_CONCURRENCY, 128))
+        # REST consumers: small pool — SP REST throttles aggressively; 8 is a
+        # safe upper bound observed across large tenants.
+        num_rest_consumers = 8
+
+        drive_consumer_tasks = [
+            asyncio.create_task(drive_consumer()) for _ in range(num_drive_consumers)
+        ]
+        rest_consumer_tasks = [
+            asyncio.create_task(rest_consumer()) for _ in range(num_rest_consumers)
+        ]
+
+        producer_tasks = []
+        for sid, slabel, stok in site_targets:
+            producer_tasks.append(asyncio.create_task(drive_producer(sid, slabel, stok)))
+            producer_tasks.append(asyncio.create_task(list_producer(sid, slabel)))
+
+        print(f"[{self.worker_id}]   [SP_PIPELINE] producers={len(producer_tasks)} "
+              f"drive_consumers={num_drive_consumers} rest_consumers={num_rest_consumers}")
+
+        # Wait for all producers to finish pushing.
+        await asyncio.gather(*producer_tasks, return_exceptions=True)
+
+        # Drain queues (consumers still running).
+        await drive_queue.join()
+        await rest_queue.join()
+
+        # Poison pills — one per consumer.
+        for _ in range(num_drive_consumers):
+            await drive_queue.put(None)
+        for _ in range(num_rest_consumers):
+            await rest_queue.put(None)
+        await asyncio.gather(*drive_consumer_tasks, *rest_consumer_tasks, return_exceptions=True)
+
+        total_items = stats["drive_ok"] + stats["list_folders"] + stats["rest_rows"]
+        total_bytes = stats["drive_bytes"] + stats["rest_bytes"]
+
+        print(f"[{self.worker_id}]   [SP_FILES] {stats['drive_ok']} uploaded, "
+              f"{stats['drive_fail']} failed, {stats['drive_excluded']} excluded, "
+              f"{stats['drive_bytes']} bytes")
+        print(f"[{self.worker_id}]   [SP_LISTS] {stats['list_folders']} lists, "
+              f"{stats['rest_rows']} rows processed, {stats['rest_files_ok']} files "
+              f"({stats['rest_bytes']} bytes), {stats['rest_fail']} failed")
+
+        if stats["new_subsite_tokens"]:
             async with async_session_factory() as sess:
                 r = await sess.get(Resource, resource.id)
                 if r:
                     r.extra_data = r.extra_data or {}
                     existing_subsite_tokens = (r.extra_data.get("subsite_delta_tokens") or {}).copy()
-                    existing_subsite_tokens.update(new_subsite_tokens)
+                    existing_subsite_tokens.update(stats["new_subsite_tokens"])
                     r.extra_data["subsite_delta_tokens"] = existing_subsite_tokens
                     await sess.commit()
 
-        print(f"[{self.worker_id}] [BACKUP COMPLETE] SharePoint: {resource.display_name} — {total_items} files, {total_bytes} bytes")
-        return {"item_count": total_items, "bytes_added": total_bytes, "new_delta_token": new_delta}
+        print(f"[{self.worker_id}] [BACKUP COMPLETE] SharePoint: {resource.display_name} — "
+              f"{total_items} items, {total_bytes} bytes")
+        return {
+            "item_count": total_items,
+            "bytes_added": total_bytes,
+            "new_delta_token": stats["new_delta"],
+        }
+
+    async def _backup_sp_rest_row(
+        self,
+        *,
+        resource: Resource,
+        tenant: Tenant,
+        snapshot: Snapshot,
+        graph_client: GraphClient,
+        shard,
+        container: str,
+        work: Dict[str, Any],
+        stats: Dict[str, int],
+    ) -> None:
+        """Process a single SP REST list row: persist its SnapshotItem and,
+        if it's a real file (not a folder, not a pure list row), stream its
+        bytes through a temp file → block-blob upload.
+
+        No byte cap — large catalog entries (e.g. multi-hundred-MB SitePages
+        attachments) stream chunk-by-chunk via ``stream_sharepoint_file_via_rest``
+        so worker RSS stays flat. All uploads go through
+        ``upload_blob_with_retry_from_file`` so 429s / transient Azure errors
+        get exponential backoff, not silent loss.
+        """
+        import tempfile
+        row = work["row"]
+        lst_id = work["lst_id"]
+        display = work["list_display"]
+        site_id = work["site_id"]
+        site_label = work["site_label"]
+        sp_hostname = work["sp_hostname"]
+        sp_site_web_url = work["sp_site_web_url"]
+
+        it_id = str(row.get("Id") or row.get("ID") or "")
+        if not it_id:
+            return
+        srv_rel = row.get("FileRef") or ""
+        leaf = row.get("FileLeafRef") or ""
+        obj_type = int(row.get("FileSystemObjectType") or 0)
+        is_folder = (obj_type == 1)
+        name = leaf or row.get("Title") or (srv_rel.rsplit("/", 1)[-1] if srv_rel else f"Item-{it_id}")
+
+        # Nest folder_path by server-relative path so Recovery mirrors real layout.
+        if srv_rel:
+            trail = srv_rel.lstrip("/")
+            parts = trail.split("/")
+            if len(parts) >= 2 and parts[0] == "sites":
+                parts = parts[2:]
+            path_parts = parts[:-1] if len(parts) > 1 else []
+            item_folder_path = f"{site_label}/lists/{display}"
+            if path_parts:
+                item_folder_path += "/" + "/".join(path_parts)
+        else:
+            item_folder_path = f"{site_label}/lists/{display}"
+
+        blob_path: Optional[str] = None
+        content_hash: Optional[str] = None
+        downloaded_bytes = 0
+        size = 0
+        file_info: Optional[Dict[str, Any]] = None
+
+        if srv_rel and not is_folder:
+            try:
+                file_info = await graph_client.get_sharepoint_file_metadata_via_rest(
+                    sp_hostname, sp_site_web_url, srv_rel,
+                )
+            except Exception:
+                file_info = None
+            if file_info:
+                size = int(file_info.get("Length") or 0)
+
+        # Idempotency — skip re-downloading catalog files that already have a
+        # matching blob from a prior snapshot (same server_relative_url + size).
+        existing_blob_path = None
+        existing_hash: Optional[str] = None
+        if file_info and size > 0:
+            blob_path_candidate = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id),
+                f"splist_{lst_id}_{it_id}",
+            )
+            # Stream download → temp file → block-blob upload.
+            if size > 0:
+                tmp_path = None
+                try:
+                    async with self.backup_semaphore:
+                        fd, tmp_path = tempfile.mkstemp(prefix="sp_rest_", suffix=".bin")
+                        os.close(fd)
+                        sha = hashlib.sha256()
+                        with open(tmp_path, "wb") as fp:
+                            async for chunk in graph_client.stream_sharepoint_file_via_rest(
+                                sp_hostname, sp_site_web_url, srv_rel,
+                            ):
+                                fp.write(chunk)
+                                sha.update(chunk)
+                        content_hash = sha.hexdigest()
+                        downloaded_bytes = os.path.getsize(tmp_path)
+                        upload_result = await upload_blob_with_retry_from_file(
+                            container_name=container,
+                            blob_path=blob_path_candidate,
+                            file_path=tmp_path,
+                            shard=shard,
+                            file_size=downloaded_bytes,
+                            metadata={
+                                "source_item_id": it_id,
+                                "source_list_id": lst_id,
+                                "server_relative_url": srv_rel,
+                                "original-name": name,
+                                "sha256": content_hash,
+                            },
+                        )
+                    if isinstance(upload_result, dict) and upload_result.get("success"):
+                        blob_path = blob_path_candidate
+                        stats["rest_files_ok"] += 1
+                        stats["rest_bytes"] += downloaded_bytes
+                    else:
+                        stats["rest_fail"] += 1
+                except Exception as exc:
+                    stats["rest_fail"] += 1
+                    print(f"[{self.worker_id}]   [SP_LIST_STREAM FAIL] "
+                          f"{site_label}/{display}/{name}: {type(exc).__name__}: {exc}")
+                finally:
+                    if tmp_path:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+
+        # Persist SnapshotItem row (file or metadata-only).
+        item_type = (
+            "SHAREPOINT_FILE" if blob_path
+            else ("SHAREPOINT_FOLDER" if is_folder else "SHAREPOINT_LIST_ITEM")
+        )
+        try:
+            async with async_session_factory() as sess:
+                sess.add(SnapshotItem(
+                    id=uuid.uuid4(),
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    external_id=f"{lst_id}:{it_id}",
+                    item_type=item_type,
+                    name=str(name)[:255],
+                    folder_path=item_folder_path,
+                    content_size=downloaded_bytes if blob_path else size,
+                    content_hash=content_hash,
+                    content_checksum=None,
+                    blob_path=blob_path,
+                    extra_data={
+                        "list_id": lst_id,
+                        "list_name": display,
+                        "site_id": site_id,
+                        "site_label": site_label,
+                        "server_relative_url": srv_rel,
+                        "file": file_info,
+                        "is_folder": is_folder,
+                        "title": row.get("Title"),
+                        "created": row.get("Created") or (file_info or {}).get("TimeCreated"),
+                        "modified": row.get("Modified") or (file_info or {}).get("TimeLastModified"),
+                        "version": (file_info or {}).get("UIVersionLabel"),
+                        "source": "sp_rest",
+                    },
+                ))
+                await sess.commit()
+            stats["rest_rows"] += 1
+        except Exception as exc:
+            logger.warning("sp_rest_row persist failed for %s/%s/%s: %s", site_label, display, name, exc)
 
     async def update_resource_backup_info(self, session: AsyncSession, resource: Resource,
                                           job_id: uuid.UUID, snapshot_id: uuid.UUID,
