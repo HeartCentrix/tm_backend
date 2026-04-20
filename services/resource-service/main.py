@@ -48,6 +48,13 @@ async def lifespan(app: FastAPI):
 UI_HIDDEN_TYPES: set[str] = {
     "TEAMS_CHAT_EXPORT",
     "USER_MAIL", "USER_ONEDRIVE", "USER_CONTACTS", "USER_CALENDAR", "USER_CHATS",
+    # TEAMS_CHANNEL rows duplicate an M365_GROUP row for the same team —
+    # same external_id on both. The M365_GROUP backup now fans out into
+    # channels + group mailbox + team site, so the TEAMS_CHANNEL row is
+    # redundant and only clutters the listing. Hide by default; callers
+    # that genuinely need the standalone channel view can opt in via
+    # includeHidden=true.
+    "TEAMS_CHANNEL",
 }
 
 

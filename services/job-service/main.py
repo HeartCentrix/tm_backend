@@ -1035,23 +1035,133 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
     return {"jobId": str(job.id)}
 
 
+# Workloads that share the folder_path column and can be mutually
+# cross-restored. Teams = the team's backing SharePoint site drive;
+# M365_GROUP carries the group's backing SharePoint drive under the
+# same snapshot. USER_ONEDRIVE is the Tier-2 child under a discovered
+# user. Adding a new family member means verifying its backup populates
+# folder_path.
+_FILES_FAMILY = {
+    "ONEDRIVE",
+    "USER_ONEDRIVE",
+    "SHAREPOINT_SITE",
+    "TEAMS_CHANNEL",
+    "M365_GROUP",
+}
+
+
+def _resource_family(resource_type: str) -> str:
+    """Collapse file-family resource types into one 'FILES' bucket for
+    the cross-resource restore guard. Non-family types return their own
+    name so the comparison is identity."""
+    return "FILES" if (resource_type or "").upper() in _FILES_FAMILY else str(resource_type or "").upper()
+
+
+@app.post("/api/v1/resources/{resource_id}/export-or-restore")
+async def files_export_or_restore(
+    resource_id: str,
+    request: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Unified entry point for Files folder-select v2.
+
+    Body shape (see docs/superpowers/specs/2026-04-20-files-folder-select-design.md):
+      restoreType:      EXPORT_ZIP | IN_PLACE | CROSS_RESOURCE
+      snapshotId:       UUID of the source snapshot (single)
+      itemIds:          files individually ticked (optional)
+      folderPaths:      folders ticked; server expands via shared resolver
+      excludedItemIds:  files un-ticked inside a ticked folder
+      conflictMode:     OVERWRITE | SEPARATE_FOLDER (IN_PLACE only)
+      targetResourceId: required for CROSS_RESOURCE; same workload family
+      preserveTree:     defaults true when folderPaths is non-empty
+
+    Delegates to ``trigger_restore`` so queueing / auditing / size-cap
+    logic stays in one place.
+    """
+    resource = await db.get(Resource, uuid.UUID(resource_id))
+    if not resource:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+    if resource_type.upper() not in _FILES_FAMILY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Resource type {resource_type} is not a file workload",
+        )
+
+    restore_type = (request.get("restoreType") or "").upper()
+    if restore_type not in ("EXPORT_ZIP", "IN_PLACE", "CROSS_RESOURCE"):
+        raise HTTPException(
+            status_code=400,
+            detail="restoreType must be EXPORT_ZIP, IN_PLACE, or CROSS_RESOURCE",
+        )
+
+    snapshot_id = request.get("snapshotId")
+    if not snapshot_id:
+        raise HTTPException(status_code=400, detail="snapshotId is required")
+
+    item_ids = list(request.get("itemIds") or [])
+    folder_paths = list(request.get("folderPaths") or [])
+    excluded_item_ids = list(request.get("excludedItemIds") or [])
+    if not item_ids and not folder_paths:
+        raise HTTPException(status_code=400, detail="Select at least one item or folder")
+
+    preserve_tree = bool(request.get("preserveTree", bool(folder_paths)))
+
+    conflict_mode = (request.get("conflictMode") or "").upper() or None
+    if restore_type == "IN_PLACE":
+        if conflict_mode not in ("OVERWRITE", "SEPARATE_FOLDER"):
+            raise HTTPException(
+                status_code=400,
+                detail="conflictMode=OVERWRITE or SEPARATE_FOLDER required for IN_PLACE",
+            )
+
+    target_resource_id = request.get("targetResourceId")
+    if restore_type == "CROSS_RESOURCE":
+        if not target_resource_id:
+            raise HTTPException(status_code=400, detail="targetResourceId required for CROSS_RESOURCE")
+        target = await db.get(Resource, uuid.UUID(target_resource_id))
+        if not target:
+            raise HTTPException(status_code=404, detail="Target resource not found")
+        if target.tenant_id != resource.tenant_id:
+            raise HTTPException(status_code=400, detail="Cross-tenant restore is not supported")
+        target_type = target.type.value if hasattr(target.type, "value") else str(target.type)
+        if _resource_family(target_type) != _resource_family(resource_type):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Target workload family mismatch ({target_type} vs {resource_type})",
+            )
+
+    # Forward into the shared trigger_restore path so auditing, queueing,
+    # and size-cap logic stay in one place.
+    body = {
+        "restoreType": restore_type,
+        "snapshotIds": [snapshot_id],
+        "itemIds": item_ids,
+        "folderPaths": folder_paths,
+        "excludedItemIds": excluded_item_ids,
+        "preserveTree": preserve_tree,
+        "conflictMode": conflict_mode,
+        "targetResourceId": target_resource_id,
+        "exportFormat": request.get("exportFormat")
+            or ("ZIP" if restore_type == "EXPORT_ZIP" else None),
+    }
+    return await trigger_restore(body, db)
+
+
 @app.post("/api/v1/sharepoint/{resource_id}/download")
 async def sharepoint_download(resource_id: str, request: dict, db: AsyncSession = Depends(get_db)):
-    """Queue a SharePoint download job for one of three scopes.
+    """DEPRECATED — use ``POST /api/v1/resources/{resource_id}/export-or-restore``.
 
-    Request body:
+    This endpoint predates the Files folder-select v2 payload. It
+    continues to work identically for the OneDrive / SharePoint callers
+    that still use it; removal is scheduled for the release AFTER
+    ``FILES_FOLDER_SELECT_V2`` is fully on in prod.
+
+    Request body (unchanged):
       * ``scope``: ``"site"`` | ``"folder"`` | ``"file"``
-      * ``snapshotId``: required for ``site`` — the snapshot to export.
-      * ``folderPath``: required for ``folder`` — restore-worker selects
-        every SnapshotItem whose folder_path starts with this value.
-      * ``itemId``: required for ``file`` — single SnapshotItem id.
-
-    Translates the scope to the existing export pipeline:
-      * ``site``  → snapshotIds=[snap], preserveTree=true, format=ZIP
-      * ``folder``→ itemIds=[items under folder], preserveTree=true, format=ZIP
-      * ``file``  → itemIds=[one], preserveTree=false, format=ORIGINAL
-        (``download_export_zip`` streams the raw blob with the original
-        content-type via ``output_mode=raw_single``)
+      * ``snapshotId``: required for ``site``.
+      * ``folderPath``: required for ``folder``.
+      * ``itemId``: required for ``file``.
 
     Returns ``{jobId}``; poll ``/api/v1/jobs/export/{jobId}/status`` and
     then GET ``/api/v1/jobs/export/{jobId}/download`` to pull the bytes.
