@@ -142,11 +142,19 @@ class EntraRestoreEngine:
         self, item_type: str, items: List[Any],
     ) -> Dict[str, Tuple[bool, Optional[str]]]:
         """Return `{external_id: (exists, live_fingerprint)}` for each
-        item in the section via two /$batch rounds (existence + raw
-        fetch for drift comparison)."""
+        item in the section via two /$batch rounds.
+
+        ENTRA_DIR_SECURITY is a union of 5 sub-buckets (CA policies,
+        Named Locations, Auth Strengths, Auth Contexts, Security
+        Defaults). Each lives under a different Graph endpoint, so the
+        single SectionSpec URL can't serve all of them — we route per
+        bucket here and merge results."""
         from shared.graph_entra import sieve_existence
         from shared.graph_batch import BatchRequest, batch_requests
         from shared.entra_fingerprint import fingerprint_object
+
+        if item_type == "ENTRA_DIR_SECURITY":
+            return await self._sieve_security_buckets(items)
 
         spec: SectionSpec = SECTION_SPECS[item_type]
 
@@ -171,6 +179,69 @@ class EntraRestoreEngine:
                     fingerprints[oid] = fingerprint_object(item_type, body)
 
         return {oid: (exists_map.get(oid, False), fingerprints.get(oid)) for oid in ids}
+
+    async def _sieve_security_buckets(
+        self, items: List[Any],
+    ) -> Dict[str, Tuple[bool, Optional[str]]]:
+        """Per-bucket sieve for ENTRA_DIR_SECURITY. Objects in each
+        bucket live under a different Graph path:
+
+          Conditional Access       /identity/conditionalAccess/policies/{id}
+          Named Locations          /identity/conditionalAccess/namedLocations/{id}
+          Authentication Contexts  /identity/conditionalAccess/authenticationContextClassReferences/{id}
+          Authentication Strengths /identity/conditionalAccess/authenticationStrength/policies/{id}
+          Security Defaults        /policies/identitySecurityDefaultsEnforcementPolicy  (singleton — no id)
+
+        Unknown / empty buckets default to the CA policies path (same
+        shape as before this fix)."""
+        from shared.graph_batch import BatchRequest, batch_requests
+        from shared.entra_fingerprint import fingerprint_object
+
+        bucket_url = {
+            "Conditional Access":       "/identity/conditionalAccess/policies/{id}",
+            "Named Locations":          "/identity/conditionalAccess/namedLocations/{id}",
+            "Authentication Contexts":  "/identity/conditionalAccess/authenticationContextClassReferences/{id}",
+            "Authentication Strengths": "/identity/conditionalAccess/authenticationStrength/policies/{id}",
+            # Security Defaults is a tenant singleton — no id in path.
+            "Policies":                 "/policies/identitySecurityDefaultsEnforcementPolicy",
+        }
+        default_url = "/identity/conditionalAccess/policies/{id}"
+
+        # Build one /$batch of existence GETs using the correct per-item
+        # URL.
+        exist_reqs: List[BatchRequest] = []
+        for i, it in enumerate(items):
+            ed = it.extra_data or {}
+            bucket = ed.get("_sec_bucket")
+            tmpl = bucket_url.get(bucket, default_url)
+            url = tmpl.format(id=it.external_id) + ("?$select=id" if "{id}" in tmpl else "")
+            exist_reqs.append(BatchRequest(id=f"sec-exist-{i}", method="GET", url=url))
+        exist_resps = await batch_requests(self.graph._post, exist_reqs)
+
+        exists_map: Dict[str, bool] = {}
+        for it, resp in zip(items, exist_resps):
+            status = (resp or {}).get("status")
+            exists_map[it.external_id] = status is not None and 200 <= status < 300
+
+        # Second round: fetch raw for drift on existing objects.
+        fp_ids: List[Tuple[Any, str]] = [(it, bucket_url.get((it.extra_data or {}).get("_sec_bucket"), default_url))
+                                         for it in items if exists_map.get(it.external_id)]
+        fingerprints: Dict[str, Optional[str]] = {it.external_id: None for it in items}
+        if fp_ids:
+            fp_reqs = [
+                BatchRequest(id=f"sec-fp-{i}", method="GET",
+                             url=tmpl.format(id=it.external_id))
+                for i, (it, tmpl) in enumerate(fp_ids)
+            ]
+            fp_resps = await batch_requests(self.graph._post, fp_reqs)
+            for (it, _tmpl), resp in zip(fp_ids, fp_resps):
+                body = (resp or {}).get("body") or {}
+                if body:
+                    fingerprints[it.external_id] = fingerprint_object("ENTRA_DIR_SECURITY", body)
+
+        return {it.external_id: (exists_map.get(it.external_id, False),
+                                 fingerprints.get(it.external_id))
+                for it in items}
 
     async def _dispatch_one(
         self, item_type: str, snap_item: Any, outcome: str,

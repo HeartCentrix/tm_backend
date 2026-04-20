@@ -72,6 +72,36 @@ _JSON_CELL_FIELDS: set = {
 }
 
 
+_MEMBERS_COMPANION = {
+    "groups": ("groups_members.csv", "group_id"),
+    "admin_units": ("admin_units_members.csv", "au_id"),
+}
+
+
+def _flatten_members_rows(parent_id_key: str, items: List[Any]) -> List[List[str]]:
+    """Expand each item's `members` list into flat CSV rows. Returns
+    header + data rows. Accepts either {"id": ..., "displayName": ...,
+    "@odata.type": "..."} dicts or bare ids."""
+    header = [parent_id_key, "member_id", "member_type", "member_displayName"]
+    out: List[List[str]] = [header]
+    for it in items:
+        raw = (getattr(it, "extra_data", None) or {}).get("raw") or {}
+        parent_id = raw.get("id", "")
+        for m in (raw.get("members") or []):
+            if isinstance(m, dict):
+                mid = m.get("id", "")
+                mtype = (m.get("@odata.type") or "").split(".")[-1] or ""
+                mname = m.get("displayName", "") or ""
+            elif isinstance(m, str):
+                mid = m.rsplit("/", 1)[-1]
+                mtype = ""
+                mname = ""
+            else:
+                continue
+            out.append([parent_id, mid, mtype, mname])
+    return out
+
+
 def _flatten_path(raw: Dict[str, Any], path: str) -> Any:
     """Resolve a dotted/underscored path like `initiatedBy_displayName`
     or `targetResources_0_displayName` against a nested raw dict. Keys
@@ -182,4 +212,15 @@ class EntraExportPipeline:
                     zf.writestr(target, format_section_csv(section, items))
                 else:
                     zf.writestr(target, format_section_json(section, items))
+                # Companion member CSV emitted only when the nested
+                # toggle is on AND the section has one configured.
+                if self.include_nested_detail and section in _MEMBERS_COMPANION:
+                    companion_name, parent_key = _MEMBERS_COMPANION[section]
+                    rows = _flatten_members_rows(parent_key, items)
+                    buf = io.StringIO()
+                    writer = csv.writer(buf)
+                    for r in rows:
+                        writer.writerow(r)
+                    zf.writestr(companion_name, buf.getvalue())
+                    manifest["counts"][companion_name] = len(rows) - 1  # minus header
         return manifest

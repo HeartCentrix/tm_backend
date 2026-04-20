@@ -114,3 +114,52 @@ def test_zip_layout_includes_manifest_and_only_selected_sections():
         assert manifest["format"] == "csv"
         assert manifest["counts"]["users"] == 1
         assert manifest["counts"]["groups"] == 1
+
+
+def test_zip_includes_member_companion_when_nested_detail_on():
+    import io, json, zipfile
+    from types import SimpleNamespace
+    from workers.restore_worker.entra_export import EntraExportPipeline
+
+    groups = [
+        SimpleNamespace(item_type="ENTRA_DIR_GROUP", external_id="g1",
+                        extra_data={"raw": {
+                            "id": "g1", "displayName": "Team",
+                            "mailNickname": "t", "mailEnabled": False,
+                            "securityEnabled": True,
+                            "members": [
+                                {"id": "u1", "displayName": "A", "@odata.type": "#microsoft.graph.user"},
+                                {"id": "u2", "displayName": "B", "@odata.type": "#microsoft.graph.user"},
+                            ],
+                        }}),
+    ]
+    pipeline = EntraExportPipeline(
+        snapshot_id="s1", format="csv", include_nested_detail=True,
+    )
+    buf = io.BytesIO()
+    manifest = pipeline.build_zip(buf, {"groups": groups})
+    buf.seek(0)
+    with zipfile.ZipFile(buf) as zf:
+        names = set(zf.namelist())
+        assert "groups.csv" in names
+        assert "groups_members.csv" in names
+        body = zf.read("groups_members.csv").decode()
+        assert "group_id,member_id,member_type,member_displayName" in body
+        assert "g1,u1,user,A" in body
+    assert manifest["counts"]["groups_members.csv"] == 2
+
+
+def test_zip_no_member_companion_when_nested_detail_off():
+    import io, zipfile
+    from types import SimpleNamespace
+    from workers.restore_worker.entra_export import EntraExportPipeline
+
+    groups = [SimpleNamespace(item_type="ENTRA_DIR_GROUP", external_id="g1",
+                              extra_data={"raw": {"id": "g1", "displayName": "T",
+                                                  "mailEnabled": False, "securityEnabled": True}})]
+    pipeline = EntraExportPipeline(snapshot_id="s1", format="csv", include_nested_detail=False)
+    buf = io.BytesIO()
+    pipeline.build_zip(buf, {"groups": groups})
+    buf.seek(0)
+    with zipfile.ZipFile(buf) as zf:
+        assert "groups_members.csv" not in set(zf.namelist())
