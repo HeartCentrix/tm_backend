@@ -34,6 +34,7 @@ from shared.power_bi_client import PowerBIClient
 from shared.power_platform_client import PowerPlatformClient
 from shared.azure_storage import azure_storage_manager
 from mail_restore import MailRestoreEngine, MODE_OVERWRITE, MODE_SEPARATE
+from entra_restore import EntraRestoreEngine
 
 
 def _mail_graph_user_id(resource) -> str:
@@ -613,10 +614,45 @@ class RestoreWorker:
                 restored_count += mail_summary["created"] + mail_summary["updated"]
                 failed_count += mail_summary["failed"]
 
+            # Entra restore v2 fast-path. When the flag is on and
+            # resource is the tenant-wide ENTRA_DIRECTORY container,
+            # route every ENTRA_DIR_* item through EntraRestoreEngine
+            # (sieve, fingerprint-diff, PATCH/POST per section,
+            # membership rebind).
+            entra_items: List[SnapshotItem] = []
+            if settings.ENTRA_RESTORE_V2_ENABLED and resource_type == "ENTRA_DIRECTORY":
+                remaining: List[SnapshotItem] = []
+                for it in resource_items:
+                    if it.item_type and it.item_type.startswith("ENTRA_DIR_"):
+                        entra_items.append(it)
+                    else:
+                        remaining.append(it)
+                resource_items = remaining
+
+            if entra_items:
+                sections_filter = spec.get("entraSections")
+                include_groups = bool(spec.get("includeGroupMembership", True))
+                include_au = bool(spec.get("includeAuMembership", True))
+                engine = EntraRestoreEngine(
+                    graph_client,
+                    resource,
+                    worker_id=self.worker_id,
+                    sections=sections_filter,
+                    include_group_membership=include_groups,
+                    include_au_membership=include_au,
+                )
+                entra_summary = await engine.run(entra_items)
+                restored_count += (
+                    entra_summary.get("created", 0)
+                    + entra_summary.get("updated", 0)
+                    + entra_summary.get("unchanged", 0)
+                )
+                failed_count += entra_summary.get("failed", 0)
+
             for item in resource_items:
                 try:
                     if item.item_type in ("EMAIL",):
-                        await self._restore_email_to_mailbox(graph_client, resource, item)
+                        await self._restore_email_to_mailbox(graph_client, resource, item, session=session)
                     elif item.item_type in ("FILE", "ONEDRIVE_FILE"):
                         await self._restore_file_to_onedrive(graph_client, resource, item, conflict_mode=conflict_mode)
                     elif item.item_type in ("SHAREPOINT_FILE", "SHAREPOINT_LIST_ITEM"):
@@ -783,7 +819,7 @@ class RestoreWorker:
         for item in items:
             try:
                 if item.item_type in ("EMAIL",):
-                    await self._restore_email_to_mailbox(graph_client, target_resource, item)
+                    await self._restore_email_to_mailbox(graph_client, target_resource, item, session=session)
                 elif item.item_type in ("FILE", "ONEDRIVE_FILE"):
                     await self._restore_file_to_onedrive(graph_client, target_resource, item)
                 elif item.item_type in ("SHAREPOINT_FILE",):
@@ -835,7 +871,7 @@ class RestoreWorker:
             try:
                 # Restore based on target resource type
                 if target_resource.type.value in ("MAILBOX", "SHARED_MAILBOX"):
-                    await self._restore_email_to_mailbox(graph_client, target_resource, item)
+                    await self._restore_email_to_mailbox(graph_client, target_resource, item, session=session)
                 elif target_resource.type.value == "ONEDRIVE":
                     await self._restore_file_to_onedrive(graph_client, target_resource, item)
                 elif target_resource.type.value == "SHAREPOINT_SITE":
@@ -1397,35 +1433,57 @@ class RestoreWorker:
         self,
         graph_client: GraphClient,
         resource: Resource,
-        item: SnapshotItem
+        item: SnapshotItem,
+        session: Optional[AsyncSession] = None,
     ):
-        """Restore email to Exchange mailbox via Graph API"""
+        """Restore email to Exchange mailbox via MIME import.
+
+        Legacy fallback (used when ``MAIL_RESTORE_V2_ENABLED`` is off).
+        Previously POSTed a JSON payload to ``/users/{id}/messages`` which
+        made Graph create the row as a draft with ``sender unknown`` and
+        silently dropped every attachment. We now rebuild the RFC-822
+        MIME — headers, body, inline and regular attachments — and POST
+        it so Graph imports it with ``isDraft=false``, the original
+        ``From``/``Sender``/``Date`` preserved, and every attachment's
+        ``Content-ID`` intact so inline images render.
+        """
+        from mail_restore import MailRestoreEngine
+
         metadata = self._get_item_metadata(item)
         raw_data = metadata.get("raw", {})
-
         user_id = resource.external_id
 
-        # Create message in mailbox
-        message_payload = {
-            "subject": raw_data.get("subject"),
-            "body": {
-                "contentType": raw_data.get("body", {}).get("contentType", "HTML"),
-                "content": raw_data.get("body", {}).get("content", ""),
-            },
-            "toRecipients": raw_data.get("toRecipients", []),
-            "ccRecipients": raw_data.get("ccRecipients", []),
-            "hasAttachments": raw_data.get("hasAttachments", False),
-            "internetMessageId": raw_data.get("internetMessageId"),
-            # Preserve original metadata
-            "receivedDateTime": raw_data.get("receivedDateTime"),
-            "sentDateTime": raw_data.get("sentDateTime"),
-        }
+        # Pull the EMAIL_ATTACHMENT children for this message so we can
+        # inline their bytes into the MIME. Match on parent_item_id.
+        att_items: List[SnapshotItem] = []
+        if session is not None:
+            att_stmt = select(SnapshotItem).where(
+                SnapshotItem.snapshot_id == item.snapshot_id,
+                SnapshotItem.item_type == "EMAIL_ATTACHMENT",
+            )
+            rows = (await session.execute(att_stmt)).scalars().all()
+            att_items = [
+                r for r in rows
+                if (r.extra_data or {}).get("parent_item_id") == item.external_id
+            ]
 
-        # POST to /users/{id}/messages
-        await graph_client._post(
-            f"{graph_client.GRAPH_URL}/users/{user_id}/messages",
-            message_payload
-        )
+        attachments_with_bytes: List[tuple] = []
+        for att in att_items:
+            if not getattr(att, "blob_path", None):
+                continue
+            try:
+                tenant_id = str(resource.tenant_id)
+                shard = azure_storage_manager.get_shard_for_resource(tenant_id, tenant_id)
+                container = azure_storage_manager.get_container_name(tenant_id, "email")
+                blob_client = shard.get_blob_client(container, att.blob_path)
+                stream = await blob_client.download_blob()
+                blob_bytes = await stream.readall()
+                attachments_with_bytes.append((att, blob_bytes))
+            except Exception as e:
+                print(f"[{self.worker_id}] attachment read failed for {att.external_id}: {type(e).__name__}: {e}")
+
+        mime_bytes = MailRestoreEngine._build_mime_from_raw(raw_data, attachments_with_bytes)
+        await graph_client.create_mime_message(user_id, mime_bytes)
 
     @staticmethod
     def _conflict_path_prefix(conflict_mode: str) -> str:
