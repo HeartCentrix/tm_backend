@@ -52,10 +52,11 @@ async def test_upload_small_file_builds_correct_url(client, monkeypatch):
     )
 
     assert result["id"] == "drv-itm-1"
-    assert calls["url"].endswith(
-        "/users/user-1/drive/root:/Projects/Q1/report.docx:/content"
-    )
-    assert calls["headers"]["@microsoft.graph.conflictBehavior"] == "replace"
+    # conflictBehavior moves to query string because httpx forbids `@`
+    # in header names.
+    assert "/users/user-1/drive/root:/Projects/Q1/report.docx:/content" in calls["url"]
+    assert "@microsoft.graph.conflictBehavior=replace" in calls["url"]
+    assert "@microsoft.graph.conflictBehavior" not in calls["headers"]
     assert calls["body_len"] == 1024
 
 

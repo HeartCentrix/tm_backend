@@ -3599,18 +3599,23 @@ class GraphClient:
 
         drive_path is relative to the drive root (no leading slash), e.g.
         "Projects/Q1/report.docx". Graph auto-creates missing ancestor
-        folders. conflict_behavior = "replace" | "rename" | "fail".
+        folders. conflict_behavior = "replace" | "rename" | "fail" —
+        passed as a URL query parameter because httpx (RFC 7230) rejects
+        the ``@`` character in HTTP header names, so the
+        ``@microsoft.graph.conflictBehavior`` header form Graph also
+        accepts isn't usable here.
         Returns the created driveItem dict.
         """
+        from urllib.parse import quote as _q
         url = (
             f"{self.GRAPH_URL}/users/{user_id}/drive/root:/"
             f"{drive_path}:/content"
+            f"?@microsoft.graph.conflictBehavior={_q(conflict_behavior)}"
         )
         token = await self._get_token()
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/octet-stream",
-            "@microsoft.graph.conflictBehavior": conflict_behavior,
         }
         async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as c:
             resp = await c.put(url, headers=headers, content=body)
