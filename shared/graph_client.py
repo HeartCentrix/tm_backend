@@ -3497,6 +3497,155 @@ class GraphClient:
         resp = await self._post(url, {"destinationId": destination_folder_id})
         return resp.get("id") if isinstance(resp, dict) else None
 
+    async def upload_small_file_to_drive(
+        self,
+        user_id: str,
+        drive_path: str,
+        body: bytes,
+        conflict_behavior: str = "rename",
+    ) -> Dict[str, Any]:
+        """Single-PUT upload for files < 4 MB (Graph's simple-upload cap).
+
+        drive_path is relative to the drive root (no leading slash), e.g.
+        "Projects/Q1/report.docx". Graph auto-creates missing ancestor
+        folders. conflict_behavior = "replace" | "rename" | "fail".
+        Returns the created driveItem dict.
+        """
+        url = (
+            f"{self.GRAPH_URL}/users/{user_id}/drive/root:/"
+            f"{drive_path}:/content"
+        )
+        token = await self._get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/octet-stream",
+            "@microsoft.graph.conflictBehavior": conflict_behavior,
+        }
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as c:
+            resp = await c.put(url, headers=headers, content=body)
+            if resp.status_code in (429, 503):
+                await asyncio.sleep(_parse_retry_after(resp))
+                resp = await c.put(url, headers=headers, content=body)
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"upload_small_file_to_drive {resp.status_code}: {resp.text[:300]}"
+                )
+            return resp.json()
+
+    async def upload_large_file_to_drive(
+        self,
+        user_id: str,
+        drive_path: str,
+        body: bytes,
+        total_size: int,
+        chunk_size: int = 10 * 1024 * 1024,
+        conflict_behavior: str = "rename",
+    ) -> Dict[str, Any]:
+        """Resumable upload for files >= 4 MB via Graph's uploadSession.
+
+        Splits body into chunk_size chunks (MS mandates multiples of 320
+        KiB; 10 MiB is safe). Each chunk is PUT with a Content-Range:
+        bytes X-Y/total header; the final chunk's response returns the
+        created driveItem with status 201.
+
+        Retries each chunk up to 3x on 500/503/connection reset — the
+        uploadSession URL stays valid so retries never re-upload earlier
+        chunks on a mid-file failure.
+        """
+        create_url = (
+            f"{self.GRAPH_URL}/users/{user_id}/drive/root:/"
+            f"{drive_path}:/createUploadSession"
+        )
+        token = await self._get_token()
+        create_headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        create_payload = {
+            "item": {
+                "@microsoft.graph.conflictBehavior": conflict_behavior,
+            }
+        }
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as c:
+            session_resp = await c.post(create_url, headers=create_headers, json=create_payload)
+            if session_resp.status_code >= 400:
+                raise RuntimeError(
+                    f"createUploadSession {session_resp.status_code}: {session_resp.text[:300]}"
+                )
+            upload_url = session_resp.json().get("uploadUrl")
+            if not upload_url:
+                raise RuntimeError("createUploadSession returned no uploadUrl")
+
+            offset = 0
+            last_json: Dict[str, Any] = {}
+            while offset < total_size:
+                end = min(offset + chunk_size, total_size) - 1
+                chunk = body[offset:end + 1]
+                put_headers = {
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {offset}-{end}/{total_size}",
+                }
+                attempt = 0
+                while True:
+                    attempt += 1
+                    try:
+                        resp = await c.put(upload_url, headers=put_headers, content=chunk)
+                    except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError):
+                        if attempt >= 3:
+                            raise
+                        await asyncio.sleep(min(2 ** attempt, 30))
+                        continue
+                    if resp.status_code in (429, 503):
+                        await asyncio.sleep(_parse_retry_after(resp))
+                        continue
+                    if resp.status_code >= 500 and attempt < 3:
+                        await asyncio.sleep(min(2 ** attempt, 30))
+                        continue
+                    if resp.status_code >= 400:
+                        raise RuntimeError(
+                            f"upload chunk {offset}-{end} {resp.status_code}: {resp.text[:300]}"
+                        )
+                    if resp.status_code in (200, 201):
+                        last_json = resp.json()
+                    break
+                offset = end + 1
+            return last_json
+
+    async def patch_drive_item_file_system_info(
+        self,
+        user_id: str,
+        drive_item_id: str,
+        created_iso: Optional[str] = None,
+        modified_iso: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Restore captured creation + modification timestamps on a
+        driveItem. Without this, Explorer shows every restored file as
+        created / modified "today". Normalises "+00:00" into the Z form
+        Graph accepts; skips the call entirely when both inputs are
+        empty.
+        """
+        def _norm(ts: Optional[str]) -> Optional[str]:
+            if not ts:
+                return None
+            t = ts.strip()
+            if t.endswith("+00:00"):
+                t = t[:-6] + "Z"
+            elif "+" not in t and not t.endswith("Z"):
+                t = t + "Z"
+            return t
+
+        created = _norm(created_iso)
+        modified = _norm(modified_iso)
+        if not (created or modified):
+            return None
+        fsi: Dict[str, str] = {}
+        if created:
+            fsi["createdDateTime"] = created
+        if modified:
+            fsi["lastModifiedDateTime"] = modified
+        url = f"{self.GRAPH_URL}/users/{user_id}/drive/items/{drive_item_id}"
+        return await self._patch(url, {"fileSystemInfo": fsi})
+
     async def json_create_non_draft_message(
         self,
         user_id: str,
