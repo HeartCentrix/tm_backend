@@ -2438,10 +2438,16 @@ class GraphClient:
         # /items endpoint — some tenants drop them, leaving the backup
         # worker's "do I stream bytes for this row?" check false for
         # every row, producing 0-byte snapshots for SitePages and
-        # other list-hosted content. Explicitly ask for them.
+        # other list-hosted content.
+        #
+        # $select is strict-all-or-nothing: if ANY field doesn't exist
+        # on a given list type, SP REST 400s the whole request. Only
+        # include the file-reference fields — they're defined on every
+        # list type. Extras like Length / Title / Modified have
+        # fire-tested as absent on catalog / hidden / tasks lists.
         params: Optional[Dict[str, str]] = {
             "$top": str(page_size),
-            "$select": "Id,FileRef,FileLeafRef,FileSystemObjectType,Title,Modified,Length,File_x0020_Size,ContentTypeId,Created",
+            "$select": "Id,FileRef,FileLeafRef,FileSystemObjectType",
         }
         next_url: Optional[str] = url
         backoff = 1.0  # seconds; doubled per consecutive transient failure
