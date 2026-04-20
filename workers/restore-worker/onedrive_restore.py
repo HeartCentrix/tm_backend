@@ -137,14 +137,14 @@ class OneDriveRestoreEngine:
         try:
             if size < SMALL_FILE_MAX_BYTES:
                 created = await self.graph.upload_small_file_to_drive(
-                    user_id=self.target_user_id,
+                    drive_id=self.target_user_id,
                     drive_path=drive_path,
                     body=body,
                     conflict_behavior=conflict,
                 )
             else:
                 created = await self.graph.upload_large_file_to_drive(
-                    user_id=self.target_user_id,
+                    drive_id=self.target_user_id,
                     drive_path=drive_path,
                     body=body,
                     total_size=len(body),
@@ -168,7 +168,7 @@ class OneDriveRestoreEngine:
         if new_item_id and (fsi.get("createdDateTime") or fsi.get("lastModifiedDateTime")):
             try:
                 await self.graph.patch_drive_item_file_system_info(
-                    user_id=self.target_user_id,
+                    drive_id=self.target_user_id,
                     drive_item_id=new_item_id,
                     created_iso=fsi.get("createdDateTime"),
                     modified_iso=fsi.get("lastModifiedDateTime"),

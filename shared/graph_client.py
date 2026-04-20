@@ -2433,7 +2433,16 @@ class GraphClient:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json;odata=nometadata",
         }
-        params: Optional[Dict[str, str]] = {"$top": str(page_size)}
+        # File-reference columns (FileRef / FileLeafRef / FileSystemObjectType)
+        # aren't always returned by the default projection of SP REST's
+        # /items endpoint — some tenants drop them, leaving the backup
+        # worker's "do I stream bytes for this row?" check false for
+        # every row, producing 0-byte snapshots for SitePages and
+        # other list-hosted content. Explicitly ask for them.
+        params: Optional[Dict[str, str]] = {
+            "$top": str(page_size),
+            "$select": "Id,FileRef,FileLeafRef,FileSystemObjectType,Title,Modified,Length,File_x0020_Size,ContentTypeId,Created",
+        }
         next_url: Optional[str] = url
         backoff = 1.0  # seconds; doubled per consecutive transient failure
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -3590,16 +3599,17 @@ class GraphClient:
 
     async def upload_small_file_to_drive(
         self,
-        user_id: str,
+        drive_id: str,
         drive_path: str,
         body: bytes,
         conflict_behavior: str = "rename",
     ) -> Dict[str, Any]:
         """Single-PUT upload for files < 4 MB (Graph's simple-upload cap).
 
-        drive_path is relative to the drive root (no leading slash), e.g.
-        "Projects/Q1/report.docx". Graph auto-creates missing ancestor
-        folders. conflict_behavior = "replace" | "rename" | "fail" —
+        Targets ``/drives/{drive_id}/root:/{path}:/content`` — this works
+        for any driveItem host (personal OneDrive, SharePoint document
+        library, Group drive) because drive_id is the canonical Graph
+        identifier. conflict_behavior = "replace" | "rename" | "fail" —
         passed as a URL query parameter because httpx (RFC 7230) rejects
         the ``@`` character in HTTP header names, so the
         ``@microsoft.graph.conflictBehavior`` header form Graph also
@@ -3608,7 +3618,7 @@ class GraphClient:
         """
         from urllib.parse import quote as _q
         url = (
-            f"{self.GRAPH_URL}/users/{user_id}/drive/root:/"
+            f"{self.GRAPH_URL}/drives/{drive_id}/root:/"
             f"{drive_path}:/content"
             f"?@microsoft.graph.conflictBehavior={_q(conflict_behavior)}"
         )
@@ -3630,7 +3640,7 @@ class GraphClient:
 
     async def upload_large_file_to_drive(
         self,
-        user_id: str,
+        drive_id: str,
         drive_path: str,
         body: bytes,
         total_size: int,
@@ -3649,7 +3659,7 @@ class GraphClient:
         chunks on a mid-file failure.
         """
         create_url = (
-            f"{self.GRAPH_URL}/users/{user_id}/drive/root:/"
+            f"{self.GRAPH_URL}/drives/{drive_id}/root:/"
             f"{drive_path}:/createUploadSession"
         )
         token = await self._get_token()
@@ -3709,7 +3719,7 @@ class GraphClient:
 
     async def patch_drive_item_file_system_info(
         self,
-        user_id: str,
+        drive_id: str,
         drive_item_id: str,
         created_iso: Optional[str] = None,
         modified_iso: Optional[str] = None,
@@ -3739,7 +3749,7 @@ class GraphClient:
             fsi["createdDateTime"] = created
         if modified:
             fsi["lastModifiedDateTime"] = modified
-        url = f"{self.GRAPH_URL}/users/{user_id}/drive/items/{drive_item_id}"
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{drive_item_id}"
         return await self._patch(url, {"fileSystemInfo": fsi})
 
     async def json_create_non_draft_message(

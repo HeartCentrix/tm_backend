@@ -96,8 +96,8 @@ async def test_upload_patches_file_system_info_from_raw():
     graph.upload_large_file_to_drive = AsyncMock()
     patched = {}
 
-    async def patch_fsi(user_id, drive_item_id, created_iso, modified_iso):
-        patched.update(dict(user=user_id, item=drive_item_id,
+    async def patch_fsi(drive_id, drive_item_id, created_iso, modified_iso):
+        patched.update(dict(drive=drive_id, item=drive_item_id,
                             created=created_iso, modified=modified_iso))
     graph.patch_drive_item_file_system_info = patch_fsi
 
@@ -115,6 +115,7 @@ async def test_upload_patches_file_system_info_from_raw():
     outcome = await engine.upload_one(item)
     assert outcome.outcome == "overwritten"
     assert patched["item"] == "drv-9"
+    assert patched["drive"] == "target-user"
     assert patched["created"] == "2024-01-01T00:00:00Z"
     assert patched["modified"] == "2024-06-01T12:00:00Z"
 

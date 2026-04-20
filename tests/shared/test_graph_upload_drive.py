@@ -45,16 +45,17 @@ async def test_upload_small_file_builds_correct_url(client, monkeypatch):
     monkeypatch.setattr("shared.graph_client.httpx.AsyncClient", FakeClient)
 
     result = await client.upload_small_file_to_drive(
-        user_id="user-1",
+        drive_id="drv-xyz",
         drive_path="Projects/Q1/report.docx",
         body=b"x" * 1024,
         conflict_behavior="replace",
     )
 
     assert result["id"] == "drv-itm-1"
-    # conflictBehavior moves to query string because httpx forbids `@`
-    # in header names.
-    assert "/users/user-1/drive/root:/Projects/Q1/report.docx:/content" in calls["url"]
+    # conflictBehavior via query string (httpx forbids `@` in headers).
+    # /drives/{drive_id} because OneDrive resources store a drive id in
+    # external_id, not a Graph user id.
+    assert "/drives/drv-xyz/root:/Projects/Q1/report.docx:/content" in calls["url"]
     assert "@microsoft.graph.conflictBehavior=replace" in calls["url"]
     assert "@microsoft.graph.conflictBehavior" not in calls["headers"]
     assert calls["body_len"] == 1024
@@ -91,7 +92,7 @@ async def test_upload_large_file_chunks_with_content_range(client, monkeypatch):
     monkeypatch.setattr("shared.graph_client.httpx.AsyncClient", FakeClient)
 
     result = await client.upload_large_file_to_drive(
-        user_id="user-1",
+        drive_id="drv-xyz",
         drive_path="bigdir/big.bin",
         body=b"A" * 25,
         total_size=25,
@@ -119,13 +120,13 @@ async def test_patch_file_system_info_normalises_plus_zero(client):
     client._patch = fake_patch
 
     await client.patch_drive_item_file_system_info(
-        user_id="user-1",
+        drive_id="drv-xyz",
         drive_item_id="drv-3",
         created_iso="2024-01-15T10:00:00+00:00",
         modified_iso="2024-02-20T12:30:00Z",
     )
 
-    assert calls["url"].endswith("/users/user-1/drive/items/drv-3")
+    assert calls["url"].endswith("/drives/drv-xyz/items/drv-3")
     fsi = calls["payload"]["fileSystemInfo"]
     assert fsi["createdDateTime"] == "2024-01-15T10:00:00Z"
     assert fsi["lastModifiedDateTime"] == "2024-02-20T12:30:00Z"
@@ -142,7 +143,7 @@ async def test_patch_file_system_info_noop_on_empty_inputs(client):
     client._patch = fake_patch
 
     result = await client.patch_drive_item_file_system_info(
-        user_id="u", drive_item_id="i", created_iso=None, modified_iso=None,
+        drive_id="d", drive_item_id="i", created_iso=None, modified_iso=None,
     )
 
     assert result is None
