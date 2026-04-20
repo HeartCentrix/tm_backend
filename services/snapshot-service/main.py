@@ -267,7 +267,7 @@ async def get_snapshot_folders(
             WITH latest AS (
               SELECT DISTINCT ON (external_id)
                      external_id, COALESCE(folder_path, '') AS path
-              FROM tm_vault.snapshot_items
+              FROM snapshot_items
               WHERE snapshot_id = ANY(:snaps)
                 {type_filter}
               ORDER BY external_id, created_at DESC
