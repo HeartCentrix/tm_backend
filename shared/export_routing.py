@@ -43,3 +43,18 @@ def pick_backup_queue(
     if drive_bytes_estimate >= settings.BACKUP_HEAVY_THRESHOLD_BYTES:
         return settings.BACKUP_HEAVY_QUEUE
     return fallback
+
+
+_HEAVY_RESTORE_THRESHOLD = 50 * 1024**3  # 50 GiB
+
+
+def pick_restore_queue(total_bytes: int) -> str:
+    """Route restore jobs by scope size.
+
+    Large restores (>50 GiB) run on restore.heavy so they don't block
+    small quick restores on the shared restore.normal queue. Mirrors
+    pick_backup_queue / pick_export_queue in the same module.
+    """
+    if total_bytes and total_bytes > _HEAVY_RESTORE_THRESHOLD:
+        return "restore.heavy"
+    return "restore.normal"
