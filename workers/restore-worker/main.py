@@ -677,16 +677,39 @@ class RestoreWorker:
         restored_count = 0
         failed_count = 0
 
-        # Fetch target resource
-        target_resource = await session.execute(
-            select(Resource).where(
-                and_(
-                    Resource.external_id == target_user_id,
-                    Resource.status == "ACTIVE"
+        # Fetch target resource. Accept either a Resource.id (DB UUID,
+        # sent by the UI's mailbox picker — unambiguous when multiple
+        # resource rows share the same external_id) or a Graph
+        # external_id string (legacy payload shape). Status filter is
+        # relaxed to include DISCOVERED so a freshly-discovered target
+        # that hasn't been backed up yet is still a valid restore
+        # destination.
+        target_resource = None
+        allowed_statuses = ("ACTIVE", "DISCOVERED")
+        try:
+            target_uuid = uuid.UUID(str(target_user_id))
+        except (TypeError, ValueError):
+            target_uuid = None
+        if target_uuid is not None:
+            row = await session.execute(
+                select(Resource).where(
+                    and_(
+                        Resource.id == target_uuid,
+                        Resource.status.in_(allowed_statuses),
+                    )
                 )
             )
-        )
-        target_resource = target_resource.scalars().first()
+            target_resource = row.scalars().first()
+        if target_resource is None:
+            row = await session.execute(
+                select(Resource).where(
+                    and_(
+                        Resource.external_id == target_user_id,
+                        Resource.status.in_(allowed_statuses),
+                    )
+                )
+            )
+            target_resource = row.scalars().first()
 
         if not target_resource:
             raise ValueError(f"Target resource {target_user_id} not found")
