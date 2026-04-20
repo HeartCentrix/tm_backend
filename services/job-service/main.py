@@ -1095,21 +1095,18 @@ async def files_export_or_restore(
 
 @app.post("/api/v1/sharepoint/{resource_id}/download")
 async def sharepoint_download(resource_id: str, request: dict, db: AsyncSession = Depends(get_db)):
-    """Queue a SharePoint download job for one of three scopes.
+    """DEPRECATED — use ``POST /api/v1/resources/{resource_id}/export-or-restore``.
 
-    Request body:
+    This endpoint predates the Files folder-select v2 payload. It
+    continues to work identically for the OneDrive / SharePoint callers
+    that still use it; removal is scheduled for the release AFTER
+    ``FILES_FOLDER_SELECT_V2`` is fully on in prod.
+
+    Request body (unchanged):
       * ``scope``: ``"site"`` | ``"folder"`` | ``"file"``
-      * ``snapshotId``: required for ``site`` — the snapshot to export.
-      * ``folderPath``: required for ``folder`` — restore-worker selects
-        every SnapshotItem whose folder_path starts with this value.
-      * ``itemId``: required for ``file`` — single SnapshotItem id.
-
-    Translates the scope to the existing export pipeline:
-      * ``site``  → snapshotIds=[snap], preserveTree=true, format=ZIP
-      * ``folder``→ itemIds=[items under folder], preserveTree=true, format=ZIP
-      * ``file``  → itemIds=[one], preserveTree=false, format=ORIGINAL
-        (``download_export_zip`` streams the raw blob with the original
-        content-type via ``output_mode=raw_single``)
+      * ``snapshotId``: required for ``site``.
+      * ``folderPath``: required for ``folder``.
+      * ``itemId``: required for ``file``.
 
     Returns ``{jobId}``; poll ``/api/v1/jobs/export/{jobId}/status`` and
     then GET ``/api/v1/jobs/export/{jobId}/download`` to pull the bytes.
