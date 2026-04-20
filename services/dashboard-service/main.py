@@ -194,8 +194,34 @@ async def get_24hour_status(
         warning_stmt = warning_stmt.where(service_clause)
         failure_stmt = failure_stmt.where(service_clause)
 
-    success = (await db.execute(success_stmt.where(Job.status == JobStatus.COMPLETED, *filters))).scalar() or 0
-    warnings = (await db.execute(warning_stmt.where(Job.status.in_([JobStatus.RUNNING, JobStatus.QUEUED]), *filters))).scalar() or 0
+    # Outcome categories (do NOT count RUNNING/QUEUED — those are
+    # in-flight, not outcomes):
+    #   success  — COMPLETED with zero failed AND zero skipped items
+    #   warnings — COMPLETED with failed_count>0 OR skipped_count>0
+    #              (partial success, typical AFI/Veeam dashboard signal),
+    #              plus RETRYING jobs (transient failures mid-execution)
+    #   failures — FAILED
+    # Runtime, queued, cancelled are intentionally excluded.
+    _partial_json = text(
+        "COALESCE((jobs.result->>'failed_count')::int, 0) > 0 "
+        "OR COALESCE((jobs.result->>'skipped_count')::int, 0) > 0"
+    )
+    success = (await db.execute(
+        success_stmt.where(
+            Job.status == JobStatus.COMPLETED,
+            text("NOT (" + _partial_json.text + ")"),
+            *filters,
+        )
+    )).scalar() or 0
+    warnings = (await db.execute(
+        warning_stmt.where(
+            or_(
+                and_(Job.status == JobStatus.COMPLETED, _partial_json),
+                Job.status == JobStatus.RETRYING,
+            ),
+            *filters,
+        )
+    )).scalar() or 0
     failures = (await db.execute(failure_stmt.where(Job.status == JobStatus.FAILED, *filters))).scalar() or 0
 
     return {"success": success, "warnings": warnings, "failures": failures}
@@ -216,11 +242,29 @@ async def get_7day_status(
     if tenantId:
         filters.append(Job.tenant_id == UUID(tenantId))
     
+    # 7-day outcome buckets match the 24h definitions above. RUNNING /
+    # QUEUED jobs are in-flight and don't belong to any outcome bucket;
+    # previously they were mis-counted as "warnings" so every active
+    # backup inflated the Warnings number on the Overview chart.
+    _partial_json_7d = text(
+        "COALESCE((jobs.result->>'failed_count')::int, 0) > 0 "
+        "OR COALESCE((jobs.result->>'skipped_count')::int, 0) > 0"
+    )
     stmt = (
         select(
             func.date(Job.created_at).label("date"),
-            func.count().filter(Job.status == JobStatus.COMPLETED).label("success"),
-            func.count().filter(Job.status.in_([JobStatus.RUNNING, JobStatus.QUEUED])).label("warnings"),
+            func.count().filter(
+                and_(
+                    Job.status == JobStatus.COMPLETED,
+                    text("NOT (" + _partial_json_7d.text + ")"),
+                )
+            ).label("success"),
+            func.count().filter(
+                or_(
+                    and_(Job.status == JobStatus.COMPLETED, _partial_json_7d),
+                    Job.status == JobStatus.RETRYING,
+                )
+            ).label("warnings"),
             func.count().filter(Job.status == JobStatus.FAILED).label("failures"),
         )
         .select_from(Job)
