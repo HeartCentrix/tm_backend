@@ -135,3 +135,180 @@ class EntraRestoreEngine:
                     continue
             plan.sections.setdefault(kind, []).append(it)
         return plan
+
+    # ---- phase 2 + 3: sieve + diff ----
+
+    async def _sieve_section(
+        self, item_type: str, items: List[Any],
+    ) -> Dict[str, Tuple[bool, Optional[str]]]:
+        """Return `{external_id: (exists, live_fingerprint)}` for each
+        item in the section via two /$batch rounds (existence + raw
+        fetch for drift comparison)."""
+        from shared.graph_entra import sieve_existence
+        from shared.graph_batch import BatchRequest, batch_requests
+        from shared.entra_fingerprint import fingerprint_object
+
+        spec: SectionSpec = SECTION_SPECS[item_type]
+
+        ids = [it.external_id for it in items]
+        exists_map = await sieve_existence(self.graph, spec, ids)
+
+        # Second round: pull raw fields for existing objects so we can
+        # fingerprint-compare.
+        live_existing_ids = [oid for oid, e in exists_map.items() if e]
+        fingerprints: Dict[str, Optional[str]] = {oid: None for oid in ids}
+        if live_existing_ids:
+            reqs = [
+                BatchRequest(id=f"fp-{i}", method="GET",
+                             url=spec.object_url_template.format(id=oid))
+                for i, oid in enumerate(live_existing_ids)
+            ]
+            fp_responses = await batch_requests(self.graph._post, reqs)
+            for req, resp in zip(reqs, fp_responses):
+                oid = req.url.rsplit("/", 1)[-1]
+                body = (resp or {}).get("body") or {}
+                if body:
+                    fingerprints[oid] = fingerprint_object(item_type, body)
+
+        return {oid: (exists_map.get(oid, False), fingerprints.get(oid)) for oid in ids}
+
+    async def _dispatch_one(
+        self, item_type: str, snap_item: Any, outcome: str,
+    ) -> EntraOutcome:
+        """Phase 4: apply the classified outcome to Graph."""
+        raw = (snap_item.extra_data or {}).get("raw") or {}
+        external_id = snap_item.external_id
+
+        try:
+            if outcome == "unchanged":
+                return EntraOutcome(
+                    item_id=str(snap_item.id),
+                    external_id=external_id,
+                    section=item_type,
+                    outcome="unchanged",
+                    graph_id=external_id,
+                )
+            if outcome == "updated":
+                await self._patch_dispatch(item_type, external_id, raw)
+                return EntraOutcome(
+                    item_id=str(snap_item.id),
+                    external_id=external_id,
+                    section=item_type,
+                    outcome="updated",
+                    graph_id=external_id,
+                )
+            # created
+            new_id = await self._create_dispatch(item_type, raw)
+            return EntraOutcome(
+                item_id=str(snap_item.id),
+                external_id=external_id,
+                section=item_type,
+                outcome="created" if new_id else "failed",
+                graph_id=new_id,
+                reason=None if new_id else "create_returned_no_id",
+            )
+        except Exception as e:
+            if _is_retryable(e):
+                raise
+            return EntraOutcome(
+                item_id=str(snap_item.id),
+                external_id=external_id,
+                section=item_type,
+                outcome="failed",
+                reason=f"{type(e).__name__}: {e}",
+            )
+
+    async def _patch_dispatch(self, item_type: str, object_id: str, raw: Dict[str, Any]) -> None:
+        from shared.graph_entra import (
+            patch_user, patch_group, patch_admin_unit,
+            patch_application, patch_ca_policy, patch_intune_policy,
+            patch_role_definition,
+        )
+        PATCH_MAP = {
+            "ENTRA_DIR_USER": patch_user,
+            "ENTRA_DIR_GROUP": patch_group,
+            "ENTRA_DIR_ADMIN_UNIT": patch_admin_unit,
+            "ENTRA_DIR_APPLICATION": patch_application,
+            "ENTRA_DIR_SECURITY": patch_ca_policy,
+            "ENTRA_DIR_INTUNE": patch_intune_policy,
+            "ENTRA_DIR_ROLE": patch_role_definition,
+        }
+        fn = PATCH_MAP.get(item_type)
+        if fn is None:
+            raise RuntimeError(f"no patch handler for {item_type}")
+        await fn(self.graph, object_id, raw)
+
+    async def _create_dispatch(self, item_type: str, raw: Dict[str, Any]) -> Optional[str]:
+        from shared.graph_entra import (
+            create_user, create_group, create_admin_unit,
+            create_application, create_ca_policy, create_intune_policy,
+            create_role_definition,
+        )
+        CREATE_MAP = {
+            "ENTRA_DIR_USER": create_user,
+            "ENTRA_DIR_GROUP": create_group,
+            "ENTRA_DIR_ADMIN_UNIT": create_admin_unit,
+            "ENTRA_DIR_APPLICATION": create_application,
+            "ENTRA_DIR_SECURITY": create_ca_policy,
+            "ENTRA_DIR_INTUNE": create_intune_policy,
+            "ENTRA_DIR_ROLE": create_role_definition,
+        }
+        fn = CREATE_MAP.get(item_type)
+        if fn is None:
+            raise RuntimeError(f"no create handler for {item_type}")
+        return await fn(self.graph, raw)
+
+    # ---- phase 5: run() ----
+
+    async def run(self, items: List[Any]) -> Dict[str, Any]:
+        plan = self.build_plan(items, self.sections)
+        summary = {"unchanged": 0, "updated": 0, "created": 0, "failed": 0, "skipped": 0}
+        all_outcomes: List[EntraOutcome] = []
+
+        global_sem = asyncio.Semaphore(settings.ENTRA_RESTORE_GLOBAL_POOL)
+        tenant_sem = asyncio.Semaphore(settings.ENTRA_RESTORE_PER_TENANT)
+
+        async def one(item_type, snap_item, exists, live_fp):
+            outcome = classify_outcome(snap_item,
+                                       exists_live=exists,
+                                       live_fingerprint=live_fp)
+            async with global_sem, tenant_sem:
+                attempt = 0
+                while True:
+                    try:
+                        return await self._dispatch_one(item_type, snap_item, outcome)
+                    except Exception as e:
+                        if _is_retryable(e) and attempt < settings.ENTRA_RESTORE_MAX_RETRIES:
+                            delay = _retry_after_seconds(e)
+                            if delay is None:
+                                delay = min(1.0 * (2 ** attempt), 16.0)
+                            await asyncio.sleep(delay)
+                            attempt += 1
+                            continue
+                        return EntraOutcome(
+                            item_id=str(snap_item.id),
+                            external_id=snap_item.external_id,
+                            section=item_type,
+                            outcome="failed",
+                            reason=f"exhausted: {type(e).__name__}: {e}",
+                        )
+
+        # Drive sections in dependency order.
+        for item_type in SECTION_ORDER:
+            section_items = plan.sections.get(item_type)
+            if not section_items:
+                continue
+            sieve = await self._sieve_section(item_type, section_items)
+            tasks = [
+                asyncio.create_task(
+                    one(item_type, it, sieve[it.external_id][0], sieve[it.external_id][1])
+                )
+                for it in section_items
+            ]
+            outcomes = await asyncio.gather(*tasks)
+            for o in outcomes:
+                summary[o.outcome] = summary.get(o.outcome, 0) + 1
+                all_outcomes.append(o)
+
+        summary["items"] = [o.__dict__ for o in all_outcomes]
+        return summary
