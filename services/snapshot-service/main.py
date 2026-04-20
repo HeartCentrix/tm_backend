@@ -1810,7 +1810,13 @@ async def get_item_content(
                 import urllib.parse as _urlp
                 fname = (item.name or f"item-{item.id}").strip()
                 safe = _urlp.quote(fname)
-                headers["Content-Disposition"] = f"attachment; filename=\"{fname}\"; filename*=UTF-8''{safe}"
+                # HTTP headers are latin-1 only. Graph-sourced filenames often
+                # carry chars like U+202F (narrow no-break space) that break
+                # Response() header encoding. Strip to ASCII for the plain
+                # filename fallback; filename* keeps the UTF-8 original for
+                # RFC 5987-aware clients.
+                ascii_fname = fname.encode("ascii", "replace").decode("ascii").replace('"', "'")
+                headers["Content-Disposition"] = f"attachment; filename=\"{ascii_fname}\"; filename*=UTF-8''{safe}"
 
                 # Audit: FILE_DOWNLOADED — one row per single-file download
                 # (distinct from bulk EXPORT_DOWNLOADED which bundles many
