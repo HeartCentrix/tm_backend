@@ -718,6 +718,16 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         # None / missing = restore everything (back-compat). Restore-worker maps each
         # label to the matching item_type values and skips anything else in the snapshot.
         "workloads": request.get("workloads"),
+        # Files folder-select v2. When either list is non-empty the
+        # restore-worker delegates to shared.folder_resolver instead of
+        # treating itemIds as the authoritative selection.
+        "folderPaths": request.get("folderPaths") or [],
+        "excludedItemIds": request.get("excludedItemIds") or [],
+        # SharePoint/OneDrive/Teams/Group restore conflict handling.
+        # OVERWRITE replaces in-place; SEPARATE_FOLDER lands under
+        # `Restored by TM/{date}/…`. Defaults to SEPARATE_FOLDER in the
+        # restore engine when not set.
+        "conflictMode": (request.get("conflictMode") or None),
         # Pass-through params consumed by Azure restore handlers (target RG, VM/DB name,
         # subscription, PITR time, firewall flag, disk name, etc). Kept as a nested
         # dict so non-Azure restores ignore it cleanly.
@@ -798,7 +808,21 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         from sqlalchemy import func as sa_func
         total_bytes = 0
         try:
-            if item_ids:
+            # Folder-scope path: resolve the selection first so the
+            # routing decision sees the same bytes the worker will
+            # actually process. Legacy paths (itemIds only, or just a
+            # snapshot) fall back to the simple aggregate.
+            if (spec.get("folderPaths") or spec.get("excludedItemIds")) and snapshot_ids:
+                from shared.folder_resolver import resolve_selection
+                resolved = await resolve_selection(
+                    db,
+                    snapshot_id=snapshot_ids[0],
+                    item_ids=item_ids,
+                    folder_paths=spec.get("folderPaths") or [],
+                    excluded_item_ids=spec.get("excludedItemIds") or [],
+                )
+                total_bytes = sum(int(r.content_size or 0) for r in resolved)
+            elif item_ids:
                 q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
                     SnapshotItem.id.in_([uuid.UUID(x) for x in item_ids])
                 )
