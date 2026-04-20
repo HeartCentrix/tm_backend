@@ -143,6 +143,22 @@ class Settings:
         # Small-attachment threshold. >= this size uses Graph's upload-session
         # endpoint (chunked PUT). Units = megabytes.
         self.MAIL_RESTORE_ATTACH_LARGE_MB = int(os.getenv("MAIL_RESTORE_ATTACH_LARGE_MB", "3"))
+        # ---- Entra Restore v2 ----
+        # Default on; set to "false" in env to disable EntraRestoreEngine
+        # + EntraExportPipeline and fall back to the legacy PATCH-only
+        # restore path for ENTRA_DIR_* items.
+        self.ENTRA_RESTORE_V2_ENABLED = os.getenv("ENTRA_RESTORE_V2_ENABLED", "true").lower() == "true"
+        # Default on; gates the server-side Entra ZIP export pipeline.
+        self.ENTRA_EXPORT_V2_ENABLED = os.getenv("ENTRA_EXPORT_V2_ENABLED", "true").lower() == "true"
+        # Per-worker cap on concurrent Entra-restore tasks across all
+        # in-flight jobs. Keeps Graph traffic bounded.
+        self.ENTRA_RESTORE_GLOBAL_POOL = int(os.getenv("ENTRA_RESTORE_GLOBAL_POOL", "32"))
+        # Per-tenant concurrency cap for $batch / PATCH calls. Graph's
+        # directory throttle budget sits around 4-6 concurrent app-only
+        # calls — stay under that.
+        self.ENTRA_RESTORE_PER_TENANT = int(os.getenv("ENTRA_RESTORE_PER_TENANT", "4"))
+        # Max retries per item on 429 / 5xx before marking failed.
+        self.ENTRA_RESTORE_MAX_RETRIES = int(os.getenv("ENTRA_RESTORE_MAX_RETRIES", "5"))
         self.EXPORT_FETCH_BATCH_SIZE = int(os.getenv("EXPORT_FETCH_BATCH_SIZE", "50"))
         self.EXPORT_MEMORY_SOFT_LIMIT_PCT = int(os.getenv("EXPORT_MEMORY_SOFT_LIMIT_PCT", "80"))
         self.EXPORT_MEMORY_KILL_GRACE_SECONDS = int(os.getenv("EXPORT_MEMORY_KILL_GRACE_SECONDS", "60"))
