@@ -203,12 +203,13 @@ class MailRestoreEngine:
                 out[fid] = {}
         return out
 
-    # Allowlisted fields for the create payload. Graph rejects / overwrites
-    # anything outside this set for POST /messages. `conversationId` and
-    # `id` are server-assigned. AFI matches this policy.
+    # Allowlisted fields for the JSON create payload. Graph rejects /
+    # overwrites anything outside this set. `conversationId`, `id`,
+    # `from`, `sender` are server-assigned — sender is restored via
+    # singleValueExtendedProperties PATCH after create.
     _CREATE_FIELDS = (
         "subject", "body", "toRecipients", "ccRecipients", "bccRecipients",
-        "sentDateTime", "receivedDateTime", "internetMessageId",
+        "replyTo", "sentDateTime", "receivedDateTime", "internetMessageId",
         "importance", "isRead", "flag", "categories",
     )
 
@@ -233,17 +234,28 @@ class MailRestoreEngine:
         sieve: Dict[str, Dict[str, str]],
         attachments: List[SnapshotItem],
     ) -> ItemOutcome:
-        """Restore a single EMAIL item. Delegates to PATCH (overwrite
-        match) or CREATE + attachment replay.
+        """Restore a single EMAIL item.
 
-        Raises retryable HTTP errors (429 / 5xx) so the outer `run()`
-        loop can apply `Retry-After` / exponential backoff. Terminal
-        errors (400, 404, non-HTTP exceptions) are captured in the
-        returned ItemOutcome and never propagate."""
+        Path taken:
+          * overwrite-mode exact match → PATCH mutable metadata only.
+          * otherwise → build an RFC-822 MIME message (headers + body +
+            every inline and regular attachment baked in) and POST it via
+            ``create_mime_message``. Unlike Graph's JSON create, MIME
+            import preserves ``From`` / ``Sender`` / ``Date`` / attachment
+            ``Content-ID`` values and marks ``isDraft=false`` so the
+            restored message shows as a real sent/received message in
+            Outlook instead of a draft with "sender unknown". The returned
+            message lands in Inbox by default; we then ``move`` it into
+            the target folder to preserve the original organisation.
+
+        Raises retryable HTTP errors (429 / 5xx) so the outer ``run()``
+        loop can apply Retry-After / exponential backoff. Terminal errors
+        (400, 404, non-HTTP exceptions) are captured in the returned
+        ItemOutcome and never propagate.
+        """
         raw = (msg_item.extra_data or {}).get("raw") or {}
         imid = raw.get("internetMessageId")
 
-        # Tier root missing — reported per the design.
         if folder_id is None:
             return ItemOutcome(
                 item_id=str(msg_item.id),
@@ -252,7 +264,6 @@ class MailRestoreEngine:
                 reason="target_archive_not_provisioned",
             )
 
-        # Overwrite-mode match → patch only.
         if self.mode == MODE_OVERWRITE and imid:
             existing_id = sieve.get(folder_id, {}).get(imid)
             if existing_id:
@@ -276,10 +287,17 @@ class MailRestoreEngine:
                         reason=f"patch_error: {type(e).__name__}: {e}",
                     )
 
-        # Otherwise create.
+        # Hybrid JSON-create + extended-property overlay (AFI/Veeam
+        # pattern). MIME import is Drafts-only on Graph v1.0, so we
+        # instead:
+        #   1. JSON-create the message in the target folder with
+        #      PR_MESSAGE_FLAGS preset → lands as NON-draft.
+        #   2. PATCH the sender MAPI properties → Outlook's From column
+        #      shows the original sender, not the mailbox owner.
+        #   3. POST attachments (inline + regular) against the message.
         payload = self.shape_message_payload(raw)
         try:
-            new_id = await self.graph.create_message_in_folder(
+            new_id = await self.graph.json_create_non_draft_message(
                 self.graph_user_id, folder_id, payload,
             )
         except Exception as e:
@@ -299,22 +317,226 @@ class MailRestoreEngine:
                 reason="create_returned_no_id",
             )
 
-        # Attachment replay. Failures here don't void the parent create
-        # — we report the parent as "created" and attach a reason string
-        # noting how many attachments failed.
+        # Restore original sender (Graph rewrites from/sender to mailbox
+        # owner on JSON create).
+        from_obj = raw.get("from") or raw.get("sender") or {}
+        ea = (from_obj or {}).get("emailAddress") or {}
+        try:
+            await self.graph.patch_sender_extended_properties(
+                self.graph_user_id,
+                new_id,
+                sender_name=ea.get("name"),
+                sender_address=ea.get("address"),
+            )
+        except Exception as e:
+            print(f"[{self.worker_id}] [MAIL-RESTORE] sender patch failed: {type(e).__name__}: {e}")
+
+        # Attachments — reuse existing _replay_attachments which handles
+        # fileAttachment / itemAttachment / referenceAttachment and sets
+        # Content-ID for inline images.
+        att_failed = 0
         if attachments:
             att_failed = await self._replay_attachments(new_id, attachments)
-        else:
-            att_failed = 0
+
+        moved_id = new_id
 
         reason = f"attachments_failed={att_failed}" if att_failed else None
         return ItemOutcome(
             item_id=str(msg_item.id),
             external_id=msg_item.external_id,
             outcome="created",
-            graph_message_id=new_id,
+            graph_message_id=moved_id,
             reason=reason,
         )
+
+    # ---- MIME builder ----
+
+    @staticmethod
+    def _build_mime_from_raw(
+        raw: Dict[str, Any],
+        attachments_with_bytes: List[Tuple[SnapshotItem, Optional[bytes]]],
+    ) -> bytes:
+        """Reconstruct an RFC-822 MIME message from a snapshot's raw Graph
+        payload + pre-fetched attachment blobs.
+
+        Structure:
+            multipart/mixed
+              multipart/related
+                multipart/alternative
+                  text/plain (derived from HTML if only HTML present)
+                  text/html  (body)
+                [inline attachments with Content-Disposition: inline]
+              [regular attachments with Content-Disposition: attachment]
+
+        Inline attachments use the original ``contentId`` (when captured
+        by the backup) so ``<img src="cid:xxx">`` references in the HTML
+        body resolve after restore. Regular attachments get their
+        original filename and content-type.
+        """
+        from email.message import EmailMessage
+        from email.utils import format_datetime, make_msgid, parseaddr
+        from email.policy import SMTP
+        from datetime import datetime as _dt, timezone as _tz
+        import re as _re
+
+        def _addr(e: Dict[str, Any]) -> str:
+            ea = (e or {}).get("emailAddress") or {}
+            name = ea.get("name") or ""
+            addr = ea.get("address") or ""
+            if name and addr:
+                return f'"{name}" <{addr}>'
+            return addr or name
+
+        def _addr_list(lst: List[Dict[str, Any]]) -> str:
+            return ", ".join(_addr(x) for x in (lst or []) if _addr(x))
+
+        def _parse_iso(s: str) -> Optional[_dt]:
+            if not s:
+                return None
+            try:
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                return _dt.fromisoformat(s)
+            except Exception:
+                return None
+
+        root = EmailMessage(policy=SMTP)
+        # Headers
+        from_hdr = _addr(raw.get("from") or raw.get("sender") or {})
+        sender_hdr = _addr(raw.get("sender") or {})
+        if from_hdr:
+            root["From"] = from_hdr
+        if sender_hdr and sender_hdr != from_hdr:
+            root["Sender"] = sender_hdr
+        to_hdr = _addr_list(raw.get("toRecipients") or [])
+        cc_hdr = _addr_list(raw.get("ccRecipients") or [])
+        bcc_hdr = _addr_list(raw.get("bccRecipients") or [])
+        rt_hdr = _addr_list(raw.get("replyTo") or [])
+        if to_hdr:
+            root["To"] = to_hdr
+        if cc_hdr:
+            root["Cc"] = cc_hdr
+        if bcc_hdr:
+            root["Bcc"] = bcc_hdr
+        if rt_hdr:
+            root["Reply-To"] = rt_hdr
+        root["Subject"] = raw.get("subject") or ""
+
+        # Date — prefer sentDateTime, then receivedDateTime, else now.
+        sent = _parse_iso(raw.get("sentDateTime") or "")
+        recv = _parse_iso(raw.get("receivedDateTime") or "")
+        stamp = sent or recv or _dt.now(_tz.utc)
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=_tz.utc)
+        root["Date"] = format_datetime(stamp)
+
+        imid = raw.get("internetMessageId") or make_msgid()
+        if not imid.startswith("<"):
+            imid = f"<{imid}>"
+        root["Message-ID"] = imid
+
+        # Outlook / Exchange look at X-Unsent to decide "is this a draft
+        # the user never sent". 0 = already sent/received → render as a
+        # normal mail. 1 would force Drafts. Pair this with the
+        # PR_MESSAGE_FLAGS patch below for full AFI-parity behaviour.
+        root["X-Unsent"] = "0"
+        root["Content-Class"] = "urn:content-classes:message"
+
+        # Keep the Received trace compact and RFC-5322 valid — the
+        # wrapping token must not contain any of the original
+        # Message-ID's special characters, so we synthesize a simple
+        # dot-atom id just for the trace. An overly elaborate header
+        # caused Graph to reject the MIME outright in previous attempts.
+        trace_time = recv or sent or _dt.now(_tz.utc)
+        if trace_time.tzinfo is None:
+            trace_time = trace_time.replace(tzinfo=_tz.utc)
+        trace_id = f"tmvaultrestore.{int(trace_time.timestamp())}"
+        root["Received"] = (
+            f"from tmvault.local by tmvault.local with SMTP id {trace_id}; "
+            f"{format_datetime(trace_time)}"
+        )
+
+        # Importance header
+        imp = (raw.get("importance") or "").lower()
+        if imp == "high":
+            root["Importance"] = "high"
+            root["X-Priority"] = "1"
+        elif imp == "low":
+            root["Importance"] = "low"
+            root["X-Priority"] = "5"
+
+        # Body
+        body = raw.get("body") or {}
+        content_type = (body.get("contentType") or "HTML").lower()
+        content = body.get("content") or ""
+        html_body = content if content_type == "html" else None
+        text_body = content if content_type != "html" else _re.sub(r"<[^>]+>", "", content)
+
+        # Partition attachments into inline vs regular.
+        inline_atts: List[Tuple[SnapshotItem, bytes]] = []
+        file_atts: List[Tuple[SnapshotItem, bytes]] = []
+        for att, blob in attachments_with_bytes:
+            if blob is None:
+                continue
+            ed = att.extra_data or {}
+            if ed.get("is_inline"):
+                inline_atts.append((att, blob))
+            else:
+                file_atts.append((att, blob))
+
+        # Build the message body.
+        if inline_atts or file_atts:
+            # Need a mixed root so regular attachments sit alongside the
+            # body/inline group.
+            root.make_mixed()
+            related = EmailMessage(policy=SMTP)
+            related.make_related()
+
+            alt = EmailMessage(policy=SMTP)
+            if html_body is not None:
+                alt.set_content(text_body or "")
+                alt.add_alternative(html_body, subtype="html")
+            else:
+                alt.set_content(text_body or "")
+            related.attach(alt)
+
+            for att, blob in inline_atts:
+                ed = att.extra_data or {}
+                ctype = ed.get("content_type") or "application/octet-stream"
+                maintype, _, subtype = ctype.partition("/")
+                subtype = subtype or "octet-stream"
+                cid = ed.get("content_id") or ed.get("contentId") or f"{att.external_id}@tmvault"
+                if cid.startswith("<"):
+                    cid = cid[1:-1] if cid.endswith(">") else cid[1:]
+                part = EmailMessage(policy=SMTP)
+                part.set_content(
+                    blob, maintype=maintype or "application", subtype=subtype,
+                    disposition="inline", cid=f"<{cid}>",
+                    filename=att.name or "inline",
+                )
+                related.attach(part)
+            root.attach(related)
+
+            for att, blob in file_atts:
+                ed = att.extra_data or {}
+                ctype = ed.get("content_type") or "application/octet-stream"
+                maintype, _, subtype = ctype.partition("/")
+                subtype = subtype or "octet-stream"
+                part = EmailMessage(policy=SMTP)
+                part.set_content(
+                    blob, maintype=maintype or "application", subtype=subtype,
+                    disposition="attachment",
+                    filename=att.name or "attachment",
+                )
+                root.attach(part)
+        else:
+            if html_body is not None:
+                root.set_content(text_body or "")
+                root.add_alternative(html_body, subtype="html")
+            else:
+                root.set_content(text_body or "")
+
+        return root.as_bytes()
 
     async def _replay_attachments(
         self,
@@ -354,16 +576,23 @@ class MailRestoreEngine:
                             is_inline=bool(ed.get("is_inline")),
                         )
                     else:
+                        att_payload = {
+                            "@odata.type": "#microsoft.graph.fileAttachment",
+                            "name": name,
+                            "contentType": ed.get("content_type") or "application/octet-stream",
+                            "isInline": bool(ed.get("is_inline")),
+                            "contentBytes": base64.b64encode(content_bytes).decode("ascii"),
+                        }
+                        # Preserve the original Content-ID for inline
+                        # images so <img src="cid:xxx"> in the restored
+                        # HTML body still resolves.
+                        cid = ed.get("content_id") or ed.get("contentId")
+                        if cid:
+                            att_payload["contentId"] = cid.strip("<>")
                         await self.graph.post_small_attachment(
                             self.graph_user_id,
                             new_message_id,
-                            {
-                                "@odata.type": "#microsoft.graph.fileAttachment",
-                                "name": name,
-                                "contentType": ed.get("content_type") or "application/octet-stream",
-                                "isInline": bool(ed.get("is_inline")),
-                                "contentBytes": base64.b64encode(content_bytes).decode("ascii"),
-                            },
+                            att_payload,
                         )
                 elif "itemattachment" in kind:
                     raw_bytes = await self._read_attachment_blob(att)

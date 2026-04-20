@@ -208,11 +208,30 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
             if cid and cid not in aggregated:
                 aggregated[cid] = c
 
+    # itemClass isn't a native property of microsoft.graph.message, so
+    # filtering by it returns 400. Contact items live in mail folders with
+    # the MAPI property PidTagMessageClass (id 0x001A) set to "IPM.Contact",
+    # which Graph surfaces as a singleValueExtendedProperty. Filter on that
+    # and $expand the same property so ``_message_to_contact_shape`` can
+    # read the class back on each hit.
+    MSG_CLASS_EP = "String 0x001A"
+    contact_class_filter = (
+        f"singleValueExtendedProperties/Any(ep:"
+        f" ep/id eq '{MSG_CLASS_EP}'"
+        f" and startswith(ep/value,'IPM.Contact'))"
+    )
+    from urllib.parse import quote as _q
+    contact_class_expand = (
+        f"singleValueExtendedProperties($filter=id eq '{MSG_CLASS_EP}')"
+    )
+
     if settings.BACKUP_CONTACTS_INCLUDE_DELETED:
         del_url = (
             f"{graph_client.GRAPH_URL}/users/{user_id}"
             f"/mailFolders('deleteditems')/messages"
-            f"?$filter=startswith(itemClass,'IPM.Contact')&$top={item_limit}"
+            f"?$filter={_q(contact_class_filter)}"
+            f"&$expand={_q(contact_class_expand)}"
+            f"&$top={item_limit}"
         )
         for msg in await _fetch_messages(del_url):
             shape = _message_to_contact_shape(msg)
@@ -225,7 +244,9 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
         rec_url = (
             f"{graph_client.GRAPH_URL}/users/{user_id}"
             f"/mailFolders('recoverableitemsdeletions')/messages"
-            f"?$filter=startswith(itemClass,'IPM.Contact')&$top={item_limit}"
+            f"?$filter={_q(contact_class_filter)}"
+            f"&$expand={_q(contact_class_expand)}"
+            f"&$top={item_limit}"
         )
         for msg in await _fetch_messages(rec_url):
             shape = _message_to_contact_shape(msg)
@@ -1436,6 +1457,10 @@ class BackupWorker:
                         "attachment_kind": att_kind,
                         "content_type": content_type,
                         "is_inline": att.get("isInline", False),
+                        # Preserve original Content-ID so inline images
+                        # restored via MIME resolve against the body's
+                        # cid:xxx references.
+                        "content_id": att.get("contentId") or att.get("contentID"),
                         "source_url": att.get("sourceUrl"),
                         "resolved": blob_path is not None,
                     },
@@ -3019,6 +3044,7 @@ class BackupWorker:
                         "attachment_kind": att_kind,
                         "content_type": att.get("contentType"),
                         "is_inline": att.get("isInline", False),
+                        "content_id": att.get("contentId") or att.get("contentID"),
                         "source_url": att.get("sourceUrl"),
                     },
                 ))
@@ -5677,6 +5703,7 @@ class BackupWorker:
                         "attachment_kind": att_kind,
                         "content_type": att.get("contentType"),
                         "is_inline": att.get("isInline", False),
+                        "content_id": att.get("contentId") or att.get("contentID"),
                         "source_url": att.get("sourceUrl"),  # referenceAttachment
                     },
                 ))

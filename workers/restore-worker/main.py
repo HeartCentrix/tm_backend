@@ -674,6 +674,22 @@ class RestoreWorker:
                 mail_summary = await engine.run(mail_items)
                 restored_count += mail_summary["created"] + mail_summary["updated"]
                 failed_count += mail_summary["failed"]
+                print(
+                    f"[{self.worker_id}] [MAIL-RESTORE] summary: "
+                    f"created={mail_summary.get('created',0)} "
+                    f"updated={mail_summary.get('updated',0)} "
+                    f"failed={mail_summary.get('failed',0)} "
+                    f"skipped={mail_summary.get('skipped',0)}",
+                    flush=True,
+                )
+                for o in mail_summary.get("items", []):
+                    if o.get("outcome") == "failed":
+                        print(
+                            f"[{self.worker_id}] [MAIL-RESTORE FAIL] "
+                            f"ext_id={o.get('external_id')} "
+                            f"reason={o.get('reason')}",
+                            flush=True,
+                        )
 
             # Entra restore v2 fast-path. When the flag is on and
             # resource is the tenant-wide ENTRA_DIRECTORY container,
@@ -1689,18 +1705,80 @@ class RestoreWorker:
             except Exception as e:
                 print(f"[{self.worker_id}] attachment read failed for {att.external_id}: {type(e).__name__}: {e}")
 
-        mime_bytes = MailRestoreEngine._build_mime_from_raw(raw_data, attachments_with_bytes)
-        # Land the MIME directly in a non-Drafts folder so Graph doesn't
-        # flag the imported message as a draft. Prefer the message's
-        # captured parentFolderId; fall back to the inbox well-known id
-        # when the snapshot didn't keep it.
+        # Hybrid JSON-create + extended-property overlay — same path
+        # MailRestoreEngine uses. Message lands non-draft with original
+        # sender and attachments.
         target_folder = raw_data.get("parentFolderId") or "inbox"
-        new_id = await graph_client.create_mime_message(user_id, mime_bytes, folder_id=target_folder)
-        if new_id:
+        payload = {
+            k: raw_data[k] for k in (
+                "subject", "body", "toRecipients", "ccRecipients", "bccRecipients",
+                "replyTo", "sentDateTime", "receivedDateTime", "internetMessageId",
+                "importance", "isRead", "flag", "categories",
+            ) if k in raw_data
+        }
+        new_id = await graph_client.json_create_non_draft_message(
+            user_id, target_folder, payload,
+        )
+        if not new_id:
+            return
+
+        # Overwrite sender via MAPI tags so From column shows the original
+        # sender, not the mailbox owner.
+        from_obj = raw_data.get("from") or raw_data.get("sender") or {}
+        ea = (from_obj or {}).get("emailAddress") or {}
+        try:
+            await graph_client.patch_sender_extended_properties(
+                user_id, new_id,
+                sender_name=ea.get("name"),
+                sender_address=ea.get("address"),
+            )
+        except Exception as e:
+            print(f"[{self.worker_id}] sender patch failed: {type(e).__name__}: {e}")
+
+        # Replay attachments (inline + regular) against the new message.
+        for att, blob_bytes in attachments_with_bytes:
+            ed = att.extra_data or {}
+            kind = (ed.get("attachment_kind") or "").lower()
             try:
-                await graph_client.clear_draft_flag(user_id, new_id)
+                if "itemattachment" in kind:
+                    import json as _json
+                    inner = {}
+                    try:
+                        inner = _json.loads(blob_bytes.decode("utf-8"))
+                    except Exception:
+                        pass
+                    await graph_client.post_small_attachment(user_id, new_id, {
+                        "@odata.type": "#microsoft.graph.itemAttachment",
+                        "name": att.name or "attachment",
+                        "item": inner,
+                    })
+                elif "referenceattachment" in kind:
+                    source_url = ed.get("source_url")
+                    if not source_url:
+                        continue
+                    await graph_client.post_small_attachment(user_id, new_id, {
+                        "@odata.type": "#microsoft.graph.referenceAttachment",
+                        "name": att.name or "attachment",
+                        "sourceUrl": source_url,
+                        "providerType": "other",
+                        "permission": "view",
+                        "isFolder": False,
+                    })
+                else:
+                    import base64 as _b64
+                    att_payload = {
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": att.name or "attachment",
+                        "contentType": ed.get("content_type") or "application/octet-stream",
+                        "isInline": bool(ed.get("is_inline")),
+                        "contentBytes": _b64.b64encode(blob_bytes).decode("ascii"),
+                    }
+                    cid = ed.get("content_id") or ed.get("contentId")
+                    if cid:
+                        att_payload["contentId"] = cid.strip("<>")
+                    await graph_client.post_small_attachment(user_id, new_id, att_payload)
             except Exception as e:
-                print(f"[{self.worker_id}] clear_draft_flag failed: {type(e).__name__}: {e}")
+                print(f"[{self.worker_id}] attachment replay failed {att.name}: {type(e).__name__}: {e}")
 
     @staticmethod
     def _conflict_path_prefix(conflict_mode: str) -> str:

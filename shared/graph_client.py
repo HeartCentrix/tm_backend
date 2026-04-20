@@ -3426,10 +3426,171 @@ class GraphClient:
         payload: Dict[str, Any],
     ) -> Optional[str]:
         """Create a message inside a specific folder. Returns the new
-        Graph message id, or None if the response didn't include one."""
+        Graph message id, or None if the response didn't include one.
+
+        NOTE: Graph always sets ``isDraft=true`` on messages created via
+        JSON POST, and it silently overwrites ``from`` / ``sender`` with
+        the mailbox owner. Use ``create_mime_message`` for true restore.
+        """
         url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{folder_id}/messages"
         resp = await self._post(url, payload)
         return resp.get("id") if isinstance(resp, dict) else None
+
+    async def create_mime_message(
+        self,
+        user_id: str,
+        mime_bytes: bytes,
+        folder_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Import an RFC-822 MIME message via Graph.
+
+        Graph has a quirk that isn't obvious from the summary docs: POST
+        to ``/users/{id}/messages`` with ``Content-Type: text/plain``
+        ALWAYS lands the message in Drafts with ``isDraft=true`` — no
+        amount of MIME header tweaking changes that. The only way to
+        create a non-draft message via MIME is to POST to the per-folder
+        endpoint ``/users/{id}/mailFolders/{folder-id}/messages`` with
+        the same content type. Graph respects the folder choice there and
+        imports the MIME with ``isDraft=false`` when the target isn't
+        Drafts.
+
+        Pass ``folder_id`` when known (normal restore path). When it's
+        omitted we fall back to the mailbox root which preserves the old
+        behaviour (imports as draft) — callers that want a non-draft
+        restore must supply a target folder.
+
+        The MIME itself preserves ``From`` / ``Sender`` / ``Date`` /
+        ``Message-ID`` / attachments / inline CIDs exactly as captured.
+        """
+        import base64 as _b64
+        if folder_id:
+            url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{folder_id}/messages"
+        else:
+            url = f"{self.GRAPH_URL}/users/{user_id}/messages"
+        token = await self._get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "text/plain",
+        }
+        body = _b64.b64encode(mime_bytes)
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            resp = await client.post(url, headers=headers, content=body)
+            if resp.status_code == 429 or resp.status_code == 503:
+                await asyncio.sleep(_parse_retry_after(resp))
+                resp = await client.post(url, headers=headers, content=body)
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"create_mime_message {resp.status_code}: {resp.text[:300]}"
+                )
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            return data.get("id") if isinstance(data, dict) else None
+
+    async def move_message(
+        self,
+        user_id: str,
+        message_id: str,
+        destination_folder_id: str,
+    ) -> Optional[str]:
+        """Move a message to another mail folder. Returns the new message
+        id (Graph rewrites the id on move)."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}/move"
+        resp = await self._post(url, {"destinationId": destination_folder_id})
+        return resp.get("id") if isinstance(resp, dict) else None
+
+    async def json_create_non_draft_message(
+        self,
+        user_id: str,
+        folder_id: str,
+        payload: Dict[str, Any],
+    ) -> Optional[str]:
+        """Create a message via JSON POST in a specific folder, with
+        ``PR_MESSAGE_FLAGS`` preset so it lands as non-draft.
+
+        This is the hybrid technique backup vendors (AFI, Veeam, Spanning)
+        use because Graph's MIME import is Drafts-only and its
+        PATCH-level write to ``PR_MESSAGE_FLAGS`` is server-ignored. At
+        CREATE time Exchange respects ``singleValueExtendedProperties``
+        including the normally-read-only MSGFLAG_UNSENT bit, so injecting
+        ``Integer 0x0E07 = 1`` (READ, not UNSENT) at create produces a
+        message that Outlook renders as real (received/sent) mail.
+
+        Caller should PATCH sender ``singleValueExtendedProperties``
+        afterwards to restore the original From / Sender — JSON POST
+        silently overrides those with the mailbox owner.
+        """
+        props = list(payload.get("singleValueExtendedProperties") or [])
+        props.append({"id": "Integer 0x0E07", "value": "1"})
+        payload = dict(payload)
+        payload["singleValueExtendedProperties"] = props
+        url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{folder_id}/messages"
+        resp = await self._post(url, payload)
+        return resp.get("id") if isinstance(resp, dict) else None
+
+    async def patch_sender_extended_properties(
+        self,
+        user_id: str,
+        message_id: str,
+        sender_name: Optional[str],
+        sender_address: Optional[str],
+    ) -> None:
+        """Overwrite a restored message's sender to the original
+        From/Sender captured in the snapshot.
+
+        Graph's JSON create silently rewrites ``from`` and ``sender`` to
+        the mailbox owner, so we have to come back via MAPI tags:
+          * ``String 0x0042`` PR_SENT_REPRESENTING_NAME
+          * ``String 0x0065`` PR_SENT_REPRESENTING_EMAIL_ADDRESS
+          * ``String 0x0064`` PR_SENT_REPRESENTING_ADDRTYPE = "SMTP"
+          * ``String 0x0C1A`` PR_SENDER_NAME
+          * ``String 0x0C1F`` PR_SENDER_EMAIL_ADDRESS
+          * ``String 0x0C1E`` PR_SENDER_ADDRTYPE = "SMTP"
+        Outlook's From column is computed from the PR_SENT_REPRESENTING_*
+        pair, with PR_SENDER_* as fallback. Setting both avoids edge
+        cases where one bag is preferred over the other.
+        """
+        if not (sender_name or sender_address):
+            return
+        props: List[Dict[str, str]] = []
+        if sender_name:
+            props.append({"id": "String 0x0042", "value": sender_name})
+            props.append({"id": "String 0x0C1A", "value": sender_name})
+        if sender_address:
+            props.append({"id": "String 0x0065", "value": sender_address})
+            props.append({"id": "String 0x0C1F", "value": sender_address})
+        props.append({"id": "String 0x0064", "value": "SMTP"})
+        props.append({"id": "String 0x0C1E", "value": "SMTP"})
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}"
+        await self._patch(url, {"singleValueExtendedProperties": props})
+
+    async def clear_draft_flag(self, user_id: str, message_id: str) -> None:
+        """Force a restored message out of Drafts into a normal
+        sent/received state by patching the MAPI PR_MESSAGE_FLAGS
+        property (tag ``Integer 0x0E07``).
+
+        Bit meanings (from MS-OXCMSG):
+            0x00000001  MSGFLAG_READ     — message has been read
+            0x00000008  MSGFLAG_UNSENT   — message is a draft
+            0x00000010  MSGFLAG_UNMODIFIED
+            0x00000020  MSGFLAG_SUBMIT
+            0x00000040  MSGFLAG_HASATTACH
+
+        Graph's MIME import often leaves ``UNSENT`` set, which is what
+        makes Outlook render the restored mail as a draft with "sender
+        unknown" cues even though the mailbox is correct. Writing the
+        flags to ``1`` clears UNSENT + keeps READ — matching what
+        Veeam/AFI do for immutable mail restore. We also set
+        ``PR_MSG_EDITOR_FORMAT`` (``Integer 0x5909``) to ``2`` (HTML)
+        as a belt-and-braces hint so clients pick the HTML part for
+        display.
+        """
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}"
+        body = {
+            "singleValueExtendedProperties": [
+                {"id": "Integer 0x0E07", "value": "1"},
+                {"id": "Integer 0x5909", "value": "2"},
+            ],
+        }
+        await self._patch(url, body)
 
     # Fields AFI patches on an already-existing matched message. Body,
     # recipients, subject, and dates are immutable per Graph and AFI
