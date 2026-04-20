@@ -662,9 +662,7 @@ class MailRestoreEngine:
             tenant_id = str(self.target.tenant_id)
             shard = azure_storage_manager.get_shard_for_resource(tenant_id, tenant_id)
             container = azure_storage_manager.get_container_name(tenant_id, "email")
-            blob_client = shard.get_blob_client(container, att.blob_path)
-            stream = await blob_client.download_blob()
-            return await stream.readall()
+            return await shard.download_blob(container, att.blob_path)
         except Exception as e:
             print(f"[{self.worker_id}] [MAIL-RESTORE] blob read failed {att.blob_path}: {type(e).__name__}: {e}")
             return None

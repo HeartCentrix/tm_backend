@@ -94,7 +94,13 @@ class OneDriveRestoreEngine:
 
     async def _read_blob_bytes(self, item: SnapshotItem) -> Optional[bytes]:
         """Fetch captured bytes from Azure Blob. Returns None on missing
-        blob_path or any read error — callers treat that as 'skipped'."""
+        blob_path or any read error — callers treat that as 'skipped'.
+
+        Uses ``AzureStorageShard.download_blob`` which returns bytes
+        directly and yields None on ResourceNotFoundError; the previous
+        ``shard.get_blob_client(...)`` call is not part of the shard's
+        public surface.
+        """
         blob_path = getattr(item, "blob_path", None)
         if not blob_path:
             return None
@@ -105,9 +111,7 @@ class OneDriveRestoreEngine:
             container = azure_storage_manager.get_container_name(
                 str(self.tenant_id), "files",
             )
-            blob_client = shard.get_blob_client(container, blob_path)
-            stream = await blob_client.download_blob()
-            return await stream.readall()
+            return await shard.download_blob(container, blob_path)
         except Exception as exc:
             print(f"[{self.worker_id}] [ONEDRIVE-RESTORE] blob read "
                   f"{blob_path} failed: {type(exc).__name__}: {exc}", flush=True)
