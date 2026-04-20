@@ -170,7 +170,10 @@ class Settings:
         self.EXPORT_FETCH_BATCH_SIZE = int(os.getenv("EXPORT_FETCH_BATCH_SIZE", "50"))
         self.EXPORT_MEMORY_SOFT_LIMIT_PCT = int(os.getenv("EXPORT_MEMORY_SOFT_LIMIT_PCT", "80"))
         self.EXPORT_MEMORY_KILL_GRACE_SECONDS = int(os.getenv("EXPORT_MEMORY_KILL_GRACE_SECONDS", "60"))
-        self.EXPORT_MAIL_V2_ENABLED = os.getenv("EXPORT_MAIL_V2_ENABLED", "false").lower() in ("true", "1", "yes")
+        # Default on: the v2 streaming mail export is what powers Download
+        # (ZIP / MBOX) from Recovery. Flip off in env only for emergency
+        # rollback to the legacy in-memory export path.
+        self.EXPORT_MAIL_V2_ENABLED = os.getenv("EXPORT_MAIL_V2_ENABLED", "true").lower() in ("true", "1", "yes")
         # MBOX tiering: folders under this byte size accumulate in memory and go
         # straight into the final ZIP without an intermediate Azure blob.
         # Folders over the limit stream via intermediate blob (bounded memory,
@@ -178,7 +181,9 @@ class Settings:
         self.EXPORT_MBOX_INLINE_LIMIT_BYTES = int(os.getenv("EXPORT_MBOX_INLINE_LIMIT_BYTES", str(100 * 1024 * 1024)))
 
         # ── OneDrive export v2 (see 2026-04-19-onedrive-export-and-backup-uncap-design.md) ──
-        self.EXPORT_ONEDRIVE_V2_ENABLED = os.getenv("EXPORT_ONEDRIVE_V2_ENABLED", "false").lower() in ("true", "1", "yes")
+        # Default on: folder-tree preserving ZIP + single-file raw stream
+        # for Download flows. Disable per env for rollback only.
+        self.EXPORT_ONEDRIVE_V2_ENABLED = os.getenv("EXPORT_ONEDRIVE_V2_ENABLED", "true").lower() in ("true", "1", "yes")
         self.EXPORT_ONEDRIVE_MISSING_POLICY = os.getenv("EXPORT_ONEDRIVE_MISSING_POLICY", "skip").lower()
         self.EXPORT_ONEDRIVE_INCLUDE_VERSIONS = os.getenv("EXPORT_ONEDRIVE_INCLUDE_VERSIONS", "false").lower() in ("true", "1", "yes")
         self.EXPORT_ONEDRIVE_MAX_FILE_BYTES = int(os.getenv("EXPORT_ONEDRIVE_MAX_FILE_BYTES", str(200 * 1024 * 1024 * 1024)))
@@ -186,7 +191,9 @@ class Settings:
         self.EXPORT_ONEDRIVE_SANITIZE_CHARS = os.getenv("EXPORT_ONEDRIVE_SANITIZE_CHARS", '<>:"/\\|?*')
 
         # ── OneDrive backup uncap ──
-        self.ONEDRIVE_BACKUP_V2_ENABLED = os.getenv("ONEDRIVE_BACKUP_V2_ENABLED", "false").lower() in ("true", "1", "yes")
+        # Default on: removes the legacy per-drive cap + uses resumable
+        # streaming so multi-TB drives survive transient failures.
+        self.ONEDRIVE_BACKUP_V2_ENABLED = os.getenv("ONEDRIVE_BACKUP_V2_ENABLED", "true").lower() in ("true", "1", "yes")
         self.ONEDRIVE_BACKUP_FILE_CONCURRENCY = int(os.getenv("ONEDRIVE_BACKUP_FILE_CONCURRENCY", "16"))
         self.MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER = int(os.getenv("MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER", "4"))
         self.ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS = int(os.getenv("ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS", "21600"))
@@ -194,7 +201,10 @@ class Settings:
         self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES", str(1024 * 1024 * 1024)))
 
         # ── Heavy backup pool ──
-        self.BACKUP_HEAVY_ENABLED = os.getenv("BACKUP_HEAVY_ENABLED", "false").lower() in ("true", "1", "yes")
+        # Default on: route OneDrive drives above the heavy threshold to
+        # backup.heavy so one monster drive doesn't starve every regular
+        # backup-worker replica.
+        self.BACKUP_HEAVY_ENABLED = os.getenv("BACKUP_HEAVY_ENABLED", "true").lower() in ("true", "1", "yes")
         self.BACKUP_HEAVY_THRESHOLD_BYTES = int(os.getenv("BACKUP_HEAVY_THRESHOLD_BYTES", str(100 * 1024 * 1024 * 1024)))
         self.BACKUP_HEAVY_QUEUE = os.getenv("BACKUP_HEAVY_QUEUE", "backup.heavy")
         self.BACKUP_WORKER_QUEUE = os.getenv("BACKUP_WORKER_QUEUE", "backup.normal")
@@ -268,7 +278,9 @@ class Settings:
             "HEAVY_EXPORT_THRESHOLD_BYTES", str(100 * 1024 * 1024 * 1024)
         ))
         self.HEAVY_EXPORT_QUEUE = os.getenv("HEAVY_EXPORT_QUEUE", "restore.heavy")
-        self.HEAVY_EXPORT_ENABLED = os.getenv("HEAVY_EXPORT_ENABLED", "false").lower() in ("true", "1", "yes")
+        # Default on: heavy exports (large mail / drive downloads) route
+        # to restore.heavy — keeps the normal restore pool responsive.
+        self.HEAVY_EXPORT_ENABLED = os.getenv("HEAVY_EXPORT_ENABLED", "true").lower() in ("true", "1", "yes")
         self.RESTORE_WORKER_QUEUE = os.getenv("RESTORE_WORKER_QUEUE", "restore.normal")
 
         # --- Chat export (v1) ---
