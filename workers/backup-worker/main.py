@@ -5880,15 +5880,21 @@ class BackupWorker:
             instead of re-walking each one."""
             per_drive_in = drive_delta_tokens_by_site.get(site_id) or {}
             per_drive_out: Dict[str, Dict[str, Optional[str]]] = {}
-            # Back-compat fallback: if we've never recorded per-drive
-            # tokens but do have the legacy singleton token, seed the
-            # new map with it keyed under the first drive we see. Graph
-            # returns the default drive first so this keeps the
-            # existing delta contract intact on the first run.
+
+            # Diagnostic: count what we actually enumerate + stream.
+            try:
+                drives = await graph_client.list_sharepoint_site_drives(site_id)
+                print(f"[{self.worker_id}]   [SP_DRIVES] {site_label}: enumerated {len(drives)} drive(s)"
+                      + (" — " + ", ".join(f"{d.get('name','?')}({d.get('driveType','?')})" for d in drives[:8]) if drives else ""))
+            except Exception as exc:
+                print(f"[{self.worker_id}]   [SP_DRIVES] {site_label}: enumerate FAIL {type(exc).__name__}: {exc}")
+
+            streamed = 0
             try:
                 async for item in graph_client.iter_sharepoint_site_all_drive_items(
                     site_id, per_drive_in, per_drive_out,
                 ):
+                    streamed += 1
                     item["_site_label"] = site_label
                     if exclusions and self._item_is_excluded("FILE", item, exclusions):
                         stats["drive_excluded"] += 1
@@ -5897,6 +5903,8 @@ class BackupWorker:
             except Exception as exc:
                 logger.warning("SharePoint drive producer %s failed: %s", site_label, exc)
             finally:
+                print(f"[{self.worker_id}]   [SP_DRIVES] {site_label}: streamed {streamed} drive-item(s) "
+                      f"across {len(per_drive_out)} drive(s)")
                 # Persist new per-drive tokens. The legacy flat
                 # `delta_token` / `subsite_delta_tokens` are still
                 # written for back-compat but are no longer consulted
@@ -6102,6 +6110,14 @@ class BackupWorker:
         print(f"[{self.worker_id}]   [SP_LISTS] {stats['list_folders']} lists, "
               f"{stats['rest_rows']} rows processed, {stats['rest_files_ok']} files "
               f"({stats['rest_bytes']} bytes), {stats['rest_fail']} failed")
+        # Breakdown of why REST rows didn't produce file content — helps
+        # diagnose "283 items, 0 bytes" type snapshots.
+        print(f"[{self.worker_id}]   [SP_REST_BREAKDOWN] "
+              f"no_fileref={stats.get('rest_rows_no_fileref', 0)} "
+              f"folder={stats.get('rest_rows_folder', 0)} "
+              f"meta_fail={stats.get('rest_rows_meta_fail', 0)} "
+              f"meta_none={stats.get('rest_rows_meta_none', 0)} "
+              f"size_zero={stats.get('rest_rows_size_zero', 0)}")
 
         if stats["new_subsite_tokens"] or stats["new_drive_tokens"]:
             async with async_session_factory() as sess:
@@ -6188,15 +6204,41 @@ class BackupWorker:
         size = 0
         file_info: Optional[Dict[str, Any]] = None
 
+        # Diagnostic counters — classify why rows end up without file
+        # content. Only one per call lands on the right bucket.
+        stats.setdefault("rest_rows_no_fileref", 0)
+        stats.setdefault("rest_rows_folder", 0)
+        stats.setdefault("rest_rows_meta_fail", 0)
+        stats.setdefault("rest_rows_meta_none", 0)
+        stats.setdefault("rest_rows_size_zero", 0)
+
+        if not srv_rel:
+            stats["rest_rows_no_fileref"] += 1
+        elif is_folder:
+            stats["rest_rows_folder"] += 1
+
         if srv_rel and not is_folder:
             try:
                 file_info = await graph_client.get_sharepoint_file_metadata_via_rest(
                     sp_hostname, sp_site_web_url, srv_rel,
                 )
-            except Exception:
+            except Exception as _meta_exc:
+                stats["rest_rows_meta_fail"] += 1
+                if stats["rest_rows_meta_fail"] <= 3:
+                    print(f"[{self.worker_id}]   [SP_REST META FAIL] {site_label}/{display}/{name}: "
+                          f"{type(_meta_exc).__name__}: {_meta_exc}")
                 file_info = None
+            if file_info is None:
+                # Distinct from meta-fail: the call succeeded but
+                # returned None/empty (e.g. row has FileRef but file
+                # was deleted, or endpoint returned 204).
+                if stats["rest_rows_meta_none"] == 0:
+                    print(f"[{self.worker_id}]   [SP_REST META NONE] {site_label}/{display}/{name} srv_rel={srv_rel}")
+                stats["rest_rows_meta_none"] += 1
             if file_info:
                 size = int(file_info.get("Length") or 0)
+                if size == 0:
+                    stats["rest_rows_size_zero"] += 1
 
         # Idempotency — skip re-downloading catalog files that already have a
         # matching blob from a prior snapshot (same server_relative_url + size).
