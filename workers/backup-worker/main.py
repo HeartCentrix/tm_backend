@@ -2874,6 +2874,46 @@ class BackupWorker:
                         self.worker_id, resource.display_name, ch_exc,
                     )
 
+            # Pull the group's SharePoint team-site content so the
+            # Recovery "Site" tab has data. Every Unified M365 group has
+            # a backing team site reachable at /groups/{id}/sites/root;
+            # we hand that site id to backup_sharepoint() which runs the
+            # full multi-drive + REST list pipeline. Items land under
+            # the same snapshot + tenant + resource so the Group
+            # Recovery view sees SHAREPOINT_* rows alongside the mail /
+            # channel rows.
+            if is_unified:
+                try:
+                    site_resp = await graph_client._get(
+                        f"{graph_client.GRAPH_URL}/groups/{obj_id}/sites/root",
+                    )
+                    raw_site_id = site_resp.get("id", "")  # "hostname,guid,guid"
+                    if raw_site_id:
+                        site_ext_id = raw_site_id.replace(",", "/")
+                        from types import SimpleNamespace as _SN
+                        site_proxy = _SN(
+                            id=resource.id,
+                            tenant_id=resource.tenant_id,
+                            type=_SN(value="SHAREPOINT_SITE"),
+                            display_name=f"{resource.display_name} (team site)",
+                            external_id=site_ext_id,
+                            # Share extra_data with the real resource so
+                            # per-drive delta tokens persist under the
+                            # M365_GROUP row between runs.
+                            extra_data=(resource.extra_data or {}),
+                            sla_policy_id=resource.sla_policy_id,
+                        )
+                        sp_result = await self.backup_sharepoint(
+                            graph_client, site_proxy, snapshot, tenant, message,
+                        )
+                        bytes_added += int(sp_result.get("bytes_added", 0))
+                        item_count += int(sp_result.get("item_count", 0))
+                except Exception as sp_exc:
+                    logger.warning(
+                        "[%s] Team site SP backup skipped for %s: %s",
+                        self.worker_id, resource.display_name, sp_exc,
+                    )
+
         elif resource_type == "ENTRA_APP":
             # Application registration — fetch via /applications?$filter=id eq '{id}'
             apps = await graph_client.get_entra_apps()
