@@ -1880,6 +1880,11 @@ class GraphClient:
         if provided so callers can persist the checkpoint after consuming
         the stream. Internal Graph pacing (``self._get``) already handles
         Retry-After, so we don't duplicate that here.
+
+        NOTE: targets ``/sites/{id}/drive`` (singular) — the site's
+        default document library only. Sites with multiple libraries need
+        ``iter_sharepoint_site_all_drive_items`` instead; this method is
+        kept for back-compat and single-drive callers.
         """
         graph_site_id = site_id.replace("/", ",")
         url = f"{self.GRAPH_URL}/sites/{graph_site_id}/drive/root/delta"
@@ -1897,6 +1902,92 @@ class GraphClient:
             if delta_holder is not None:
                 delta_holder["deltaLink"] = page.get("@odata.deltaLink")
             break
+
+    async def list_sharepoint_site_drives(self, site_id: str) -> List[Dict[str, Any]]:
+        """Enumerate every drive (document library) attached to a
+        SharePoint site. Returns raw drive dicts (at minimum each has
+        ``id``, ``name``, ``driveType``). Paginated.
+
+        Needed to back up sites whose content lives outside the default
+        ``/sites/{id}/drive`` singleton — e.g. Team Sites with multiple
+        libraries, or Communication Sites whose ``Pages`` library isn't
+        the default one."""
+        graph_site_id = site_id.replace("/", ",")
+        url = f"{self.GRAPH_URL}/sites/{graph_site_id}/drives"
+        params: Optional[Dict[str, str]] = {"$top": "200"}
+        out: List[Dict[str, Any]] = []
+        while url:
+            page = await self._get(url, params=params)
+            params = None
+            out.extend(page.get("value") or [])
+            url = page.get("@odata.nextLink")
+        return out
+
+    async def iter_drive_items_by_id(
+        self,
+        drive_id: str,
+        delta_token: Optional[str] = None,
+        delta_holder: Optional[Dict[str, Optional[str]]] = None,
+    ):
+        """Delta-iterate items of a specific drive. Same shape as
+        ``iter_sharepoint_site_drive_items`` but targets ``/drives/{id}``
+        directly so multi-library SharePoint sites can walk each drive
+        independently."""
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/root/delta"
+        if delta_token:
+            url = delta_token
+        params = {"$top": "999"}
+        while url:
+            page = await self._get(url, params=params)
+            params = None
+            for item in (page.get("value") or []):
+                # Tag with drive id so the backup-worker's file-row
+                # builder can partition blob paths correctly even when
+                # the upstream producer aggregates drives.
+                if "_drive_id" not in item:
+                    item["_drive_id"] = drive_id
+                yield item
+            if "@odata.nextLink" in page:
+                url = page["@odata.nextLink"]
+                continue
+            if delta_holder is not None:
+                delta_holder["deltaLink"] = page.get("@odata.deltaLink")
+            break
+
+    async def iter_sharepoint_site_all_drive_items(
+        self,
+        site_id: str,
+        drive_delta_tokens: Optional[Dict[str, str]] = None,
+        drive_delta_holder: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
+    ):
+        """Enumerate every drive on the site, then delta-iterate each.
+        Yields the same drive-item dicts as
+        ``iter_sharepoint_site_drive_items`` plus ``_drive_id`` and
+        ``_drive_name`` so callers can tell which library an item came
+        from.
+
+        ``drive_delta_tokens`` — optional ``{drive_id: deltaLink}`` read
+        from the previous run to resume per-drive.
+
+        ``drive_delta_holder`` — optional ``{drive_id: {"deltaLink": ...}}``
+        written during iteration so callers can persist the new tokens
+        after consuming the stream.
+        """
+        drive_delta_tokens = drive_delta_tokens or {}
+        drives = await self.list_sharepoint_site_drives(site_id)
+        for drv in drives:
+            drive_id = drv.get("id")
+            drive_name = drv.get("name") or drive_id
+            if not drive_id:
+                continue
+            local_holder: Dict[str, Optional[str]] = {"deltaLink": None}
+            async for item in self.iter_drive_items_by_id(
+                drive_id, drive_delta_tokens.get(drive_id), local_holder,
+            ):
+                item["_drive_name"] = drive_name
+                yield item
+            if drive_delta_holder is not None and local_holder.get("deltaLink"):
+                drive_delta_holder[drive_id] = local_holder
 
     async def get_sharepoint_subsites(self, site_id: str) -> Dict[str, Any]:
         """

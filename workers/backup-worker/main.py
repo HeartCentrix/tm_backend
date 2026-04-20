@@ -5821,6 +5821,13 @@ class BackupWorker:
 
         delta_token = (resource.extra_data or {}).get("delta_token")
         subsite_delta_tokens = ((resource.extra_data or {}).get("subsite_delta_tokens") or {}).copy()
+        # Per-drive resume tokens. Needed because a single SharePoint
+        # site routinely has several document libraries; using the
+        # singleton `/drive` endpoint (the legacy path) only captures
+        # the default one.
+        drive_delta_tokens_by_site: Dict[str, Dict[str, str]] = (
+            (resource.extra_data or {}).get("drive_delta_tokens_by_site") or {}
+        )
 
         site_targets: List[tuple[str, str, Optional[str]]] = [
             (resource.external_id, resource.display_name, delta_token)
@@ -5859,14 +5866,28 @@ class BackupWorker:
             "list_folders": 0,
             "new_delta": None,
             "new_subsite_tokens": {},
+            # Per-(site, drive) delta tokens written by the multi-drive
+            # producer. Shape: {site_id: {drive_id: deltaLink}}.
+            "new_drive_tokens": {},
         }
 
         # --- Producers ----------------------------------------------------
         async def drive_producer(site_id: str, site_label: str, site_delta_token: Optional[str]):
-            delta_holder: Dict[str, Optional[str]] = {"deltaLink": None}
+            """Enumerate every library on the site (not just the default
+            ``/drive`` singleton) and stream drive-items through the
+            pipeline. Per-library delta tokens are persisted on the
+            resource so subsequent runs resume cheaply per library
+            instead of re-walking each one."""
+            per_drive_in = drive_delta_tokens_by_site.get(site_id) or {}
+            per_drive_out: Dict[str, Dict[str, Optional[str]]] = {}
+            # Back-compat fallback: if we've never recorded per-drive
+            # tokens but do have the legacy singleton token, seed the
+            # new map with it keyed under the first drive we see. Graph
+            # returns the default drive first so this keeps the
+            # existing delta contract intact on the first run.
             try:
-                async for item in graph_client.iter_sharepoint_site_drive_items(
-                    site_id, site_delta_token, delta_holder,
+                async for item in graph_client.iter_sharepoint_site_all_drive_items(
+                    site_id, per_drive_in, per_drive_out,
                 ):
                     item["_site_label"] = site_label
                     if exclusions and self._item_is_excluded("FILE", item, exclusions):
@@ -5876,12 +5897,16 @@ class BackupWorker:
             except Exception as exc:
                 logger.warning("SharePoint drive producer %s failed: %s", site_label, exc)
             finally:
-                delta_link = delta_holder.get("deltaLink")
-                if delta_link:
-                    if site_id == resource.external_id:
-                        stats["new_delta"] = delta_link
-                    else:
-                        stats["new_subsite_tokens"][site_id] = delta_link
+                # Persist new per-drive tokens. The legacy flat
+                # `delta_token` / `subsite_delta_tokens` are still
+                # written for back-compat but are no longer consulted
+                # at read time once drive_delta_tokens_by_site exists.
+                if per_drive_out:
+                    stats.setdefault("new_drive_tokens", {})[site_id] = {
+                        drive_id: holder.get("deltaLink")
+                        for drive_id, holder in per_drive_out.items()
+                        if holder.get("deltaLink")
+                    }
 
         async def list_producer(site_id: str, site_label: str):
             try:
@@ -6078,14 +6103,22 @@ class BackupWorker:
               f"{stats['rest_rows']} rows processed, {stats['rest_files_ok']} files "
               f"({stats['rest_bytes']} bytes), {stats['rest_fail']} failed")
 
-        if stats["new_subsite_tokens"]:
+        if stats["new_subsite_tokens"] or stats["new_drive_tokens"]:
             async with async_session_factory() as sess:
                 r = await sess.get(Resource, resource.id)
                 if r:
                     r.extra_data = r.extra_data or {}
-                    existing_subsite_tokens = (r.extra_data.get("subsite_delta_tokens") or {}).copy()
-                    existing_subsite_tokens.update(stats["new_subsite_tokens"])
-                    r.extra_data["subsite_delta_tokens"] = existing_subsite_tokens
+                    if stats["new_subsite_tokens"]:
+                        existing_subsite_tokens = (r.extra_data.get("subsite_delta_tokens") or {}).copy()
+                        existing_subsite_tokens.update(stats["new_subsite_tokens"])
+                        r.extra_data["subsite_delta_tokens"] = existing_subsite_tokens
+                    if stats["new_drive_tokens"]:
+                        existing_drive_tokens = (r.extra_data.get("drive_delta_tokens_by_site") or {}).copy()
+                        for site_id_key, per_drive in stats["new_drive_tokens"].items():
+                            merged = (existing_drive_tokens.get(site_id_key) or {}).copy()
+                            merged.update(per_drive)
+                            existing_drive_tokens[site_id_key] = merged
+                        r.extra_data["drive_delta_tokens_by_site"] = existing_drive_tokens
                     await sess.commit()
 
         print(f"[{self.worker_id}] [BACKUP COMPLETE] SharePoint: {resource.display_name} — "
