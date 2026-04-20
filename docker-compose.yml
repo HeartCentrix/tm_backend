@@ -408,8 +408,6 @@ services:
         reservations:
           memory: 4G
     mem_limit: 16g
-    profiles:
-      - heavy
     restart: unless-stopped
     networks:
       - tm-network
@@ -587,8 +585,6 @@ services:
         reservations:
           memory: 4G
     mem_limit: 16g
-    profiles:
-      - heavy
     restart: unless-stopped
     networks:
       - tm-network
