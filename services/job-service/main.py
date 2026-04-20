@@ -1,6 +1,7 @@
 """Job Service - Manages jobs, backup triggers, restore, and exports"""
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, List
+import uuid
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 import json
