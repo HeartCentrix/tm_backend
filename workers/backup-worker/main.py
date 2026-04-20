@@ -86,6 +86,7 @@ from shared.azure_storage import (
     upload_blob_with_retry,
     upload_blob_with_retry_from_file,
 )
+from shared.entra_fingerprint import fingerprint_object as _entra_fp
 
 logger = logging.getLogger(__name__)
 
@@ -5172,7 +5173,7 @@ class BackupWorker:
                     content_size=len(raw_bytes),
                     content_hash=hashlib.sha256(raw_bytes).hexdigest(),
                     content_checksum=None,
-                    extra_data={"raw": obj, "category": category_label},
+                    extra_data={"raw": obj, "category": category_label, "fingerprint": _entra_fp(item_type, obj)},
                 ))
                 total_bytes += len(raw_bytes)
             async with async_session_factory() as sess:
