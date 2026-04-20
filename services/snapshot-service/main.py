@@ -502,7 +502,16 @@ async def list_resources_with_backups(
             "external_id": r.external_id,
             "name": r.display_name,
             "email": r.email,
-            "data": r.extra_data or {},
+            # Merge top-level Azure columns into the data dict so the
+            # Recover modal can read subscription/RG/region without a
+            # second fetch. Backfills `location` for SQL resources
+            # (discovery only stores it on PostgreSQL metadata).
+            "data": {
+                **(r.extra_data or {}),
+                **({"azure_region": r.azure_region} if r.azure_region else {}),
+                **({"azure_subscription_id": r.azure_subscription_id} if r.azure_subscription_id else {}),
+                **({"azure_resource_group": r.azure_resource_group} if r.azure_resource_group else {}),
+            },
             "storage_bytes": r.storage_bytes or 0,
             "last_backup_at": r.last_backup_at.isoformat() if r.last_backup_at else None,
             "last_backup_status": r.last_backup_status if r.last_backup_status else None,

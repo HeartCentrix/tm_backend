@@ -252,7 +252,7 @@ async def list_resources(
         SELECT r.id, r.tenant_id, r.type, r.external_id, r.display_name, r.email, r.metadata, r.sla_policy_id,
                r.status, r.storage_bytes, r.last_backup_at,
                COALESCE(latest_job.status::text, r.last_backup_status) AS last_backup_status,
-               r.created_at
+               r.azure_region, r.azure_subscription_id, r.azure_resource_group, r.created_at
         FROM resources r
         LEFT JOIN LATERAL (
             SELECT j.status FROM jobs j
@@ -390,7 +390,16 @@ async def list_resources(
             "kind": map_kind(r[2]),
             "provider": "azure" if r[2] and "AZURE" in r[2] else "o365",
             "external_id": r[3], "name": r[4], "email": r[5],
-            "data": r[6] or {},
+            # Merge the Azure top-level columns into the metadata JSON
+            # so the Recover modal can read subscription/RG/region
+            # without a second fetch. Also backfills `location` for
+            # SQL resources (discovery only stores it on PostgreSQL).
+            "data": {
+                **(r[6] or {}),
+                **({"azure_region": r[12]} if len(r) > 12 and r[12] else {}),
+                **({"azure_subscription_id": r[13]} if len(r) > 13 and r[13] else {}),
+                **({"azure_resource_group": r[14]} if len(r) > 14 and r[14] else {}),
+            },
             "archived": r[8] == "ARCHIVED", "deleted": r[8] == "PENDING_DELETION",
             "protections": [{"policy_id": str(r[7])}] if r[7] else None,
             "usage": {"resource_id": str(r[0]), "tenant_id": str(r[1]), "backups": backup_count,
@@ -474,7 +483,7 @@ async def get_resources_by_type(
         SELECT r.id, r.tenant_id, r.type, r.external_id, r.display_name, r.email, r.metadata, r.sla_policy_id,
                r.status, r.storage_bytes, r.last_backup_at,
                COALESCE(latest_job.status::text, r.last_backup_status) AS last_backup_status,
-               r.created_at
+               r.azure_region, r.azure_subscription_id, r.azure_resource_group, r.created_at
         FROM resources r
         LEFT JOIN LATERAL (
             SELECT j.status FROM jobs j

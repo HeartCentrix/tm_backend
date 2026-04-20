@@ -1219,28 +1219,41 @@ async def azure_restore_options(
     ]
     server_lists = await asyncio.gather(*server_tasks, return_exceptions=True)
 
-    servers: set[str] = set()
-    # Track which RGs ANY server lives in too, so the union-fallback
-    # case still returns something usable when no sub is selected.
+    # Servers: returned as `{name, resourceGroup, location}` so the
+    # Recover modal can auto-fill the RG field once the user picks a
+    # server. Filtered by subscription + location only — the RG field
+    # in the modal is "where the new DB will land", not a constraint
+    # on which server to pick; narrowing by RG too would hide servers
+    # the user is trying to restore into.
+    server_objs: list[dict] = []
+    seen_server_keys: set[str] = set()
     rgs_from_servers: set[str] = set()
     for payload in server_lists:
         if isinstance(payload, Exception) or not payload:
             continue
         for srv in payload:
             srv_id = srv.get("id", "")
-            srv_rg = _rg_from_id(srv_id).lower()
+            srv_rg_actual = _rg_from_id(srv_id)
             srv_loc = (srv.get("location") or "").lower()
-            # Filter by RG / location when the user has narrowed.
-            if rg_filter and srv_rg != rg_filter.lower():
-                continue
             if loc_filter and srv_loc != loc_filter:
                 continue
-            if srv.get("name"):
-                servers.add(srv["name"])
-            if srv_rg:
-                rgs_from_servers.add(_rg_from_id(srv_id))
+            name = srv.get("name")
+            if not name:
+                continue
+            key = f"{srv_rg_actual.lower()}/{name}"
+            if key in seen_server_keys:
+                continue
+            seen_server_keys.add(key)
+            server_objs.append({
+                "name": name,
+                "resourceGroup": srv_rg_actual,
+                "location": srv_loc,
+            })
+            if srv_rg_actual:
+                rgs_from_servers.add(srv_rg_actual)
     if not sub_filter:
         rgs = rgs_from_servers
+    server_objs.sort(key=lambda s: s["name"].lower())
 
     result = {
         "subscriptions": subs_out,
@@ -1249,7 +1262,7 @@ async def azure_restore_options(
         # regions currently host a server, since the user is creating a
         # NEW database and could land it anywhere their sub allows.
         "locations": sorted(AZURE_REGIONS, key=lambda x: x["displayName"].lower()),
-        "servers": sorted(servers),
+        "servers": server_objs,
     }
     _AZURE_OPTIONS_CACHE[cache_key] = (result, time.time() + _AZURE_OPTIONS_TTL)
     return result
