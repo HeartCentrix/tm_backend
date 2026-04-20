@@ -127,9 +127,10 @@ class Settings:
         self.EXPORT_BLOCK_SIZE_BYTES = int(os.getenv("EXPORT_BLOCK_SIZE_BYTES", str(4 * 1024 * 1024)))
         self.EXPORT_FOLDER_QUEUE_MAXSIZE = int(os.getenv("EXPORT_FOLDER_QUEUE_MAXSIZE", "20"))
         self.MAX_CONCURRENT_EXPORTS_PER_WORKER = int(os.getenv("MAX_CONCURRENT_EXPORTS_PER_WORKER", "2"))
-        # Mail Restore v2 — AFI-parity pipeline. Off by default; flip to
-        # "true" in env to route EMAIL items through MailRestoreEngine.
-        self.MAIL_RESTORE_V2_ENABLED = os.getenv("MAIL_RESTORE_V2_ENABLED", "false").lower() == "true"
+        # Mail Restore v2 — AFI-parity pipeline. Default on; set
+        # MAIL_RESTORE_V2_ENABLED=false in env to roll back to the legacy
+        # _restore_email_to_mailbox path if the engine misbehaves.
+        self.MAIL_RESTORE_V2_ENABLED = os.getenv("MAIL_RESTORE_V2_ENABLED", "true").lower() == "true"
         # Per-worker global cap on concurrent mail-restore tasks across all
         # in-flight jobs. Keeps Graph traffic bounded even if many jobs run at once.
         self.MAIL_RESTORE_GLOBAL_POOL = int(os.getenv("MAIL_RESTORE_GLOBAL_POOL", "32"))
