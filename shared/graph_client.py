@@ -3526,6 +3526,54 @@ class GraphClient:
         resp = await self._post(url, payload)
         return resp.get("id") if isinstance(resp, dict) else None
 
+    async def patch_original_timestamps(
+        self,
+        user_id: str,
+        message_id: str,
+        sent_iso: Optional[str] = None,
+        received_iso: Optional[str] = None,
+    ) -> None:
+        """Restore the message's original send / receive timestamps via
+        MAPI extended properties.
+
+        Graph ignores ``sentDateTime`` / ``receivedDateTime`` on JSON
+        create and stamps server-now instead, so the restored mail would
+        otherwise show "today" in Outlook. Writing the underlying MAPI
+        tags directly fixes the displayed date columns:
+
+          * ``SystemTime 0x0039`` PR_CLIENT_SUBMIT_TIME  — Sent column
+          * ``SystemTime 0x0E06`` PR_MESSAGE_DELIVERY_TIME — Received column
+          * ``SystemTime 0x3007`` PR_CREATION_TIME
+          * ``SystemTime 0x3008`` PR_LAST_MODIFICATION_TIME
+
+        Timestamps must be ISO-8601 UTC (``2024-01-15T10:30:00Z`` form);
+        we normalise the common ``…+00:00`` form Graph emits into the
+        trailing-``Z`` form Exchange expects.
+        """
+        def _norm(ts: Optional[str]) -> Optional[str]:
+            if not ts:
+                return None
+            t = ts.strip()
+            if t.endswith("+00:00"):
+                t = t[:-6] + "Z"
+            elif "+" not in t and not t.endswith("Z"):
+                t = t + "Z"
+            return t
+
+        sent = _norm(sent_iso)
+        recv = _norm(received_iso)
+        if not (sent or recv):
+            return
+        props: List[Dict[str, str]] = []
+        if sent:
+            props.append({"id": "SystemTime 0x0039", "value": sent})
+            props.append({"id": "SystemTime 0x3007", "value": sent})
+        if recv:
+            props.append({"id": "SystemTime 0x0E06", "value": recv})
+            props.append({"id": "SystemTime 0x3008", "value": recv})
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}"
+        await self._patch(url, {"singleValueExtendedProperties": props})
+
     async def patch_sender_extended_properties(
         self,
         user_id: str,

@@ -331,6 +331,20 @@ class MailRestoreEngine:
         except Exception as e:
             print(f"[{self.worker_id}] [MAIL-RESTORE] sender patch failed: {type(e).__name__}: {e}")
 
+        # Restore original sent/received timestamps — Graph stamps
+        # server-now on create and ignores the JSON payload's date
+        # fields, which would otherwise show every restored mail as
+        # "today" in Outlook.
+        try:
+            await self.graph.patch_original_timestamps(
+                self.graph_user_id,
+                new_id,
+                sent_iso=raw.get("sentDateTime"),
+                received_iso=raw.get("receivedDateTime"),
+            )
+        except Exception as e:
+            print(f"[{self.worker_id}] [MAIL-RESTORE] timestamp patch failed: {type(e).__name__}: {e}")
+
         # Attachments — reuse existing _replay_attachments which handles
         # fileAttachment / itemAttachment / referenceAttachment and sets
         # Content-ID for inline images.

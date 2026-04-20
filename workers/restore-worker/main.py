@@ -1735,6 +1735,15 @@ class RestoreWorker:
         except Exception as e:
             print(f"[{self.worker_id}] sender patch failed: {type(e).__name__}: {e}")
 
+        try:
+            await graph_client.patch_original_timestamps(
+                user_id, new_id,
+                sent_iso=raw_data.get("sentDateTime"),
+                received_iso=raw_data.get("receivedDateTime"),
+            )
+        except Exception as e:
+            print(f"[{self.worker_id}] timestamp patch failed: {type(e).__name__}: {e}")
+
         # Replay attachments (inline + regular) against the new message.
         for att, blob_bytes in attachments_with_bytes:
             ed = att.extra_data or {}
