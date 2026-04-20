@@ -989,6 +989,11 @@ class VmBackupHandler:
             meta = {
                 "vm_name": vm_name,
                 "disk_name": name,
+                # Full ARM id of the source managed disk — the synthetic
+                # `disk_name` we use for blob paths (e.g. "vm-demo-os-disk")
+                # isn't the disk's real Azure name, so the live-detail
+                # endpoint uses this to look the disk up directly.
+                "disk_arm_id": d.get("disk_id"),
                 "disk_type": d.get("type"),
                 "os_type": d.get("os_type"),
                 "snapshot_name": d.get("snapshot_name"),
@@ -1011,23 +1016,53 @@ class VmBackupHandler:
                 blob_path=cr.get("blob_path"),
                 extra_data=meta,
             ))
-            # Volume row — mirrors the disk so the Volumes tab has a row
-            # even though we don't enumerate NTFS/ext4 partitions.
-            vol_name = f"{name} (volume)"
+            # Volume rows — one "Raw block device" entry per disk
+            # (always present, file system unknown) and one logical
+            # filesystem entry the Volumes tab can browse. For Windows
+            # OS disks we default to "Windows (C:)" NTFS; for Linux we
+            # emit "/ (root)" ext4. Data disks stay as Raw only because
+            # we can't infer their mount point without guest inspection.
+            is_os = (d.get("os_type") or "").lower() in ("windows", "linux")
+            os_t = (d.get("os_type") or "").lower()
+            raw_meta = {**meta, "volume_kind": "raw", "file_system": ""}
             rows.append(SnapshotItem(
                 id=_uuid.uuid4(),
                 snapshot_id=snapshot.id,
                 tenant_id=tenant.id,
-                external_id=f"{vm_name}:volume:{name}",
+                external_id=f"{vm_name}:volume:{name}:raw",
                 item_type="AZURE_VM_VOLUME",
-                name=vol_name,
-                folder_path=vm_name,
+                name="Raw block device",
+                folder_path=f"{vm_name}/{name}",
                 content_size=int(cr.get("size_bytes") or 0),
                 content_hash=None,
                 content_checksum=None,
                 blob_path=None,
-                extra_data=meta,
+                extra_data=raw_meta,
             ))
+            if is_os:
+                fs_name = "Windows (C:)" if os_t == "windows" else "/ (root)"
+                fs_type = "NTFS" if os_t == "windows" else "ext4"
+                mount = "C:\\" if os_t == "windows" else "/"
+                fs_meta = {
+                    **meta,
+                    "volume_kind": "filesystem",
+                    "file_system": fs_type,
+                    "mount_point": mount,
+                }
+                rows.append(SnapshotItem(
+                    id=_uuid.uuid4(),
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    external_id=f"{vm_name}:volume:{name}:fs",
+                    item_type="AZURE_VM_VOLUME",
+                    name=fs_name,
+                    folder_path=f"{vm_name}/{name}",
+                    content_size=int(cr.get("size_bytes") or 0),
+                    content_hash=None,
+                    content_checksum=None,
+                    blob_path=None,
+                    extra_data=fs_meta,
+                ))
         # Reference so linters don't complain about the helper dict.
         _ = by_name
 
