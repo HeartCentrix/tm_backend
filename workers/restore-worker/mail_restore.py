@@ -100,9 +100,16 @@ class MailRestoreEngine:
         *,
         separate_folder_root: Optional[str] = None,
         worker_id: str = "",
+        graph_user_id: Optional[str] = None,
     ):
         self.graph = graph_client
         self.target = target_resource
+        # Real Graph user id for Microsoft Graph URL construction. Tier 1
+        # mailbox rows (MAILBOX/SHARED_MAILBOX/ROOM_MAILBOX) store the
+        # Graph user id directly in `external_id`. Tier 2 USER_MAIL rows
+        # append a `:mail` suffix for uniqueness, so the caller MUST pass
+        # the suffix-free user id via `graph_user_id`.
+        self.graph_user_id = graph_user_id or target_resource.external_id
         self.mode = mode if mode in (MODE_SEPARATE, MODE_OVERWRITE) else MODE_SEPARATE
         # In SEPARATE mode every original path is prefixed with the user-
         # supplied root (e.g. "/Restored by TM/2026-04-20"). An empty root
@@ -184,7 +191,7 @@ class MailRestoreEngine:
                 out[(tier, source_path)] = resolved[(tier, target_path)]
                 continue
             fid = await self.graph.ensure_mail_folder_path(
-                self.target.external_id, tier, target_path,
+                self.graph_user_id, tier, target_path,
             )
             resolved[(tier, target_path)] = fid
             out[(tier, source_path)] = fid
@@ -211,7 +218,7 @@ class MailRestoreEngine:
             seen.add(fid)
             try:
                 out[fid] = await self.graph.list_folder_internet_message_ids(
-                    self.target.external_id, fid,
+                    self.graph_user_id, fid,
                 )
             except Exception as e:
                 print(f"[{self.worker_id}] [MAIL-RESTORE] sieve fetch failed for folder {fid}: {type(e).__name__}: {e}")
@@ -273,7 +280,7 @@ class MailRestoreEngine:
             if existing_id:
                 try:
                     await self.graph.patch_message_metadata(
-                        self.target.external_id, existing_id, raw,
+                        self.graph_user_id, existing_id, raw,
                     )
                     return ItemOutcome(
                         item_id=str(msg_item.id),
@@ -295,7 +302,7 @@ class MailRestoreEngine:
         payload = self.shape_message_payload(raw)
         try:
             new_id = await self.graph.create_message_in_folder(
-                self.target.external_id, folder_id, payload,
+                self.graph_user_id, folder_id, payload,
             )
         except Exception as e:
             if _is_retryable(e):
@@ -360,7 +367,7 @@ class MailRestoreEngine:
                         continue
                     if len(content_bytes) >= large_threshold:
                         await self.graph.upload_large_attachment(
-                            self.target.external_id,
+                            self.graph_user_id,
                             new_message_id,
                             name=name,
                             size=len(content_bytes),
@@ -370,7 +377,7 @@ class MailRestoreEngine:
                         )
                     else:
                         await self.graph.post_small_attachment(
-                            self.target.external_id,
+                            self.graph_user_id,
                             new_message_id,
                             {
                                 "@odata.type": "#microsoft.graph.fileAttachment",
@@ -389,7 +396,7 @@ class MailRestoreEngine:
                         except Exception:
                             inner = {}
                     await self.graph.post_small_attachment(
-                        self.target.external_id,
+                        self.graph_user_id,
                         new_message_id,
                         {
                             "@odata.type": "#microsoft.graph.itemAttachment",
@@ -403,7 +410,7 @@ class MailRestoreEngine:
                         failed += 1
                         continue
                     await self.graph.post_small_attachment(
-                        self.target.external_id,
+                        self.graph_user_id,
                         new_message_id,
                         {
                             "@odata.type": "#microsoft.graph.referenceAttachment",

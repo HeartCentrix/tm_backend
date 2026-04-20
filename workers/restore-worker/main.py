@@ -36,6 +36,30 @@ from shared.azure_storage import azure_storage_manager
 from mail_restore import MailRestoreEngine, MODE_OVERWRITE, MODE_SEPARATE
 
 
+def _mail_graph_user_id(resource) -> str:
+    """Return the Microsoft Graph user id for a mail-bearing resource.
+
+    Tier 1 mailbox rows (MAILBOX / SHARED_MAILBOX / ROOM_MAILBOX) store
+    the Graph user id directly in `external_id`.
+
+    Tier 2 USER_MAIL rows append a `:mail` suffix for uniqueness (see
+    `graph_client.py:1603` where the row is emitted as
+    `{user_external_id}:mail`). The real Graph user id lives in
+    `extra_data.user_id` — stripping the `:mail` suffix is the
+    defensive fallback if that field is absent."""
+    rtype = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+    if rtype == "USER_MAIL":
+        meta = resource.extra_data or {}
+        uid = meta.get("user_id")
+        if uid:
+            return str(uid)
+        raw = str(resource.external_id or "")
+        if raw.endswith(":mail"):
+            return raw[: -len(":mail")]
+        return raw
+    return str(resource.external_id or "")
+
+
 def _safe_name(name: str) -> str:
     """Sanitize a string for use as a filename inside the ZIP — strip
     path separators and colons, collapse whitespace, cap length."""
@@ -551,14 +575,16 @@ class RestoreWorker:
             # Route by item type
             teams_skipped = 0  # per-resource counter; rolled into total_teams_skipped
 
-            # Mail restore v2 fast-path. When the flag is on and this
-            # resource is a mailbox flavor, route EMAIL + EMAIL_ATTACHMENT
-            # items through MailRestoreEngine (folder-preserving, dedup,
-            # attachment replay). Items are removed from the legacy loop
-            # so we don't double-process them.
+            # Mail restore v2 fast-path. Tier 1 mailbox rows
+            # (MAILBOX / SHARED_MAILBOX / ROOM_MAILBOX) and the Tier 2
+            # USER_MAIL category row all route through MailRestoreEngine.
+            # USER_MAIL's external_id carries a `:mail` suffix for
+            # uniqueness, so the real Graph user id comes from
+            # extra_data.user_id (populated by discover_user_content);
+            # Tier 1 rows store the Graph user id verbatim.
             mail_items: List[SnapshotItem] = []
             if settings.MAIL_RESTORE_V2_ENABLED and resource_type in (
-                "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX"
+                "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX", "USER_MAIL"
             ):
                 remaining: List[SnapshotItem] = []
                 for it in resource_items:
@@ -574,12 +600,14 @@ class RestoreWorker:
                 # string OR the RestoreModal's `overwrite: bool`. Either
                 # one true → OVERWRITE mode.
                 mail_overwrite = conflict_mode == "OVERWRITE" or bool(spec.get("overwrite"))
+                graph_user_id = _mail_graph_user_id(resource)
                 engine = MailRestoreEngine(
                     graph_client,
                     resource,
                     MODE_OVERWRITE if mail_overwrite else MODE_SEPARATE,
                     separate_folder_root=spec.get("targetFolder"),
                     worker_id=self.worker_id,
+                    graph_user_id=graph_user_id,
                 )
                 mail_summary = await engine.run(mail_items)
                 restored_count += mail_summary["created"] + mail_summary["updated"]
@@ -727,7 +755,9 @@ class RestoreWorker:
 
         target_type = target_resource.type.value if hasattr(target_resource.type, "value") else str(target_resource.type)
         mail_items: List[SnapshotItem] = []
-        if settings.MAIL_RESTORE_V2_ENABLED and target_type in ("MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX"):
+        if settings.MAIL_RESTORE_V2_ENABLED and target_type in (
+            "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX", "USER_MAIL"
+        ):
             remaining: List[SnapshotItem] = []
             for it in items:
                 if it.item_type in ("EMAIL", "EMAIL_ATTACHMENT"):
@@ -744,6 +774,7 @@ class RestoreWorker:
                 MODE_OVERWRITE if overwrite else MODE_SEPARATE,
                 separate_folder_root=spec.get("targetFolder"),
                 worker_id=self.worker_id,
+                graph_user_id=_mail_graph_user_id(target_resource),
             )
             mail_summary = await engine.run(mail_items)
             restored_count += mail_summary["created"] + mail_summary["updated"]
