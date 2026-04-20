@@ -421,15 +421,18 @@ async def list_resources_with_backups(
     card for the same team / user content that M365_GROUP (or the user's
     ENTRA_USER parent) already covers."""
     # Keep in sync with resource-service/main.py::UI_HIDDEN_TYPES.
-    _HIDDEN_RECOVERY_TYPES = {
+    # Filter on the enum's string values to avoid pulling ResourceType
+    # into this module — SQLAlchemy compares the Postgres enum column
+    # against string values cleanly via .in_().
+    _HIDDEN_RECOVERY_TYPES = (
         "TEAMS_CHAT_EXPORT",
         "USER_MAIL", "USER_ONEDRIVE", "USER_CONTACTS", "USER_CALENDAR", "USER_CHATS",
         "TEAMS_CHANNEL",
-    }
+    )
     resources_stmt = (
         select(Resource)
         .where(Resource.tenant_id == UUID(tenantId))
-        .where(~Resource.type.in_([ResourceType[t] for t in _HIDDEN_RECOVERY_TYPES if hasattr(ResourceType, t)]))
+        .where(Resource.type.notin_(_HIDDEN_RECOVERY_TYPES))
         .order_by(Resource.display_name)
     )
     resources_result = await db.execute(resources_stmt)
