@@ -703,6 +703,27 @@ async def init_db() -> None:
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """,
+        # File-level index of every Azure VM VHD captured during backup.
+        # Drives backup-based (not live) Volumes browsing + download.
+        # See shared.models.VmFileIndex for schema rationale.
+        """
+        CREATE TABLE IF NOT EXISTS vm_file_index (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            snapshot_id UUID NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+            volume_item_id UUID NOT NULL,
+            parent_path VARCHAR NOT NULL,
+            name VARCHAR NOT NULL,
+            is_directory BOOLEAN NOT NULL DEFAULT FALSE,
+            size_bytes BIGINT NOT NULL DEFAULT 0,
+            modified_at TIMESTAMP,
+            fs_inode BIGINT,
+            fs_type VARCHAR,
+            partition_offset BIGINT,
+            blob_path VARCHAR,
+            extents_json JSON,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
     ]
 
     index_statements = [
@@ -722,6 +743,10 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_discovery_runs_status ON discovery_runs(status)",
         "CREATE INDEX IF NOT EXISTS idx_discovery_stage_run ON resource_discovery_staging(run_id)",
         "CREATE INDEX IF NOT EXISTS idx_discovery_stage_lookup ON resource_discovery_staging(run_id, tenant_id, resource_type, external_id)",
+        # vm_file_index — hot lookup is (snapshot, volume, parent_path)
+        # driving per-folder listings in the Volumes tab.
+        "CREATE INDEX IF NOT EXISTS idx_vm_file_index_lookup ON vm_file_index(snapshot_id, volume_item_id, parent_path)",
+        "CREATE INDEX IF NOT EXISTS idx_vm_file_index_snap ON vm_file_index(snapshot_id)",
         "CREATE INDEX IF NOT EXISTS idx_report_configs_org ON report_configs(org_id)",
         "CREATE INDEX IF NOT EXISTS idx_report_history_org ON report_history(org_id)",
         "CREATE INDEX IF NOT EXISTS idx_report_history_generated ON report_history(generated_at DESC)",

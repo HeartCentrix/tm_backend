@@ -5,7 +5,7 @@ from typing import Optional, List, Dict, Any
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, distinct, and_, or_
 
@@ -1204,6 +1204,25 @@ async def azure_db_export(
 
     shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
 
+    # Pull resource_type for audit scoping so the Activity feed's
+    # service filter can separate Azure SQL vs PostgreSQL downloads.
+    _snap = await db.get(Snapshot, UUID(snapshot_id))
+    _resource = await db.get(Resource, _snap.resource_id) if _snap else None
+    _resource_type = (
+        _resource.type.value if _resource and hasattr(_resource.type, "value")
+        else (str(_resource.type) if _resource else None)
+    )
+    await _emit_download_audit(
+        action="AZURE_DB_DOWNLOAD",
+        outcome="SUCCESS",
+        tenant_id=tenant_id,
+        resource_id=str(_resource.id) if _resource else None,
+        resource_type=_resource_type,
+        snapshot_id=snapshot_id,
+        item_count=len(snap_items),
+        details={"item_ids": [str(it.id) for it in snap_items][:50]},
+    )
+
     async def _fetch_item_bytes(item: SnapshotItem) -> tuple[str, bytes]:
         """Return (zip-path, bytes) for a single SnapshotItem per its
         item_type's download format."""
@@ -1944,6 +1963,76 @@ async def get_item_attachments(
 import httpx as _httpx
 import time as _t
 
+
+@app.post("/api/v1/snapshot-items/{item_id}/download-audit")
+async def azure_item_download_audit(
+    item_id: str,
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Client-called audit emitter for downloads that assemble their
+    bytes entirely in the browser (VM config JSON / Disk / NIC /
+    Public IP JSON). The frontend POSTs here after saving the file
+    so the Audit + Activity feeds still carry a DOWNLOAD row even
+    for those bypass-the-server flows.
+
+    Body: { action?, kind?, notes? }"""
+    item = await db.get(SnapshotItem, UUID(item_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Snapshot item not found")
+    snapshot = await db.get(Snapshot, item.snapshot_id)
+    resource = await db.get(Resource, snapshot.resource_id) if snapshot else None
+    rtype = (
+        resource.type.value if resource and hasattr(resource.type, "value")
+        else (str(resource.type) if resource else None)
+    )
+    await _emit_download_audit(
+        action=str(payload.get("action") or "AZURE_VM_DOWNLOAD"),
+        outcome="SUCCESS",
+        tenant_id=str(resource.tenant_id) if resource else None,
+        resource_id=str(resource.id) if resource else None,
+        resource_type=rtype,
+        snapshot_id=str(snapshot.id) if snapshot else None,
+        item_count=1,
+        details={
+            "kind": payload.get("kind") or item.item_type,
+            "item_id": item_id,
+            **({"notes": payload.get("notes")} if payload.get("notes") else {}),
+        },
+    )
+    return {"ok": True}
+
+
+async def _emit_download_audit(
+    *, action: str, outcome: str,
+    tenant_id: Optional[str], resource_id: Optional[str], resource_type: Optional[str],
+    snapshot_id: Optional[str] = None, item_count: int = 1,
+    details: Optional[dict] = None,
+) -> None:
+    """Best-effort audit emission for user-triggered downloads.
+    Never raises — audit-service downtime shouldn't block the download.
+    Reused by every Azure-flavored download endpoint (Azure DB export,
+    VM volume file / ZIP, VM config JSON) so the Activity + Audit feeds
+    show a consistent row per download."""
+    try:
+        payload = {
+            "action": action,
+            "tenant_id": tenant_id,
+            "actor_type": "USER",
+            "resource_id": resource_id,
+            "resource_type": resource_type,
+            "outcome": outcome,
+            "details": {
+                **(details or {}),
+                **({"snapshot_id": snapshot_id} if snapshot_id else {}),
+                "item_count": item_count,
+            },
+        }
+        async with _httpx.AsyncClient(timeout=5.0) as c:
+            await c.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json=payload)
+    except Exception:
+        pass
+
 _VM_DETAIL_CACHE: dict[str, tuple[dict, float]] = {}
 _VM_DETAIL_TTL = 60
 
@@ -2271,3 +2360,337 @@ async def azure_vm_volume_files(
     result = {"detected": True, "items": items, "path": target}
     _VM_FILES_CACHE[cache_key] = (result, _t.time() + _VM_FILES_TTL)
     return result
+
+
+# ──────────────────────────────────────────────────────────────────────
+# VM volume file download — for a given volume SnapshotItem, fetch one
+# or more files / folders from the running VM via Azure Run Command
+# and either stream the single file back or build a ZIP preserving
+# the original folder structure. Used by the Volumes tab's Download
+# button. Run Command has a ~4 KB stdout cap so we read file bytes in
+# chunked base64 blocks — each chunk is its own Run Command call.
+# ──────────────────────────────────────────────────────────────────────
+
+import base64 as _b64
+import io as _io
+import zipfile as _zipfile
+import posixpath as _pp
+
+
+async def _run_script(
+    token: str, sub: str, rg: str, vm_name: str, script: list[str], is_windows: bool,
+) -> Optional[str]:
+    return await _run_command_on_vm(token, sub, rg, vm_name, script, is_windows=is_windows)
+
+
+def _windows_path_join(parent: str, name: str) -> str:
+    p = parent if parent.endswith("\\") else (parent + "\\")
+    return p + name
+
+
+def _posix_path_join(parent: str, name: str) -> str:
+    return _pp.join(parent, name)
+
+
+async def _vm_list_dir(token: str, sub: str, rg: str, vm_name: str,
+                      path: str, is_windows: bool) -> list[dict]:
+    """Return `{name,isDirectory,size}[]` for every entry in `path`.
+    Recursive enumeration happens in the caller (one RunCommand per
+    directory) so we stay under the output limit even for deep trees."""
+    safe = path.replace("'", "''" if is_windows else "'\\''")
+    if is_windows:
+        script = [
+            f"Get-ChildItem -Force -LiteralPath '{safe}' -ErrorAction SilentlyContinue | "
+            "Select-Object Name, @{n='IsDirectory';e={$_.PSIsContainer}}, Length | "
+            "ConvertTo-Json -Compress"
+        ]
+    else:
+        script = [
+            f"ls -la --time-style=full-iso '{safe}' 2>/dev/null | awk '"
+            "NR>1 {type=substr($1,1,1); size=$5; "
+            "name=\"\"; for(i=9;i<=NF;i++) name=name\" \"$i; sub(/^ /,\"\",name); "
+            "printf \"%s\\t%s\\t%s\\n\", (type==\"d\"?\"D\":\"F\"), size, name}'"
+        ]
+    stdout = await _run_script(token, sub, rg, vm_name, script, is_windows=is_windows)
+    if stdout is None:
+        return []
+    out: list[dict] = []
+    if is_windows:
+        m = _re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", stdout)
+        if m:
+            try:
+                parsed = _json.loads(m.group(1))
+                if isinstance(parsed, dict):
+                    parsed = [parsed]
+                for e in parsed:
+                    nm = e.get("Name")
+                    if nm and nm not in (".", ".."):
+                        out.append({
+                            "name": nm,
+                            "isDirectory": bool(e.get("IsDirectory")),
+                            "size": int(e.get("Length") or 0),
+                        })
+            except Exception:
+                pass
+    else:
+        for line in stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3 and parts[2].strip() not in (".", ".."):
+                out.append({
+                    "name": parts[2].strip(),
+                    "isDirectory": parts[0] == "D",
+                    "size": int(parts[1] or 0),
+                })
+    return out
+
+
+async def _vm_read_file_bytes(
+    token: str, sub: str, rg: str, vm_name: str, path: str, is_windows: bool,
+) -> Optional[bytes]:
+    """Read a single file off the VM as bytes. Azure Run Command caps
+    output at ~4096 bytes so we stream the file in 3000-byte base64
+    chunks — each chunk is its own Run Command invocation reading a
+    different byte range of the source file."""
+    chunk_bytes = 3000  # chunk size in RAW bytes; base64 expands ~1.33x → ~4000 chars
+    if is_windows:
+        safe = path.replace("'", "''")
+        # First get the file length so we know how many chunks to read.
+        len_script = [f"(Get-Item -LiteralPath '{safe}' -ErrorAction Stop).Length"]
+        len_out = await _run_script(token, sub, rg, vm_name, len_script, is_windows=True)
+        if len_out is None:
+            return None
+        try:
+            total = int(_re.search(r"\d+", len_out or "").group(0))
+        except Exception:
+            return None
+        buf = bytearray()
+        offset = 0
+        while offset < total:
+            take = min(chunk_bytes, total - offset)
+            # Read a specific byte range from the file and emit it
+            # base64-encoded. Run Command returns stdout as text; we
+            # strip the transcript header with a regex on the client.
+            script = [
+                f"$fs = [System.IO.File]::OpenRead('{safe}'); "
+                f"$fs.Seek({offset}, 'Begin') | Out-Null; "
+                f"$buf = New-Object byte[] {take}; "
+                f"$n = $fs.Read($buf, 0, {take}); "
+                f"$fs.Close(); "
+                f"[Convert]::ToBase64String($buf, 0, $n)"
+            ]
+            out = await _run_script(token, sub, rg, vm_name, script, is_windows=True)
+            if out is None:
+                return None
+            # Extract the base64 payload (only printable A-Z,a-z,0-9,+,/,= run).
+            m = _re.search(r"[A-Za-z0-9+/=]{4,}\s*$", out.strip())
+            if not m:
+                return None
+            try:
+                buf.extend(_b64.b64decode(m.group(0)))
+            except Exception:
+                return None
+            offset += take
+        return bytes(buf)
+    else:
+        safe = path.replace("'", "'\\''")
+        len_script = [f"stat -c%s '{safe}' 2>/dev/null"]
+        len_out = await _run_script(token, sub, rg, vm_name, len_script, is_windows=False)
+        if len_out is None:
+            return None
+        try:
+            total = int(_re.search(r"\d+", len_out or "").group(0))
+        except Exception:
+            return None
+        buf = bytearray()
+        offset = 0
+        while offset < total:
+            take = min(chunk_bytes, total - offset)
+            script = [
+                f"dd if='{safe}' bs=1 skip={offset} count={take} 2>/dev/null | base64 -w0"
+            ]
+            out = await _run_script(token, sub, rg, vm_name, script, is_windows=False)
+            if out is None:
+                return None
+            m = _re.search(r"[A-Za-z0-9+/=]{4,}\s*$", out.strip())
+            if not m:
+                return None
+            try:
+                buf.extend(_b64.b64decode(m.group(0)))
+            except Exception:
+                return None
+            offset += take
+        return bytes(buf)
+
+
+@app.post("/api/v1/snapshot-items/{item_id}/vm-volume-download")
+async def azure_vm_volume_download(
+    item_id: str,
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Download one or more files / folders from a VM volume.
+
+    Body: `{ paths: ["C:\\Users\\admin\\notes.txt", "C:\\Temp"] }`
+    Returns either the raw file (when paths is exactly one file) or
+    a ZIP archive with the paths rooted at their basename so the
+    original folder structure is preserved inside the archive."""
+    from shared.models import Tenant
+    paths = [p for p in (payload.get("paths") or []) if isinstance(p, str) and p]
+    if not paths:
+        raise HTTPException(status_code=400, detail="paths[] required")
+
+    item = await db.get(SnapshotItem, UUID(item_id))
+    if not item or (item.item_type or "").upper() != "AZURE_VM_VOLUME":
+        raise HTTPException(status_code=404, detail="Volume item not found")
+
+    snapshot = await db.get(Snapshot, item.snapshot_id)
+    resource = await db.get(Resource, snapshot.resource_id)
+    tenant = await db.get(Tenant, resource.tenant_id)
+    sub = resource.azure_subscription_id
+    rg = resource.azure_resource_group
+    vm_name = resource.external_id
+    if not (tenant and tenant.external_tenant_id and sub and rg and vm_name):
+        raise HTTPException(status_code=400, detail="Missing tenant/sub/RG/vm")
+
+    meta = item.extra_data or {}
+    os_type = (meta.get("os_type") or "").lower()
+    fs_hint = (meta.get("file_system") or "").upper()
+    is_windows = fs_hint == "NTFS" or (not fs_hint and os_type == "windows")
+
+    token = await _arm_token_for_tenant(tenant.external_tenant_id)
+    if not token:
+        raise HTTPException(status_code=502, detail="Failed to acquire ARM token")
+
+    # Figure out whether each path is a file or a directory up front
+    # so we can decide between single-file stream vs ZIP.
+    async def _stat(path: str) -> Optional[dict]:
+        """Is it a file or a folder? `Test-Path` tells us existence even
+        when `Get-Item` returns null for locked files (pagefile.sys,
+        DumpStack.log.tmp, swapfile, etc) — access denied shouldn't
+        look the same as "doesn't exist" to the caller."""
+        safe = path.replace("'", "''" if is_windows else "'\\''")
+        if is_windows:
+            script = [
+                f"$p = '{safe}'; "
+                "if (Test-Path -LiteralPath $p -PathType Container) { "
+                "'{\"IsDirectory\":true,\"Length\":0}' "
+                "} elseif (Test-Path -LiteralPath $p) { "
+                # File exists. Try to read its length; if the OS has
+                # the handle open exclusively, fall back to 0 (the
+                # reader will fail later with a clear error rather
+                # than us claiming the file doesn't exist here).
+                "$len = 0; "
+                "try { $len = (Get-Item -Force -LiteralPath $p -ErrorAction Stop).Length } catch {} "
+                "'{\"IsDirectory\":false,\"Length\":' + $len + '}' "
+                "} else { 'NOT_FOUND' }"
+            ]
+        else:
+            script = [f"[ -d '{safe}' ] && echo D || ([ -f '{safe}' ] && echo F || echo X); stat -c%s '{safe}' 2>/dev/null || echo 0"]
+        out = await _run_script(token, sub, rg, vm_name, script, is_windows=is_windows)
+        if out is None:
+            return None
+        if is_windows:
+            if "NOT_FOUND" in out:
+                return None
+            m = _re.search(r"\{[\s\S]*?\}", out)
+            if not m:
+                return None
+            try:
+                return _json.loads(m.group(0))
+            except Exception:
+                return None
+        lines = out.strip().splitlines()
+        if len(lines) < 2:
+            return None
+        typ, sz = lines[0].strip(), lines[1].strip()
+        if typ == "X":
+            return None
+        return {"IsDirectory": typ == "D", "Length": int(sz or 0)}
+
+    # Best-effort stat. Windows system files (pagefile.sys, swapfile,
+    # DumpStack.log.tmp, etc.) are locked by the kernel in ways that
+    # confuse both Get-Item and Test-Path depending on the SP's ACLs.
+    # Rather than claim the file doesn't exist we mark it "unknown
+    # file" and let the reader surface the real error if it fails.
+    stats = {}
+    for p in paths:
+        stats[p] = await _stat(p) or {"IsDirectory": False, "Length": 0, "statFailed": True}
+
+    # Single file → stream directly. Only take this shortcut when the
+    # request was for exactly one path and that path is a regular file.
+    if len(paths) == 1 and not stats[paths[0]]["IsDirectory"]:
+        path = paths[0]
+        data = await _vm_read_file_bytes(token, sub, rg, vm_name, path, is_windows=is_windows)
+        if data is None:
+            raise HTTPException(status_code=502, detail="Failed to read file from VM")
+        filename = path.rsplit("\\" if is_windows else "/", 1)[-1] or "download"
+        await _emit_download_audit(
+            action="AZURE_VM_DOWNLOAD",
+            outcome="SUCCESS",
+            tenant_id=str(tenant.id),
+            resource_id=str(resource.id),
+            resource_type="AZURE_VM",
+            snapshot_id=str(snapshot.id),
+            item_count=1,
+            details={"mode": "single_file", "path": path, "volume_item_id": item_id},
+        )
+        return StreamingResponse(
+            iter([data]),
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # Otherwise build a ZIP in memory. Walk any folders recursively
+    # so the caller can select a folder and get everything inside.
+    sep = "\\" if is_windows else "/"
+
+    async def _walk(root_path: str, arcname_prefix: str):
+        """Yield (archive_name, bytes) for every file under root_path."""
+        stack: list[tuple[str, str]] = [(root_path, arcname_prefix)]
+        while stack:
+            cur, arc = stack.pop()
+            entries = await _vm_list_dir(token, sub, rg, vm_name, cur, is_windows=is_windows)
+            for e in entries:
+                nm = e["name"]
+                child = (_windows_path_join(cur, nm) if is_windows
+                         else _posix_path_join(cur, nm))
+                arc_child = f"{arc}/{nm}" if arc else nm
+                if e["isDirectory"]:
+                    stack.append((child, arc_child))
+                else:
+                    data = await _vm_read_file_bytes(token, sub, rg, vm_name, child, is_windows=is_windows)
+                    if data is not None:
+                        yield (arc_child, data)
+
+    zip_buf = _io.BytesIO()
+    with _zipfile.ZipFile(zip_buf, "w", _zipfile.ZIP_DEFLATED) as zf:
+        for p in paths:
+            base = p.rstrip(sep).rsplit(sep, 1)[-1] or p
+            if stats[p]["IsDirectory"]:
+                async for arc_name, data in _walk(p, base):
+                    zf.writestr(arc_name, data)
+            else:
+                data = await _vm_read_file_bytes(token, sub, rg, vm_name, p, is_windows=is_windows)
+                if data is not None:
+                    zf.writestr(base, data)
+
+    zip_buf.seek(0)
+    await _emit_download_audit(
+        action="AZURE_VM_DOWNLOAD",
+        outcome="SUCCESS",
+        tenant_id=str(tenant.id),
+        resource_id=str(resource.id),
+        resource_type="AZURE_VM",
+        snapshot_id=str(snapshot.id),
+        item_count=len(paths),
+        details={
+            "mode": "zip",
+            "paths": paths[:10],
+            "volume_item_id": item_id,
+        },
+    )
+    return StreamingResponse(
+        zip_buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{vm_name}-volume-files.zip"'},
+    )

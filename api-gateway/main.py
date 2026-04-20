@@ -313,6 +313,16 @@ async def snapshot(request: Request):
     return await proxy_request("snapshot", request.url.path, request)
 
 
+# Volumes tab download — accepts `{ paths: [...] }` and returns the
+# raw file (for single-file requests) or a ZIP preserving folder
+# structure (for multi-path or folder requests).
+@app.post("/api/v1/snapshot-items/{item_id}/vm-volume-download")
+# Client-callable audit emitter for frontend-only downloads (config JSON).
+@app.post("/api/v1/snapshot-items/{item_id}/download-audit")
+async def vm_volume_download(request: Request):
+    return await proxy_request("snapshot", request.url.path, request)
+
+
 # Restore routes
 @app.post("/api/v1/jobs/restore")
 @app.post("/api/v1/jobs/restore/mailbox")

@@ -669,3 +669,52 @@ class TenantSecret(Base):
     is_default = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=utcnow, nullable=False)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class VmFileIndex(Base):
+    """Per-file / per-directory index produced by walking the VHD snapshot
+    captured during an Azure VM backup. Each row represents one file or
+    folder inside a disk at snapshot time.
+
+    The index lets the Volumes tab browse + download files from the
+    *backup* (not the live VM) — so locked files, stopped VMs, and deleted
+    files all remain recoverable. `fs_inode` + `fs_extents` carry enough
+    TSK-level information to re-open the same VHD blob later and stream
+    the file's bytes out without re-walking the whole filesystem.
+
+    Storage shape trades a LOT of rows (100k+ per VM is normal) for very
+    cheap lookups: `(snapshot_id, volume_item_id, parent_path)` is the
+    hot query path driving the directory listing UI."""
+    __tablename__ = "vm_file_index"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Which AZURE_VM_VOLUME SnapshotItem this file belongs to — the
+    # Recovery UI picks a volume first, then lists files from that
+    # volume only. NOT a FK into snapshot_items because the index may
+    # be produced before (or after) that table is populated.
+    volume_item_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    # Directory containing this entry. Forward-slash normalised so SQL
+    # queries don't have to care about Windows vs Linux sources.
+    parent_path = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    is_directory = Column(Boolean, default=False, nullable=False)
+    size_bytes = Column(BigInteger, default=0, nullable=False)
+    modified_at = Column(DateTime, nullable=True)
+    # Filesystem-level identifier (NTFS MFT record number, ext4 inode
+    # number, etc). Stable across the same VHD snapshot so we can
+    # re-open the file later for extraction without doing a path walk.
+    fs_inode = Column(BigInteger, nullable=True)
+    # Filesystem kind ("ntfs", "ext4", "fat32", ...) — influences how
+    # the downloader parses the VHD.
+    fs_type = Column(String, nullable=True)
+    # VHD partition byte offset the file lives in (start of the
+    # partition containing the FS, NOT the file's data offset). Used
+    # by the downloader to hand pytsk3 the right slice of the image.
+    partition_offset = Column(BigInteger, nullable=True)
+    # Path to the VHD blob so the downloader can range-read from the
+    # right backup artifact.
+    blob_path = Column(String, nullable=True)
+    # Optional extent list for very-large or fragmented files. Omitted
+    # for typical files — pytsk3 can reconstruct the runs from the MFT.
+    extents_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)

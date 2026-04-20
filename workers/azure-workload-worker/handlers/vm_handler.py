@@ -1132,6 +1132,101 @@ class VmBackupHandler:
                   f"{sum(1 for r in rows if r.item_type=='AZURE_VM_VOLUME')} volumes + "
                   f"{len(nics)} NICs + {len(pips)} public IPs)")
 
+        # ── File-level index ───────────────────────────────────────
+        # Walk every copied VHD and populate vm_file_index so the
+        # Volumes tab can browse + download files directly from the
+        # backup (no live-VM dependency). Per-disk, so one broken
+        # disk doesn't kill the whole index.
+        await self._build_file_index(
+            tenant=tenant, snapshot=snapshot, rows=rows,
+            copy_results=copy_results,
+        )
+
+    async def _build_file_index(
+        self, *, tenant, snapshot, rows, copy_results,
+    ) -> None:
+        """Walk each disk's VHD blob with pytsk3 and write rows to
+        vm_file_index. Runs after disk copy + SnapshotItem persist so
+        the index rows can reference the AZURE_VM_VOLUME item id that
+        the Recovery UI will browse by.
+
+        One blob per OS/Data disk. pytsk3 is blocking so the per-disk
+        walk happens in a thread; disks walk sequentially so we don't
+        saturate Azure blob bandwidth."""
+        import asyncio
+        import os as _os
+        from handlers.vm_file_index import walk_and_index_blob
+        from azure.storage.blob import BlobClient as _SyncBlobClient
+
+        # Map disk_name → AZURE_VM_VOLUME row id (filesystem-kind only
+        # — we don't index the "raw block device" rows, those are just
+        # the whole-disk pseudo-entries).
+        fs_volumes_by_disk: dict[str, str] = {}
+        for r in rows:
+            if r.item_type != "AZURE_VM_VOLUME":
+                continue
+            m = r.extra_data or {}
+            if m.get("volume_kind") != "filesystem":
+                continue
+            disk_name = m.get("disk_name")
+            if disk_name:
+                fs_volumes_by_disk[disk_name] = str(r.id)
+
+        if not fs_volumes_by_disk:
+            self._log("File index skipped — no filesystem-flavored "
+                      "AZURE_VM_VOLUME rows to attach index rows to")
+            return
+
+        # We need the sync blob client because pytsk3.Img_Info.read()
+        # is called synchronously from inside TSK's C code.
+        from shared.azure_storage import azure_storage_manager
+        shard = azure_storage_manager.get_default_shard()
+        container = azure_storage_manager.get_container_name(str(tenant.id), "azure-vm")
+
+        for cr in copy_results or []:
+            disk_name = cr.get("disk_name")
+            blob_path = cr.get("blob_path")
+            size_bytes = int(cr.get("size_bytes") or 0)
+            vol_id = fs_volumes_by_disk.get(disk_name)
+            if not blob_path or not vol_id or size_bytes <= 0:
+                self._log(f"File index skip {disk_name}: blob={blob_path!r} "
+                          f"vol_id={vol_id!r} size={size_bytes}", "WARNING")
+                continue
+            self._log(f"File index start disk={disk_name} "
+                      f"blob={blob_path} size_mb={size_bytes//(1024*1024)}")
+            account_url = f"https://{shard.account_name}.blob.core.windows.net"
+            sync_client = _SyncBlobClient(
+                account_url=account_url,
+                container_name=container,
+                blob_name=blob_path,
+                credential=shard.account_key,
+            )
+            try:
+                stats = await asyncio.to_thread(
+                    walk_and_index_blob,
+                    sync_client,
+                    blob_path,
+                    size_bytes,
+                    str(snapshot.id),
+                    vol_id,
+                    None,  # no max_entries cap in production
+                )
+                self._log(
+                    f"File index OK disk={disk_name} dirs={stats.directories} "
+                    f"files={stats.files} bytes={stats.total_bytes} "
+                    f"elapsed={stats.elapsed():.1f}s"
+                )
+            except Exception as e:
+                self._log(
+                    f"File index FAILED disk={disk_name}: {type(e).__name__}: {e}",
+                    "ERROR",
+                )
+            finally:
+                try:
+                    sync_client.close()
+                except Exception:
+                    pass
+
     # ==================== Utility ====================
 
     def _log(self, message: str, level: str = "INFO"):

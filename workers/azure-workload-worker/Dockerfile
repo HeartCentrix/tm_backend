@@ -7,6 +7,7 @@ WORKDIR /app
 # Plus SqlPackage CLI for passwordless SQL backup (multi-TB support)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
+        g++ \
         libffi-dev \
         libssl-dev \
         libpq-dev \
@@ -15,6 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gnupg2 \
         ca-certificates \
         unzip \
+        # pytsk3 is used to parse NTFS / ext4 filesystems inside the
+        # captured VHD so the file-level index can be built without
+        # the VM running. libtsk-dev ships the headers pytsk3 links
+        # against; afl-fuzz is pulled in as a harmless dep, ignored.
+        libtsk-dev \
     && curl https://packages.microsoft.com/keys/microsoft.asc | tee /etc/apt/trusted.gpg.d/microsoft.asc \
     && curl https://packages.microsoft.com/config/debian/11/prod.list | tee /etc/apt/sources.list.d/mssql-release.list \
     && apt-get update \

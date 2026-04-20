@@ -114,6 +114,8 @@ ACTIONS = {
     "EXPORT_COMPLETED": "Export completed",
     "EXPORT_DOWNLOADED": "Export file downloaded",
     "FILE_DOWNLOADED": "Single file downloaded from a snapshot",
+    "AZURE_DB_DOWNLOAD": "Azure DB content downloaded (SQL / PostgreSQL)",
+    "AZURE_VM_DOWNLOAD": "Azure VM content downloaded (config / volume files)",
     "DISCOVERY_RUN": "Resource discovery executed",
     "SLA_CREATED": "SLA policy created",
     "SLA_UPDATED": "SLA policy updated",
