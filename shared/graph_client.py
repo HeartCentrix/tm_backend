@@ -3338,13 +3338,26 @@ class GraphClient:
 
         # Walk segments: at each step look up the child by displayName
         # under the current parent; create if missing.
-        # For primary tier the root is mailFolders (top-level list endpoint).
-        # For other tiers (archive, recoverable) we need to append /childFolders
-        # to the well-known folder path to list its children.
-        if tier == "primary" or tier not in self._MAIL_TIER_ROOTS:
+        #
+        # Graph's URL shape for the tier root is asymmetric:
+        #   primary      → /users/{u}/mailFolders             (a collection)
+        #   archive      → /users/{u}/mailFolders('archive')  (a singleton)
+        #   recoverable  → /users/{u}/mailFolders('recoverableitemsroot')
+        #
+        # Listing children of the primary collection is just a GET on the
+        # collection; listing children of a singleton needs /childFolders.
+        # Creating a top-level folder is the opposite: POST the collection
+        # directly, or POST /childFolders on a singleton. Once we have a
+        # concrete parent_id, both tiers use the same /mailFolders/{id}/
+        # childFolders endpoint.
+        is_primary_root = tier == "primary" or tier not in self._MAIL_TIER_ROOTS
+        if is_primary_root:
             root_list_path = f"/users/{user_id}/{root_segment}"
+            root_create_path = f"/users/{user_id}/{root_segment}"
         else:
             root_list_path = f"/users/{user_id}/{root_segment}/childFolders"
+            root_create_path = f"/users/{user_id}/{root_segment}/childFolders"
+
         parent_id: Optional[str] = None
         for i, name in enumerate(segments):
             if parent_id is None:
@@ -3363,11 +3376,10 @@ class GraphClient:
                 parent_id = values[0].get("id")
             else:
                 # Create under the current parent.
-                create_url = (
-                    f"{self.GRAPH_URL}/users/{user_id}/{root_segment}/childFolders"
-                    if parent_id is None
-                    else f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{parent_id}/childFolders"
-                )
+                if parent_id is None:
+                    create_url = f"{self.GRAPH_URL}{root_create_path}"
+                else:
+                    create_url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{parent_id}/childFolders"
                 created = await self._post(create_url, {"displayName": name})
                 parent_id = created.get("id") if isinstance(created, dict) else None
                 if parent_id is None:
