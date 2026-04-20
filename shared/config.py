@@ -158,6 +158,11 @@ class Settings:
         self.ENTRA_RESTORE_V2_ENABLED = os.getenv("ENTRA_RESTORE_V2_ENABLED", "true").lower() == "true"
         # Default on; gates the server-side Entra ZIP export pipeline.
         self.ENTRA_EXPORT_V2_ENABLED = os.getenv("ENTRA_EXPORT_V2_ENABLED", "true").lower() == "true"
+        # Files folder-select v2. Enables the folderPaths/excludedItemIds
+        # payload on the /export-or-restore endpoint and the generic
+        # FileBrowserTable on SharePoint/Teams/Groups tabs. Rollback by
+        # setting FILES_FOLDER_SELECT_V2=false in env.
+        self.FILES_FOLDER_SELECT_V2 = os.getenv("FILES_FOLDER_SELECT_V2", "true").lower() == "true"
         # Per-worker cap on concurrent Entra-restore tasks across all
         # in-flight jobs. Keeps Graph traffic bounded.
         self.ENTRA_RESTORE_GLOBAL_POOL = int(os.getenv("ENTRA_RESTORE_GLOBAL_POOL", "32"))
