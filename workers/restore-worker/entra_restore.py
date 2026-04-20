@@ -310,5 +310,117 @@ class EntraRestoreEngine:
                 summary[o.outcome] = summary.get(o.outcome, 0) + 1
                 all_outcomes.append(o)
 
+            if item_type == "ENTRA_DIR_GROUP" and self.include_group_membership:
+                rb = await self._reconcile_group_memberships(outcomes, section_items)
+                summary["members_added"] = summary.get("members_added", 0) + rb["added"]
+                summary["members_removed"] = summary.get("members_removed", 0) + rb["removed"]
+                summary["members_failed"] = summary.get("members_failed", 0) + rb["failed"]
+            elif item_type == "ENTRA_DIR_ADMIN_UNIT" and self.include_au_membership:
+                rb = await self._reconcile_au_memberships(outcomes, section_items)
+                summary["members_added"] = summary.get("members_added", 0) + rb["added"]
+                summary["members_removed"] = summary.get("members_removed", 0) + rb["removed"]
+                summary["members_failed"] = summary.get("members_failed", 0) + rb["failed"]
+
         summary["items"] = [o.__dict__ for o in all_outcomes]
         return summary
+
+    # ---- phase 6: membership rebind ----
+
+    async def _reconcile_group_memberships(
+        self, group_outcomes: List[EntraOutcome], snap_items: List[Any],
+    ) -> Dict[str, int]:
+        """Reconcile membership for each successfully-restored group.
+        Adds missing members, removes extras. Counts rolled into
+        summary at the run-level."""
+        from shared.graph_entra import set_group_members
+        from shared.graph_batch import BatchRequest, batch_requests
+
+        snap_by_ext = {s.external_id: s for s in snap_items}
+        to_rebind = []
+        for o in group_outcomes:
+            if o.outcome in ("failed", "skipped"):
+                continue
+            snap = snap_by_ext.get(o.external_id)
+            if not snap:
+                continue
+            raw = (snap.extra_data or {}).get("raw") or {}
+            desired = self._extract_member_ids(raw.get("members") or [])
+            to_rebind.append((o.graph_id or o.external_id, desired))
+
+        if not to_rebind:
+            return {"added": 0, "removed": 0, "failed": 0}
+
+        # Fetch live members via /$batch. One request per group.
+        reqs = [
+            BatchRequest(id=f"members-{i}", method="GET",
+                         url=f"/groups/{gid}/members?$select=id")
+            for i, (gid, _) in enumerate(to_rebind)
+        ]
+        responses = await batch_requests(self.graph._post, reqs)
+        totals = {"added": 0, "removed": 0, "failed": 0}
+        for (gid, desired), resp in zip(to_rebind, responses):
+            body = (resp or {}).get("body") or {}
+            live_ids = [m.get("id") for m in (body.get("value") or []) if m.get("id")]
+            result = await set_group_members(
+                self.graph, group_id=gid,
+                desired_member_ids=desired, live_member_ids=live_ids,
+            )
+            for k in totals:
+                totals[k] += result.get(k, 0)
+        return totals
+
+    async def _reconcile_au_memberships(
+        self, au_outcomes: List[EntraOutcome], snap_items: List[Any],
+    ) -> Dict[str, int]:
+        from shared.graph_entra import set_admin_unit_members
+        from shared.graph_batch import BatchRequest, batch_requests
+
+        snap_by_ext = {s.external_id: s for s in snap_items}
+        to_rebind = []
+        for o in au_outcomes:
+            if o.outcome in ("failed", "skipped"):
+                continue
+            snap = snap_by_ext.get(o.external_id)
+            if not snap:
+                continue
+            raw = (snap.extra_data or {}).get("raw") or {}
+            desired = self._extract_member_ids(raw.get("members") or [])
+            to_rebind.append((o.graph_id or o.external_id, desired))
+
+        if not to_rebind:
+            return {"added": 0, "removed": 0, "failed": 0}
+
+        reqs = [
+            BatchRequest(id=f"au-members-{i}", method="GET",
+                         url=f"/directory/administrativeUnits/{aid}/members?$select=id")
+            for i, (aid, _) in enumerate(to_rebind)
+        ]
+        responses = await batch_requests(self.graph._post, reqs)
+        totals = {"added": 0, "removed": 0, "failed": 0}
+        for (aid, desired), resp in zip(to_rebind, responses):
+            body = (resp or {}).get("body") or {}
+            live_ids = [m.get("id") for m in (body.get("value") or []) if m.get("id")]
+            result = await set_admin_unit_members(
+                self.graph, au_id=aid,
+                desired_member_ids=desired, live_member_ids=live_ids,
+            )
+            for k in totals:
+                totals[k] += result.get(k, 0)
+        return totals
+
+    @staticmethod
+    def _extract_member_ids(members_field: Any) -> List[str]:
+        """Flatten snapshot member lists. Accepts either a list of
+        dicts ({"id": "..."}) or a list of odata.bind URLs ending in
+        the object id. Returns a plain list of ids."""
+        out: List[str] = []
+        if isinstance(members_field, list):
+            for m in members_field:
+                if isinstance(m, dict) and "id" in m:
+                    out.append(m["id"])
+                elif isinstance(m, str):
+                    if "directoryObjects/" in m:
+                        out.append(m.rsplit("/", 1)[-1])
+                    else:
+                        out.append(m)
+        return out

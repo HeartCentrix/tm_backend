@@ -140,3 +140,44 @@ async def test_run_skips_unchanged_and_patches_drifted_and_creates_deleted():
     assert summary["updated"] == 1, summary
     assert summary["created"] == 1, summary
     assert summary["failed"] == 0, summary
+
+
+@pytest.mark.asyncio
+async def test_group_membership_rebind_adds_missing_and_removes_extras():
+    """include_group_membership=True: after group creates/patches, the
+    engine reconciles each group's members via /members/$ref."""
+    gc = MagicMock()
+    from shared.entra_fingerprint import fingerprint_object
+    raw_g = {"id": "g1", "displayName": "Team", "mailNickname": "team",
+             "mailEnabled": False, "securityEnabled": True,
+             "members": [{"id": "u1"}, {"id": "u2"}, {"id": "u3"}]}
+    snap_g = _mk("ENTRA_DIR_GROUP", "g1", raw=raw_g,
+                 fingerprint=fingerprint_object("ENTRA_DIR_GROUP", raw_g))
+
+    gc._post = AsyncMock(side_effect=[
+        # sieve_existence batch: g1 exists
+        {"responses": [{"id": "exist-0", "status": 200, "body": {"id": "g1"}}]},
+        # live fingerprint batch: g1 raw returned (same raw → fingerprint matches → unchanged)
+        {"responses": [{"id": "fp-0", "status": 200, "body": raw_g}]},
+        # live members fetch batch: live has u2, u3, u4 (u1 missing, u4 extra)
+        {"responses": [{"id": "members-0", "status": 200, "body": {"value": [
+            {"id": "u2"}, {"id": "u3"}, {"id": "u4"},
+        ]}}]},
+        # POST /members/$ref for missing u1
+        {},
+    ])
+    gc._delete = AsyncMock(return_value=None)
+    gc._patch = AsyncMock(return_value={})
+    gc.GRAPH_URL = "https://graph.microsoft.com/v1.0"
+
+    target = SimpleNamespace(external_id="t1", id="r1", tenant_id="t1")
+    engine = EntraRestoreEngine(gc, target, include_group_membership=True)
+
+    summary = await engine.run([snap_g])
+
+    # Group unchanged → no PATCH. Membership reconcile adds u1, removes u4.
+    assert summary["unchanged"] == 1, summary
+    assert gc._post.await_count >= 3   # sieve + fp + members + add u1 (= 4)
+    assert gc._delete.await_count == 1  # remove u4
+    assert summary.get("members_added", 0) == 1
+    assert summary.get("members_removed", 0) == 1
