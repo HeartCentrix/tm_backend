@@ -645,3 +645,27 @@ class ReportHistory(Base):
     error_message = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=utcnow)
+
+
+class TenantSecret(Base):
+    """Credentials + KMS-key references the user stores once and reuses
+    across restore + other operations. Known `type` values:
+      • SQL_SERVER_LOGIN / POSTGRESQL_LOGIN — login + password used
+        during Azure DB out-of-place restore.
+      • AES_256_KEY — external-KMS key material (AWS/GCP/Azure KV).
+
+    Passwords / key material live in `encrypted_payload` (opaque base64
+    of shared.security.encrypt_secret), never returned to the frontend.
+    `metadata_hints` carries non-sensitive fields safe to render in
+    lists (login username, KMS provider name, etc)."""
+    __tablename__ = "tenant_secrets"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False)
+    type = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    metadata_hints = Column(JSON, default=dict, nullable=True)
+    encrypted_payload = Column(Text, nullable=True)
+    is_default = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
