@@ -1537,13 +1537,19 @@ class RestoreWorker:
         zip_bytes = buf.getvalue()
 
         # Upload using the same path the legacy export uses.
-        download_url = await self._publish_entra_zip(session, message, zip_bytes)
+        upload_meta = await self._publish_entra_zip(session, message, zip_bytes)
         return {
             "exported_count": sum(manifest["counts"].values()),
             "export_type": "ZIP",
             "entra": True,
             "manifest": manifest,
-            "download_url": download_url,
+            # The /api/v1/jobs/export/{job_id}/download endpoint reads
+            # these specific keys off Job.result to locate the blob.
+            # Keeping the same contract as the legacy exporter so the
+            # download path works without modification.
+            "blob_path": upload_meta["blob_path"],
+            "container": upload_meta["container"],
+            "download_url": upload_meta["download_url"],
         }
 
     @staticmethod
@@ -1570,10 +1576,11 @@ class RestoreWorker:
                 return True
         return False
 
-    async def _publish_entra_zip(self, session, message, zip_bytes: bytes) -> str:
+    async def _publish_entra_zip(self, session, message, zip_bytes: bytes) -> Dict[str, str]:
         """Write the Entra export ZIP into blob storage and return a
-        download URL. Reuses the same container + upload_blob pattern
-        the legacy export_as_zip body uses."""
+        dict with {blob_path, container, download_url} — the first two
+        are what /api/v1/jobs/export/{id}/download expects on
+        Job.result to locate the blob."""
         container_name = "exports"
         job_id = str(message.get("jobId") or uuid.uuid4())
         blob_name = f"{job_id}/entra_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
@@ -1586,11 +1593,16 @@ class RestoreWorker:
             if not (isinstance(upload_result, dict) and upload_result.get("success")):
                 err = (upload_result or {}).get("error", "unknown") if isinstance(upload_result, dict) else upload_result
                 print(f"[{self.worker_id}] [ENTRA-EXPORT] upload failed: {err}")
-                return ""
+                return {"blob_path": "", "container": container_name, "download_url": ""}
         except Exception as e:
             print(f"[{self.worker_id}] [ENTRA-EXPORT] upload failed: {type(e).__name__}: {e}")
-            return ""
-        return f"/api/v1/jobs/export/{job_id}/download"
+            return {"blob_path": "", "container": container_name, "download_url": ""}
+        print(f"[{self.worker_id}] [ENTRA-EXPORT] uploaded {len(zip_bytes)} bytes to {container_name}/{blob_name}")
+        return {
+            "blob_path": blob_name,
+            "container": container_name,
+            "download_url": f"/api/v1/jobs/export/{job_id}/download",
+        }
 
     async def export_download(
         self,
@@ -1678,7 +1690,17 @@ class RestoreWorker:
                 print(f"[{self.worker_id}] attachment read failed for {att.external_id}: {type(e).__name__}: {e}")
 
         mime_bytes = MailRestoreEngine._build_mime_from_raw(raw_data, attachments_with_bytes)
-        await graph_client.create_mime_message(user_id, mime_bytes)
+        # Land the MIME directly in a non-Drafts folder so Graph doesn't
+        # flag the imported message as a draft. Prefer the message's
+        # captured parentFolderId; fall back to the inbox well-known id
+        # when the snapshot didn't keep it.
+        target_folder = raw_data.get("parentFolderId") or "inbox"
+        new_id = await graph_client.create_mime_message(user_id, mime_bytes, folder_id=target_folder)
+        if new_id:
+            try:
+                await graph_client.clear_draft_flag(user_id, new_id)
+            except Exception as e:
+                print(f"[{self.worker_id}] clear_draft_flag failed: {type(e).__name__}: {e}")
 
     @staticmethod
     def _conflict_path_prefix(conflict_mode: str) -> str:
