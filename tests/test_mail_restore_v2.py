@@ -72,6 +72,46 @@ async def test_ensure_mail_folder_path_uses_archive_root_for_archive_tier():
 
 
 @pytest.mark.asyncio
+async def test_ensure_mail_folder_path_creates_primary_top_level_without_childFolders():
+    """Regression: POST /mailFolders/childFolders → 405. Primary tier's
+    top-level collection is just /mailFolders; the /childFolders suffix
+    only applies to singleton tier roots (archive/recoverable) and to
+    nested folders once we have a parent_id."""
+    gc = GraphClient.__new__(GraphClient)
+    # Parent segment "Restored by TM" doesn't exist → Graph returns empty,
+    # triggering a POST to create it at the primary root.
+    gc._get = AsyncMock(side_effect=[{"value": []}])
+    gc._post = AsyncMock(return_value={"id": "FOLDER-ROOT", "displayName": "Restored by TM"})
+    gc._mail_folder_path_cache = {}
+    gc.GRAPH_URL = "https://graph.microsoft.com/v1.0"
+
+    fid = await gc.ensure_mail_folder_path("user-1", "primary", "/Restored by TM")
+
+    assert fid == "FOLDER-ROOT"
+    create_url = gc._post.await_args.args[0]
+    # Must POST /users/{u}/mailFolders directly — not /mailFolders/childFolders.
+    assert create_url.endswith("/users/user-1/mailFolders")
+    assert "childFolders" not in create_url
+
+
+@pytest.mark.asyncio
+async def test_ensure_mail_folder_path_creates_archive_top_level_via_childFolders():
+    """Archive + recoverable tiers are singletons, so their top-level
+    creates go through /mailFolders('archive')/childFolders."""
+    gc = GraphClient.__new__(GraphClient)
+    gc._get = AsyncMock(side_effect=[{"value": []}])
+    gc._post = AsyncMock(return_value={"id": "A-TOP", "displayName": "Recovered"})
+    gc._mail_folder_path_cache = {}
+    gc.GRAPH_URL = "https://graph.microsoft.com/v1.0"
+
+    fid = await gc.ensure_mail_folder_path("user-1", "archive", "/Recovered")
+
+    assert fid == "A-TOP"
+    create_url = gc._post.await_args.args[0]
+    assert "mailFolders('archive')/childFolders" in create_url
+
+
+@pytest.mark.asyncio
 async def test_list_folder_internet_message_ids_merges_pages():
     """Handles Graph pagination by following @odata.nextLink."""
     gc = GraphClient.__new__(GraphClient)

@@ -34,6 +34,31 @@ from shared.power_bi_client import PowerBIClient
 from shared.power_platform_client import PowerPlatformClient
 from shared.azure_storage import azure_storage_manager
 from mail_restore import MailRestoreEngine, MODE_OVERWRITE, MODE_SEPARATE
+from entra_restore import EntraRestoreEngine
+
+
+def _mail_graph_user_id(resource) -> str:
+    """Return the Microsoft Graph user id for a mail-bearing resource.
+
+    Tier 1 mailbox rows (MAILBOX / SHARED_MAILBOX / ROOM_MAILBOX) store
+    the Graph user id directly in `external_id`.
+
+    Tier 2 USER_MAIL rows append a `:mail` suffix for uniqueness (see
+    `graph_client.py:1603` where the row is emitted as
+    `{user_external_id}:mail`). The real Graph user id lives in
+    `extra_data.user_id` — stripping the `:mail` suffix is the
+    defensive fallback if that field is absent."""
+    rtype = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+    if rtype == "USER_MAIL":
+        meta = resource.extra_data or {}
+        uid = meta.get("user_id")
+        if uid:
+            return str(uid)
+        raw = str(resource.external_id or "")
+        if raw.endswith(":mail"):
+            return raw[: -len(":mail")]
+        return raw
+    return str(resource.external_id or "")
 
 
 def _safe_name(name: str) -> str:
@@ -388,7 +413,11 @@ class RestoreWorker:
                     snapshot_ids = message.get("snapshotIds", [])
                     item_ids = message.get("itemIds", [])
 
-                    items_to_restore = await self.fetch_snapshot_items(session, snapshot_ids, item_ids)
+                    items_to_restore = await self.fetch_snapshot_items(
+                        session, snapshot_ids, item_ids,
+                        folder_paths=spec.get("folderPaths") or [],
+                        excluded_item_ids=spec.get("excludedItemIds") or [],
+                    )
                     print(f"[{self.worker_id}] fetched {len(items_to_restore)} snapshot items job={job_id}", flush=True)
 
                     # Workload filter (from RestoreModal checkboxes). When spec.workloads is
@@ -451,20 +480,105 @@ class RestoreWorker:
         self,
         session: AsyncSession,
         snapshot_ids: List[str],
-        item_ids: List[str]
+        item_ids: List[str],
+        folder_paths: Optional[List[str]] = None,
+        excluded_item_ids: Optional[List[str]] = None,
     ) -> List[SnapshotItem]:
-        """Fetch snapshot items to restore"""
-        stmt = select(SnapshotItem)
+        """Resolve the SnapshotItems a restore job should process.
+
+        Three modes, in priority order:
+
+          * ``folder_paths`` OR ``excluded_item_ids`` given → delegate to
+            ``shared.folder_resolver.resolve_selection`` which handles
+            id ∪ folder-prefix ∪ exact-folder-match in one indexed SQL
+            round-trip. Single snapshot id (first of ``snapshot_ids``)
+            is used — the Files folder-select v2 payload is
+            single-snapshot by contract.
+          * ``item_ids`` given → strict lookup by id. The user picked
+            specific items in the UI; restore exactly those.
+          * only ``snapshot_ids`` given → point-in-time fan-out. Because
+            M365 backups are delta-based, a single INCREMENTAL snapshot
+            holds only rows that changed since the prior run. Restoring
+            just that one snapshot would replay the delta alone and leave
+            the target mailbox / drive missing every item captured in an
+            earlier snapshot but untouched in this one.
+
+            Fix: for each picked snapshot, resolve every sibling snapshot
+            of the same resource with ``created_at <= picked.created_at``
+            and union them. Then dedupe by ``external_id`` with newest-
+            wins semantics via ``DISTINCT ON``. An item edited or moved
+            in a later snapshot gets its newest captured state; untouched
+            items come through from the original FULL snapshot.
+
+            Mirrors ``_resolve_sibling_snapshot_ids`` in snapshot-service
+            so the restore matches what the Recovery UI was showing.
+        """
+        folder_paths = folder_paths or []
+        excluded_item_ids = excluded_item_ids or []
+
+        if folder_paths or excluded_item_ids:
+            from shared.folder_resolver import resolve_selection
+            if not snapshot_ids:
+                return []
+            return await resolve_selection(
+                session,
+                snapshot_id=snapshot_ids[0],
+                item_ids=item_ids,
+                folder_paths=folder_paths,
+                excluded_item_ids=excluded_item_ids,
+            )
 
         if item_ids:
-            stmt = stmt.where(SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids]))
-        elif snapshot_ids:
-            stmt = stmt.where(SnapshotItem.snapshot_id.in_([uuid.UUID(sid) for sid in snapshot_ids]))
-        else:
+            stmt = select(SnapshotItem).where(
+                SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids])
+            )
+            return (await session.execute(stmt)).scalars().all()
+
+        if not snapshot_ids:
             return []
 
-        result = await session.execute(stmt)
-        return result.scalars().all()
+        picked_uuids = [uuid.UUID(sid) for sid in snapshot_ids]
+        picked_rows = (
+            await session.execute(
+                select(Snapshot).where(Snapshot.id.in_(picked_uuids))
+            )
+        ).scalars().all()
+        if not picked_rows:
+            # Unknown ids — fall back to strict behaviour so we don't
+            # silently turn a bad id into an empty restore.
+            stmt = select(SnapshotItem).where(
+                SnapshotItem.snapshot_id.in_(picked_uuids)
+            )
+            return (await session.execute(stmt)).scalars().all()
+
+        sibling_ids: set = set()
+        for picked in picked_rows:
+            rows = (
+                await session.execute(
+                    select(Snapshot.id).where(
+                        Snapshot.resource_id == picked.resource_id,
+                        Snapshot.created_at <= picked.created_at,
+                    )
+                )
+            ).all()
+            sibling_ids.update(r[0] for r in rows)
+
+        if not sibling_ids:
+            sibling_ids = set(picked_uuids)
+
+        # DISTINCT ON (external_id) + ORDER BY external_id, Snapshot
+        # created_at DESC → one row per logical item, newest captured
+        # version wins. Join Snapshot to rank by the snapshot's own
+        # timestamp — SnapshotItem.created_at can drift within a
+        # snapshot and isn't the right clock to order on.
+        stmt = (
+            select(SnapshotItem)
+            .join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id)
+            .where(SnapshotItem.snapshot_id.in_(sibling_ids))
+            .order_by(SnapshotItem.external_id, Snapshot.created_at.desc())
+            .distinct(SnapshotItem.external_id)
+        )
+        return (await session.execute(stmt)).scalars().all()
 
     # ==================== Restore Handlers ====================
 
@@ -567,14 +681,16 @@ class RestoreWorker:
             # Route by item type
             teams_skipped = 0  # per-resource counter; rolled into total_teams_skipped
 
-            # Mail restore v2 fast-path. When the flag is on and this
-            # resource is a mailbox flavor, route EMAIL + EMAIL_ATTACHMENT
-            # items through MailRestoreEngine (folder-preserving, dedup,
-            # attachment replay). Items are removed from the legacy loop
-            # so we don't double-process them.
+            # Mail restore v2 fast-path. Tier 1 mailbox rows
+            # (MAILBOX / SHARED_MAILBOX / ROOM_MAILBOX) and the Tier 2
+            # USER_MAIL category row all route through MailRestoreEngine.
+            # USER_MAIL's external_id carries a `:mail` suffix for
+            # uniqueness, so the real Graph user id comes from
+            # extra_data.user_id (populated by discover_user_content);
+            # Tier 1 rows store the Graph user id verbatim.
             mail_items: List[SnapshotItem] = []
             if settings.MAIL_RESTORE_V2_ENABLED and resource_type in (
-                "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX"
+                "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX", "USER_MAIL"
             ):
                 remaining: List[SnapshotItem] = []
                 for it in resource_items:
@@ -590,21 +706,121 @@ class RestoreWorker:
                 # string OR the RestoreModal's `overwrite: bool`. Either
                 # one true → OVERWRITE mode.
                 mail_overwrite = conflict_mode == "OVERWRITE" or bool(spec.get("overwrite"))
+                graph_user_id = _mail_graph_user_id(resource)
                 engine = MailRestoreEngine(
                     graph_client,
                     resource,
                     MODE_OVERWRITE if mail_overwrite else MODE_SEPARATE,
                     separate_folder_root=spec.get("targetFolder"),
                     worker_id=self.worker_id,
+                    graph_user_id=graph_user_id,
                 )
                 mail_summary = await engine.run(mail_items)
                 restored_count += mail_summary["created"] + mail_summary["updated"]
                 failed_count += mail_summary["failed"]
+                print(
+                    f"[{self.worker_id}] [MAIL-RESTORE] summary: "
+                    f"created={mail_summary.get('created',0)} "
+                    f"updated={mail_summary.get('updated',0)} "
+                    f"failed={mail_summary.get('failed',0)} "
+                    f"skipped={mail_summary.get('skipped',0)}",
+                    flush=True,
+                )
+                for o in mail_summary.get("items", []):
+                    if o.get("outcome") == "failed":
+                        print(
+                            f"[{self.worker_id}] [MAIL-RESTORE FAIL] "
+                            f"ext_id={o.get('external_id')} "
+                            f"reason={o.get('reason')}",
+                            flush=True,
+                        )
+
+            # OneDrive restore v2 — streaming engine with per-target-user
+            # concurrency cap. Routes FILE / ONEDRIVE_FILE items out of the
+            # per-item loop below so they go through resumable upload
+            # sessions instead of the (broken) legacy shim.
+            onedrive_items: List[SnapshotItem] = []
+            if settings.ONEDRIVE_RESTORE_ENGINE_ENABLED and resource_type in (
+                "ONEDRIVE", "USER_ONEDRIVE"
+            ):
+                remaining_od: List[SnapshotItem] = []
+                for it in resource_items:
+                    if it.item_type in ("FILE", "ONEDRIVE_FILE"):
+                        onedrive_items.append(it)
+                    else:
+                        remaining_od.append(it)
+                resource_items = remaining_od
+
+            if onedrive_items:
+                from onedrive_restore import OneDriveRestoreEngine, Mode as OdMode
+                target_user_id, is_cross = await self._resolve_onedrive_target_user(
+                    session, resource, spec,
+                )
+                od_engine = OneDriveRestoreEngine(
+                    graph_client=graph_client,
+                    source_resource=resource,
+                    target_drive_user_id=target_user_id,
+                    tenant_id=str(resource.tenant_id),
+                    mode=OdMode.OVERWRITE if spec.get("overwrite") else OdMode.SEPARATE_FOLDER,
+                    separate_folder_root=spec.get("targetFolder"),
+                    worker_id=self.worker_id,
+                    is_cross_user=is_cross,
+                )
+                od_summary = await od_engine.run(onedrive_items)
+                restored_count += (
+                    od_summary.get("created", 0)
+                    + od_summary.get("overwritten", 0)
+                    + od_summary.get("renamed", 0)
+                )
+                failed_count += od_summary.get("failed", 0)
+                for o in od_summary.get("items", []):
+                    if o.get("outcome") == "failed":
+                        print(
+                            f"[{self.worker_id}] [ONEDRIVE-RESTORE FAIL] "
+                            f"ext_id={o.get('external_id')} name={o.get('name')} "
+                            f"reason={o.get('reason')}",
+                            flush=True,
+                        )
+
+            # Entra restore v2 fast-path. When the flag is on and
+            # resource is the tenant-wide ENTRA_DIRECTORY container,
+            # route every ENTRA_DIR_* item through EntraRestoreEngine
+            # (sieve, fingerprint-diff, PATCH/POST per section,
+            # membership rebind).
+            entra_items: List[SnapshotItem] = []
+            if settings.ENTRA_RESTORE_V2_ENABLED and resource_type == "ENTRA_DIRECTORY":
+                remaining: List[SnapshotItem] = []
+                for it in resource_items:
+                    if it.item_type and it.item_type.startswith("ENTRA_DIR_"):
+                        entra_items.append(it)
+                    else:
+                        remaining.append(it)
+                resource_items = remaining
+
+            if entra_items:
+                sections_filter = spec.get("entraSections")
+                include_groups = bool(spec.get("includeGroupMembership", True))
+                include_au = bool(spec.get("includeAuMembership", True))
+                engine = EntraRestoreEngine(
+                    graph_client,
+                    resource,
+                    worker_id=self.worker_id,
+                    sections=sections_filter,
+                    include_group_membership=include_groups,
+                    include_au_membership=include_au,
+                )
+                entra_summary = await engine.run(entra_items)
+                restored_count += (
+                    entra_summary.get("created", 0)
+                    + entra_summary.get("updated", 0)
+                    + entra_summary.get("unchanged", 0)
+                )
+                failed_count += entra_summary.get("failed", 0)
 
             for item in resource_items:
                 try:
                     if item.item_type in ("EMAIL",):
-                        await self._restore_email_to_mailbox(graph_client, resource, item)
+                        await self._restore_email_to_mailbox(graph_client, resource, item, session=session)
                     elif item.item_type in ("FILE", "ONEDRIVE_FILE"):
                         await self._restore_file_to_onedrive(graph_client, resource, item, conflict_mode=conflict_mode)
                     elif item.item_type in ("SHAREPOINT_FILE", "SHAREPOINT_LIST_ITEM"):
@@ -693,16 +909,39 @@ class RestoreWorker:
         restored_count = 0
         failed_count = 0
 
-        # Fetch target resource
-        target_resource = await session.execute(
-            select(Resource).where(
-                and_(
-                    Resource.external_id == target_user_id,
-                    Resource.status == "ACTIVE"
+        # Fetch target resource. Accept either a Resource.id (DB UUID,
+        # sent by the UI's mailbox picker — unambiguous when multiple
+        # resource rows share the same external_id) or a Graph
+        # external_id string (legacy payload shape). Status filter is
+        # relaxed to include DISCOVERED so a freshly-discovered target
+        # that hasn't been backed up yet is still a valid restore
+        # destination.
+        target_resource = None
+        allowed_statuses = ("ACTIVE", "DISCOVERED")
+        try:
+            target_uuid = uuid.UUID(str(target_user_id))
+        except (TypeError, ValueError):
+            target_uuid = None
+        if target_uuid is not None:
+            row = await session.execute(
+                select(Resource).where(
+                    and_(
+                        Resource.id == target_uuid,
+                        Resource.status.in_(allowed_statuses),
+                    )
                 )
             )
-        )
-        target_resource = target_resource.scalars().first()
+            target_resource = row.scalars().first()
+        if target_resource is None:
+            row = await session.execute(
+                select(Resource).where(
+                    and_(
+                        Resource.external_id == target_user_id,
+                        Resource.status.in_(allowed_statuses),
+                    )
+                )
+            )
+            target_resource = row.scalars().first()
 
         if not target_resource:
             raise ValueError(f"Target resource {target_user_id} not found")
@@ -720,7 +959,9 @@ class RestoreWorker:
 
         target_type = target_resource.type.value if hasattr(target_resource.type, "value") else str(target_resource.type)
         mail_items: List[SnapshotItem] = []
-        if settings.MAIL_RESTORE_V2_ENABLED and target_type in ("MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX"):
+        if settings.MAIL_RESTORE_V2_ENABLED and target_type in (
+            "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX", "USER_MAIL"
+        ):
             remaining: List[SnapshotItem] = []
             for it in items:
                 if it.item_type in ("EMAIL", "EMAIL_ATTACHMENT"):
@@ -737,15 +978,65 @@ class RestoreWorker:
                 MODE_OVERWRITE if overwrite else MODE_SEPARATE,
                 separate_folder_root=spec.get("targetFolder"),
                 worker_id=self.worker_id,
+                graph_user_id=_mail_graph_user_id(target_resource),
             )
             mail_summary = await engine.run(mail_items)
             restored_count += mail_summary["created"] + mail_summary["updated"]
             failed_count += mail_summary["failed"]
 
+        # OneDrive cross-user v2 — route FILE / ONEDRIVE_FILE items
+        # through the streaming engine against the chosen target drive.
+        od_items: List[SnapshotItem] = []
+        if settings.ONEDRIVE_RESTORE_ENGINE_ENABLED and target_type in (
+            "ONEDRIVE", "USER_ONEDRIVE"
+        ):
+            remaining_od: List[SnapshotItem] = []
+            for it in items:
+                if it.item_type in ("FILE", "ONEDRIVE_FILE"):
+                    od_items.append(it)
+                else:
+                    remaining_od.append(it)
+            items = remaining_od
+
+        if od_items:
+            from onedrive_restore import OneDriveRestoreEngine, Mode as OdMode
+            # Source resource for blob reads: the item's own snapshot's
+            # resource. All items in this handler come from a single
+            # restore job, so grab the first item's resource once.
+            first_snapshot = await session.get(Snapshot, od_items[0].snapshot_id)
+            source_resource_for_blobs = await session.get(
+                Resource, first_snapshot.resource_id,
+            ) if first_snapshot else target_resource
+            od_engine = OneDriveRestoreEngine(
+                graph_client=graph_client,
+                source_resource=source_resource_for_blobs,
+                target_drive_user_id=self._graph_drive_id_for(target_resource),
+                tenant_id=str(target_resource.tenant_id),
+                mode=OdMode.OVERWRITE if spec.get("overwrite") else OdMode.SEPARATE_FOLDER,
+                separate_folder_root=spec.get("targetFolder"),
+                worker_id=self.worker_id,
+                is_cross_user=True,
+            )
+            od_summary = await od_engine.run(od_items)
+            restored_count += (
+                od_summary.get("created", 0)
+                + od_summary.get("overwritten", 0)
+                + od_summary.get("renamed", 0)
+            )
+            failed_count += od_summary.get("failed", 0)
+            for o in od_summary.get("items", []):
+                if o.get("outcome") == "failed":
+                    print(
+                        f"[{self.worker_id}] [ONEDRIVE-RESTORE FAIL] "
+                        f"ext_id={o.get('external_id')} name={o.get('name')} "
+                        f"reason={o.get('reason')}",
+                        flush=True,
+                    )
+
         for item in items:
             try:
                 if item.item_type in ("EMAIL",):
-                    await self._restore_email_to_mailbox(graph_client, target_resource, item)
+                    await self._restore_email_to_mailbox(graph_client, target_resource, item, session=session)
                 elif item.item_type in ("FILE", "ONEDRIVE_FILE"):
                     await self._restore_file_to_onedrive(graph_client, target_resource, item)
                 elif item.item_type in ("SHAREPOINT_FILE",):
@@ -797,7 +1088,7 @@ class RestoreWorker:
             try:
                 # Restore based on target resource type
                 if target_resource.type.value in ("MAILBOX", "SHARED_MAILBOX"):
-                    await self._restore_email_to_mailbox(graph_client, target_resource, item)
+                    await self._restore_email_to_mailbox(graph_client, target_resource, item, session=session)
                 elif target_resource.type.value == "ONEDRIVE":
                     await self._restore_file_to_onedrive(graph_client, target_resource, item)
                 elif target_resource.type.value == "SHAREPOINT_SITE":
@@ -839,6 +1130,17 @@ class RestoreWorker:
     ) -> Dict:
         """Export items as downloadable ZIP file"""
         print(f"[{self.worker_id}] export_as_zip ENTER items={len(items)}", flush=True)
+        # Entra export v2 fast-path — new section-scoped ZIP pipeline.
+        if (
+            settings.ENTRA_EXPORT_V2_ENABLED
+            and spec.get("entraSections")
+            and any(
+                it.item_type and it.item_type.startswith("ENTRA_DIR_")
+                for it in items
+            )
+        ):
+            return await self._export_entra_zip(session, items, message, spec)
+        # ... legacy body continues below unchanged
         # v2 mail export — feature-flagged. Accepts mixed EMAIL + EMAIL_ATTACHMENT
         # selections (e.g. "Download all" with workloads=["Mail"] pulls both
         # types). EMAIL_ATTACHMENT rows are skipped — their bytes already get
@@ -1323,6 +1625,141 @@ class RestoreWorker:
             "file_size": zip_size,
         }
 
+    async def _export_entra_zip(self, session, items, message, spec) -> Dict:
+        """Section-grouped Entra ZIP export. Groups items by UI section
+        label (splitting multi-bucket item_types into per-file labels),
+        runs EntraExportPipeline, uploads the resulting ZIP to the same
+        export blob path everything else uses. Returns the job result
+        dict with manifest + download url."""
+        from entra_export import EntraExportPipeline
+
+        snapshot_id = (message.get("snapshotIds") or [""])[0]
+        fmt = (spec.get("format") or "json").lower()
+        include_nested = bool(spec.get("includeNestedDetail", False))
+        sections = spec.get("entraSections") or []
+
+        # Map item_type + bucket to the UI section file label used in
+        # EntraExportPipeline._CSV_COLUMNS / ZIP filenames.
+        label_of_item_type = {
+            "ENTRA_DIR_USER": "users",
+            "ENTRA_DIR_GROUP": "groups",
+            "ENTRA_DIR_ROLE": "roles",
+            "ENTRA_DIR_APPLICATION": "applications",   # split by _app_bucket below
+            "ENTRA_DIR_SECURITY": "conditional_access_policies",  # split by _sec_bucket
+            "ENTRA_DIR_ADMIN_UNIT": "admin_units",
+            "ENTRA_DIR_INTUNE": "intune_compliance",   # split by _intune_bucket
+            "ENTRA_DIR_AUDIT": "audit_logs",           # split by _audit_bucket
+        }
+        section_items: Dict[str, List[SnapshotItem]] = {}
+        for it in items:
+            if not (it.item_type and it.item_type.startswith("ENTRA_DIR_")):
+                continue
+            ed = it.extra_data or {}
+            if it.item_type == "ENTRA_DIR_APPLICATION":
+                bucket = ed.get("_app_bucket")
+                label = "service_principals" if bucket == "Enterprise Applications" else "applications"
+            elif it.item_type == "ENTRA_DIR_SECURITY":
+                b = ed.get("_sec_bucket") or ""
+                label = {
+                    "Conditional Access": "conditional_access_policies",
+                    "Authentication Contexts": "auth_contexts",
+                    "Authentication Strengths": "auth_strengths",
+                    "Named Locations": "named_locations",
+                    "Policies": "security_defaults",
+                    "Risky Users": "risky_users",
+                    "Alerts": "security_alerts",
+                }.get(b, "conditional_access_policies")
+            elif it.item_type == "ENTRA_DIR_INTUNE":
+                b = ed.get("_intune_bucket") or ""
+                label = {
+                    "Devices": "intune_devices",
+                    "Compliance Policies": "intune_compliance",
+                    "Configuration Profiles": "intune_configuration",
+                }.get(b, "intune_compliance")
+            elif it.item_type == "ENTRA_DIR_AUDIT":
+                b = ed.get("_audit_bucket") or ""
+                label = "sign_in_logs" if b == "Sign-In Logs" else "audit_logs"
+            else:
+                label = label_of_item_type.get(it.item_type, "other")
+            if sections and not self._entra_section_matches(label, sections):
+                continue
+            section_items.setdefault(label, []).append(it)
+
+        pipeline = EntraExportPipeline(
+            snapshot_id=snapshot_id, format=fmt, include_nested_detail=include_nested,
+        )
+        buf = io.BytesIO()
+        manifest = pipeline.build_zip(buf, section_items)
+        zip_bytes = buf.getvalue()
+
+        # Upload using the same path the legacy export uses.
+        upload_meta = await self._publish_entra_zip(session, message, zip_bytes)
+        return {
+            "exported_count": sum(manifest["counts"].values()),
+            "export_type": "ZIP",
+            "entra": True,
+            "manifest": manifest,
+            # The /api/v1/jobs/export/{job_id}/download endpoint reads
+            # these specific keys off Job.result to locate the blob.
+            # Keeping the same contract as the legacy exporter so the
+            # download path works without modification.
+            "blob_path": upload_meta["blob_path"],
+            "container": upload_meta["container"],
+            "download_url": upload_meta["download_url"],
+        }
+
+    @staticmethod
+    def _entra_section_matches(file_label: str, ui_sections: List[str]) -> bool:
+        """True when a section's output file_label falls under one of
+        the top-level UI sections the user selected."""
+        ui = {s.lower() for s in ui_sections}
+        groups = {
+            "users": {"users"},
+            "groups": {"groups"},
+            "roles": {"roles"},
+            "applications": {"applications", "service_principals"},
+            "security": {
+                "conditional_access_policies", "auth_contexts",
+                "auth_strengths", "named_locations", "security_defaults",
+                "risky_users", "security_alerts",
+            },
+            "adminunits": {"admin_units"},
+            "intune": {"intune_devices", "intune_compliance", "intune_configuration"},
+            "audit": {"audit_logs", "sign_in_logs"},
+        }
+        for top in ui:
+            if file_label in groups.get(top, set()):
+                return True
+        return False
+
+    async def _publish_entra_zip(self, session, message, zip_bytes: bytes) -> Dict[str, str]:
+        """Write the Entra export ZIP into blob storage and return a
+        dict with {blob_path, container, download_url} — the first two
+        are what /api/v1/jobs/export/{id}/download expects on
+        Job.result to locate the blob."""
+        container_name = "exports"
+        job_id = str(message.get("jobId") or uuid.uuid4())
+        blob_name = f"{job_id}/entra_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+        try:
+            shard = azure_storage_manager.get_default_shard()
+            upload_result = await shard.upload_blob(
+                container_name, blob_name, zip_bytes,
+                metadata={"job_id": job_id, "entra_export": "true"},
+            )
+            if not (isinstance(upload_result, dict) and upload_result.get("success")):
+                err = (upload_result or {}).get("error", "unknown") if isinstance(upload_result, dict) else upload_result
+                print(f"[{self.worker_id}] [ENTRA-EXPORT] upload failed: {err}")
+                return {"blob_path": "", "container": container_name, "download_url": ""}
+        except Exception as e:
+            print(f"[{self.worker_id}] [ENTRA-EXPORT] upload failed: {type(e).__name__}: {e}")
+            return {"blob_path": "", "container": container_name, "download_url": ""}
+        print(f"[{self.worker_id}] [ENTRA-EXPORT] uploaded {len(zip_bytes)} bytes to {container_name}/{blob_name}")
+        return {
+            "blob_path": blob_name,
+            "container": container_name,
+            "download_url": f"/api/v1/jobs/export/{job_id}/download",
+        }
+
     async def export_download(
         self,
         session: AsyncSession,
@@ -1359,35 +1796,138 @@ class RestoreWorker:
         self,
         graph_client: GraphClient,
         resource: Resource,
-        item: SnapshotItem
+        item: SnapshotItem,
+        session: Optional[AsyncSession] = None,
     ):
-        """Restore email to Exchange mailbox via Graph API"""
+        """Restore email to Exchange mailbox via MIME import.
+
+        Legacy fallback (used when ``MAIL_RESTORE_V2_ENABLED`` is off).
+        Previously POSTed a JSON payload to ``/users/{id}/messages`` which
+        made Graph create the row as a draft with ``sender unknown`` and
+        silently dropped every attachment. We now rebuild the RFC-822
+        MIME — headers, body, inline and regular attachments — and POST
+        it so Graph imports it with ``isDraft=false``, the original
+        ``From``/``Sender``/``Date`` preserved, and every attachment's
+        ``Content-ID`` intact so inline images render.
+        """
+        from mail_restore import MailRestoreEngine
+
         metadata = self._get_item_metadata(item)
         raw_data = metadata.get("raw", {})
-
         user_id = resource.external_id
 
-        # Create message in mailbox
-        message_payload = {
-            "subject": raw_data.get("subject"),
-            "body": {
-                "contentType": raw_data.get("body", {}).get("contentType", "HTML"),
-                "content": raw_data.get("body", {}).get("content", ""),
-            },
-            "toRecipients": raw_data.get("toRecipients", []),
-            "ccRecipients": raw_data.get("ccRecipients", []),
-            "hasAttachments": raw_data.get("hasAttachments", False),
-            "internetMessageId": raw_data.get("internetMessageId"),
-            # Preserve original metadata
-            "receivedDateTime": raw_data.get("receivedDateTime"),
-            "sentDateTime": raw_data.get("sentDateTime"),
-        }
+        # Pull the EMAIL_ATTACHMENT children for this message so we can
+        # inline their bytes into the MIME. Match on parent_item_id.
+        att_items: List[SnapshotItem] = []
+        if session is not None:
+            att_stmt = select(SnapshotItem).where(
+                SnapshotItem.snapshot_id == item.snapshot_id,
+                SnapshotItem.item_type == "EMAIL_ATTACHMENT",
+            )
+            rows = (await session.execute(att_stmt)).scalars().all()
+            att_items = [
+                r for r in rows
+                if (r.extra_data or {}).get("parent_item_id") == item.external_id
+            ]
 
-        # POST to /users/{id}/messages
-        await graph_client._post(
-            f"{graph_client.GRAPH_URL}/users/{user_id}/messages",
-            message_payload
+        attachments_with_bytes: List[tuple] = []
+        for att in att_items:
+            if not getattr(att, "blob_path", None):
+                continue
+            try:
+                tenant_id = str(resource.tenant_id)
+                shard = azure_storage_manager.get_shard_for_resource(tenant_id, tenant_id)
+                container = azure_storage_manager.get_container_name(tenant_id, "email")
+                blob_client = shard.get_blob_client(container, att.blob_path)
+                stream = await blob_client.download_blob()
+                blob_bytes = await stream.readall()
+                attachments_with_bytes.append((att, blob_bytes))
+            except Exception as e:
+                print(f"[{self.worker_id}] attachment read failed for {att.external_id}: {type(e).__name__}: {e}")
+
+        # Hybrid JSON-create + extended-property overlay — same path
+        # MailRestoreEngine uses. Message lands non-draft with original
+        # sender and attachments.
+        target_folder = raw_data.get("parentFolderId") or "inbox"
+        payload = {
+            k: raw_data[k] for k in (
+                "subject", "body", "toRecipients", "ccRecipients", "bccRecipients",
+                "replyTo", "sentDateTime", "receivedDateTime", "internetMessageId",
+                "importance", "isRead", "flag", "categories",
+            ) if k in raw_data
+        }
+        new_id = await graph_client.json_create_non_draft_message(
+            user_id, target_folder, payload,
         )
+        if not new_id:
+            return
+
+        # Overwrite sender via MAPI tags so From column shows the original
+        # sender, not the mailbox owner.
+        from_obj = raw_data.get("from") or raw_data.get("sender") or {}
+        ea = (from_obj or {}).get("emailAddress") or {}
+        try:
+            await graph_client.patch_sender_extended_properties(
+                user_id, new_id,
+                sender_name=ea.get("name"),
+                sender_address=ea.get("address"),
+            )
+        except Exception as e:
+            print(f"[{self.worker_id}] sender patch failed: {type(e).__name__}: {e}")
+
+        try:
+            await graph_client.patch_original_timestamps(
+                user_id, new_id,
+                sent_iso=raw_data.get("sentDateTime"),
+                received_iso=raw_data.get("receivedDateTime"),
+            )
+        except Exception as e:
+            print(f"[{self.worker_id}] timestamp patch failed: {type(e).__name__}: {e}")
+
+        # Replay attachments (inline + regular) against the new message.
+        for att, blob_bytes in attachments_with_bytes:
+            ed = att.extra_data or {}
+            kind = (ed.get("attachment_kind") or "").lower()
+            try:
+                if "itemattachment" in kind:
+                    import json as _json
+                    inner = {}
+                    try:
+                        inner = _json.loads(blob_bytes.decode("utf-8"))
+                    except Exception:
+                        pass
+                    await graph_client.post_small_attachment(user_id, new_id, {
+                        "@odata.type": "#microsoft.graph.itemAttachment",
+                        "name": att.name or "attachment",
+                        "item": inner,
+                    })
+                elif "referenceattachment" in kind:
+                    source_url = ed.get("source_url")
+                    if not source_url:
+                        continue
+                    await graph_client.post_small_attachment(user_id, new_id, {
+                        "@odata.type": "#microsoft.graph.referenceAttachment",
+                        "name": att.name or "attachment",
+                        "sourceUrl": source_url,
+                        "providerType": "other",
+                        "permission": "view",
+                        "isFolder": False,
+                    })
+                else:
+                    import base64 as _b64
+                    att_payload = {
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": att.name or "attachment",
+                        "contentType": ed.get("content_type") or "application/octet-stream",
+                        "isInline": bool(ed.get("is_inline")),
+                        "contentBytes": _b64.b64encode(blob_bytes).decode("ascii"),
+                    }
+                    cid = ed.get("content_id") or ed.get("contentId")
+                    if cid:
+                        att_payload["contentId"] = cid.strip("<>")
+                    await graph_client.post_small_attachment(user_id, new_id, att_payload)
+            except Exception as e:
+                print(f"[{self.worker_id}] attachment replay failed {att.name}: {type(e).__name__}: {e}")
 
     @staticmethod
     def _conflict_path_prefix(conflict_mode: str) -> str:
@@ -1397,6 +1937,46 @@ class RestoreWorker:
             return f"Restored by TM/{datetime.utcnow().strftime('%Y-%m-%d')}/"
         return ""
 
+    @staticmethod
+    def _graph_drive_id_for(resource: Resource) -> str:
+        """Resolve the real Graph drive id for a OneDrive-like resource.
+
+        USER_ONEDRIVE rows store the drive id in ``extra_data.drive_id``
+        and keep ``external_id`` as a composite ``{userId}:onedrive``
+        scoped to this product (see GraphClient.discover per-user OneDrive).
+        ONEDRIVE rows have ``external_id`` already set to the Graph drive
+        id. We fall back to ``external_id`` when metadata is absent so
+        either shape works.
+        """
+        md = getattr(resource, "extra_data", None) or {}
+        drive_id = md.get("drive_id") if isinstance(md, dict) else None
+        return drive_id or resource.external_id
+
+    async def _resolve_onedrive_target_user(
+        self,
+        session: AsyncSession,
+        source_resource: Resource,
+        spec: Dict,
+    ) -> tuple[str, bool]:
+        """Return (target_drive_id, is_cross_user) for a OneDrive
+        restore. ``spec.targetUserId`` is the DB UUID of the target
+        OneDrive resource row. Unset → restore into the source's own
+        drive. Cross-tenant targets raise."""
+        target_uuid = spec.get("targetUserId")
+        if not target_uuid:
+            return self._graph_drive_id_for(source_resource), False
+        target_res = await session.get(Resource, uuid.UUID(str(target_uuid)))
+        if not target_res:
+            raise ValueError(f"targetUserId {target_uuid} not found")
+        target_type = target_res.type.value if hasattr(target_res.type, "value") else str(target_res.type)
+        if target_type not in ("ONEDRIVE", "USER_ONEDRIVE"):
+            raise ValueError(
+                f"targetUserId {target_uuid} is not a OneDrive resource (got {target_type})"
+            )
+        if target_res.tenant_id != source_resource.tenant_id:
+            raise ValueError("Cross-tenant restore is not supported")
+        return self._graph_drive_id_for(target_res), (target_res.id != source_resource.id)
+
     async def _restore_file_to_onedrive(
         self,
         graph_client: GraphClient,
@@ -1404,28 +1984,29 @@ class RestoreWorker:
         item: SnapshotItem,
         conflict_mode: str = "SEPARATE_FOLDER",
     ):
-        """Restore file to OneDrive via Graph API."""
-        metadata = self._get_item_metadata(item)
-        raw_data = metadata.get("raw", {})
+        """Per-item shim kept for the narrow set of callers that bypass
+        the engine (single-item test paths, legacy handlers). Delegates
+        to ``OneDriveRestoreEngine.upload_one`` so no caller lands on a
+        stale broken path.
+        """
+        from onedrive_restore import OneDriveRestoreEngine, Mode as OdMode
 
-        user_id = resource.external_id
-        file_content = raw_data.get("content", "")
-        file_name = raw_data.get("name", item.name or f"restored_{item.external_id}")
-
-        # SEPARATE_FOLDER: stash under "Restored by TM/{date}/{original_folder}/"
-        # OVERWRITE: write to the original path (`...root:/{file_name}:/content`).
-        prefix = self._conflict_path_prefix(conflict_mode)
-        target_path = f"{prefix}{file_name}"
-        url = f"{graph_client.GRAPH_URL}/users/{user_id}/drive/root:/{target_path}:/content"
-
-        result = await graph_client._put(
-            url,
-            content=file_content,
-            headers={"Content-Type": "application/octet-stream"}
+        engine = OneDriveRestoreEngine(
+            graph_client=graph_client,
+            source_resource=resource,
+            target_drive_user_id=self._graph_drive_id_for(resource),
+            tenant_id=str(resource.tenant_id),
+            mode=OdMode.OVERWRITE if conflict_mode == "OVERWRITE" else OdMode.SEPARATE_FOLDER,
+            separate_folder_root=(
+                f"Restored by TM/{datetime.utcnow().strftime('%Y-%m-%d')}"
+                if conflict_mode != "OVERWRITE" else None
+            ),
+            worker_id=self.worker_id,
+            is_cross_user=False,
         )
-
-        # Round 1.1 — replay captured ACLs onto the restored item.
-        await self._replay_file_permissions(graph_client, item, result)
+        outcome = await engine.upload_one(item)
+        if outcome.outcome == "failed":
+            raise RuntimeError(outcome.reason or "onedrive restore failed")
 
     async def _restore_file_to_sharepoint(
         self,

@@ -1880,6 +1880,11 @@ class GraphClient:
         if provided so callers can persist the checkpoint after consuming
         the stream. Internal Graph pacing (``self._get``) already handles
         Retry-After, so we don't duplicate that here.
+
+        NOTE: targets ``/sites/{id}/drive`` (singular) — the site's
+        default document library only. Sites with multiple libraries need
+        ``iter_sharepoint_site_all_drive_items`` instead; this method is
+        kept for back-compat and single-drive callers.
         """
         graph_site_id = site_id.replace("/", ",")
         url = f"{self.GRAPH_URL}/sites/{graph_site_id}/drive/root/delta"
@@ -1897,6 +1902,92 @@ class GraphClient:
             if delta_holder is not None:
                 delta_holder["deltaLink"] = page.get("@odata.deltaLink")
             break
+
+    async def list_sharepoint_site_drives(self, site_id: str) -> List[Dict[str, Any]]:
+        """Enumerate every drive (document library) attached to a
+        SharePoint site. Returns raw drive dicts (at minimum each has
+        ``id``, ``name``, ``driveType``). Paginated.
+
+        Needed to back up sites whose content lives outside the default
+        ``/sites/{id}/drive`` singleton — e.g. Team Sites with multiple
+        libraries, or Communication Sites whose ``Pages`` library isn't
+        the default one."""
+        graph_site_id = site_id.replace("/", ",")
+        url = f"{self.GRAPH_URL}/sites/{graph_site_id}/drives"
+        params: Optional[Dict[str, str]] = {"$top": "200"}
+        out: List[Dict[str, Any]] = []
+        while url:
+            page = await self._get(url, params=params)
+            params = None
+            out.extend(page.get("value") or [])
+            url = page.get("@odata.nextLink")
+        return out
+
+    async def iter_drive_items_by_id(
+        self,
+        drive_id: str,
+        delta_token: Optional[str] = None,
+        delta_holder: Optional[Dict[str, Optional[str]]] = None,
+    ):
+        """Delta-iterate items of a specific drive. Same shape as
+        ``iter_sharepoint_site_drive_items`` but targets ``/drives/{id}``
+        directly so multi-library SharePoint sites can walk each drive
+        independently."""
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/root/delta"
+        if delta_token:
+            url = delta_token
+        params = {"$top": "999"}
+        while url:
+            page = await self._get(url, params=params)
+            params = None
+            for item in (page.get("value") or []):
+                # Tag with drive id so the backup-worker's file-row
+                # builder can partition blob paths correctly even when
+                # the upstream producer aggregates drives.
+                if "_drive_id" not in item:
+                    item["_drive_id"] = drive_id
+                yield item
+            if "@odata.nextLink" in page:
+                url = page["@odata.nextLink"]
+                continue
+            if delta_holder is not None:
+                delta_holder["deltaLink"] = page.get("@odata.deltaLink")
+            break
+
+    async def iter_sharepoint_site_all_drive_items(
+        self,
+        site_id: str,
+        drive_delta_tokens: Optional[Dict[str, str]] = None,
+        drive_delta_holder: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
+    ):
+        """Enumerate every drive on the site, then delta-iterate each.
+        Yields the same drive-item dicts as
+        ``iter_sharepoint_site_drive_items`` plus ``_drive_id`` and
+        ``_drive_name`` so callers can tell which library an item came
+        from.
+
+        ``drive_delta_tokens`` — optional ``{drive_id: deltaLink}`` read
+        from the previous run to resume per-drive.
+
+        ``drive_delta_holder`` — optional ``{drive_id: {"deltaLink": ...}}``
+        written during iteration so callers can persist the new tokens
+        after consuming the stream.
+        """
+        drive_delta_tokens = drive_delta_tokens or {}
+        drives = await self.list_sharepoint_site_drives(site_id)
+        for drv in drives:
+            drive_id = drv.get("id")
+            drive_name = drv.get("name") or drive_id
+            if not drive_id:
+                continue
+            local_holder: Dict[str, Optional[str]] = {"deltaLink": None}
+            async for item in self.iter_drive_items_by_id(
+                drive_id, drive_delta_tokens.get(drive_id), local_holder,
+            ):
+                item["_drive_name"] = drive_name
+                yield item
+            if drive_delta_holder is not None and local_holder.get("deltaLink"):
+                drive_delta_holder[drive_id] = local_holder
 
     async def get_sharepoint_subsites(self, site_id: str) -> Dict[str, Any]:
         """
@@ -2342,7 +2433,22 @@ class GraphClient:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json;odata=nometadata",
         }
-        params: Optional[Dict[str, str]] = {"$top": str(page_size)}
+        # File-reference columns (FileRef / FileLeafRef / FileSystemObjectType)
+        # aren't always returned by the default projection of SP REST's
+        # /items endpoint — some tenants drop them, leaving the backup
+        # worker's "do I stream bytes for this row?" check false for
+        # every row, producing 0-byte snapshots for SitePages and
+        # other list-hosted content.
+        #
+        # $select is strict-all-or-nothing: if ANY field doesn't exist
+        # on a given list type, SP REST 400s the whole request. Only
+        # include the file-reference fields — they're defined on every
+        # list type. Extras like Length / Title / Modified have
+        # fire-tested as absent on catalog / hidden / tasks lists.
+        params: Optional[Dict[str, str]] = {
+            "$top": str(page_size),
+            "$select": "Id,FileRef,FileLeafRef,FileSystemObjectType",
+        }
         next_url: Optional[str] = url
         backoff = 1.0  # seconds; doubled per consecutive transient failure
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -3338,13 +3444,26 @@ class GraphClient:
 
         # Walk segments: at each step look up the child by displayName
         # under the current parent; create if missing.
-        # For primary tier the root is mailFolders (top-level list endpoint).
-        # For other tiers (archive, recoverable) we need to append /childFolders
-        # to the well-known folder path to list its children.
-        if tier == "primary" or tier not in self._MAIL_TIER_ROOTS:
+        #
+        # Graph's URL shape for the tier root is asymmetric:
+        #   primary      → /users/{u}/mailFolders             (a collection)
+        #   archive      → /users/{u}/mailFolders('archive')  (a singleton)
+        #   recoverable  → /users/{u}/mailFolders('recoverableitemsroot')
+        #
+        # Listing children of the primary collection is just a GET on the
+        # collection; listing children of a singleton needs /childFolders.
+        # Creating a top-level folder is the opposite: POST the collection
+        # directly, or POST /childFolders on a singleton. Once we have a
+        # concrete parent_id, both tiers use the same /mailFolders/{id}/
+        # childFolders endpoint.
+        is_primary_root = tier == "primary" or tier not in self._MAIL_TIER_ROOTS
+        if is_primary_root:
             root_list_path = f"/users/{user_id}/{root_segment}"
+            root_create_path = f"/users/{user_id}/{root_segment}"
         else:
             root_list_path = f"/users/{user_id}/{root_segment}/childFolders"
+            root_create_path = f"/users/{user_id}/{root_segment}/childFolders"
+
         parent_id: Optional[str] = None
         for i, name in enumerate(segments):
             if parent_id is None:
@@ -3363,11 +3482,10 @@ class GraphClient:
                 parent_id = values[0].get("id")
             else:
                 # Create under the current parent.
-                create_url = (
-                    f"{self.GRAPH_URL}/users/{user_id}/{root_segment}/childFolders"
-                    if parent_id is None
-                    else f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{parent_id}/childFolders"
-                )
+                if parent_id is None:
+                    create_url = f"{self.GRAPH_URL}{root_create_path}"
+                else:
+                    create_url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{parent_id}/childFolders"
                 created = await self._post(create_url, {"displayName": name})
                 parent_id = created.get("id") if isinstance(created, dict) else None
                 if parent_id is None:
@@ -3414,10 +3532,382 @@ class GraphClient:
         payload: Dict[str, Any],
     ) -> Optional[str]:
         """Create a message inside a specific folder. Returns the new
-        Graph message id, or None if the response didn't include one."""
+        Graph message id, or None if the response didn't include one.
+
+        NOTE: Graph always sets ``isDraft=true`` on messages created via
+        JSON POST, and it silently overwrites ``from`` / ``sender`` with
+        the mailbox owner. Use ``create_mime_message`` for true restore.
+        """
         url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{folder_id}/messages"
         resp = await self._post(url, payload)
         return resp.get("id") if isinstance(resp, dict) else None
+
+    async def create_mime_message(
+        self,
+        user_id: str,
+        mime_bytes: bytes,
+        folder_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Import an RFC-822 MIME message via Graph.
+
+        Graph has a quirk that isn't obvious from the summary docs: POST
+        to ``/users/{id}/messages`` with ``Content-Type: text/plain``
+        ALWAYS lands the message in Drafts with ``isDraft=true`` — no
+        amount of MIME header tweaking changes that. The only way to
+        create a non-draft message via MIME is to POST to the per-folder
+        endpoint ``/users/{id}/mailFolders/{folder-id}/messages`` with
+        the same content type. Graph respects the folder choice there and
+        imports the MIME with ``isDraft=false`` when the target isn't
+        Drafts.
+
+        Pass ``folder_id`` when known (normal restore path). When it's
+        omitted we fall back to the mailbox root which preserves the old
+        behaviour (imports as draft) — callers that want a non-draft
+        restore must supply a target folder.
+
+        The MIME itself preserves ``From`` / ``Sender`` / ``Date`` /
+        ``Message-ID`` / attachments / inline CIDs exactly as captured.
+        """
+        import base64 as _b64
+        if folder_id:
+            url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{folder_id}/messages"
+        else:
+            url = f"{self.GRAPH_URL}/users/{user_id}/messages"
+        token = await self._get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "text/plain",
+        }
+        body = _b64.b64encode(mime_bytes)
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            resp = await client.post(url, headers=headers, content=body)
+            if resp.status_code == 429 or resp.status_code == 503:
+                await asyncio.sleep(_parse_retry_after(resp))
+                resp = await client.post(url, headers=headers, content=body)
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"create_mime_message {resp.status_code}: {resp.text[:300]}"
+                )
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            return data.get("id") if isinstance(data, dict) else None
+
+    async def move_message(
+        self,
+        user_id: str,
+        message_id: str,
+        destination_folder_id: str,
+    ) -> Optional[str]:
+        """Move a message to another mail folder. Returns the new message
+        id (Graph rewrites the id on move)."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}/move"
+        resp = await self._post(url, {"destinationId": destination_folder_id})
+        return resp.get("id") if isinstance(resp, dict) else None
+
+    async def upload_small_file_to_drive(
+        self,
+        drive_id: str,
+        drive_path: str,
+        body: bytes,
+        conflict_behavior: str = "rename",
+    ) -> Dict[str, Any]:
+        """Single-PUT upload for files < 4 MB (Graph's simple-upload cap).
+
+        Targets ``/drives/{drive_id}/root:/{path}:/content`` — this works
+        for any driveItem host (personal OneDrive, SharePoint document
+        library, Group drive) because drive_id is the canonical Graph
+        identifier. conflict_behavior = "replace" | "rename" | "fail" —
+        passed as a URL query parameter because httpx (RFC 7230) rejects
+        the ``@`` character in HTTP header names, so the
+        ``@microsoft.graph.conflictBehavior`` header form Graph also
+        accepts isn't usable here.
+        Returns the created driveItem dict.
+        """
+        from urllib.parse import quote as _q
+        # URL-escape each path segment (spaces / unicode / `#` are valid
+        # in OneDrive filenames but break Graph routing unescaped). Keep
+        # `/` as a literal separator by quoting each segment then
+        # rejoining.
+        quoted_path = "/".join(_q(seg, safe="") for seg in drive_path.split("/") if seg)
+        url = (
+            f"{self.GRAPH_URL}/drives/{drive_id}/root:/"
+            f"{quoted_path}:/content"
+            f"?@microsoft.graph.conflictBehavior={_q(conflict_behavior)}"
+        )
+        token = await self._get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/octet-stream",
+        }
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as c:
+            resp = await c.put(url, headers=headers, content=body)
+            if resp.status_code in (429, 503):
+                await asyncio.sleep(_parse_retry_after(resp))
+                resp = await c.put(url, headers=headers, content=body)
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"upload_small_file_to_drive {resp.status_code}: "
+                    f"{resp.text[:300]} · url={url}"
+                )
+            return resp.json()
+
+    async def upload_large_file_to_drive(
+        self,
+        drive_id: str,
+        drive_path: str,
+        body: bytes,
+        total_size: int,
+        chunk_size: int = 10 * 1024 * 1024,
+        conflict_behavior: str = "rename",
+    ) -> Dict[str, Any]:
+        """Resumable upload for files >= 4 MB via Graph's uploadSession.
+
+        Splits body into chunk_size chunks (MS mandates multiples of 320
+        KiB; 10 MiB is safe). Each chunk is PUT with a Content-Range:
+        bytes X-Y/total header; the final chunk's response returns the
+        created driveItem with status 201.
+
+        Retries each chunk up to 3x on 500/503/connection reset — the
+        uploadSession URL stays valid so retries never re-upload earlier
+        chunks on a mid-file failure.
+        """
+        from urllib.parse import quote as _qseg
+        quoted_path_lg = "/".join(_qseg(seg, safe="") for seg in drive_path.split("/") if seg)
+        create_url = (
+            f"{self.GRAPH_URL}/drives/{drive_id}/root:/"
+            f"{quoted_path_lg}:/createUploadSession"
+        )
+        token = await self._get_token()
+        create_headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        create_payload = {
+            "item": {
+                "@microsoft.graph.conflictBehavior": conflict_behavior,
+            }
+        }
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as c:
+            session_resp = await c.post(create_url, headers=create_headers, json=create_payload)
+            if session_resp.status_code >= 400:
+                raise RuntimeError(
+                    f"createUploadSession {session_resp.status_code}: {session_resp.text[:300]}"
+                )
+            upload_url = session_resp.json().get("uploadUrl")
+            if not upload_url:
+                raise RuntimeError("createUploadSession returned no uploadUrl")
+
+            offset = 0
+            last_json: Dict[str, Any] = {}
+            while offset < total_size:
+                end = min(offset + chunk_size, total_size) - 1
+                chunk = body[offset:end + 1]
+                put_headers = {
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {offset}-{end}/{total_size}",
+                }
+                attempt = 0
+                while True:
+                    attempt += 1
+                    try:
+                        resp = await c.put(upload_url, headers=put_headers, content=chunk)
+                    except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError):
+                        if attempt >= 3:
+                            raise
+                        await asyncio.sleep(min(2 ** attempt, 30))
+                        continue
+                    if resp.status_code in (429, 503):
+                        await asyncio.sleep(_parse_retry_after(resp))
+                        continue
+                    if resp.status_code >= 500 and attempt < 3:
+                        await asyncio.sleep(min(2 ** attempt, 30))
+                        continue
+                    if resp.status_code >= 400:
+                        raise RuntimeError(
+                            f"upload chunk {offset}-{end} {resp.status_code}: {resp.text[:300]}"
+                        )
+                    if resp.status_code in (200, 201):
+                        last_json = resp.json()
+                    break
+                offset = end + 1
+            return last_json
+
+    async def patch_drive_item_file_system_info(
+        self,
+        drive_id: str,
+        drive_item_id: str,
+        created_iso: Optional[str] = None,
+        modified_iso: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Restore captured creation + modification timestamps on a
+        driveItem. Without this, Explorer shows every restored file as
+        created / modified "today". Normalises "+00:00" into the Z form
+        Graph accepts; skips the call entirely when both inputs are
+        empty.
+        """
+        def _norm(ts: Optional[str]) -> Optional[str]:
+            if not ts:
+                return None
+            t = ts.strip()
+            if t.endswith("+00:00"):
+                t = t[:-6] + "Z"
+            elif "+" not in t and not t.endswith("Z"):
+                t = t + "Z"
+            return t
+
+        created = _norm(created_iso)
+        modified = _norm(modified_iso)
+        if not (created or modified):
+            return None
+        fsi: Dict[str, str] = {}
+        if created:
+            fsi["createdDateTime"] = created
+        if modified:
+            fsi["lastModifiedDateTime"] = modified
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{drive_item_id}"
+        return await self._patch(url, {"fileSystemInfo": fsi})
+
+    async def json_create_non_draft_message(
+        self,
+        user_id: str,
+        folder_id: str,
+        payload: Dict[str, Any],
+    ) -> Optional[str]:
+        """Create a message via JSON POST in a specific folder, with
+        ``PR_MESSAGE_FLAGS`` preset so it lands as non-draft.
+
+        This is the hybrid technique backup vendors (AFI, Veeam, Spanning)
+        use because Graph's MIME import is Drafts-only and its
+        PATCH-level write to ``PR_MESSAGE_FLAGS`` is server-ignored. At
+        CREATE time Exchange respects ``singleValueExtendedProperties``
+        including the normally-read-only MSGFLAG_UNSENT bit, so injecting
+        ``Integer 0x0E07 = 1`` (READ, not UNSENT) at create produces a
+        message that Outlook renders as real (received/sent) mail.
+
+        Caller should PATCH sender ``singleValueExtendedProperties``
+        afterwards to restore the original From / Sender — JSON POST
+        silently overrides those with the mailbox owner.
+        """
+        props = list(payload.get("singleValueExtendedProperties") or [])
+        props.append({"id": "Integer 0x0E07", "value": "1"})
+        payload = dict(payload)
+        payload["singleValueExtendedProperties"] = props
+        url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{folder_id}/messages"
+        resp = await self._post(url, payload)
+        return resp.get("id") if isinstance(resp, dict) else None
+
+    async def patch_original_timestamps(
+        self,
+        user_id: str,
+        message_id: str,
+        sent_iso: Optional[str] = None,
+        received_iso: Optional[str] = None,
+    ) -> None:
+        """Restore the message's original send / receive timestamps via
+        MAPI extended properties.
+
+        Graph ignores ``sentDateTime`` / ``receivedDateTime`` on JSON
+        create and stamps server-now instead, so the restored mail would
+        otherwise show "today" in Outlook. Writing the underlying MAPI
+        tags directly fixes the displayed date columns:
+
+          * ``SystemTime 0x0039`` PR_CLIENT_SUBMIT_TIME  — Sent column
+          * ``SystemTime 0x0E06`` PR_MESSAGE_DELIVERY_TIME — Received column
+          * ``SystemTime 0x3007`` PR_CREATION_TIME
+          * ``SystemTime 0x3008`` PR_LAST_MODIFICATION_TIME
+
+        Timestamps must be ISO-8601 UTC (``2024-01-15T10:30:00Z`` form);
+        we normalise the common ``…+00:00`` form Graph emits into the
+        trailing-``Z`` form Exchange expects.
+        """
+        def _norm(ts: Optional[str]) -> Optional[str]:
+            if not ts:
+                return None
+            t = ts.strip()
+            if t.endswith("+00:00"):
+                t = t[:-6] + "Z"
+            elif "+" not in t and not t.endswith("Z"):
+                t = t + "Z"
+            return t
+
+        sent = _norm(sent_iso)
+        recv = _norm(received_iso)
+        if not (sent or recv):
+            return
+        props: List[Dict[str, str]] = []
+        if sent:
+            props.append({"id": "SystemTime 0x0039", "value": sent})
+            props.append({"id": "SystemTime 0x3007", "value": sent})
+        if recv:
+            props.append({"id": "SystemTime 0x0E06", "value": recv})
+            props.append({"id": "SystemTime 0x3008", "value": recv})
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}"
+        await self._patch(url, {"singleValueExtendedProperties": props})
+
+    async def patch_sender_extended_properties(
+        self,
+        user_id: str,
+        message_id: str,
+        sender_name: Optional[str],
+        sender_address: Optional[str],
+    ) -> None:
+        """Overwrite a restored message's sender to the original
+        From/Sender captured in the snapshot.
+
+        Graph's JSON create silently rewrites ``from`` and ``sender`` to
+        the mailbox owner, so we have to come back via MAPI tags:
+          * ``String 0x0042`` PR_SENT_REPRESENTING_NAME
+          * ``String 0x0065`` PR_SENT_REPRESENTING_EMAIL_ADDRESS
+          * ``String 0x0064`` PR_SENT_REPRESENTING_ADDRTYPE = "SMTP"
+          * ``String 0x0C1A`` PR_SENDER_NAME
+          * ``String 0x0C1F`` PR_SENDER_EMAIL_ADDRESS
+          * ``String 0x0C1E`` PR_SENDER_ADDRTYPE = "SMTP"
+        Outlook's From column is computed from the PR_SENT_REPRESENTING_*
+        pair, with PR_SENDER_* as fallback. Setting both avoids edge
+        cases where one bag is preferred over the other.
+        """
+        if not (sender_name or sender_address):
+            return
+        props: List[Dict[str, str]] = []
+        if sender_name:
+            props.append({"id": "String 0x0042", "value": sender_name})
+            props.append({"id": "String 0x0C1A", "value": sender_name})
+        if sender_address:
+            props.append({"id": "String 0x0065", "value": sender_address})
+            props.append({"id": "String 0x0C1F", "value": sender_address})
+        props.append({"id": "String 0x0064", "value": "SMTP"})
+        props.append({"id": "String 0x0C1E", "value": "SMTP"})
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}"
+        await self._patch(url, {"singleValueExtendedProperties": props})
+
+    async def clear_draft_flag(self, user_id: str, message_id: str) -> None:
+        """Force a restored message out of Drafts into a normal
+        sent/received state by patching the MAPI PR_MESSAGE_FLAGS
+        property (tag ``Integer 0x0E07``).
+
+        Bit meanings (from MS-OXCMSG):
+            0x00000001  MSGFLAG_READ     — message has been read
+            0x00000008  MSGFLAG_UNSENT   — message is a draft
+            0x00000010  MSGFLAG_UNMODIFIED
+            0x00000020  MSGFLAG_SUBMIT
+            0x00000040  MSGFLAG_HASATTACH
+
+        Graph's MIME import often leaves ``UNSENT`` set, which is what
+        makes Outlook render the restored mail as a draft with "sender
+        unknown" cues even though the mailbox is correct. Writing the
+        flags to ``1`` clears UNSENT + keeps READ — matching what
+        Veeam/AFI do for immutable mail restore. We also set
+        ``PR_MSG_EDITOR_FORMAT`` (``Integer 0x5909``) to ``2`` (HTML)
+        as a belt-and-braces hint so clients pick the HTML part for
+        display.
+        """
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}"
+        body = {
+            "singleValueExtendedProperties": [
+                {"id": "Integer 0x0E07", "value": "1"},
+                {"id": "Integer 0x5909", "value": "2"},
+            ],
+        }
+        await self._patch(url, body)
 
     # Fields AFI patches on an already-existing matched message. Body,
     # recipients, subject, and dates are immutable per Graph and AFI

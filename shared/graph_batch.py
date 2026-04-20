@@ -13,12 +13,23 @@ reads. See:
 https://learn.microsoft.com/en-us/graph/throttling
 
 Spec: docs/superpowers/specs/2026-04-19-graph-api-throttle-hardening-design.md
+
+This module exposes two entry points:
+
+* ``BatchClient`` — production-grade class wrapping a ``GraphClient``.
+  Handles auth, rate-limit policy, 429 sub-response retry. Use this
+  for live Graph traffic.
+
+* ``batch_requests(post, requests)`` — thin functional helper that
+  takes a caller-supplied POST coroutine. Used by engines (e.g.
+  EntraRestoreEngine) that stub Graph at the ``_post`` boundary for
+  testing and don't need the full rate-limit machinery.
 """
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
@@ -28,6 +39,7 @@ from shared.graph_ratelimit import (
 
 
 GRAPH_BATCH_URL = "https://graph.microsoft.com/v1.0/$batch"
+_BATCH_CHUNK_SIZE = 20
 
 # Sub-paths that return paginated responses. $batch sub-requests cannot
 # follow their @odata.nextLink — using them silently truncates.
@@ -36,9 +48,14 @@ _PAGINATED_MARKERS = ("/delta", "$skiptoken=", "$top=")
 
 @dataclass
 class BatchRequest:
+    """One logical operation inside a /$batch POST. `id` MUST be unique
+    within the surrounding batch so we can re-order the responses back
+    to input order."""
     id: str
     method: str
     url: str
+    # Original BatchClient callers pass headers as a dict with a default
+    # factory. `batch_requests` callers pass body via the keyword.
     headers: Dict[str, str] = field(default_factory=dict)
     body: Optional[dict] = None
 
@@ -157,3 +174,44 @@ class BatchClient:
                 body=sub.get("body") or {},
             ))
         return out
+
+
+# ---- Functional helper used by engines that stub Graph at _post ---------
+
+PostFn = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
+
+
+async def batch_requests(post: PostFn, requests: List[BatchRequest]) -> List[Dict[str, Any]]:
+    """POST ``requests`` to Graph's /$batch endpoint in chunks of 20.
+    Returns a flat list of sub-response dicts in input order. Each
+    response dict has at least ``status`` and ``body``.
+
+    Use ``BatchClient`` for production code that needs rate-limit +
+    retry semantics. Use ``batch_requests`` for engines that stub
+    Graph at the ``_post`` boundary for unit testing."""
+    if not requests:
+        return []
+
+    out: List[Dict[str, Any]] = [None] * len(requests)  # type: ignore[list-item]
+    id_to_index: Dict[str, int] = {r.id: i for i, r in enumerate(requests)}
+
+    for chunk_start in range(0, len(requests), _BATCH_CHUNK_SIZE):
+        chunk = requests[chunk_start:chunk_start + _BATCH_CHUNK_SIZE]
+        payload = {
+            "requests": [
+                {
+                    "id": r.id,
+                    "method": r.method,
+                    "url": r.url,
+                    **({"body": r.body} if r.body is not None else {}),
+                    **({"headers": r.headers} if r.headers else {}),
+                }
+                for r in chunk
+            ],
+        }
+        resp = await post(GRAPH_BATCH_URL, payload)
+        for item in (resp or {}).get("responses", []) or []:
+            idx = id_to_index.get(item.get("id"))
+            if idx is not None:
+                out[idx] = item
+    return out

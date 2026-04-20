@@ -86,6 +86,7 @@ from shared.azure_storage import (
     upload_blob_with_retry,
     upload_blob_with_retry_from_file,
 )
+from shared.entra_fingerprint import fingerprint_object as _entra_fp
 
 logger = logging.getLogger(__name__)
 
@@ -207,11 +208,30 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
             if cid and cid not in aggregated:
                 aggregated[cid] = c
 
+    # itemClass isn't a native property of microsoft.graph.message, so
+    # filtering by it returns 400. Contact items live in mail folders with
+    # the MAPI property PidTagMessageClass (id 0x001A) set to "IPM.Contact",
+    # which Graph surfaces as a singleValueExtendedProperty. Filter on that
+    # and $expand the same property so ``_message_to_contact_shape`` can
+    # read the class back on each hit.
+    MSG_CLASS_EP = "String 0x001A"
+    contact_class_filter = (
+        f"singleValueExtendedProperties/Any(ep:"
+        f" ep/id eq '{MSG_CLASS_EP}'"
+        f" and startswith(ep/value,'IPM.Contact'))"
+    )
+    from urllib.parse import quote as _q
+    contact_class_expand = (
+        f"singleValueExtendedProperties($filter=id eq '{MSG_CLASS_EP}')"
+    )
+
     if settings.BACKUP_CONTACTS_INCLUDE_DELETED:
         del_url = (
             f"{graph_client.GRAPH_URL}/users/{user_id}"
             f"/mailFolders('deleteditems')/messages"
-            f"?$filter=startswith(itemClass,'IPM.Contact')&$top={item_limit}"
+            f"?$filter={_q(contact_class_filter)}"
+            f"&$expand={_q(contact_class_expand)}"
+            f"&$top={item_limit}"
         )
         for msg in await _fetch_messages(del_url):
             shape = _message_to_contact_shape(msg)
@@ -224,7 +244,9 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
         rec_url = (
             f"{graph_client.GRAPH_URL}/users/{user_id}"
             f"/mailFolders('recoverableitemsdeletions')/messages"
-            f"?$filter=startswith(itemClass,'IPM.Contact')&$top={item_limit}"
+            f"?$filter={_q(contact_class_filter)}"
+            f"&$expand={_q(contact_class_expand)}"
+            f"&$top={item_limit}"
         )
         for msg in await _fetch_messages(rec_url):
             shape = _message_to_contact_shape(msg)
@@ -1435,6 +1457,10 @@ class BackupWorker:
                         "attachment_kind": att_kind,
                         "content_type": content_type,
                         "is_inline": att.get("isInline", False),
+                        # Preserve original Content-ID so inline images
+                        # restored via MIME resolve against the body's
+                        # cid:xxx references.
+                        "content_id": att.get("contentId") or att.get("contentID"),
                         "source_url": att.get("sourceUrl"),
                         "resolved": blob_path is not None,
                     },
@@ -2848,6 +2874,46 @@ class BackupWorker:
                         self.worker_id, resource.display_name, ch_exc,
                     )
 
+            # Pull the group's SharePoint team-site content so the
+            # Recovery "Site" tab has data. Every Unified M365 group has
+            # a backing team site reachable at /groups/{id}/sites/root;
+            # we hand that site id to backup_sharepoint() which runs the
+            # full multi-drive + REST list pipeline. Items land under
+            # the same snapshot + tenant + resource so the Group
+            # Recovery view sees SHAREPOINT_* rows alongside the mail /
+            # channel rows.
+            if is_unified:
+                try:
+                    site_resp = await graph_client._get(
+                        f"{graph_client.GRAPH_URL}/groups/{obj_id}/sites/root",
+                    )
+                    raw_site_id = site_resp.get("id", "")  # "hostname,guid,guid"
+                    if raw_site_id:
+                        site_ext_id = raw_site_id.replace(",", "/")
+                        from types import SimpleNamespace as _SN
+                        site_proxy = _SN(
+                            id=resource.id,
+                            tenant_id=resource.tenant_id,
+                            type=_SN(value="SHAREPOINT_SITE"),
+                            display_name=f"{resource.display_name} (team site)",
+                            external_id=site_ext_id,
+                            # Share extra_data with the real resource so
+                            # per-drive delta tokens persist under the
+                            # M365_GROUP row between runs.
+                            extra_data=(resource.extra_data or {}),
+                            sla_policy_id=resource.sla_policy_id,
+                        )
+                        sp_result = await self.backup_sharepoint(
+                            graph_client, site_proxy, snapshot, tenant, message,
+                        )
+                        bytes_added += int(sp_result.get("bytes_added", 0))
+                        item_count += int(sp_result.get("item_count", 0))
+                except Exception as sp_exc:
+                    logger.warning(
+                        "[%s] Team site SP backup skipped for %s: %s",
+                        self.worker_id, resource.display_name, sp_exc,
+                    )
+
         elif resource_type == "ENTRA_APP":
             # Application registration — fetch via /applications?$filter=id eq '{id}'
             apps = await graph_client.get_entra_apps()
@@ -3018,6 +3084,7 @@ class BackupWorker:
                         "attachment_kind": att_kind,
                         "content_type": att.get("contentType"),
                         "is_inline": att.get("isInline", False),
+                        "content_id": att.get("contentId") or att.get("contentID"),
                         "source_url": att.get("sourceUrl"),
                     },
                 ))
@@ -3154,6 +3221,59 @@ class BackupWorker:
                 if isinstance(r, tuple):
                     item_count += r[0]
                     bytes_added += r[1]
+
+            # A TEAMS_CHANNEL row's external_id is the team (M365 group) id.
+            # Fan out to the group mailbox + the team's SharePoint site so
+            # the Recovery view's Site + Mail tabs have data alongside the
+            # channel messages. Each sub-backup guards its own exceptions
+            # so a single-permission-denied step doesn't abort the rest.
+            #
+            # Group mailbox.
+            try:
+                mbx_items, mbx_bytes = await self.backup_group_mailbox_content(
+                    resource, tenant, snapshot, graph_client,
+                )
+                if mbx_items:
+                    async with async_session_factory() as session:
+                        session.add_all(mbx_items)
+                        await session.commit()
+                    item_count += len(mbx_items)
+                bytes_added += mbx_bytes
+            except Exception as mbx_exc:
+                logger.warning(
+                    "[%s] Team group-mailbox backup skipped for %s: %s",
+                    self.worker_id, resource.display_name, mbx_exc,
+                )
+
+            # SharePoint team-site content (incl. subsites — backup_sharepoint
+            # enumerates them internally).
+            try:
+                site_resp = await graph_client._get(
+                    f"{graph_client.GRAPH_URL}/groups/{team_id}/sites/root",
+                )
+                raw_site_id = site_resp.get("id", "")
+                if raw_site_id:
+                    site_ext_id = raw_site_id.replace(",", "/")
+                    from types import SimpleNamespace as _SN
+                    site_proxy = _SN(
+                        id=resource.id,
+                        tenant_id=resource.tenant_id,
+                        type=_SN(value="SHAREPOINT_SITE"),
+                        display_name=f"{resource.display_name} (team site)",
+                        external_id=site_ext_id,
+                        extra_data=(resource.extra_data or {}),
+                        sla_policy_id=resource.sla_policy_id,
+                    )
+                    sp_result = await self.backup_sharepoint(
+                        graph_client, site_proxy, snapshot, tenant, message,
+                    )
+                    bytes_added += int(sp_result.get("bytes_added", 0))
+                    item_count += int(sp_result.get("item_count", 0))
+            except Exception as sp_exc:
+                logger.warning(
+                    "[%s] Team site SP backup skipped for %s: %s",
+                    self.worker_id, resource.display_name, sp_exc,
+                )
 
         elif resource.type.value == "TEAMS_CHAT":
             item_count, bytes_added = await self._backup_single_chat(resource, tenant, snapshot, graph_client)
@@ -5172,7 +5292,7 @@ class BackupWorker:
                     content_size=len(raw_bytes),
                     content_hash=hashlib.sha256(raw_bytes).hexdigest(),
                     content_checksum=None,
-                    extra_data={"raw": obj, "category": category_label},
+                    extra_data={"raw": obj, "category": category_label, "fingerprint": _entra_fp(item_type, obj)},
                 ))
                 total_bytes += len(raw_bytes)
             async with async_session_factory() as sess:
@@ -5676,6 +5796,7 @@ class BackupWorker:
                         "attachment_kind": att_kind,
                         "content_type": att.get("contentType"),
                         "is_inline": att.get("isInline", False),
+                        "content_id": att.get("contentId") or att.get("contentID"),
                         "source_url": att.get("sourceUrl"),  # referenceAttachment
                     },
                 ))
@@ -5793,6 +5914,13 @@ class BackupWorker:
 
         delta_token = (resource.extra_data or {}).get("delta_token")
         subsite_delta_tokens = ((resource.extra_data or {}).get("subsite_delta_tokens") or {}).copy()
+        # Per-drive resume tokens. Needed because a single SharePoint
+        # site routinely has several document libraries; using the
+        # singleton `/drive` endpoint (the legacy path) only captures
+        # the default one.
+        drive_delta_tokens_by_site: Dict[str, Dict[str, str]] = (
+            (resource.extra_data or {}).get("drive_delta_tokens_by_site") or {}
+        )
 
         site_targets: List[tuple[str, str, Optional[str]]] = [
             (resource.external_id, resource.display_name, delta_token)
@@ -5831,15 +5959,35 @@ class BackupWorker:
             "list_folders": 0,
             "new_delta": None,
             "new_subsite_tokens": {},
+            # Per-(site, drive) delta tokens written by the multi-drive
+            # producer. Shape: {site_id: {drive_id: deltaLink}}.
+            "new_drive_tokens": {},
         }
 
         # --- Producers ----------------------------------------------------
         async def drive_producer(site_id: str, site_label: str, site_delta_token: Optional[str]):
-            delta_holder: Dict[str, Optional[str]] = {"deltaLink": None}
+            """Enumerate every library on the site (not just the default
+            ``/drive`` singleton) and stream drive-items through the
+            pipeline. Per-library delta tokens are persisted on the
+            resource so subsequent runs resume cheaply per library
+            instead of re-walking each one."""
+            per_drive_in = drive_delta_tokens_by_site.get(site_id) or {}
+            per_drive_out: Dict[str, Dict[str, Optional[str]]] = {}
+
+            # Diagnostic: count what we actually enumerate + stream.
             try:
-                async for item in graph_client.iter_sharepoint_site_drive_items(
-                    site_id, site_delta_token, delta_holder,
+                drives = await graph_client.list_sharepoint_site_drives(site_id)
+                print(f"[{self.worker_id}]   [SP_DRIVES] {site_label}: enumerated {len(drives)} drive(s)"
+                      + (" — " + ", ".join(f"{d.get('name','?')}({d.get('driveType','?')})" for d in drives[:8]) if drives else ""))
+            except Exception as exc:
+                print(f"[{self.worker_id}]   [SP_DRIVES] {site_label}: enumerate FAIL {type(exc).__name__}: {exc}")
+
+            streamed = 0
+            try:
+                async for item in graph_client.iter_sharepoint_site_all_drive_items(
+                    site_id, per_drive_in, per_drive_out,
                 ):
+                    streamed += 1
                     item["_site_label"] = site_label
                     if exclusions and self._item_is_excluded("FILE", item, exclusions):
                         stats["drive_excluded"] += 1
@@ -5848,12 +5996,18 @@ class BackupWorker:
             except Exception as exc:
                 logger.warning("SharePoint drive producer %s failed: %s", site_label, exc)
             finally:
-                delta_link = delta_holder.get("deltaLink")
-                if delta_link:
-                    if site_id == resource.external_id:
-                        stats["new_delta"] = delta_link
-                    else:
-                        stats["new_subsite_tokens"][site_id] = delta_link
+                print(f"[{self.worker_id}]   [SP_DRIVES] {site_label}: streamed {streamed} drive-item(s) "
+                      f"across {len(per_drive_out)} drive(s)")
+                # Persist new per-drive tokens. The legacy flat
+                # `delta_token` / `subsite_delta_tokens` are still
+                # written for back-compat but are no longer consulted
+                # at read time once drive_delta_tokens_by_site exists.
+                if per_drive_out:
+                    stats.setdefault("new_drive_tokens", {})[site_id] = {
+                        drive_id: holder.get("deltaLink")
+                        for drive_id, holder in per_drive_out.items()
+                        if holder.get("deltaLink")
+                    }
 
         async def list_producer(site_id: str, site_label: str):
             try:
@@ -6049,15 +6203,31 @@ class BackupWorker:
         print(f"[{self.worker_id}]   [SP_LISTS] {stats['list_folders']} lists, "
               f"{stats['rest_rows']} rows processed, {stats['rest_files_ok']} files "
               f"({stats['rest_bytes']} bytes), {stats['rest_fail']} failed")
+        # Breakdown of why REST rows didn't produce file content — helps
+        # diagnose "283 items, 0 bytes" type snapshots.
+        print(f"[{self.worker_id}]   [SP_REST_BREAKDOWN] "
+              f"no_fileref={stats.get('rest_rows_no_fileref', 0)} "
+              f"folder={stats.get('rest_rows_folder', 0)} "
+              f"meta_fail={stats.get('rest_rows_meta_fail', 0)} "
+              f"meta_none={stats.get('rest_rows_meta_none', 0)} "
+              f"size_zero={stats.get('rest_rows_size_zero', 0)}")
 
-        if stats["new_subsite_tokens"]:
+        if stats["new_subsite_tokens"] or stats["new_drive_tokens"]:
             async with async_session_factory() as sess:
                 r = await sess.get(Resource, resource.id)
                 if r:
                     r.extra_data = r.extra_data or {}
-                    existing_subsite_tokens = (r.extra_data.get("subsite_delta_tokens") or {}).copy()
-                    existing_subsite_tokens.update(stats["new_subsite_tokens"])
-                    r.extra_data["subsite_delta_tokens"] = existing_subsite_tokens
+                    if stats["new_subsite_tokens"]:
+                        existing_subsite_tokens = (r.extra_data.get("subsite_delta_tokens") or {}).copy()
+                        existing_subsite_tokens.update(stats["new_subsite_tokens"])
+                        r.extra_data["subsite_delta_tokens"] = existing_subsite_tokens
+                    if stats["new_drive_tokens"]:
+                        existing_drive_tokens = (r.extra_data.get("drive_delta_tokens_by_site") or {}).copy()
+                        for site_id_key, per_drive in stats["new_drive_tokens"].items():
+                            merged = (existing_drive_tokens.get(site_id_key) or {}).copy()
+                            merged.update(per_drive)
+                            existing_drive_tokens[site_id_key] = merged
+                        r.extra_data["drive_delta_tokens_by_site"] = existing_drive_tokens
                     await sess.commit()
 
         print(f"[{self.worker_id}] [BACKUP COMPLETE] SharePoint: {resource.display_name} — "
@@ -6127,15 +6297,41 @@ class BackupWorker:
         size = 0
         file_info: Optional[Dict[str, Any]] = None
 
+        # Diagnostic counters — classify why rows end up without file
+        # content. Only one per call lands on the right bucket.
+        stats.setdefault("rest_rows_no_fileref", 0)
+        stats.setdefault("rest_rows_folder", 0)
+        stats.setdefault("rest_rows_meta_fail", 0)
+        stats.setdefault("rest_rows_meta_none", 0)
+        stats.setdefault("rest_rows_size_zero", 0)
+
+        if not srv_rel:
+            stats["rest_rows_no_fileref"] += 1
+        elif is_folder:
+            stats["rest_rows_folder"] += 1
+
         if srv_rel and not is_folder:
             try:
                 file_info = await graph_client.get_sharepoint_file_metadata_via_rest(
                     sp_hostname, sp_site_web_url, srv_rel,
                 )
-            except Exception:
+            except Exception as _meta_exc:
+                stats["rest_rows_meta_fail"] += 1
+                if stats["rest_rows_meta_fail"] <= 3:
+                    print(f"[{self.worker_id}]   [SP_REST META FAIL] {site_label}/{display}/{name}: "
+                          f"{type(_meta_exc).__name__}: {_meta_exc}")
                 file_info = None
+            if file_info is None:
+                # Distinct from meta-fail: the call succeeded but
+                # returned None/empty (e.g. row has FileRef but file
+                # was deleted, or endpoint returned 204).
+                if stats["rest_rows_meta_none"] == 0:
+                    print(f"[{self.worker_id}]   [SP_REST META NONE] {site_label}/{display}/{name} srv_rel={srv_rel}")
+                stats["rest_rows_meta_none"] += 1
             if file_info:
                 size = int(file_info.get("Length") or 0)
+                if size == 0:
+                    stats["rest_rows_size_zero"] += 1
 
         # Idempotency — skip re-downloading catalog files that already have a
         # matching blob from a prior snapshot (same server_relative_url + size).

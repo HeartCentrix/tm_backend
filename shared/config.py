@@ -127,9 +127,10 @@ class Settings:
         self.EXPORT_BLOCK_SIZE_BYTES = int(os.getenv("EXPORT_BLOCK_SIZE_BYTES", str(4 * 1024 * 1024)))
         self.EXPORT_FOLDER_QUEUE_MAXSIZE = int(os.getenv("EXPORT_FOLDER_QUEUE_MAXSIZE", "20"))
         self.MAX_CONCURRENT_EXPORTS_PER_WORKER = int(os.getenv("MAX_CONCURRENT_EXPORTS_PER_WORKER", "2"))
-        # Mail Restore v2 — AFI-parity pipeline. Off by default; flip to
-        # "true" in env to route EMAIL items through MailRestoreEngine.
-        self.MAIL_RESTORE_V2_ENABLED = os.getenv("MAIL_RESTORE_V2_ENABLED", "false").lower() == "true"
+        # Mail Restore v2 — AFI-parity pipeline. Default on; set
+        # MAIL_RESTORE_V2_ENABLED=false in env to roll back to the legacy
+        # _restore_email_to_mailbox path if the engine misbehaves.
+        self.MAIL_RESTORE_V2_ENABLED = os.getenv("MAIL_RESTORE_V2_ENABLED", "true").lower() == "true"
         # Per-worker global cap on concurrent mail-restore tasks across all
         # in-flight jobs. Keeps Graph traffic bounded even if many jobs run at once.
         self.MAIL_RESTORE_GLOBAL_POOL = int(os.getenv("MAIL_RESTORE_GLOBAL_POOL", "32"))
@@ -142,10 +143,42 @@ class Settings:
         # Small-attachment threshold. >= this size uses Graph's upload-session
         # endpoint (chunked PUT). Units = megabytes.
         self.MAIL_RESTORE_ATTACH_LARGE_MB = int(os.getenv("MAIL_RESTORE_ATTACH_LARGE_MB", "3"))
+        # ---- OneDrive Restore engine ----
+        # Streams files back via Graph upload-session for ≥ 4 MB, simple PUT
+        # otherwise. Flag off → legacy _restore_file_to_onedrive shim (still
+        # delegates to the engine — the flag is an emergency escape hatch).
+        self.ONEDRIVE_RESTORE_ENGINE_ENABLED = os.getenv("ONEDRIVE_RESTORE_ENGINE_ENABLED", "true").lower() == "true"
+        self.ONEDRIVE_RESTORE_CONCURRENCY = int(os.getenv("ONEDRIVE_RESTORE_CONCURRENCY", "16"))
+        self.ONEDRIVE_RESTORE_CHUNK_BYTES = int(os.getenv("ONEDRIVE_RESTORE_CHUNK_BYTES", str(10 * 1024 * 1024)))
+        self.ONEDRIVE_RESTORE_PER_TARGET_USER_CAP = int(os.getenv("ONEDRIVE_RESTORE_PER_TARGET_USER_CAP", "5"))
+        # ---- Entra Restore v2 ----
+        # Default on; set to "false" in env to disable EntraRestoreEngine
+        # + EntraExportPipeline and fall back to the legacy PATCH-only
+        # restore path for ENTRA_DIR_* items.
+        self.ENTRA_RESTORE_V2_ENABLED = os.getenv("ENTRA_RESTORE_V2_ENABLED", "true").lower() == "true"
+        # Default on; gates the server-side Entra ZIP export pipeline.
+        self.ENTRA_EXPORT_V2_ENABLED = os.getenv("ENTRA_EXPORT_V2_ENABLED", "true").lower() == "true"
+        # Files folder-select v2. Enables the folderPaths/excludedItemIds
+        # payload on the /export-or-restore endpoint and the generic
+        # FileBrowserTable on SharePoint/Teams/Groups tabs. Rollback by
+        # setting FILES_FOLDER_SELECT_V2=false in env.
+        self.FILES_FOLDER_SELECT_V2 = os.getenv("FILES_FOLDER_SELECT_V2", "true").lower() == "true"
+        # Per-worker cap on concurrent Entra-restore tasks across all
+        # in-flight jobs. Keeps Graph traffic bounded.
+        self.ENTRA_RESTORE_GLOBAL_POOL = int(os.getenv("ENTRA_RESTORE_GLOBAL_POOL", "32"))
+        # Per-tenant concurrency cap for $batch / PATCH calls. Graph's
+        # directory throttle budget sits around 4-6 concurrent app-only
+        # calls — stay under that.
+        self.ENTRA_RESTORE_PER_TENANT = int(os.getenv("ENTRA_RESTORE_PER_TENANT", "4"))
+        # Max retries per item on 429 / 5xx before marking failed.
+        self.ENTRA_RESTORE_MAX_RETRIES = int(os.getenv("ENTRA_RESTORE_MAX_RETRIES", "5"))
         self.EXPORT_FETCH_BATCH_SIZE = int(os.getenv("EXPORT_FETCH_BATCH_SIZE", "50"))
         self.EXPORT_MEMORY_SOFT_LIMIT_PCT = int(os.getenv("EXPORT_MEMORY_SOFT_LIMIT_PCT", "80"))
         self.EXPORT_MEMORY_KILL_GRACE_SECONDS = int(os.getenv("EXPORT_MEMORY_KILL_GRACE_SECONDS", "60"))
-        self.EXPORT_MAIL_V2_ENABLED = os.getenv("EXPORT_MAIL_V2_ENABLED", "false").lower() in ("true", "1", "yes")
+        # Default on: the v2 streaming mail export is what powers Download
+        # (ZIP / MBOX) from Recovery. Flip off in env only for emergency
+        # rollback to the legacy in-memory export path.
+        self.EXPORT_MAIL_V2_ENABLED = os.getenv("EXPORT_MAIL_V2_ENABLED", "true").lower() in ("true", "1", "yes")
         # MBOX tiering: folders under this byte size accumulate in memory and go
         # straight into the final ZIP without an intermediate Azure blob.
         # Folders over the limit stream via intermediate blob (bounded memory,
@@ -153,7 +186,9 @@ class Settings:
         self.EXPORT_MBOX_INLINE_LIMIT_BYTES = int(os.getenv("EXPORT_MBOX_INLINE_LIMIT_BYTES", str(100 * 1024 * 1024)))
 
         # ── OneDrive export v2 (see 2026-04-19-onedrive-export-and-backup-uncap-design.md) ──
-        self.EXPORT_ONEDRIVE_V2_ENABLED = os.getenv("EXPORT_ONEDRIVE_V2_ENABLED", "false").lower() in ("true", "1", "yes")
+        # Default on: folder-tree preserving ZIP + single-file raw stream
+        # for Download flows. Disable per env for rollback only.
+        self.EXPORT_ONEDRIVE_V2_ENABLED = os.getenv("EXPORT_ONEDRIVE_V2_ENABLED", "true").lower() in ("true", "1", "yes")
         self.EXPORT_ONEDRIVE_MISSING_POLICY = os.getenv("EXPORT_ONEDRIVE_MISSING_POLICY", "skip").lower()
         self.EXPORT_ONEDRIVE_INCLUDE_VERSIONS = os.getenv("EXPORT_ONEDRIVE_INCLUDE_VERSIONS", "false").lower() in ("true", "1", "yes")
         self.EXPORT_ONEDRIVE_MAX_FILE_BYTES = int(os.getenv("EXPORT_ONEDRIVE_MAX_FILE_BYTES", str(200 * 1024 * 1024 * 1024)))
@@ -161,7 +196,9 @@ class Settings:
         self.EXPORT_ONEDRIVE_SANITIZE_CHARS = os.getenv("EXPORT_ONEDRIVE_SANITIZE_CHARS", '<>:"/\\|?*')
 
         # ── OneDrive backup uncap ──
-        self.ONEDRIVE_BACKUP_V2_ENABLED = os.getenv("ONEDRIVE_BACKUP_V2_ENABLED", "false").lower() in ("true", "1", "yes")
+        # Default on: removes the legacy per-drive cap + uses resumable
+        # streaming so multi-TB drives survive transient failures.
+        self.ONEDRIVE_BACKUP_V2_ENABLED = os.getenv("ONEDRIVE_BACKUP_V2_ENABLED", "true").lower() in ("true", "1", "yes")
         self.ONEDRIVE_BACKUP_FILE_CONCURRENCY = int(os.getenv("ONEDRIVE_BACKUP_FILE_CONCURRENCY", "16"))
         self.MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER = int(os.getenv("MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER", "4"))
         self.ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS = int(os.getenv("ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS", "21600"))
@@ -169,7 +206,10 @@ class Settings:
         self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES", str(1024 * 1024 * 1024)))
 
         # ── Heavy backup pool ──
-        self.BACKUP_HEAVY_ENABLED = os.getenv("BACKUP_HEAVY_ENABLED", "false").lower() in ("true", "1", "yes")
+        # Default on: route OneDrive drives above the heavy threshold to
+        # backup.heavy so one monster drive doesn't starve every regular
+        # backup-worker replica.
+        self.BACKUP_HEAVY_ENABLED = os.getenv("BACKUP_HEAVY_ENABLED", "true").lower() in ("true", "1", "yes")
         self.BACKUP_HEAVY_THRESHOLD_BYTES = int(os.getenv("BACKUP_HEAVY_THRESHOLD_BYTES", str(100 * 1024 * 1024 * 1024)))
         self.BACKUP_HEAVY_QUEUE = os.getenv("BACKUP_HEAVY_QUEUE", "backup.heavy")
         self.BACKUP_WORKER_QUEUE = os.getenv("BACKUP_WORKER_QUEUE", "backup.normal")
@@ -243,7 +283,9 @@ class Settings:
             "HEAVY_EXPORT_THRESHOLD_BYTES", str(100 * 1024 * 1024 * 1024)
         ))
         self.HEAVY_EXPORT_QUEUE = os.getenv("HEAVY_EXPORT_QUEUE", "restore.heavy")
-        self.HEAVY_EXPORT_ENABLED = os.getenv("HEAVY_EXPORT_ENABLED", "false").lower() in ("true", "1", "yes")
+        # Default on: heavy exports (large mail / drive downloads) route
+        # to restore.heavy — keeps the normal restore pool responsive.
+        self.HEAVY_EXPORT_ENABLED = os.getenv("HEAVY_EXPORT_ENABLED", "true").lower() in ("true", "1", "yes")
         self.RESTORE_WORKER_QUEUE = os.getenv("RESTORE_WORKER_QUEUE", "restore.normal")
 
         # --- Chat export (v1) ---
