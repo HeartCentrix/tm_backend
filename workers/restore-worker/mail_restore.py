@@ -28,29 +28,7 @@ from shared.azure_storage import azure_storage_manager
 from shared.config import settings
 from shared.graph_client import GraphClient
 from shared.models import Resource, SnapshotItem
-
-
-def _is_retryable(exc: BaseException) -> bool:
-    """True for HTTP 429 / 5xx. httpx raises HTTPStatusError carrying
-    a .response; detect that structurally so we don't hard-couple to
-    httpx in the type."""
-    resp = getattr(exc, "response", None)
-    code = getattr(resp, "status_code", None)
-    if code is None:
-        return False
-    return code == 429 or 500 <= code < 600
-
-
-def _retry_after_seconds(exc: BaseException) -> Optional[float]:
-    resp = getattr(exc, "response", None)
-    headers = getattr(resp, "headers", None) or {}
-    ra = headers.get("Retry-After") or headers.get("retry-after")
-    if ra is None:
-        return None
-    try:
-        return float(ra)
-    except (TypeError, ValueError):
-        return None
+from shared._graph_retry import _is_retryable, _retry_after_seconds  # noqa: F401  (re-exported so mail tests work unchanged)
 
 
 # ----- Mode enum-ish ---------------------------------------------------
