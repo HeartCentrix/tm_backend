@@ -794,7 +794,23 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
             spec=spec,
             resource_type=resource_type,
         )
-        queue = restore_message.get("queue", "restore.normal")
+        from shared.export_routing import pick_restore_queue
+        from sqlalchemy import func as sa_func
+        total_bytes = 0
+        try:
+            if item_ids:
+                q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
+                    SnapshotItem.id.in_([uuid.UUID(x) for x in item_ids])
+                )
+                total_bytes = int((await db.execute(q)).scalar() or 0)
+            elif snapshot_ids:
+                q = sa_select(sa_func.coalesce(sa_func.sum(SnapshotItem.content_size), 0)).where(
+                    SnapshotItem.snapshot_id.in_([uuid.UUID(x) for x in snapshot_ids])
+                )
+                total_bytes = int((await db.execute(q)).scalar() or 0)
+        except Exception:
+            total_bytes = 0
+        queue = restore_message.get("queue") or pick_restore_queue(total_bytes=total_bytes)
         await message_bus.publish(queue, restore_message, priority=restore_message.get("priority", 5))
 
     return {

@@ -691,6 +691,53 @@ class RestoreWorker:
                             flush=True,
                         )
 
+            # OneDrive restore v2 — streaming engine with per-target-user
+            # concurrency cap. Routes FILE / ONEDRIVE_FILE items out of the
+            # per-item loop below so they go through resumable upload
+            # sessions instead of the (broken) legacy shim.
+            onedrive_items: List[SnapshotItem] = []
+            if settings.ONEDRIVE_RESTORE_ENGINE_ENABLED and resource_type in (
+                "ONEDRIVE", "USER_ONEDRIVE"
+            ):
+                remaining_od: List[SnapshotItem] = []
+                for it in resource_items:
+                    if it.item_type in ("FILE", "ONEDRIVE_FILE"):
+                        onedrive_items.append(it)
+                    else:
+                        remaining_od.append(it)
+                resource_items = remaining_od
+
+            if onedrive_items:
+                from onedrive_restore import OneDriveRestoreEngine, Mode as OdMode
+                target_user_id, is_cross = await self._resolve_onedrive_target_user(
+                    session, resource, spec,
+                )
+                od_engine = OneDriveRestoreEngine(
+                    graph_client=graph_client,
+                    source_resource=resource,
+                    target_drive_user_id=target_user_id,
+                    tenant_id=str(resource.tenant_id),
+                    mode=OdMode.OVERWRITE if spec.get("overwrite") else OdMode.SEPARATE_FOLDER,
+                    separate_folder_root=spec.get("targetFolder"),
+                    worker_id=self.worker_id,
+                    is_cross_user=is_cross,
+                )
+                od_summary = await od_engine.run(onedrive_items)
+                restored_count += (
+                    od_summary.get("created", 0)
+                    + od_summary.get("overwritten", 0)
+                    + od_summary.get("renamed", 0)
+                )
+                failed_count += od_summary.get("failed", 0)
+                for o in od_summary.get("items", []):
+                    if o.get("outcome") == "failed":
+                        print(
+                            f"[{self.worker_id}] [ONEDRIVE-RESTORE FAIL] "
+                            f"ext_id={o.get('external_id')} name={o.get('name')} "
+                            f"reason={o.get('reason')}",
+                            flush=True,
+                        )
+
             # Entra restore v2 fast-path. When the flag is on and
             # resource is the tenant-wide ENTRA_DIRECTORY container,
             # route every ENTRA_DIR_* item through EntraRestoreEngine
@@ -892,6 +939,55 @@ class RestoreWorker:
             mail_summary = await engine.run(mail_items)
             restored_count += mail_summary["created"] + mail_summary["updated"]
             failed_count += mail_summary["failed"]
+
+        # OneDrive cross-user v2 — route FILE / ONEDRIVE_FILE items
+        # through the streaming engine against the chosen target drive.
+        od_items: List[SnapshotItem] = []
+        if settings.ONEDRIVE_RESTORE_ENGINE_ENABLED and target_type in (
+            "ONEDRIVE", "USER_ONEDRIVE"
+        ):
+            remaining_od: List[SnapshotItem] = []
+            for it in items:
+                if it.item_type in ("FILE", "ONEDRIVE_FILE"):
+                    od_items.append(it)
+                else:
+                    remaining_od.append(it)
+            items = remaining_od
+
+        if od_items:
+            from onedrive_restore import OneDriveRestoreEngine, Mode as OdMode
+            # Source resource for blob reads: the item's own snapshot's
+            # resource. All items in this handler come from a single
+            # restore job, so grab the first item's resource once.
+            first_snapshot = await session.get(Snapshot, od_items[0].snapshot_id)
+            source_resource_for_blobs = await session.get(
+                Resource, first_snapshot.resource_id,
+            ) if first_snapshot else target_resource
+            od_engine = OneDriveRestoreEngine(
+                graph_client=graph_client,
+                source_resource=source_resource_for_blobs,
+                target_drive_user_id=target_resource.external_id,
+                tenant_id=str(target_resource.tenant_id),
+                mode=OdMode.OVERWRITE if spec.get("overwrite") else OdMode.SEPARATE_FOLDER,
+                separate_folder_root=spec.get("targetFolder"),
+                worker_id=self.worker_id,
+                is_cross_user=True,
+            )
+            od_summary = await od_engine.run(od_items)
+            restored_count += (
+                od_summary.get("created", 0)
+                + od_summary.get("overwritten", 0)
+                + od_summary.get("renamed", 0)
+            )
+            failed_count += od_summary.get("failed", 0)
+            for o in od_summary.get("items", []):
+                if o.get("outcome") == "failed":
+                    print(
+                        f"[{self.worker_id}] [ONEDRIVE-RESTORE FAIL] "
+                        f"ext_id={o.get('external_id')} name={o.get('name')} "
+                        f"reason={o.get('reason')}",
+                        flush=True,
+                    )
 
         for item in items:
             try:
@@ -1797,6 +1893,31 @@ class RestoreWorker:
             return f"Restored by TM/{datetime.utcnow().strftime('%Y-%m-%d')}/"
         return ""
 
+    async def _resolve_onedrive_target_user(
+        self,
+        session: AsyncSession,
+        source_resource: Resource,
+        spec: Dict,
+    ) -> tuple[str, bool]:
+        """Return (target_user_graph_id, is_cross_user) for a OneDrive
+        restore. ``spec.targetUserId`` is the DB UUID of the target
+        OneDrive resource row (not a Graph user id). Unset → restore
+        into the source's own drive. Cross-tenant targets raise."""
+        target_uuid = spec.get("targetUserId")
+        if not target_uuid:
+            return source_resource.external_id, False
+        target_res = await session.get(Resource, uuid.UUID(str(target_uuid)))
+        if not target_res:
+            raise ValueError(f"targetUserId {target_uuid} not found")
+        target_type = target_res.type.value if hasattr(target_res.type, "value") else str(target_res.type)
+        if target_type != "ONEDRIVE":
+            raise ValueError(
+                f"targetUserId {target_uuid} is not a OneDrive resource (got {target_type})"
+            )
+        if target_res.tenant_id != source_resource.tenant_id:
+            raise ValueError("Cross-tenant restore is not supported")
+        return target_res.external_id, (target_res.id != source_resource.id)
+
     async def _restore_file_to_onedrive(
         self,
         graph_client: GraphClient,
@@ -1804,28 +1925,29 @@ class RestoreWorker:
         item: SnapshotItem,
         conflict_mode: str = "SEPARATE_FOLDER",
     ):
-        """Restore file to OneDrive via Graph API."""
-        metadata = self._get_item_metadata(item)
-        raw_data = metadata.get("raw", {})
+        """Per-item shim kept for the narrow set of callers that bypass
+        the engine (single-item test paths, legacy handlers). Delegates
+        to ``OneDriveRestoreEngine.upload_one`` so no caller lands on a
+        stale broken path.
+        """
+        from onedrive_restore import OneDriveRestoreEngine, Mode as OdMode
 
-        user_id = resource.external_id
-        file_content = raw_data.get("content", "")
-        file_name = raw_data.get("name", item.name or f"restored_{item.external_id}")
-
-        # SEPARATE_FOLDER: stash under "Restored by TM/{date}/{original_folder}/"
-        # OVERWRITE: write to the original path (`...root:/{file_name}:/content`).
-        prefix = self._conflict_path_prefix(conflict_mode)
-        target_path = f"{prefix}{file_name}"
-        url = f"{graph_client.GRAPH_URL}/users/{user_id}/drive/root:/{target_path}:/content"
-
-        result = await graph_client._put(
-            url,
-            content=file_content,
-            headers={"Content-Type": "application/octet-stream"}
+        engine = OneDriveRestoreEngine(
+            graph_client=graph_client,
+            source_resource=resource,
+            target_drive_user_id=resource.external_id,
+            tenant_id=str(resource.tenant_id),
+            mode=OdMode.OVERWRITE if conflict_mode == "OVERWRITE" else OdMode.SEPARATE_FOLDER,
+            separate_folder_root=(
+                f"Restored by TM/{datetime.utcnow().strftime('%Y-%m-%d')}"
+                if conflict_mode != "OVERWRITE" else None
+            ),
+            worker_id=self.worker_id,
+            is_cross_user=False,
         )
-
-        # Round 1.1 — replay captured ACLs onto the restored item.
-        await self._replay_file_permissions(graph_client, item, result)
+        outcome = await engine.upload_one(item)
+        if outcome.outcome == "failed":
+            raise RuntimeError(outcome.reason or "onedrive restore failed")
 
     async def _restore_file_to_sharepoint(
         self,
