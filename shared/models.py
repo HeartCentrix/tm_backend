@@ -397,6 +397,9 @@ class Job(Base):
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     completed_at = Column(DateTime)
+    # Storage toggle retry plumbing (2026-04-21)
+    retry_reason = Column(Text)
+    pre_toggle_job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id"))
 
 
 class Snapshot(Base):
@@ -428,6 +431,9 @@ class Snapshot(Base):
     dr_replicated_at = Column(DateTime, nullable=True)
     dr_error = Column(Text, nullable=True)
     dr_replication_attempts = Column(Integer, default=0, nullable=False)
+    # Storage backend that holds this snapshot's blobs (2026-04-21).
+    # NOT NULL enforced after backfill migration.
+    backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
     created_at = Column(DateTime, default=utcnow)
 
 
@@ -450,6 +456,9 @@ class SnapshotItem(Base):
     extra_data = Column("metadata", JSON, default=dict)
     is_deleted = Column(Boolean, default=False)
     indexed_at = Column(DateTime)
+    # Storage backend that holds this item's blob. Permanent — wins over
+    # system_config.active_backend_id during passthrough restores.
+    backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
     created_at = Column(DateTime, default=utcnow)
 
 
@@ -669,3 +678,78 @@ class TenantSecret(Base):
     is_default = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=utcnow, nullable=False)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+
+# ==================== Storage backend abstraction (2026-04-21) ====================
+
+
+class StorageBackendKind(str, enum.Enum):
+    azure_blob = "azure_blob"
+    seaweedfs = "seaweedfs"
+
+
+class TransitionState(str, enum.Enum):
+    stable = "stable"
+    draining = "draining"
+    flipping = "flipping"
+
+
+class ToggleStatus(str, enum.Enum):
+    started = "started"
+    drain_started = "drain_started"
+    drain_completed = "drain_completed"
+    db_promoted = "db_promoted"
+    dns_flipped = "dns_flipped"
+    workers_restarted = "workers_restarted"
+    smoke_passed = "smoke_passed"
+    completed = "completed"
+    aborted = "aborted"
+    failed = "failed"
+
+
+# Import extras used only by these new classes; placed here instead of at the
+# top so unrelated code doesn't pay the import tax until storage is imported.
+from sqlalchemy import SmallInteger
+from sqlalchemy.dialects.postgresql import INET, JSONB
+
+
+class StorageBackend(Base):
+    __tablename__ = "storage_backends"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    kind = Column(String, nullable=False)
+    name = Column(String, unique=True, nullable=False)
+    endpoint = Column(String, nullable=False)
+    config = Column(JSONB, nullable=False, default=dict)
+    secret_ref = Column(String, nullable=False)
+    is_enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class SystemConfig(Base):
+    __tablename__ = "system_config"
+    id = Column(SmallInteger, primary_key=True)
+    active_backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    transition_state = Column(String, nullable=False, default="stable")
+    last_toggle_at = Column(DateTime(timezone=True))
+    cooldown_until = Column(DateTime(timezone=True))
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class StorageToggleEvent(Base):
+    __tablename__ = "storage_toggle_events"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    actor_id = Column(UUID(as_uuid=True), nullable=False)
+    actor_ip = Column(INET)
+    from_backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    to_backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    reason = Column(String)
+    status = Column(String, nullable=False, default="started")
+    started_at = Column(DateTime(timezone=True), default=utcnow)
+    drain_completed_at = Column(DateTime(timezone=True))
+    flip_completed_at = Column(DateTime(timezone=True))
+    completed_at = Column(DateTime(timezone=True))
+    error_message = Column(Text)
+    pre_flight_checks = Column(JSONB)
+    drained_job_count = Column(Integer)
+    retried_job_count = Column(Integer)
