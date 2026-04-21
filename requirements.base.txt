@@ -39,9 +39,10 @@ azure-identity==1.15.0
 azure-mgmt-storage==21.0.0
 
 # --- S3 / SeaweedFS (on-prem backend) ---
-aioboto3==12.3.0
-aiobotocore==2.11.0
-boto3==1.34.14
+# Pinned to minor versions that resolve cleanly with botocore 1.40.x.
+aioboto3>=15.5.0,<16
+aiobotocore>=2.25.0,<3
+boto3>=1.40.0,<2
 
 # --- Server-Sent Events (admin storage toggle stream) ---
 sse-starlette==1.8.2

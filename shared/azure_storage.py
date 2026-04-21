@@ -499,7 +499,8 @@ class AzureStorageShard:
             return {
                 "name": props.name,
                 "size": props.size,
-                "content_type": props.content_type,
+                "etag": getattr(props, "etag", None),
+                "content_type": props.content_settings.content_type if props.content_settings else None,
                 "last_modified": props.last_modified,
                 "copy_status": props.copy.status if props.copy else None,
                 "copy_progress": props.copy.progress if props.copy else None,
