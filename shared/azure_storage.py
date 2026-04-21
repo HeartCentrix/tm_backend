@@ -343,7 +343,20 @@ class AzureStorageShard:
         instance.shard_index = shard_index
         instance._async_client = AsyncBlobServiceClient.from_connection_string(connection_string)
         instance._sync_client = None
-        instance.account_name = "devstoreaccount1"
+        # Parse AccountName + AccountKey out of the connection string so SAS
+        # generation works. Falls back to the Azurite well-known pair when
+        # omitted (enables Azurite's default creds via short conn strings).
+        parts = {}
+        for kv in connection_string.split(";"):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                parts[k.strip()] = v.strip()
+        instance.account_name = parts.get("AccountName", "devstoreaccount1")
+        instance.account_key = parts.get(
+            "AccountKey",
+            # Azurite well-known account key
+            "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
+        )
         return instance
 
     async def ensure_container(self, container_name: str) -> None:
