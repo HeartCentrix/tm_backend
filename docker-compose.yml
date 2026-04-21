@@ -74,6 +74,31 @@ services:
       - test
     restart: unless-stopped
 
+  # SeaweedFS — local S3-compatible object store used for on-prem backend
+  # contract tests. Started only under the `test` profile.
+  # Object Lock + versioning enabled at bucket creation — see
+  # tests/fixtures/seaweedfs-s3.json and the _ensure_test_bucket fixture.
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.71
+    container_name: tm_vault_seaweedfs
+    command:
+      - "server"
+      - "-dir=/data"
+      - "-ip=0.0.0.0"
+      - "-s3"
+      - "-s3.config=/config/s3.json"
+      - "-filer"
+      - "-master.volumeSizeLimitMB=1024"
+    volumes:
+      - ./tests/fixtures/seaweedfs-s3.json:/config/s3.json:ro
+      - seaweedfs_data:/data
+    ports:
+      - "8333:8333"
+      - "9333:9333"
+    profiles:
+      - test
+    restart: unless-stopped
+
   api-gateway:
     build:
       context: .
@@ -659,6 +684,7 @@ volumes:
   postgres_data:
   redis_data:
   azurite_data:
+  seaweedfs_data:
 
 networks:
   tm-network:

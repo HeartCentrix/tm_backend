@@ -1,0 +1,12 @@
+{
+  "identities": [
+    {
+      "name": "tmvault-test",
+      "credentials": [
+        { "accessKey": "testaccess", "secretKey": "testsecret" }
+      ],
+      "actions": ["Admin"]
+    }
+  ],
+  "buckets": { "objectLockEnabled": true, "versioning": "Enabled" }
+}
