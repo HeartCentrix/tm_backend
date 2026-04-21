@@ -1132,6 +1132,8 @@ async def run_all_discoveries():
 
 
 async def main():
+    from shared.storage.startup import startup_router
+    await startup_router()
     logger.info("=== Discovery Worker Starting ===")
     logger.info("DB: %s@%s:%s/%s", settings.DB_USERNAME, settings.DB_HOST, settings.DB_PORT, settings.DB_NAME)
     logger.info("Microsoft Client ID: %s", settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID or "NOT SET")

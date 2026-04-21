@@ -225,12 +225,17 @@ async def _create_batch_backup_jobs(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from shared.storage.startup import startup_router, shutdown_router
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
     await message_bus.connect()
-    yield
-    await message_bus.disconnect()
-    await close_db()
+    await startup_router()
+    try:
+        yield
+    finally:
+        await shutdown_router()
+        await message_bus.disconnect()
+        await close_db()
 
 
 app = FastAPI(title="Job Service", version="1.0.0", lifespan=lifespan)

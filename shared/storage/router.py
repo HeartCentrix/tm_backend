@@ -64,6 +64,19 @@ class StorageRouter:
         assert self._db_dsn, "router not loaded"
         conn = await asyncpg.connect(self._db_dsn)
         try:
+            # Tolerant of pre-Phase-2 schema (tables may not exist during the
+            # initial deploy window before migrations apply). In that case we
+            # simply no-op — callers get a clear error via get_active_store().
+            tables_exist = await conn.fetchval(
+                "SELECT to_regclass('storage_backends') IS NOT NULL "
+                "  AND to_regclass('system_config') IS NOT NULL"
+            )
+            if not tables_exist:
+                log.warning(
+                    "storage_backends / system_config tables not present yet; "
+                    "router will reload once migrations have run",
+                )
+                return
             sb_rows = await conn.fetch(
                 "SELECT id::text, kind, name, endpoint, config::text, secret_ref "
                 "FROM storage_backends WHERE is_enabled = true"

@@ -385,8 +385,13 @@ class AzureWorkloadWorker:
 
 
 async def main():
-    worker = AzureWorkloadWorker()
-    await worker.start()
+    from shared.storage.startup import startup_router, shutdown_router
+    await startup_router()
+    try:
+        worker = AzureWorkloadWorker()
+        await worker.start()
+    finally:
+        await shutdown_router()
 
 
 if __name__ == "__main__":

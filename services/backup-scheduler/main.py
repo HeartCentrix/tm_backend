@@ -304,7 +304,9 @@ async def startup():
     """Initialize services on startup and schedule jobs per SLA policy"""
     # Auto-create schema and tables if they don't exist
     from shared.database import init_db as db_init_db
+    from shared.storage.startup import startup_router
     await db_init_db()
+    await startup_router()
 
     await message_bus.connect()
 

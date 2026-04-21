@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse, Response
 import httpx
 
 from shared.config import settings
+from shared.storage.startup import startup_router, shutdown_router
 
 
 class _SilentPollFilter(logging.Filter):
@@ -50,8 +51,12 @@ GATEWAY_LIMITS = httpx.Limits(max_keepalive_connections=20, max_connections=100)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.http_client = httpx.AsyncClient(timeout=GATEWAY_TIMEOUT, limits=GATEWAY_LIMITS)
-    yield
-    await app.state.http_client.aclose()
+    await startup_router()
+    try:
+        yield
+    finally:
+        await shutdown_router()
+        await app.state.http_client.aclose()
 
 
 app = FastAPI(title="TM Vault API Gateway", version="1.0.0", lifespan=lifespan)

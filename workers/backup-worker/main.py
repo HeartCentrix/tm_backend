@@ -6964,8 +6964,13 @@ class BackupWorker:
 # ==================== Entry Point ====================
 
 async def main():
-    worker = BackupWorker()
-    await worker.start()
+    from shared.storage.startup import startup_router, shutdown_router
+    await startup_router()
+    try:
+        worker = BackupWorker()
+        await worker.start()
+    finally:
+        await shutdown_router()
 
 
 if __name__ == "__main__":
