@@ -10,6 +10,10 @@ import httpx
 from shared.config import settings
 from shared.storage.startup import startup_router, shutdown_router
 
+import sys as _sys, pathlib as _pl
+_sys.path.insert(0, str(_pl.Path(__file__).parent))  # make `routes` importable
+from routes import admin_storage  # noqa: E402
+
 
 class _SilentPollFilter(logging.Filter):
     """Drop uvicorn.access log lines for requests tagged with
@@ -60,6 +64,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="TM Vault API Gateway", version="1.0.0", lifespan=lifespan)
+app.include_router(admin_storage.router)
 
 # CORS
 app.add_middleware(
