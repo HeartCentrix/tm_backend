@@ -42,7 +42,27 @@ class AzureBlobStore:
 
     @classmethod
     def from_config(cls, backend_id: str, name: str, config: dict) -> "AzureBlobStore":
-        """config = {'shards': [{'account': ..., 'key_ref': 'env://...'}]}."""
+        """Build shards from a backend's config row.
+
+        Two formats accepted:
+          1. {'shards': [{'account': ..., 'key_ref': 'env://...'}]}
+             Uses AzureStorageShard(account, key) and the global
+             settings.AZURE_STORAGE_BLOB_ENDPOINT for the suffix.
+          2. {'connection_string': 'env://TM_AZ_CONN'}
+             Uses AzureStorageShard.from_connection_string — honors the
+             full endpoint (useful for Azurite/non-prod endpoints).
+        """
+        conn_ref = config.get("connection_string")
+        if conn_ref:
+            if conn_ref.startswith("env://"):
+                conn = os.getenv(conn_ref[len("env://"):], "")
+            else:
+                conn = conn_ref
+            if not conn:
+                raise ValueError(f"connection_string ref {conn_ref!r} resolved to empty")
+            return cls(backend_id=backend_id, name=name,
+                       shards=[AzureStorageShard.from_connection_string(conn)])
+
         shards: list[AzureStorageShard] = []
         for idx, s in enumerate(config.get("shards", [])):
             key_ref: str = s["key_ref"]

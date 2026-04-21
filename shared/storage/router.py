@@ -62,14 +62,19 @@ class StorageRouter:
 
     async def _reload_from_db(self) -> None:
         assert self._db_dsn, "router not loaded"
+        import os as _os
+        schema = _os.getenv("DB_SCHEMA", "tm")
         conn = await asyncpg.connect(self._db_dsn)
         try:
+            # TMvault uses a non-default search_path (tm schema). Set it on
+            # this connection so table references resolve.
+            await conn.execute(f"SET search_path TO {schema}, public")
             # Tolerant of pre-Phase-2 schema (tables may not exist during the
             # initial deploy window before migrations apply). In that case we
             # simply no-op — callers get a clear error via get_active_store().
             tables_exist = await conn.fetchval(
-                "SELECT to_regclass('storage_backends') IS NOT NULL "
-                "  AND to_regclass('system_config') IS NOT NULL"
+                f"SELECT to_regclass('{schema}.storage_backends') IS NOT NULL "
+                f"  AND to_regclass('{schema}.system_config') IS NOT NULL"
             )
             if not tables_exist:
                 log.warning(
