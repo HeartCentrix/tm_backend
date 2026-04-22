@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, distinct, and_, or_
 
 from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus
+from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType
 from shared.config import settings
 from shared.power_bi_snapshot import assemble_power_bi_items
 from shared.azure_storage import azure_storage_manager, workload_candidates_for_resource_type
@@ -843,7 +843,11 @@ async def _read_blob_json(shard, tenant_id: str, candidates: tuple, blob_path: s
         return {}
 
 
-async def _resolve_sibling_snapshot_ids(db: AsyncSession, snapshot_id: str) -> list:
+async def _resolve_sibling_snapshot_ids(
+    db: AsyncSession,
+    snapshot_id: str,
+    target_child_type: Optional[ResourceType] = None,
+) -> list:
     """For a given snapshot, return every snapshot ID for the same resource
     up to and including this one (ordered by created_at).
 
@@ -855,6 +859,16 @@ async def _resolve_sibling_snapshot_ids(db: AsyncSession, snapshot_id: str) -> l
     of sibling snapshot ids the caller should UNION over. Callers then
     dedupe items by external_id with newest-wins semantics.
 
+    When ``target_child_type`` is passed (e.g. ResourceType.USER_CHATS),
+    the helper also performs cross-resource auto-resolve: if the
+    incoming snapshot's resource isn't of the target type, it walks up
+    to the ENTRA_USER parent and down to the sibling of the target type
+    and returns ITS snapshots instead. This fixes the UX bug where the
+    Recovery UI could pick any of a user's Tier 2 snapshot ids (Contacts,
+    Mail, Calendar, Chats) and navigate to `/chats`, `/mail` etc. —
+    without this, the endpoint would return 0 silently because the
+    queried snapshot held no rows of the requested type.
+
     Returns [snapshot_uuid] alone if the snapshot can't be resolved
     (keeps the endpoint behavior unchanged for malformed inputs).
     """
@@ -865,11 +879,44 @@ async def _resolve_sibling_snapshot_ids(db: AsyncSession, snapshot_id: str) -> l
     row = (await db.execute(select(Snapshot).where(Snapshot.id == snap_uuid))).scalar_one_or_none()
     if not row:
         return [snap_uuid]
+
+    resource_id_for_siblings = row.resource_id
+
+    # Cross-resource auto-resolve — if caller requested a specific
+    # child type and this snapshot's resource doesn't match, swap to
+    # the sibling resource of the requested type under the same
+    # parent user. Best-effort: falls back to the passed snapshot's
+    # own resource on any lookup failure.
+    if target_child_type is not None:
+        try:
+            src_res = (await db.execute(
+                select(Resource).where(Resource.id == row.resource_id)
+            )).scalar_one_or_none()
+            if src_res is not None and src_res.type != target_child_type:
+                # Find the user root: either src itself (if ENTRA_USER)
+                # or src.parent_resource_id (if one of the Tier-2 kids).
+                parent_id = (
+                    src_res.id if src_res.type == ResourceType.ENTRA_USER
+                    else src_res.parent_resource_id
+                )
+                if parent_id is not None:
+                    sibling = (await db.execute(
+                        select(Resource).where(
+                            Resource.parent_resource_id == parent_id,
+                            Resource.type == target_child_type,
+                        )
+                    )).scalar_one_or_none()
+                    if sibling is not None:
+                        resource_id_for_siblings = sibling.id
+        except Exception:
+            # Auto-resolve is advisory; fall back to the literal resource.
+            pass
+
     rows = (await db.execute(
         select(Snapshot.id).where(
-            Snapshot.resource_id == row.resource_id,
+            Snapshot.resource_id == resource_id_for_siblings,
             Snapshot.created_at <= row.created_at,
-        )
+        ).order_by(Snapshot.created_at.desc())
     )).all()
     return [r[0] for r in rows] or [snap_uuid]
 
@@ -895,7 +942,11 @@ async def list_snapshot_emails(
     # Aggregate every EMAIL row across all sibling snapshots (newest-wins)
     # so the view shows "inbox state as of this snapshot" instead of just
     # the messages captured in the most recent delta.
-    sibling_ids = await _resolve_sibling_snapshot_ids(db, snapshot_id)
+    # Auto-resolve to USER_MAIL sibling if caller passed a non-mail
+    # snapshot id — otherwise the endpoint returned 0 silently.
+    sibling_ids = await _resolve_sibling_snapshot_ids(
+        db, snapshot_id, target_child_type=ResourceType.USER_MAIL,
+    )
     if not sibling_ids:
         sibling_ids = [UUID(snapshot_id)]
     filters = [
@@ -977,7 +1028,12 @@ async def list_snapshot_messages(
     # prior one. Aggregate rows across every sibling snapshot for this
     # resource and dedupe by external_id (newest-wins) so the Recovery
     # view shows the full chat history, not just the latest delta.
-    sibling_ids = await _resolve_sibling_snapshot_ids(db, snapshot_id)
+    # Auto-resolve to the USER_CHATS sibling if caller passed a
+    # Contacts/Mail/Calendar/ENTRA_USER snapshot (common UX bug —
+    # without it the endpoint returned 0 silently).
+    sibling_ids = await _resolve_sibling_snapshot_ids(
+        db, snapshot_id, target_child_type=ResourceType.USER_CHATS,
+    )
     if not sibling_ids:
         sibling_ids = [UUID(snapshot_id)]
     filters = [
@@ -1419,8 +1475,12 @@ async def list_snapshot_calendar(
     version. Without this, the calendar view flickers in and out of
     existence between full-pulls and delta-resumes (particularly for
     cancelled events that only appeared in the initial full snapshot).
+    Auto-resolves to the USER_CALENDAR sibling when the passed
+    snapshot id is for a non-calendar resource.
     """
-    sibling_ids = await _resolve_sibling_snapshot_ids(db, snapshot_id)
+    sibling_ids = await _resolve_sibling_snapshot_ids(
+        db, snapshot_id, target_child_type=ResourceType.USER_CALENDAR,
+    )
     if not sibling_ids:
         return {"content": [], "total": 0, "page": page, "size": size, "pages": 0}
 
@@ -1711,9 +1771,17 @@ async def list_snapshot_contacts(
     search: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return contacts in a snapshot."""
+    """Return contacts in a snapshot. Auto-resolves to the USER_CONTACTS
+    sibling when the caller passed a non-contacts snapshot id, so the
+    Recovery UI doesn't silently show 0 when a real contacts snapshot
+    exists under the same user."""
+    sibling_ids = await _resolve_sibling_snapshot_ids(
+        db, snapshot_id, target_child_type=ResourceType.USER_CONTACTS,
+    )
+    if not sibling_ids:
+        sibling_ids = [UUID(snapshot_id)]
     filters = [
-        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.snapshot_id.in_(sibling_ids),
         SnapshotItem.item_type.in_(CONTACT_ITEM_TYPES),
     ]
     if folder is not None:
