@@ -124,20 +124,45 @@ class StorageRouter:
             self._cooldown_until = sc["cooldown_until"]
 
     async def _listen_loop(self) -> None:
+        """Self-healing: LISTEN on both channels, and a periodic safety-net
+        reload so a silent connection drop or a missed NOTIFY cannot leave
+        the in-memory registry stale indefinitely."""
+        reload_interval_s = 60.0
         while True:
+            conn = None
             try:
                 conn = await asyncpg.connect(self._db_dsn)
-                await conn.add_listener(
-                    "system_config_changed",
-                    lambda *_: asyncio.create_task(self._reload_from_db()),
-                )
+
+                def _on_notify(*_args):
+                    asyncio.create_task(self._reload_from_db())
+
+                await conn.add_listener("system_config_changed", _on_notify)
+                await conn.add_listener("storage_backends_changed", _on_notify)
+
                 while True:
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(reload_interval_s)
+                    # Heartbeat: proves the connection is alive AND catches
+                    # any NOTIFY we missed while reconnecting.
+                    try:
+                        await conn.fetchval("SELECT 1")
+                        await self._reload_from_db()
+                    except Exception as hb_exc:
+                        log.warning(
+                            "router heartbeat failed: %s — reconnecting",
+                            hb_exc,
+                        )
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 log.warning("router listen loop error: %s, reconnecting in 5s", e)
                 await asyncio.sleep(5)
+            finally:
+                if conn is not None:
+                    try:
+                        await conn.close()
+                    except Exception:
+                        pass
 
     # ---- primary API
 

@@ -916,6 +916,12 @@ async def init_db() -> None:
         async with engine.begin() as conn:
             await _execute_batch(conn, post_alter_index_statements)
         await _seed_preset_policies_for_existing_tenants()
+        try:
+            from shared.storage_bootstrap import ensure_storage_bootstrap
+            await ensure_storage_bootstrap(engine)
+        except Exception as sb_exc:
+            logger.error("[DB INIT] storage bootstrap failed: %s", sb_exc)
+            raise
     except Exception as exc:
         logger.warning("[DB INIT] Schema sync phase failed: %s", exc)
         if await wait_for_schema_ready(timeout_seconds=30):
