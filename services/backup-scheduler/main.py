@@ -386,6 +386,91 @@ async def startup():
         _sweep_stale_snapshots, "interval", minutes=5,
     )
 
+    # Job outbox reconciler — fixes the classic "row committed but
+    # publish failed" dual-write bug. job-service writes the Job row and
+    # then publishes a RabbitMQ message in separate steps; if the
+    # service crashes, restarts, or the broker hiccups between those
+    # two operations, the row sits in QUEUED forever with no message
+    # ever delivered to a worker.
+    #
+    # This sweeper finds any BACKUP job that's been QUEUED for >3min
+    # and has no in-flight snapshots (i.e. no worker has ever started
+    # on it), and re-publishes the message using the same helper the
+    # original submit path uses. Idempotent: if the original message
+    # is still in flight, the handler will just no-op on the first
+    # one that wins the race (or create one batch of duplicates in
+    # the worst case, which the idempotent-snapshot resume handles).
+    #
+    # Also catches jobs that were created while RabbitMQ was down
+    # (brief outage) — they come back automatically once RMQ is up.
+    async def _reconcile_stuck_queued_jobs():
+        try:
+            from shared.message_bus import (
+                message_bus, create_mass_backup_message,
+            )
+            from shared.models import Job, Snapshot, JobStatus
+            await message_bus.connect()
+            async with async_session_factory() as session:
+                stuck = await session.execute(select(Job).where(
+                    Job.status == JobStatus.QUEUED,
+                    Job.type == JobType.BACKUP,
+                    Job.created_at < datetime.utcnow() - timedelta(minutes=3),
+                ))
+                stuck_jobs = stuck.scalars().all()
+                published = 0
+                for job in stuck_jobs:
+                    # Skip if a worker did start on it (handler may be
+                    # mid-initialization before first ack).
+                    snap_exists = await session.execute(
+                        select(func.count(Snapshot.id))
+                        .where(Snapshot.job_id == job.id),
+                    )
+                    if (snap_exists.scalar() or 0) > 0:
+                        continue
+                    resource_ids = [
+                        str(r) for r in (job.batch_resource_ids or [])
+                    ]
+                    if not resource_ids:
+                        continue
+                    queue = (job.spec or {}).get("queue", "backup.urgent")
+                    msg = create_mass_backup_message(
+                        job_id=str(job.id),
+                        tenant_id=str(job.tenant_id),
+                        resource_type="BATCH",
+                        resource_ids=resource_ids,
+                        sla_policy_id=None,
+                        full_backup=bool(
+                            (job.spec or {}).get("fullBackup", False),
+                        ),
+                    )
+                    try:
+                        await message_bus.publish(
+                            queue, msg, priority=job.priority or 1,
+                        )
+                        published += 1
+                        print(
+                            f"[backup-scheduler] outbox_reconcile: "
+                            f"republished QUEUED job {str(job.id)[:8]} "
+                            f"→ {queue} ({len(resource_ids)} resources)",
+                        )
+                    except Exception as pub_err:
+                        print(
+                            f"[backup-scheduler] outbox_reconcile: "
+                            f"republish failed for {str(job.id)[:8]}: "
+                            f"{pub_err}",
+                        )
+                if published:
+                    print(
+                        f"[backup-scheduler] outbox_reconcile: "
+                        f"republished {published} stuck jobs",
+                    )
+        except Exception as exc:
+            print(f"[backup-scheduler] outbox_reconcile failed: {exc}")
+
+    scheduler.add_job(
+        _reconcile_stuck_queued_jobs, "interval", minutes=3,
+    )
+
     # Task 26: Delete orphaned export ZIPs older than 1 day (3am UTC daily).
     # Primary mechanism is Azure lifecycle rule (ops/azure-lifecycle-exports.json);
     # this is a fallback for envs without lifecycle API access (local Azurite, restricted tenants).

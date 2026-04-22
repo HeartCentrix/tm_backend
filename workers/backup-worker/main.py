@@ -28,6 +28,31 @@ import time
 from typing import Dict, List, Any, Optional, Tuple
 
 
+async def _is_job_cancelled(job_id) -> bool:
+    """Cheap best-effort cancel-check. Long-running handlers poll this at
+    heartbeat boundaries so a DB-level CANCELLED job stops pulling Graph
+    pages within seconds instead of running to natural completion. A DB
+    hiccup returns False (don't cancel on transient errors)."""
+    if job_id is None:
+        return False
+    try:
+        if isinstance(job_id, str):
+            job_id = uuid.UUID(job_id)
+    except Exception:
+        return False
+    try:
+        from shared.database import async_session_factory as _f
+        from shared.models import Job as _J
+        async with _f() as _s:
+            _j = await _s.get(_J, job_id)
+            if not _j:
+                return False
+            status_val = _j.status.name if hasattr(_j.status, "name") else str(_j.status)
+            return status_val == "CANCELLED"
+    except Exception:
+        return False
+
+
 async def _update_job_pct(job_id, pct: int) -> None:
     """Write live `jobs.progress_pct` on a short-lived session so the
     Protection / Activity UI can animate during long M365 backups. Best-
@@ -1129,6 +1154,11 @@ class BackupWorker:
                     per_chat_sem = asyncio.Semaphore(max(1, chat_fanout))
                     _progress = {"chats_done": 0, "msgs": 0}
 
+                    cancel_check_every = int(os.getenv(
+                        "USER_CHATS_CANCEL_CHECK_EVERY_CHATS", "10",
+                    ))
+                    _chat_fanout_cancelled = False
+
                     async def _drain_one_chat(cid: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
                         """Drain a single chat's messages. Returns
                         (cid, messages, new_cursor).
@@ -1151,6 +1181,12 @@ class BackupWorker:
                         parallel iterators don't race on module-level
                         graph_client state.
                         """
+                        # If the job was cancelled while we were queued
+                        # behind the semaphore, bail without even opening
+                        # the connection. Mid-drain cancellation stops
+                        # at the next page boundary (see below).
+                        if _chat_fanout_cancelled:
+                            return cid, [], None
                         saved_cursor = existing_tokens.get(cid)
                         url = f"{graph_client.GRAPH_URL}/chats/{cid}/messages"
                         params: Dict[str, str] = {"$top": "50"}
@@ -1191,14 +1227,25 @@ class BackupWorker:
                         _progress["chats_done"] += 1
                         _progress["msgs"] += len(msgs_local)
                         # Heartbeat every 10 chats so operators can see
-                        # long fan-outs making progress.
-                        if _progress["chats_done"] % 10 == 0:
+                        # long fan-outs making progress. Also poll the
+                        # job-status here — if the user cancelled the
+                        # job from the UI, short-circuit remaining
+                        # drains at the next semaphore boundary.
+                        if _progress["chats_done"] % cancel_check_every == 0:
                             print(
                                 f"[{self.worker_id}] [USER_CHATS] "
                                 f"{user_label}: {_progress['chats_done']}/"
                                 f"{len(chat_ids_to_drain)} chats, "
                                 f"{_progress['msgs']} msgs so far"
                             )
+                            nonlocal _chat_fanout_cancelled
+                            if not _chat_fanout_cancelled and await _is_job_cancelled(job_id):
+                                _chat_fanout_cancelled = True
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"{user_label}: job cancelled — "
+                                    f"short-circuiting remaining drains"
+                                )
                         return cid, msgs_local, max_stamp
 
                     async def _drain_chats_parallel() -> None:
@@ -7096,7 +7143,31 @@ class BackupWorker:
         snapshot_type: SnapshotType = SnapshotType.INCREMENTAL,
         extra_data: Optional[Dict[str, Any]] = None,
     ) -> Snapshot:
+        """Idempotent snapshot creation. If a RabbitMQ message is
+        redelivered (worker restart, ack timeout, redeploy) we don't
+        want a fresh IN_PROGRESS row per delivery — every redelivery
+        would add a duplicate, polluting Recovery view with phantom
+        spinning snapshots until the stale-sweep closes them.
+
+        Resume-first: for (job_id, resource_id), if an IN_PROGRESS
+        snapshot already exists, return it. The handler continues
+        writing items against the same snapshot id, idempotency keys
+        on snapshot_items (external_id) keep dupes out. Only create
+        a fresh snapshot when no prior one exists for this exact
+        (job_id, resource_id) pair.
+        """
         async with async_session_factory() as session:
+            existing = await session.execute(
+                select(Snapshot).where(
+                    Snapshot.job_id == job_id,
+                    Snapshot.resource_id == resource.id,
+                    Snapshot.status == SnapshotStatus.IN_PROGRESS,
+                ).limit(1),
+            )
+            prior = existing.scalar_one_or_none()
+            if prior is not None:
+                return prior
+
             snapshot = Snapshot(
                 id=uuid.uuid4(),
                 resource_id=resource.id,
