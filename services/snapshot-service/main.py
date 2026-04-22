@@ -1186,12 +1186,42 @@ async def list_snapshot_chat_groups(
     The display name is derived from the first message's `chatTopic` if
     present, otherwise falls back to the sender's display name to give the
     user a meaningful label for 1:1 chats. Powers the chats tab's left
-    panel — clicking a row sets ?chatId=<id> on the messages query."""
+    panel — clicking a row sets ?chatId=<id> on the messages query.
+
+    Auto-resolves to the USER_CHATS sibling if the caller passed the
+    ENTRA_USER parent's snapshot id or a non-chat sibling's. Without
+    this, the left-panel thread list rendered empty even when the user
+    had thousands of backed-up chat messages (the UI commonly uses the
+    user's ENTRA_USER snapshot for navigation). Also aggregates across
+    every prior USER_CHATS snapshot via the sibling helper so delta-only
+    later runs don't drop threads captured by an earlier full run.
+    """
+    sibling_ids = await _resolve_sibling_snapshot_ids(
+        db, snapshot_id, target_child_type=ResourceType.USER_CHATS,
+    )
+    if not sibling_ids:
+        sibling_ids = [UUID(snapshot_id)]
+
     items = (await db.execute(
         select(SnapshotItem)
-        .where(SnapshotItem.snapshot_id == UUID(snapshot_id))
+        .where(SnapshotItem.snapshot_id.in_(sibling_ids))
         .where(SnapshotItem.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
+        .order_by(SnapshotItem.created_at.desc())
     )).scalars().all()
+
+    # Dedupe by external_id across sibling snapshots (newest-wins).
+    # Aggregating across prior delta runs can surface the same Graph
+    # message twice if two snapshots both captured it; without this
+    # dedupe the per-chat counts would double on every delta run.
+    seen: set = set()
+    deduped = []
+    for it in items:
+        key = it.external_id or str(it.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(it)
+    items = deduped
 
     groups: Dict[str, Dict[str, Any]] = {}
     for it in items:
