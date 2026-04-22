@@ -4,3 +4,18 @@ httpx==0.26.0
 pydantic==2.5.3
 pydantic-settings==2.1.0
 python-dotenv==1.0.0
+python-jose[cryptography]==3.3.0
+# Needed by shared.storage.router (admin storage toggle endpoints)
+asyncpg==0.29.0
+aio-pika==9.4.0
+sqlalchemy==2.0.25
+# Azure SDK — pulled in via shared.azure_storage
+azure-storage-blob==12.19.0
+azure-identity==1.15.0
+azure-mgmt-storage==21.0.0
+# S3 backend client (SeaweedFS on-prem)
+aioboto3>=15.5.0,<16
+aiobotocore>=2.25.0,<3
+boto3>=1.40.0,<2
+# SSE stream for live toggle-phase updates
+sse-starlette==1.8.2
