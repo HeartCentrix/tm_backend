@@ -90,8 +90,15 @@ services:
       - "-s3"
       - "-s3.config=/config/s3.json"
       - "-filer"
-      - "-master.volumeSizeLimitMB=1024"
+      # Volume size + preallocation sized for dev hosts with tight disk.
+      # 1024 MB + default preallocation refuses all writes on a machine
+      # with <1 GB free (preflight probe fails with "no free volumes").
+      # Smaller volumes + no preallocation makes writes work on any host;
+      # throughput impact is negligible for per-backup object patterns.
+      - "-master.volumeSizeLimitMB=256"
       - "-volume.max=0"
+      - "-volume.preStopSeconds=1"
+      - "-master.volumePreallocate=false"
     volumes:
       - ./tests/fixtures/seaweedfs-s3.json:/config/s3.json:ro
       - seaweedfs_data:/data
