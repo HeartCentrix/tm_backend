@@ -1576,10 +1576,31 @@ class GraphClient:
         """Discover the five fixed content categories for one Entra user.
 
         Returns up to 5 dicts (type ∈ USER_MAIL, USER_ONEDRIVE, USER_CONTACTS,
-        USER_CALENDAR, USER_CHATS). A category is omitted if Graph returns
-        404/403 (e.g. user has no mailbox / OneDrive not provisioned)."""
+        USER_CALENDAR, USER_CHATS). For categories where Graph returns
+        404/403 (e.g. user has no mailbox / OneDrive not provisioned — i.e.
+        no Exchange Online / OneDrive license), we emit a marker row with
+        metadata.license_missing=True so the UI can render a small
+        "no license" badge on the workload instead of silently hiding it.
+        """
         display = user_display_name or user_principal_name or user_external_id
         email = user_principal_name
+
+        # Map of per-category licensing hints surfaced in the UI when
+        # Graph returns 403/404/423 (not-licensed / locked / absent).
+        _LICENSE_HINT = {
+            "mail": "Exchange Online",
+            "onedrive": "OneDrive for Business",
+            "calendar": "Exchange Online",
+            "contacts": "Exchange Online",
+            "chats": "Microsoft Teams",
+        }
+        _KIND = {
+            "mail": ("USER_MAIL", f"Mail — {display}"),
+            "onedrive": ("USER_ONEDRIVE", f"OneDrive — {display}"),
+            "calendar": ("USER_CALENDAR", f"Calendar — {display}"),
+            "contacts": ("USER_CONTACTS", f"Contacts — {display}"),
+            "chats": ("USER_CHATS", f"Chats — {display}"),
+        }
 
         async def _safe(name: str, coro):
             try:
@@ -1587,7 +1608,29 @@ class GraphClient:
             except Exception as e:
                 msg = str(e)
                 if "404" in msg or "403" in msg or "423" in msg:
-                    return None
+                    # Emit a license-missing marker instead of dropping
+                    # the row. The persist side stores it with
+                    # status=INACCESSIBLE + license_missing flag so the
+                    # UI can show "No <license> license" without
+                    # changing backup scope (INACCESSIBLE rows aren't
+                    # backed up).
+                    kind, label = _KIND.get(name, ("USER_UNKNOWN", name))
+                    return {
+                        "external_id": f"{user_external_id}:{name}",
+                        "display_name": label,
+                        "email": email,
+                        "type": kind,
+                        "parent_external_id": user_external_id,
+                        "metadata": {
+                            "user_id": user_external_id,
+                            "license_missing": True,
+                            "license_hint": _LICENSE_HINT.get(name),
+                            "probe_status": (
+                                "404" if "404" in msg else
+                                "403" if "403" in msg else "423"
+                            ),
+                        },
+                    }
                 print(f"[GraphClient] discover_user_content {name} failed for {display}: {e}")
                 return None
 

@@ -435,6 +435,16 @@ async def discover_user_content(
         rtype = TYPE_MAP.get(c["type"])
         if rtype is None:
             continue
+        # License-missing markers land as INACCESSIBLE so the UI can
+        # render a "No <license> license" badge without hiding the row.
+        # Backup fan-out skips INACCESSIBLE resources so these show up
+        # but don't break the "every resource needs an SLA" gate.
+        meta = c.get("metadata", {}) or {}
+        is_license_missing = bool(meta.get("license_missing"))
+        child_status = (
+            ResourceStatus.INACCESSIBLE if is_license_missing
+            else ResourceStatus.DISCOVERED
+        )
         existing = (await db.execute(
             select(Resource).where(
                 Resource.tenant_id == tenant.id,
@@ -452,10 +462,13 @@ async def discover_user_content(
             # continuation keeps working across re-triggers. Graph discovery
             # fields (drive_id, user_id, …) are stable keys that won't
             # collide with backup-written state.
-            existing.extra_data = {**(existing.extra_data or {}), **c.get("metadata", {})}
+            existing.extra_data = {**(existing.extra_data or {}), **meta}
             existing.external_id = c["external_id"]
             # Re-inherit parent SLA each time (covers parent SLA changes since last discovery).
             existing.sla_policy_id = user.sla_policy_id
+            # Update status when license state changes across rediscovery
+            # (user gets / loses a license).
+            existing.status = child_status
             child_ids.append(str(existing.id))
         else:
             new_id = uuid4()
@@ -466,13 +479,13 @@ async def discover_user_content(
                 external_id=c["external_id"],
                 display_name=c["display_name"],
                 email=c.get("email"),
-                extra_data=c.get("metadata", {}),
+                extra_data=meta,
                 parent_resource_id=user.id,
                 # Children inherit the parent user's SLA so trigger-bulk's
                 # "every resource must have a policy" gate doesn't trip when
                 # we fan a backup out across them.
                 sla_policy_id=user.sla_policy_id,
-                status=ResourceStatus.DISCOVERED,
+                status=child_status,
             ))
             child_ids.append(str(new_id))
         upserted += 1
@@ -548,6 +561,15 @@ async def backup_user_with_discovery(
                 rtype = TYPE_MAP.get(c["type"])
                 if rtype is None:
                     continue
+                # Same license-missing handling as discover_user_content:
+                # persist the row as INACCESSIBLE so the UI renders it
+                # with a "No license" badge, but exclude from backup.
+                meta = c.get("metadata", {}) or {}
+                is_license_missing = bool(meta.get("license_missing"))
+                child_status = (
+                    ResourceStatus.INACCESSIBLE if is_license_missing
+                    else ResourceStatus.DISCOVERED
+                )
                 existing = (await bg_db.execute(
                     select(Resource).where(
                         Resource.tenant_id == tenant_uuid,
@@ -561,10 +583,13 @@ async def backup_user_with_discovery(
                     # Merge, don't overwrite — preserves delta tokens and
                     # any other backup-written state between re-triggers.
                     # See matching comment in discover_user_content().
-                    existing.extra_data = {**(existing.extra_data or {}), **c.get("metadata", {})}
+                    existing.extra_data = {**(existing.extra_data or {}), **meta}
                     existing.external_id = c["external_id"]
                     existing.sla_policy_id = user_sla_policy_id
-                    child_ids.append(str(existing.id))
+                    existing.status = child_status
+                    # Don't fan out backup to INACCESSIBLE children.
+                    if not is_license_missing:
+                        child_ids.append(str(existing.id))
                 else:
                     new_id = uuid4()
                     bg_db.add(Resource(
@@ -574,12 +599,13 @@ async def backup_user_with_discovery(
                         external_id=c["external_id"],
                         display_name=c["display_name"],
                         email=c.get("email"),
-                        extra_data=c.get("metadata", {}),
+                        extra_data=meta,
                         parent_resource_id=user_id,
                         sla_policy_id=user_sla_policy_id,
-                        status=ResourceStatus.DISCOVERED,
+                        status=child_status,
                     ))
-                    child_ids.append(str(new_id))
+                    if not is_license_missing:
+                        child_ids.append(str(new_id))
             await bg_db.commit()
 
         # Hand the bulk backup to the job-service. Direct HTTP call so we
