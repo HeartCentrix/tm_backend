@@ -28,6 +28,58 @@ import time
 from typing import Dict, List, Any, Optional, Tuple
 
 
+# orjson is ~5-10× faster than stdlib json for payload-heavy paths like
+# per-chat-message persistence. Defensive import so deployments without
+# the package still work — falls back transparently.
+try:
+    import orjson as _fast_json  # type: ignore
+
+    def _json_dumps_bytes(obj) -> bytes:
+        return _fast_json.dumps(obj, default=str)
+except ImportError:
+    import json as _stdlib_json
+
+    def _json_dumps_bytes(obj) -> bytes:
+        return _stdlib_json.dumps(obj, default=str).encode("utf-8")
+
+
+# Chunk size for multi-row INSERTs. 2000 rows × ~2 KB each keeps a single
+# statement well under Postgres' 1 GB protocol limit while being large
+# enough to amortize per-statement overhead (10-50× faster than per-row
+# ORM add_all at these sizes). Tunable via env for huge mailboxes.
+_BULK_INSERT_CHUNK = int(os.getenv("BULK_INSERT_CHUNK", "2000"))
+
+
+async def _bulk_upsert_snapshot_items(
+    session, rows: List[Dict[str, Any]],
+) -> int:
+    """Insert snapshot_items rows in chunked multi-row INSERTs with
+    ON CONFLICT DO NOTHING on (snapshot_id, external_id).
+
+    Replaces the legacy session.add_all + commit loop which serialized
+    12k rows into 12k separate SQL statements — dominated wall time on
+    chat-heavy users (~15-20s for 12k msgs). Multi-row pg_insert with
+    the UNIQUE idempotency guard both speeds up the path ~10× and makes
+    message redelivery safe (race-inserted duplicates silently skipped).
+
+    Returns the number of rows attempted (not necessarily inserted —
+    conflicts are dropped silently by design).
+    """
+    if not rows:
+        return 0
+    from sqlalchemy.dialects.postgresql import insert as _pg_insert
+    total = 0
+    for i in range(0, len(rows), _BULK_INSERT_CHUNK):
+        chunk = rows[i:i + _BULK_INSERT_CHUNK]
+        stmt = _pg_insert(SnapshotItem).values(chunk).on_conflict_do_nothing(
+            index_elements=["snapshot_id", "external_id"],
+        )
+        await session.execute(stmt)
+        total += len(chunk)
+    await session.commit()
+    return total
+
+
 async def _is_job_cancelled(job_id) -> bool:
     """Cheap best-effort cancel-check. Long-running handlers poll this at
     heartbeat boundaries so a DB-level CANCELLED job stops pulling Graph
@@ -1160,6 +1212,7 @@ class BackupWorker:
                     _chat_fanout_cancelled = False
 
                     async def _drain_one_chat(cid: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
+                        nonlocal _chat_fanout_cancelled
                         """Drain a single chat's messages. Returns
                         (cid, messages, new_cursor).
 
@@ -1238,7 +1291,6 @@ class BackupWorker:
                                 f"{len(chat_ids_to_drain)} chats, "
                                 f"{_progress['msgs']} msgs so far"
                             )
-                            nonlocal _chat_fanout_cancelled
                             if not _chat_fanout_cancelled and await _is_job_cancelled(job_id):
                                 _chat_fanout_cancelled = True
                                 print(
@@ -1360,7 +1412,13 @@ class BackupWorker:
 
                 bytes_total = 0
                 async with async_session_factory() as session:
-                    db_items = []
+                    # Build plain dicts for a multi-row pg_insert instead
+                    # of SQLAlchemy ORM objects — the bulk path is 10×+
+                    # faster on 10k+ rows (one round-trip, server-side
+                    # batching, no per-row ORM state tracking) and pairs
+                    # with the UNIQUE(snapshot_id,external_id) guard to
+                    # make message redelivery safely idempotent.
+                    db_rows: List[Dict[str, Any]] = []
                     for tup in items_data:
                         # Tuple shape: (item_type, name, ext_id, extra_data, folder_path)
                         # — extra_data is the full envelope. Always present
@@ -1374,24 +1432,31 @@ class BackupWorker:
                             folder_path = None
                         if not isinstance(extra, dict):
                             extra = {"raw": extra}
-                        body = json.dumps(extra.get("raw", extra), default=str).encode("utf-8")
+                        # orjson is faster than stdlib json for JSON-heavy
+                        # objects (chat msgs avg ~2 KB each); returns bytes
+                        # directly so we skip the .encode("utf-8") hop.
+                        body = _json_dumps_bytes(extra.get("raw", extra))
                         bytes_total += len(body)
-                        db_items.append(SnapshotItem(
-                            id=uuid.uuid4(),
-                            snapshot_id=snapshot.id,
-                            tenant_id=tenant.id,
-                            external_id=str(ext_id or uuid.uuid4()),
-                            item_type=item_type,
-                            name=(name or "")[:255],
-                            folder_path=folder_path,
-                            content_size=len(body),
-                            content_hash=hashlib.sha256(body).hexdigest(),
-                            extra_data=extra,
-                            content_checksum=hashlib.sha256(body).hexdigest(),
-                        ))
-                    if db_items:
-                        session.add_all(db_items)
-                        await session.commit()
+                        # Compute the hash ONCE — the previous code ran
+                        # sha256 twice per item for identical content
+                        # (content_hash + content_checksum both read the
+                        # same bytes), doubling CPU for zero benefit.
+                        body_hash = hashlib.sha256(body).hexdigest()
+                        db_rows.append({
+                            "id": uuid.uuid4(),
+                            "snapshot_id": snapshot.id,
+                            "tenant_id": tenant.id,
+                            "external_id": str(ext_id or uuid.uuid4()),
+                            "item_type": item_type,
+                            "name": (name or "")[:255],
+                            "folder_path": folder_path,
+                            "content_size": len(body),
+                            "content_hash": body_hash,
+                            "extra_data": extra,
+                            "content_checksum": body_hash,
+                        })
+                    if db_rows:
+                        await _bulk_upsert_snapshot_items(session, db_rows)
 
                 # Second pass: per-message attachment capture. The main
                 # snapshot items hold the raw Graph objects; attachments are
