@@ -899,6 +899,7 @@ async def _resolve_sibling_snapshot_ids(
         return [snap_uuid]
 
     resource_id_for_siblings = row.resource_id
+    cross_resource_swap = False
 
     # Cross-resource auto-resolve — if caller requested a specific
     # child type and this snapshot's resource doesn't match, swap to
@@ -926,15 +927,26 @@ async def _resolve_sibling_snapshot_ids(
                     )).scalar_one_or_none()
                     if sibling is not None:
                         resource_id_for_siblings = sibling.id
+                        cross_resource_swap = True
         except Exception:
             # Auto-resolve is advisory; fall back to the literal resource.
             pass
 
+    # For same-resource sibling aggregation (delta runs of the same
+    # resource): cap at source.created_at so "state as of snapshot X"
+    # is well-defined.
+    # For cross-resource swaps (different sibling resource entirely):
+    # DON'T cap — the target resource's snapshots have independent
+    # timing. Capping by source.created_at excludes the Chats snapshot
+    # created 9 seconds after the Calendar snapshot in the same batch,
+    # leaving the Recovery chats tab empty when navigated from any
+    # non-chat sibling. Instead return every snapshot of the target.
+    where_clauses = [Snapshot.resource_id == resource_id_for_siblings]
+    if not cross_resource_swap:
+        where_clauses.append(Snapshot.created_at <= row.created_at)
     rows = (await db.execute(
-        select(Snapshot.id).where(
-            Snapshot.resource_id == resource_id_for_siblings,
-            Snapshot.created_at <= row.created_at,
-        ).order_by(Snapshot.created_at.desc())
+        select(Snapshot.id).where(*where_clauses)
+        .order_by(Snapshot.created_at.desc())
     )).all()
     return [r[0] for r in rows] or [snap_uuid]
 
