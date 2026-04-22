@@ -842,7 +842,10 @@ class BackupWorker:
         semaphore = asyncio.Semaphore(settings.BACKUP_CONCURRENCY)
         ITEM_LIMIT = 200  # First page only — keeps the handler bounded.
 
-        async def _fetch_for(resource: Resource) -> List[tuple]:
+        async def _fetch_for(
+            resource: Resource,
+            snapshot: Optional["Snapshot"] = None,
+        ) -> List[tuple]:
             """Returns a list of (item_type, name, ext_id, extra_data, folder_path).
 
             `extra_data` is the full SnapshotItem envelope. For most types
@@ -1363,6 +1366,82 @@ class BackupWorker:
                     ))
                     _chat_fanout_cancelled = False
 
+                    # Streaming-persist bookkeeping. When snapshot is
+                    # provided we bucket + bulk-insert each chat's items
+                    # as soon as that chat's drain finishes (vs. after
+                    # ALL chats complete). Benefits:
+                    #   * Peak memory drops from O(sum-of-all-chats) to
+                    #     O(one chat) — big user with 10k msgs/chat
+                    #     stays under ~20 MB heap instead of GBs.
+                    #   * snapshot.item_count ticks up live so the UI
+                    #     shows real progress instead of sitting at 0.
+                    #   * Pipeline overlap: DB write happens while the
+                    #     next chat is still fetching from Graph.
+                    _streaming_enabled = snapshot is not None
+                    _persisted_total = 0
+                    _persisted_bytes = 0
+                    _persist_lock = asyncio.Lock()
+
+                    async def _stream_persist_chat_items(
+                        cid: str,
+                        msgs: List[Dict[str, Any]],
+                    ) -> Tuple[int, int]:
+                        """Bucket and bulk-insert one chat's messages.
+                        Returns (items_written, bytes_written)."""
+                        if not msgs:
+                            return 0, 0
+                        rows: List[Dict[str, Any]] = []
+                        local_bytes = 0
+                        info = chat_meta.get(cid) or {
+                            "displayName": f"Chat {cid[:8]}",
+                            "chatType": "unknown",
+                            "topic": None,
+                            "memberCount": 0,
+                            "memberNames": [],
+                            "memberEmails": [],
+                        }
+                        display = info["displayName"]
+                        folder = f"chats/{display}"
+                        for m in msgs:
+                            chat_id = m.get("chatId") or (
+                                m.get("channelIdentity") or {}
+                            ).get("channelId") or cid
+                            m["_chat_folder_path"] = folder
+                            m["chatId"] = chat_id
+                            body_str = (m.get("body") or {}).get("content") or ""
+                            ext = {
+                                "raw": m,
+                                "chatId": chat_id,
+                                "chatTopic": display,
+                                "chatType": info["chatType"],
+                                "memberNames": info["memberNames"],
+                                "memberCount": info["memberCount"],
+                                "exportedVia": user_id,
+                            }
+                            body = _json_dumps_bytes(ext["raw"])
+                            local_bytes += len(body)
+                            rows.append({
+                                "id": uuid.uuid4(),
+                                "snapshot_id": snapshot.id,
+                                "tenant_id": tenant.id,
+                                "external_id": str(
+                                    m.get("id") or uuid.uuid4(),
+                                ),
+                                "item_type": "TEAMS_CHAT_MESSAGE",
+                                "name": (body_str[:120] or "(empty)"),
+                                "folder_path": folder,
+                                "content_size": len(body),
+                                "content_hash": _fast_hash_hex(body),
+                                "extra_data": ext,
+                                "content_checksum": None,
+                            })
+                        async with _persist_lock:
+                            async with async_session_factory() as _sess:
+                                await _bulk_upsert_snapshot_items(
+                                    _sess, rows,
+                                )
+                        return len(rows), local_bytes
+
                     async def _drain_one_chat(cid: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
                         nonlocal _chat_fanout_cancelled
                         """Drain a single chat's messages. Returns
@@ -1429,6 +1508,53 @@ class BackupWorker:
                                 f"drain failed: {type(e).__name__}: {e} "
                                 f"(kept {len(msgs_local)})"
                             )
+                        # Streaming persist — if a snapshot is in scope,
+                        # persist this chat's items RIGHT NOW instead of
+                        # accumulating into all_msgs + one mega-commit
+                        # at the end. Returns a lightweight marker list
+                        # (only the raw dicts we still need for the
+                        # attachment / hostedContent 2nd pass) so
+                        # downstream logic is unchanged.
+                        if _streaming_enabled and msgs_local:
+                            try:
+                                n, b = await _stream_persist_chat_items(
+                                    cid, msgs_local,
+                                )
+                                nonlocal _persisted_total, _persisted_bytes
+                                _persisted_total += n
+                                _persisted_bytes += b
+                                # Live item_count bump on the snapshot
+                                # row so the Recovery UI shows real
+                                # progress instead of sitting at 0
+                                # until the very end.
+                                try:
+                                    async with async_session_factory() as _s2:
+                                        snap = await _s2.get(
+                                            Snapshot, snapshot.id,
+                                        )
+                                        if snap is not None:
+                                            snap.item_count = _persisted_total
+                                            snap.new_item_count = _persisted_total
+                                            snap.bytes_total = _persisted_bytes
+                                            snap.bytes_added = _persisted_bytes
+                                            await _s2.commit()
+                                except Exception as _bump_err:
+                                    # Progress bump is advisory — a DB
+                                    # hiccup on the bump must not abort
+                                    # the handler.
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"live item_count bump failed: "
+                                        f"{_bump_err}"
+                                    )
+                            except Exception as persist_err:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"chat {cid[:8]} streaming persist "
+                                    f"failed: {type(persist_err).__name__}: "
+                                    f"{persist_err}"
+                                )
+
                         _progress["chats_done"] += 1
                         _progress["msgs"] += len(msgs_local)
                         # Heartbeat every 10 chats so operators can see
@@ -1512,11 +1638,66 @@ class BackupWorker:
                         except Exception as _e:
                             print(f"[{self.worker_id}] [USER_CHATS] delta persist failed: {_e}")
 
-                    # Bucket the flat message list into per-chat rows using
-                    # the pre-computed chat_meta for display name / type.
-                    # Messages whose chatId isn't in chat_meta (auth drift,
-                    # chat created mid-backup) get a synthetic fallback so
-                    # they still show up in Recovery.
+                    # When streaming persist ran inline per-chat, the
+                    # heavy lift is already in the DB — item_count was
+                    # bumped live, TEAMS_CHAT_MESSAGE rows committed
+                    # per-chat. All we need to hand back is the subset
+                    # of msgs the 2nd-pass attachment/hostedContent
+                    # capture needs (those that carry attachments or
+                    # hostedContents). Even if _backup_one re-enters
+                    # these into _bulk_upsert_snapshot_items, the
+                    # UNIQUE(snapshot_id, external_id) guard makes
+                    # repeats a silent no-op — so this path is safe
+                    # against any future wiring change.
+                    if _streaming_enabled:
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] streaming "
+                            f"persist: {_persisted_total} msgs, "
+                            f"{_persisted_bytes} bytes committed"
+                        )
+                        att_candidates: List = []
+                        for m in all_msgs:
+                            if not (m.get("attachments")
+                                    or m.get("hostedContents")):
+                                continue
+                            chat_id = m.get("chatId") or (
+                                m.get("channelIdentity") or {}
+                            ).get("channelId")
+                            if not chat_id:
+                                continue
+                            info = chat_meta.get(chat_id) or {
+                                "displayName": f"Chat {chat_id[:8]}",
+                                "chatType": "unknown",
+                                "topic": None,
+                                "memberCount": 0,
+                                "memberNames": [],
+                                "memberEmails": [],
+                            }
+                            display = info["displayName"]
+                            folder = f"chats/{display}"
+                            m["_chat_folder_path"] = folder
+                            m["chatId"] = chat_id
+                            body_text = (m.get("body") or {}).get("content") or ""
+                            att_candidates.append((
+                                "TEAMS_CHAT_MESSAGE",
+                                body_text[:120] or "(empty)",
+                                m.get("id"),
+                                {
+                                    "raw": m,
+                                    "chatId": chat_id,
+                                    "chatTopic": display,
+                                    "chatType": info["chatType"],
+                                    "memberNames": info["memberNames"],
+                                    "memberCount": info["memberCount"],
+                                    "exportedVia": user_id,
+                                },
+                                folder,
+                            ))
+                        return att_candidates
+
+                    # Legacy path (snapshot not threaded in) — bucket
+                    # the full flat list into tuples and return for
+                    # _backup_one to persist the old way.
                     for m in all_msgs:
                         chat_id = m.get("chatId") or (m.get("channelIdentity") or {}).get("channelId")
                         if not chat_id:
@@ -1560,7 +1741,11 @@ class BackupWorker:
         async def _backup_one(resource: Resource) -> Dict:
             async with semaphore:
                 snapshot = await self.create_snapshot(resource, message, job_id)
-                items_data = await _fetch_for(resource)
+                # Pass snapshot into the fetcher so handlers (USER_CHATS
+                # today, USER_MAIL next) can stream-persist their items
+                # inline and return a lightweight attachment-candidate
+                # list. Cuts peak memory O(all-items) → O(one-chunk).
+                items_data = await _fetch_for(resource, snapshot)
 
                 bytes_total = 0
                 async with async_session_factory() as session:
