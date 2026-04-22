@@ -11,3 +11,7 @@ azure-storage-blob>=12.19
 aiohttp>=3.9
 pydantic==2.5.3
 pydantic-settings==2.1.0
+# Required by shared.storage.router (loaded on startup via startup_router)
+aioboto3>=15.5.0,<16
+aiobotocore>=2.25.0,<3
+boto3>=1.40.0,<2

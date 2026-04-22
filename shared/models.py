@@ -6,6 +6,7 @@ from sqlalchemy import (
     Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func, LargeBinary
 )
 from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID
 import enum
 
@@ -241,6 +242,10 @@ class Resource(Base):
     # via parent_resource_id. Lets the UI group all of a user's backup-ables
     # under one card.
     parent_resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id", ondelete="CASCADE"), nullable=True, index=True)
+
+    # Eager-load target for the scheduler dispatcher
+    # (backup-scheduler uses selectinload(Resource.tenant)).
+    tenant = relationship("Tenant", foreign_keys=[tenant_id], lazy="raise")
 
 
 class SlaPolicy(Base):
