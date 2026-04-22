@@ -989,10 +989,13 @@ async def init_db() -> None:
             await _execute_batch(conn, table_statements)
 
             for stmt in add_column_statements:
+                await conn.execute(text("SAVEPOINT add_col_sp"))
                 try:
                     await conn.execute(text(stmt))
-                except Exception:
-                    pass
+                    await conn.execute(text("RELEASE SAVEPOINT add_col_sp"))
+                except Exception as stmt_exc:
+                    await conn.execute(text("ROLLBACK TO SAVEPOINT add_col_sp"))
+                    logger.debug("[DB INIT] add_column skipped: %s — %s", stmt[:80], stmt_exc)
 
             await _execute_batch(conn, index_statements)
 

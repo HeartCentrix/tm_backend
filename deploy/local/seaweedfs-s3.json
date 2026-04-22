@@ -1,0 +1,12 @@
+{
+  "identities": [
+    {
+      "name": "tmvault-local",
+      "credentials": [
+        { "accessKey": "tmvault-local-access", "secretKey": "tmvault-local-secret" }
+      ],
+      "actions": ["Admin"]
+    }
+  ],
+  "buckets": { "objectLockEnabled": true, "versioning": "Enabled" }
+}
