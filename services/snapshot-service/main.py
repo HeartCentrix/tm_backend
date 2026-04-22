@@ -233,7 +233,25 @@ async def get_snapshot_folders(
     # left-panel folder list reflects the full running state (mail,
     # chats, calendar all use delta backups — the latest snapshot alone
     # may hold zero or near-zero items after a successful delta).
-    sibling_ids = await _resolve_sibling_snapshot_ids(db, snapshot_id)
+    # Cross-sibling auto-resolve by item_type: when the caller wants a
+    # folder list scoped to EMAIL / TEAMS_CHAT_MESSAGE / CALENDAR_EVENT /
+    # USER_CONTACT but passed the ENTRA_USER parent's snapshot id (or
+    # the sibling Contacts snapshot id, etc.), swap to the Tier 2 child
+    # of the matching type. Without this, the mail folders tab was
+    # empty even when the USER_MAIL snapshot had 39 folders + 967 items.
+    _item_type_to_child: Dict[str, "ResourceType"] = {
+        "EMAIL": ResourceType.USER_MAIL,
+        "TEAMS_CHAT_MESSAGE": ResourceType.USER_CHATS,
+        "TEAMS_MESSAGE": ResourceType.USER_CHATS,
+        "TEAMS_MESSAGE_REPLY": ResourceType.USER_CHATS,
+        "CALENDAR_EVENT": ResourceType.USER_CALENDAR,
+        "USER_CONTACT": ResourceType.USER_CONTACTS,
+        "CONTACT": ResourceType.USER_CONTACTS,
+    }
+    target_child = _item_type_to_child.get(item_type or "")
+    sibling_ids = await _resolve_sibling_snapshot_ids(
+        db, snapshot_id, target_child_type=target_child,
+    )
     if not sibling_ids:
         sibling_ids = [UUID(snapshot_id)]
     filters = [SnapshotItem.snapshot_id.in_(sibling_ids)]
