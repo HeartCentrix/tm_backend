@@ -90,8 +90,8 @@ services:
       - "-s3"
       - "-s3.config=/config/s3.json"
       - "-filer"
-      - "-master.volumeSizeLimitMB=256"
-      - "-volume.max=100"
+      - "-master.volumeSizeLimitMB=1024"
+      - "-volume.max=0"
     volumes:
       - ./tests/fixtures/seaweedfs-s3.json:/config/s3.json:ro
       - seaweedfs_data:/data
