@@ -241,24 +241,53 @@ async def _ensure_seaweed_buckets() -> None:
         log.info("[storage-bootstrap] ONPREM_S3 creds not set; skipping bucket create")
         return
 
+    # Retry the endpoint-reachability probe with backoff so a cold
+    # docker-compose up doesn't leave the bucket uncreated when the
+    # toggle-worker beats seaweedfs to readiness (seaweedfs has no
+    # healthcheck so we can't depends_on it). 5 retries × 4s = ~20s
+    # cold-boot tolerance.
+    import asyncio as _asyncio
     session = aioboto3.Session()
-    async with session.client(
-        "s3", endpoint_url=endpoint,
-        aws_access_key_id=access, aws_secret_access_key=secret,
-        region_name=os.getenv("ONPREM_S3_REGION", "us-east-1"),
-        verify=os.getenv("ONPREM_S3_VERIFY_TLS", "true").lower() == "true",
-    ) as s3:
-        for bucket in buckets:
-            try:
-                await s3.head_bucket(Bucket=bucket)
-                continue
-            except Exception:
-                pass
-            try:
-                await s3.create_bucket(Bucket=bucket)
-                log.info("[storage-bootstrap] created seaweed bucket %s", bucket)
-            except Exception as exc:
+    attempts = int(os.getenv("STORAGE_BUCKET_ENSURE_ATTEMPTS", "5"))
+    backoff_s = float(os.getenv("STORAGE_BUCKET_ENSURE_BACKOFF_S", "4"))
+    for attempt in range(1, attempts + 1):
+        try:
+            async with session.client(
+                "s3", endpoint_url=endpoint,
+                aws_access_key_id=access, aws_secret_access_key=secret,
+                region_name=os.getenv("ONPREM_S3_REGION", "us-east-1"),
+                verify=os.getenv(
+                    "ONPREM_S3_VERIFY_TLS", "true",
+                ).lower() == "true",
+            ) as s3:
+                for bucket in buckets:
+                    try:
+                        await s3.head_bucket(Bucket=bucket)
+                        continue
+                    except Exception:
+                        pass
+                    try:
+                        await s3.create_bucket(Bucket=bucket)
+                        log.info(
+                            "[storage-bootstrap] created seaweed bucket %s",
+                            bucket,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "[storage-bootstrap] create_bucket(%s) failed: "
+                            "%s", bucket, exc,
+                        )
+            return
+        except Exception as exc:
+            if attempt >= attempts:
                 log.warning(
-                    "[storage-bootstrap] create_bucket(%s) failed: %s",
-                    bucket, exc,
+                    "[storage-bootstrap] s3 endpoint unreachable after "
+                    "%d attempts: %s", attempts, exc,
                 )
+                return
+            log.info(
+                "[storage-bootstrap] s3 endpoint not ready (attempt "
+                "%d/%d), retrying in %.1fs",
+                attempt, attempts, backoff_s,
+            )
+            await _asyncio.sleep(backoff_s)
