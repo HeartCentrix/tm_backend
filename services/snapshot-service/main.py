@@ -1999,6 +1999,11 @@ async def get_item_attachments(
         # Email attachments store the original URL as `source_url`;
         # chat attachments as `content_url`. Surface one normalized field
         # so the UI doesn't need to know the difference.
+        # contentId is the MIME Content-ID the email body references
+        # via <img src="cid:..."> for inline images (logos, embedded
+        # signatures). We expose it so EmailPreview can rewrite those
+        # cid: URLs into real content-endpoint URLs before rendering —
+        # without it, all inline images show broken.
         return {
             "id": str(r.id),
             "name": r.name,
@@ -2006,6 +2011,7 @@ async def get_item_attachments(
             "kind": meta.get("attachment_kind"),
             "contentType": meta.get("content_type"),
             "isInline": bool(meta.get("is_inline")),
+            "contentId": meta.get("content_id"),
             "resolved": bool(meta.get("resolved")) and bool(r.blob_path),
             "sourceUrl": meta.get("source_url") or meta.get("content_url"),
         }
