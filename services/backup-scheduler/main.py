@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 from fastapi import FastAPI, BackgroundTasks
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 import httpx
@@ -330,6 +330,61 @@ async def startup():
 
     # Phase 2: Retention cleanup — FLAT/GFS snapshot pruning per SLA policy (daily)
     scheduler.add_job(run_retention_cleanup, "interval", hours=24)
+
+    # Stale-snapshot sweep — close out snapshots that have been
+    # IN_PROGRESS for >30min with no live handler. This happens when a
+    # worker is killed mid-run (redeploy, OOM, docker restart) and the
+    # snapshot row gets stranded; without a sweeper, the Recovery UI
+    # shows a permanently-spinning row and downstream consumers (SLA,
+    # dashboard, dr-replication) skip these rows forever.
+    #
+    # Runs every 5 min. Snapshots with items already persisted get
+    # promoted to COMPLETED with the true item_count; snapshots with
+    # zero items get FAILED. Mirrors the same COMPLETED-vs-FAILED
+    # logic the job-service cancel path uses.
+    async def _sweep_stale_snapshots():
+        try:
+            async with async_session_factory() as session:
+                result = await session.execute(text("""
+                    WITH counts AS (
+                        SELECT s.id,
+                               s.started_at,
+                               (SELECT count(*) FROM snapshot_items si
+                                WHERE si.snapshot_id = s.id) AS n_items
+                        FROM snapshots s
+                        WHERE s.status = 'IN_PROGRESS'
+                          AND s.started_at < NOW() - INTERVAL '30 minutes'
+                    )
+                    UPDATE snapshots s SET
+                        status = (CASE WHEN c.n_items > 0 THEN 'COMPLETED'
+                                       ELSE 'FAILED' END)::snapshotstatus,
+                        item_count = c.n_items,
+                        new_item_count = COALESCE(s.new_item_count, c.n_items),
+                        completed_at = NOW(),
+                        duration_secs = EXTRACT(EPOCH FROM
+                            (NOW() - c.started_at))::int,
+                        extra_data = COALESCE(s.extra_data, '{}'::json)::jsonb
+                                     || jsonb_build_object(
+                                        'stale_sweep', true,
+                                        'reason',
+                                        'handler orphaned by worker restart')
+                    FROM counts c
+                    WHERE s.id = c.id
+                    RETURNING s.id
+                """))
+                rows = result.fetchall()
+                await session.commit()
+                if rows:
+                    print(
+                        f"[backup-scheduler] stale_snapshot_sweep: "
+                        f"closed {len(rows)} orphaned IN_PROGRESS rows",
+                    )
+        except Exception as exc:
+            print(f"[backup-scheduler] stale_snapshot_sweep failed: {exc}")
+
+    scheduler.add_job(
+        _sweep_stale_snapshots, "interval", minutes=5,
+    )
 
     # Task 26: Delete orphaned export ZIPs older than 1 day (3am UTC daily).
     # Primary mechanism is Azure lifecycle rule (ops/azure-lifecycle-exports.json);
