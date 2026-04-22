@@ -101,6 +101,8 @@ services:
     profiles:
       - test
     restart: unless-stopped
+    networks:
+      - tm-network
 
   api-gateway:
     build:
