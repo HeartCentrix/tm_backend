@@ -144,9 +144,18 @@ class PostgresRestoreHandler:
     async def _apply_schema(self, conn, tenant: Tenant, schema_blob: str) -> int:
         container = azure_storage_manager.get_container_name(str(tenant.id), "azure-postgresql")
         shard = azure_storage_manager.get_default_shard()
-        blob_client = shard.get_async_client().get_blob_client(container, schema_blob)
-        download = await blob_client.download_blob()
-        content = (await download.readall()).decode("utf-8")
+        # Facade download — works on whichever backend the snapshot
+        # was captured on (Azure Blob or on-prem SeaweedFS). Raises
+        # RuntimeError instead of silently returning None if the blob
+        # is missing — a missing schema dump means we can't restore
+        # and should fail loudly so the operator notices.
+        content_bytes = await shard.download_blob(container, schema_blob)
+        if content_bytes is None:
+            raise RuntimeError(
+                f"schema blob missing for restore: container={container} "
+                f"path={schema_blob}"
+            )
+        content = content_bytes.decode("utf-8")
 
         # Execute the whole dump in one shot. The backup handler writes a
         # semicolon-separated series of CREATE TABLE / CREATE INDEX statements;
@@ -158,17 +167,25 @@ class PostgresRestoreHandler:
     async def _apply_data(self, conn, tenant: Tenant, data_prefix: str) -> Dict[str, int]:
         container = azure_storage_manager.get_container_name(str(tenant.id), "azure-postgresql")
         shard = azure_storage_manager.get_default_shard()
-        container_client = shard.get_async_client().get_container_client(container)
 
-        # List all per-table .sql blobs under data/
+        # List all per-table .sql blobs under data/ via the facade's
+        # prefix-aware list — pushes the filter to the backend so we
+        # don't pull millions of metadata rows when a tenant has many
+        # DBs in the same container.
+        prefix = data_prefix + "data/"
         tables = 0
         rows = 0
-        async for blob in container_client.list_blobs(name_starts_with=data_prefix + "data/"):
-            if not blob.name.endswith(".sql"):
+        blob_names = []
+        async for name in shard.list_blobs(container, name_starts_with=prefix):
+            if name.endswith(".sql"):
+                blob_names.append(name)
+
+        for blob_name in blob_names:
+            content_bytes = await shard.download_blob(container, blob_name)
+            if content_bytes is None:
+                self._log(f"  ✗ {blob_name}: blob missing, skipping", "WARNING")
                 continue
-            blob_client = shard.get_async_client().get_blob_client(container, blob.name)
-            download = await blob_client.download_blob()
-            content = (await download.readall()).decode("utf-8")
+            content = content_bytes.decode("utf-8")
 
             # Each file is a stream of INSERT statements, one per row.
             insert_count = sum(1 for ln in content.splitlines() if ln.strip().upper().startswith("INSERT"))
@@ -176,9 +193,9 @@ class PostgresRestoreHandler:
                 await conn.execute(content)
                 tables += 1
                 rows += insert_count
-                self._log(f"  ✓ Applied {blob.name} ({insert_count} rows)")
+                self._log(f"  ✓ Applied {blob_name} ({insert_count} rows)")
             except Exception as e:
-                self._log(f"  ✗ Failed to apply {blob.name}: {e}", "WARNING")
+                self._log(f"  ✗ Failed to apply {blob_name}: {e}", "WARNING")
                 # Continue with other tables — partial restores beat total failure.
 
         return {"tables": tables, "rows": rows}

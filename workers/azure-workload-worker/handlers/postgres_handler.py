@@ -433,14 +433,34 @@ class PostgresBackupHandler:
             rows_json_bytes = rows_json.encode("utf-8")
             rows_blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/data/{schema}_{table}.json"
 
+            # Route uploads through the storage-router facade so this
+            # handler honours the active storage backend (Azure Blob
+            # or on-prem SeaweedFS). The facade returns a dict with
+            # success=False on failure; we raise explicitly so an
+            # upload failure can't silently leave the snapshot
+            # half-committed — critical at enterprise scale where
+            # 5k users × 400 TiB of data means a silent drop is a
+            # genuine data-loss event, not a nuisance.
             shard = azure_storage_manager.get_default_shard()
             container = azure_storage_manager.get_container_name(str(tenant.id), "azure-postgresql")
-            await shard._ensure_container(container)
+            await shard.ensure_container(container)
 
-            blob_client = shard.get_async_client().get_blob_client(container, blob_path)
-            await blob_client.upload_blob(sql_content.encode("utf-8"), overwrite=True)
-            rows_blob_client = shard.get_async_client().get_blob_client(container, rows_blob_path)
-            await rows_blob_client.upload_blob(rows_json_bytes, overwrite=True)
+            sql_res = await shard.upload_blob(
+                container, blob_path, sql_content.encode("utf-8"),
+                overwrite=True,
+            )
+            if not sql_res.get("success"):
+                raise RuntimeError(
+                    f"SQL dump upload failed for {blob_path}: {sql_res.get('error')}"
+                )
+            rows_res = await shard.upload_blob(
+                container, rows_blob_path, rows_json_bytes,
+                overwrite=True,
+            )
+            if not rows_res.get("success"):
+                raise RuntimeError(
+                    f"Rows JSON upload failed for {rows_blob_path}: {rows_res.get('error')}"
+                )
 
             elapsed = time.monotonic() - start
             tables_count += 1
@@ -514,7 +534,7 @@ class PostgresBackupHandler:
         """
         shard = azure_storage_manager.get_default_shard()
         container = azure_storage_manager.get_container_name(str(resource.tenant_id), "azure-postgresql")
-        await shard._ensure_container(container)
+        await shard.ensure_container(container)
 
         snap_dir = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/schema"
         files: list = []
@@ -523,8 +543,16 @@ class PostgresBackupHandler:
         async def _upload(rel_path: str, content: str) -> tuple:
             blob_path = f"{snap_dir}/{rel_path}"
             data = content.encode("utf-8") if isinstance(content, str) else content
-            client = shard.get_async_client().get_blob_client(container, blob_path)
-            await client.upload_blob(data, overwrite=True)
+            # Facade path — honours the storage toggle. Raise on
+            # non-success so a failed per-file upload aborts the
+            # enclosing snapshot instead of silently missing bytes.
+            res = await shard.upload_blob(
+                container, blob_path, data, overwrite=True,
+            )
+            if not res.get("success"):
+                raise RuntimeError(
+                    f"schema upload failed for {blob_path}: {res.get('error')}"
+                )
             return blob_path, len(data)
 
         def _add(name: str, folder_path: str, blob_path: str, size: int):
@@ -842,13 +870,22 @@ class PostgresBackupHandler:
 
         shard = azure_storage_manager.get_default_shard()
         container = azure_storage_manager.get_container_name(str(resource.tenant_id), "azure-postgresql")
-        await shard._ensure_container(container)
+        await shard.ensure_container(container)
 
         db_name = resource.extra_data.get("database_name", resource.external_id)
         config_blob_path = f"{server_name}/{db_name}/{snapshot.id.hex[:12]}/config/{server_name}-config.json"
 
-        blob_client = shard.get_async_client().get_blob_client(container, config_blob_path)
-        await blob_client.upload_blob(config_content.encode("utf-8"), overwrite=True)
+        # Facade upload — honours active storage backend. Raise on
+        # non-success so we don't stamp a snapshot as COMPLETED with
+        # a missing config blob.
+        cfg_res = await shard.upload_blob(
+            container, config_blob_path,
+            config_content.encode("utf-8"), overwrite=True,
+        )
+        if not cfg_res.get("success"):
+            raise RuntimeError(
+                f"config upload failed for {config_blob_path}: {cfg_res.get('error')}"
+            )
 
         self._log(f"  Phase 3: Configuration captured: {self._format_size(config_bytes)}")
 

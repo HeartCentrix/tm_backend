@@ -216,23 +216,25 @@ class SeaweedStore:
             content_md5=None, last_modified=head["LastModified"],
         )
 
-    async def list_blobs(self, container):
+    async def list_blobs(self, container, prefix: Optional[str] = None):
         bucket = self._bucket(container)
-        prefix = f"{container}/" if self._forced_bucket and container else ""
+        base = f"{container}/" if self._forced_bucket and container else ""
+        full_prefix = (base + prefix) if prefix else base
         async with self._client_ctx() as s3:
             paginator = s3.get_paginator("list_objects_v2")
-            async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            async for page in paginator.paginate(Bucket=bucket, Prefix=full_prefix):
                 for obj in page.get("Contents", []):
-                    yield obj["Key"][len(prefix):] if prefix else obj["Key"]
+                    yield obj["Key"][len(base):] if base else obj["Key"]
 
-    async def list_with_props(self, container):
+    async def list_with_props(self, container, prefix: Optional[str] = None):
         bucket = self._bucket(container)
-        prefix = f"{container}/" if self._forced_bucket and container else ""
+        base = f"{container}/" if self._forced_bucket and container else ""
+        full_prefix = (base + prefix) if prefix else base
         async with self._client_ctx() as s3:
             paginator = s3.get_paginator("list_objects_v2")
-            async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            async for page in paginator.paginate(Bucket=bucket, Prefix=full_prefix):
                 for obj in page.get("Contents", []):
-                    name = obj["Key"][len(prefix):] if prefix else obj["Key"]
+                    name = obj["Key"][len(base):] if base else obj["Key"]
                     yield name, BlobProps(
                         size=obj["Size"], content_type=None,
                         last_modified=obj["LastModified"], metadata={},
