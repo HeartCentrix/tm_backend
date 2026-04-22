@@ -72,13 +72,30 @@ def _azure_endpoint() -> str:
 
 
 def _seaweed_endpoint() -> str:
-    return os.getenv("SEAWEEDFS_S3_ENDPOINT", "http://seaweedfs:8333").strip()
+    # Match ONPREM_S3_ENDPOINT (the var the SeaweedStore expects via
+    # secret_ref resolution) so operator config flows through one place.
+    return os.getenv("ONPREM_S3_ENDPOINT", "http://seaweedfs:8333").strip()
+
+
+def _seaweed_buckets() -> list[str]:
+    raw = os.getenv("ONPREM_S3_BUCKETS", "").strip()
+    if not raw:
+        return ["tmvault-shard-0"]
+    return [b.strip() for b in raw.split(",") if b.strip()]
 
 
 def _seaweed_config() -> dict:
+    """Config blob that SeaweedStore.from_config() consumes.
+
+    - access_key_env: env var name to read the access key from
+    - buckets: list of pre-created buckets (object-lock enabled)
+    - verify_tls: bool — false for local Azurite/SeaweedFS over plain HTTP
+    """
     return {
-        "access_key": os.getenv("SEAWEEDFS_ACCESS_KEY", "testaccess"),
-        "secret_key": os.getenv("SEAWEEDFS_SECRET_KEY", "testsecret"),
+        "access_key_env": "ONPREM_S3_ACCESS_KEY",
+        "buckets": _seaweed_buckets(),
+        "verify_tls": os.getenv("ONPREM_S3_VERIFY_TLS", "true").lower() == "true",
+        "region": os.getenv("ONPREM_S3_REGION", "us-east-1"),
     }
 
 
@@ -116,15 +133,23 @@ async def ensure_storage_bootstrap(engine: AsyncEngine) -> None:
         )
 
         seaweed_id = str(uuid.uuid4())
+        # Upsert on re-seed: SeaweedStore.from_config() reads credentials
+        # from env vars referenced by secret_ref / access_key_env, so if the
+        # operator later changes ONPREM_S3_* vars, the DB row needs to stay
+        # in sync with the expected env names + bucket list.
         await conn.execute(
             text(
                 "INSERT INTO storage_backends "
                 "(id, kind, name, endpoint, secret_ref, config, is_enabled, "
                 " created_at, updated_at) "
                 "VALUES (:id, 'seaweedfs', 'seaweedfs-local', :endpoint, "
-                " 'env://SEAWEEDFS_ACCESS_KEY', CAST(:config AS JSONB), "
+                " 'env://ONPREM_S3_SECRET_KEY', CAST(:config AS JSONB), "
                 " true, NOW(), NOW()) "
-                "ON CONFLICT (name) DO NOTHING"
+                "ON CONFLICT (name) DO UPDATE SET "
+                "  endpoint = EXCLUDED.endpoint, "
+                "  secret_ref = EXCLUDED.secret_ref, "
+                "  config = EXCLUDED.config, "
+                "  updated_at = NOW()"
             ),
             {
                 "id": seaweed_id,
@@ -165,3 +190,53 @@ async def ensure_storage_bootstrap(engine: AsyncEngine) -> None:
             )
 
     log.info("[storage-bootstrap] seed + triggers + invariants OK")
+
+    # Bucket auto-provisioning — SeaweedStore expects buckets to pre-exist,
+    # and preflight probes write to _buckets[0]. A fresh SeaweedFS has none,
+    # so every toggle would fail with NoSuchBucket / SignatureDoesNotMatch.
+    try:
+        await _ensure_seaweed_buckets()
+    except Exception as exc:
+        log.warning("[storage-bootstrap] seaweed bucket ensure failed: %s", exc)
+
+
+async def _ensure_seaweed_buckets() -> None:
+    """Create any buckets listed in ONPREM_S3_BUCKETS that don't yet exist.
+    Idempotent. Skipped when aioboto3 isn't available in this runtime."""
+    buckets = _seaweed_buckets()
+    if not buckets:
+        return
+    try:
+        import aioboto3  # type: ignore
+    except ImportError:
+        log.info("[storage-bootstrap] aioboto3 not available; skipping bucket create")
+        return
+
+    endpoint = _seaweed_endpoint()
+    access = os.getenv("ONPREM_S3_ACCESS_KEY", "")
+    secret = os.getenv("ONPREM_S3_SECRET_KEY", "")
+    if not access or not secret:
+        log.info("[storage-bootstrap] ONPREM_S3 creds not set; skipping bucket create")
+        return
+
+    session = aioboto3.Session()
+    async with session.client(
+        "s3", endpoint_url=endpoint,
+        aws_access_key_id=access, aws_secret_access_key=secret,
+        region_name=os.getenv("ONPREM_S3_REGION", "us-east-1"),
+        verify=os.getenv("ONPREM_S3_VERIFY_TLS", "true").lower() == "true",
+    ) as s3:
+        for bucket in buckets:
+            try:
+                await s3.head_bucket(Bucket=bucket)
+                continue
+            except Exception:
+                pass
+            try:
+                await s3.create_bucket(Bucket=bucket)
+                log.info("[storage-bootstrap] created seaweed bucket %s", bucket)
+            except Exception as exc:
+                log.warning(
+                    "[storage-bootstrap] create_bucket(%s) failed: %s",
+                    bucket, exc,
+                )
