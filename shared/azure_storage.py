@@ -452,19 +452,23 @@ class AzureStorageShard:
         blob_client = async_client.get_blob_client(container=container_name, blob=blob_path)
         return blob_client.url
 
-    async def list_blobs(self, container_name: str):
+    async def list_blobs(self, container_name: str, name_starts_with: Optional[str] = None):
         """Yield blob names in the container. Async generator — safe to
-        iterate large containers without buffering."""
+        iterate large containers without buffering. Optional
+        name_starts_with pushes the prefix filter into Azure so we don't
+        have to pull millions of names just to filter in Python."""
         async_client = self.get_async_client()
         container = async_client.get_container_client(container_name)
-        async for b in container.list_blobs():
+        kw = {"name_starts_with": name_starts_with} if name_starts_with else {}
+        async for b in container.list_blobs(**kw):
             yield b.name
 
-    async def list_blobs_with_properties(self, container_name: str):
+    async def list_blobs_with_properties(self, container_name: str, name_starts_with: Optional[str] = None):
         """Yield (name, {last_modified, size}) tuples. Used by retention cleanup."""
         async_client = self.get_async_client()
         container = async_client.get_container_client(container_name)
-        async for b in container.list_blobs():
+        kw = {"name_starts_with": name_starts_with} if name_starts_with else {}
+        async for b in container.list_blobs(**kw):
             yield b.name, {"last_modified": b.last_modified, "size": b.size}
 
     async def get_blob_sas_url(self, container_name: str, blob_path: str, valid_for_hours: int = 6) -> str:
@@ -647,12 +651,22 @@ class _StoreFacade:
             container_name, blob_path, valid_for_hours,
         )
 
-    async def list_blobs(self, container_name):
-        async for name in self._store.list_blobs(container_name):
+    async def list_blobs(self, container_name, name_starts_with: Optional[str] = None):
+        # Optional server-side prefix filter. Critical at enterprise
+        # scale: a 400 TiB tenant's VHD container can hold millions of
+        # blobs, and pulling the entire list just to filter in Python
+        # balloons memory + wire time per restore. Passing it down lets
+        # the backend do the filter (Azure's name_starts_with, S3's
+        # Prefix).
+        async for name in self._store.list_blobs(
+            container_name, prefix=name_starts_with,
+        ):
             yield name
 
-    async def list_blobs_with_properties(self, container_name):
-        async for name, p in self._store.list_with_props(container_name):
+    async def list_blobs_with_properties(self, container_name, name_starts_with: Optional[str] = None):
+        async for name, p in self._store.list_with_props(
+            container_name, prefix=name_starts_with,
+        ):
             yield name, {
                 "last_modified": p.last_modified,
                 "size": p.size,

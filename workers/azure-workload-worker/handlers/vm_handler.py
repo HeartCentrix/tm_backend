@@ -708,6 +708,35 @@ class VmBackupHandler:
                 "error": "No snapshot ID available",
             }
 
+        # Backend-kind guard — VM disk backup uses Azure's native
+        # server-side copy (start_copy_from_url) which reads from the
+        # Azure-provided SAS URL of the disk snapshot and writes into
+        # the destination blob WITHOUT the bytes traversing the
+        # worker. There is no equivalent on S3 / SeaweedFS: the disk
+        # bytes would have to stream through the worker network
+        # (400 GB disk ≈ 13 min at 500 MB/s, blocking a worker for the
+        # whole duration; at 5k users × 400 TiB this would saturate
+        # every NIC we have). On-prem VM backup isn't just slow —
+        # it's architecturally wrong because the disk bytes would
+        # have to ship back to Azure for any restore anyway.
+        # Fail cleanly with a clear operator message instead of
+        # blowing up on AttributeError inside an Azure SDK call.
+        shard = azure_storage_manager.get_default_shard()
+        shard_kind = getattr(shard, "kind", "azure_blob") or "azure_blob"
+        if shard_kind != "azure_blob":
+            return {
+                "disk_name": disk_name,
+                "status": "failed",
+                "error": (
+                    f"VM disk backup requires the active storage backend "
+                    f"to be Azure Blob (current: {shard_kind}). VM disk "
+                    f"backups use Azure's server-side async copy which "
+                    f"has no on-prem equivalent. Toggle the storage "
+                    f"backend to azure-primary in Settings → Storage to "
+                    f"enable VM backups."
+                ),
+            }
+
         # Grant read access (SAS URL, 24h expiry for large disks)
         self._log(f"  Granting read access to snapshot {disk_name}...")
         sas_url = None

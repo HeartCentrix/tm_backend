@@ -35,11 +35,11 @@ class VmRestoreHandler:
                          restore_params: Dict) -> Dict:
         """
         Full VM restore from backup.
-        
+
         Reads VM config and network config from backup blobs,
         recreates managed disks from VHD blobs, then creates
         the VM with original configuration.
-        
+
         restore_params:
             target_vm_name: str — name for restored VM
             target_resource_group: str — where to restore
@@ -47,6 +47,25 @@ class VmRestoreHandler:
             target_subnet_id: str — optional, override subnet
             overwrite: bool — overwrite if VM exists
         """
+        # Backend-kind guard — VM restore builds Azure managed disks
+        # from blobs by handing Azure ARM a SAS URL pointing AT the
+        # backing blob. Azure Recovery / the Managed Disk API can only
+        # pull from Azure Blob. When the active backend is on-prem
+        # (SeaweedFS / S3), the blob bytes live outside Azure's reach
+        # and any SAS URL we generate is from a different cloud.
+        # Fail cleanly up-front instead of crashing on an Azure SDK
+        # call mid-restore, when disks may have been half-created.
+        shard = azure_storage_manager.get_default_shard()
+        shard_kind = getattr(shard, "kind", "azure_blob") or "azure_blob"
+        if shard_kind != "azure_blob":
+            raise RuntimeError(
+                f"VM restore requires the active storage backend to be "
+                f"Azure Blob (current: {shard_kind}). Azure Managed Disks "
+                f"can only be hydrated from Azure-hosted VHDs. Toggle the "
+                f"storage backend to azure-primary in Settings → Storage "
+                f"before triggering a VM restore."
+            )
+
         credential = get_arm_credential()
         compute_client = ComputeManagementClient(credential, tenant.subscription_id or "")
         network_client = NetworkManagementClient(credential, tenant.subscription_id or "")
@@ -103,6 +122,17 @@ class VmRestoreHandler:
         Restore a single disk from backup.
         Useful for data recovery without full VM recreation.
         """
+        # Same backend-kind guard as restore_vm — the Managed Disk API
+        # can only hydrate from Azure-hosted VHDs. See restore_vm for
+        # the full reasoning.
+        shard = azure_storage_manager.get_default_shard()
+        shard_kind = getattr(shard, "kind", "azure_blob") or "azure_blob"
+        if shard_kind != "azure_blob":
+            raise RuntimeError(
+                f"Disk restore requires the active storage backend to be "
+                f"Azure Blob (current: {shard_kind})."
+            )
+
         credential = get_arm_credential()
         compute_client = ComputeManagementClient(credential, tenant.subscription_id or "")
 

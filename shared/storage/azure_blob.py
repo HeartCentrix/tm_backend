@@ -166,12 +166,16 @@ class AzureBlobStore:
             last_modified=props["last_modified"] if props else datetime.utcnow(),
         )
 
-    async def list_blobs(self, container) -> AsyncIterator[str]:
-        async for name in self._default_shard().list_blobs(container):
+    async def list_blobs(self, container, prefix: Optional[str] = None) -> AsyncIterator[str]:
+        async for name in self._default_shard().list_blobs(
+            container, name_starts_with=prefix,
+        ):
             yield name
 
-    async def list_with_props(self, container) -> AsyncIterator[tuple[str, BlobProps]]:
-        async for name, p in self._default_shard().list_blobs_with_properties(container):
+    async def list_with_props(self, container, prefix: Optional[str] = None) -> AsyncIterator[tuple[str, BlobProps]]:
+        async for name, p in self._default_shard().list_blobs_with_properties(
+            container, name_starts_with=prefix,
+        ):
             yield name, BlobProps(
                 size=p["size"], content_type=None,
                 last_modified=p["last_modified"], metadata={},

@@ -209,16 +209,16 @@ class PostgresRestoreHandler:
     async def _apply_schema(self, conn, tenant: Tenant, schema_blob: str) -> int:
         container = azure_storage_manager.get_container_name(str(tenant.id), "azure-postgresql")
         shard = azure_storage_manager.get_default_shard()
-        blob_client = shard.get_async_client().get_blob_client(container, schema_blob)
-        try:
-            download = await blob_client.download_blob()
-            payload = await download.readall()
-        except Exception as fetch_err:
-            self._log(f"Schema blob {schema_blob} fetch failed: {fetch_err}", "WARNING")
-            return 0
-        if not payload:
-            return 0
-        content = payload.decode("utf-8") if isinstance(payload, (bytes, bytearray)) else str(payload)
+        # Facade download — works on whichever backend the snapshot was
+        # captured on (Azure Blob or on-prem SeaweedFS). Fail loudly if
+        # the blob is missing — a missing schema dump means we can't restore.
+        content_bytes = await shard.download_blob(container, schema_blob)
+        if content_bytes is None:
+            raise RuntimeError(
+                f"schema blob missing for restore: container={container} "
+                f"path={schema_blob}"
+            )
+        content = content_bytes.decode("utf-8")
 
         # Execute the whole dump in one shot. The backup handler writes a
         # semicolon-separated series of CREATE TABLE / CREATE INDEX statements;
@@ -241,13 +241,15 @@ class PostgresRestoreHandler:
 
         container = azure_storage_manager.get_container_name(str(tenant.id), "azure-postgresql")
         shard = azure_storage_manager.get_default_shard()
-        container_client = shard.get_async_client().get_container_client(container)
 
-        # Bucket every blob under data/ so we can pair .json with .sql
-        # and prefer the JSON sibling.
+        # Bucket every blob under data/ via the facade list_blobs so we
+        # can pair .json with .sql siblings and prefer the JSON dump
+        # (authoritative full snapshot, always present post-Phase-1).
+        # The facade works against whichever backend the snapshot was
+        # captured on (Azure Blob or on-prem SeaweedFS).
+        prefix = data_prefix + "data/"
         blobs_by_stem: Dict[str, Dict[str, str]] = {}
-        async for blob in container_client.list_blobs(name_starts_with=data_prefix + "data/"):
-            name = blob.name
+        async for name in shard.list_blobs(container, name_starts_with=prefix):
             if name.endswith(".json"):
                 stem = name[:-5]
                 blobs_by_stem.setdefault(stem, {})["json"] = name
@@ -261,12 +263,9 @@ class PostgresRestoreHandler:
             chosen = kinds.get("json") or kinds.get("sql")
             if not chosen:
                 continue
-            blob_client = shard.get_async_client().get_blob_client(container, chosen)
-            try:
-                download = await blob_client.download_blob()
-                payload = await download.readall()
-            except Exception as fetch_err:
-                self._log(f"  ✗ Failed to download {chosen}: {fetch_err}", "WARNING")
+            payload = await shard.download_blob(container, chosen)
+            if payload is None:
+                self._log(f"  ✗ {chosen}: blob missing, skipping", "WARNING")
                 continue
             if not payload:
                 tables += 1
@@ -303,7 +302,6 @@ class PostgresRestoreHandler:
         name to approximate that ordering."""
         container = azure_storage_manager.get_container_name(str(tenant.id), "azure-postgresql")
         shard = azure_storage_manager.get_default_shard()
-        container_client = shard.get_async_client().get_container_client(container)
 
         files: list[tuple[int, str]] = []
         # Strict dependency order. Sequences MUST come before Tables —
@@ -313,25 +311,22 @@ class PostgresRestoreHandler:
         order = {"schemas": 0, "Sequences": 1, "Tables": 2,
                  "Views": 3, "indexes": 4, "foreign_keys": 5,
                  "grants": 6, "users_permissions": 7}
-        async for blob in container_client.list_blobs(name_starts_with=data_prefix + "schema/"):
+        async for name in shard.list_blobs(container, name_starts_with=data_prefix + "schema/"):
             # Pick the first path segment we recognise to decide order;
             # unknown buckets land at the end.
             rank = 99
             for key, val in order.items():
-                if f"/{key}/" in blob.name or blob.name.endswith(f"/{key}"):
+                if f"/{key}/" in name or name.endswith(f"/{key}"):
                     rank = val
                     break
-            files.append((rank, blob.name))
+            files.append((rank, name))
         files.sort()
 
         applied = 0
         for _, name in files:
-            blob_client = shard.get_async_client().get_blob_client(container, name)
-            try:
-                download = await blob_client.download_blob()
-                payload = await download.readall()
-            except Exception as fetch_err:
-                self._log(f"  ✗ Failed to download {name}: {fetch_err}", "WARNING")
+            payload = await shard.download_blob(container, name)
+            if payload is None:
+                self._log(f"  ✗ {name}: blob missing, skipping", "WARNING")
                 continue
             if not payload:
                 continue
