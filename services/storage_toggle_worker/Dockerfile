@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.base.txt
 COPY . /app
 ENV PYTHONPATH=/app
 
-CMD ["python", "-m", "services.storage-toggle-worker.main"]
+CMD ["python", "-m", "services.storage_toggle_worker.main"]
