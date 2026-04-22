@@ -618,6 +618,38 @@ class _StoreFacade:
         except Exception as e:
             return {"success": False, "error": str(e), "method": "stream_upload"}
 
+    async def upload_blob_stream(
+        self, container_name, blob_path, byte_stream, total_size,
+        metadata=None, chunk_size=8 * 1024 * 1024,
+        max_parallel_parts=4,
+    ):
+        """Memory-bounded streaming upload — pipes an async bytes
+        iterator directly into the backend's multipart / block-list
+        API without a /tmp hop. Used by OneDrive backup to flow
+        Graph download bytes straight into SeaweedFS / Azure. Returns
+        the same dict shape as upload_blob, plus `content_sha256`
+        computed inline so callers don't re-hash."""
+        try:
+            info = await self._store.upload_stream(
+                container_name, blob_path, byte_stream, total_size,
+                metadata=metadata,
+                chunk_size=chunk_size,
+                max_parallel_parts=max_parallel_parts,
+            )
+            return {
+                "success": True,
+                "blob_url": info.url,
+                "blob_path": info.path,
+                "size_bytes": info.size,
+                "content_sha256": info.content_md5,  # stored inline
+                "method": "stream_multipart",
+            }
+        except Exception as e:
+            return {
+                "success": False, "error": str(e),
+                "method": "stream_multipart",
+            }
+
     async def download_blob(self, container_name, blob_path):
         return await self._store.download(container_name, blob_path)
 

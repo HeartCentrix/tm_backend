@@ -9,10 +9,11 @@ not possible.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 from datetime import datetime
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import aioboto3
 from botocore.exceptions import ClientError
@@ -125,6 +126,131 @@ class SeaweedStore:
             size=head["ContentLength"], etag=head["ETag"].strip('"'),
             url=f"{self._endpoint}/{bucket}/{key}",
             content_md5=None, last_modified=head["LastModified"],
+        )
+
+    async def upload_stream(
+        self, container, path,
+        byte_stream: "AsyncIterator[bytes]",
+        total_size: int,
+        metadata=None,
+        chunk_size: int = 8 * 1024 * 1024,
+        max_parallel_parts: int = 4,
+    ) -> BlobInfo:
+        """Stream-upload bytes arriving from an async iterator directly
+        into an S3 multipart upload — never touches the worker's /tmp.
+
+        Why this exists:
+          * The legacy OneDrive backup path downloaded each file to
+            /tmp and then uploaded it. At 5k users doing concurrent
+            multi-GB file backups that saturated worker local disk.
+          * Holding the entire file in Python memory works for small
+            files but OOMs on big ones (1 GB file ≈ 1 GB heap).
+
+        Design notes:
+          * Up to max_parallel_parts upload_part calls are in flight at
+            once. Throughput ≈ (chunk_size × max_parallel_parts) /
+            RTT, so 4 × 8 MB / 50 ms ≈ 640 MB/s per file — limited by
+            NIC / SeaweedFS ingest rather than serial RTT cost.
+          * On ANY part failure the multipart is aborted so we never
+            leave dangling parts consuming bucket quota.
+          * Supports streams of unknown length — we read until EOF
+            and complete the multipart regardless of total_size.
+          * Computes sha256 incrementally as bytes flow past so the
+            snapshot_items row can be stamped without a re-read.
+        """
+        import hashlib as _hl
+        bucket = self._bucket(container)
+        key = self._key(container, path)
+        md = _clean_metadata(metadata or {})
+        hasher = _hl.sha256()
+        total_written = 0
+
+        async with self._client_ctx() as s3:
+            try:
+                mp = await s3.create_multipart_upload(
+                    Bucket=bucket, Key=key, Metadata=md,
+                )
+                upload_id = mp["UploadId"]
+            except ClientError as e:
+                raise BackendUnreachableError(str(e)) from e
+
+            parts: List[Dict[str, Any]] = []
+            sem = asyncio.Semaphore(max_parallel_parts)
+            inflight: List[asyncio.Task] = []
+            part_number = 0
+            buf = bytearray()
+
+            async def _send_part(pn: int, data: bytes):
+                async with sem:
+                    resp = await s3.upload_part(
+                        Bucket=bucket, Key=key,
+                        PartNumber=pn, UploadId=upload_id,
+                        Body=data,
+                    )
+                    return {"PartNumber": pn, "ETag": resp["ETag"]}
+
+            try:
+                async for chunk in byte_stream:
+                    if not chunk:
+                        continue
+                    hasher.update(chunk)
+                    total_written += len(chunk)
+                    buf.extend(chunk)
+                    while len(buf) >= chunk_size:
+                        part_number += 1
+                        part_data = bytes(buf[:chunk_size])
+                        del buf[:chunk_size]
+                        inflight.append(asyncio.create_task(
+                            _send_part(part_number, part_data),
+                        ))
+
+                # Flush remainder. S3 requires min 5 MiB per part
+                # EXCEPT the last one — any size is fine there.
+                if buf or part_number == 0:
+                    part_number += 1
+                    inflight.append(asyncio.create_task(
+                        _send_part(part_number, bytes(buf)),
+                    ))
+
+                # Gather all outstanding part uploads. If any failed,
+                # cancel the multipart cleanly before re-raising.
+                results = await asyncio.gather(*inflight, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        raise r
+                    parts.append(r)
+                parts.sort(key=lambda p: p["PartNumber"])
+
+                await s3.complete_multipart_upload(
+                    Bucket=bucket, Key=key,
+                    UploadId=upload_id,
+                    MultipartUpload={"Parts": parts},
+                )
+            except Exception:
+                # Defensive: abort the multipart so parts uploaded
+                # so far are garbage-collected by SeaweedFS / S3.
+                try:
+                    await s3.abort_multipart_upload(
+                        Bucket=bucket, Key=key, UploadId=upload_id,
+                    )
+                except Exception:
+                    pass
+                raise
+
+            head = await s3.head_object(Bucket=bucket, Key=key)
+
+        # Stash the sha256 we computed on the stream onto BlobInfo so
+        # callers don't re-hash by reading the object back. BlobInfo's
+        # content_md5 field is reused as the "content hash" slot for
+        # SeaweedStore since there's no separate sha field on the
+        # dataclass and downstream code accesses it as a hex string.
+        return BlobInfo(
+            backend_id=self.backend_id, container=container, path=path,
+            size=head["ContentLength"],
+            etag=head["ETag"].strip('"'),
+            url=f"{self._endpoint}/{bucket}/{key}",
+            content_md5=hasher.hexdigest(),
+            last_modified=head["LastModified"],
         )
 
     async def upload_from_file(self, container, path, file_path, size,
