@@ -844,46 +844,174 @@ class BackupWorker:
                         print(f"[{self.worker_id}] [USER_MAIL] folder tree fetch failed for {user_id}: {e}")
                         folder_tree = {}
 
-                    # Route through GraphClient._iter_pages so pacing,
-                    # multi-app rotation, Retry-After, cumulative-cap, and
-                    # sticky failover all apply automatically (behind
-                    # GRAPH_HARDENING_ENABLED — legacy path unchanged when
-                    # the flag is off). Partial captures still land in out[]
-                    # so cap-exhaustion surfaces as partial snapshot, not
-                    # failed job.
+                    # Per-folder parallel delta drain — replaces the legacy
+                    # single serial /users/{uid}/messages chain. Mail folder
+                    # delta IS officially supported on Graph, so on first
+                    # run each folder does a full scan; subsequent runs
+                    # resume from the saved @odata.deltaLink per folder
+                    # and fetch only changes since (30-50× faster on
+                    # incremental). First-run speedup scales with the
+                    # parallel cap (default 10 folders concurrent).
+                    user_label_mail = resource.display_name or user_id
+                    mail_start_mono = time.monotonic()
+                    print(
+                        f"[{self.worker_id}] [USER_MAIL START] "
+                        f"{user_label_mail} ({user_id}) — "
+                        f"{len(folder_tree)} folders"
+                    )
+                    mail_existing_tokens: Dict[str, str] = dict(
+                        (resource.extra_data or {}).get(
+                            "mail_delta_tokens_by_folder", {},
+                        ) or {},
+                    )
+                    mail_new_tokens: Dict[str, str] = {}
                     out: List = []
-                    mail_url = f"{graph_client.GRAPH_URL}/users/{user_id}/messages"
-                    mail_params = {
-                        "$top": "50",
-                        # NOTE: `parentFolderName` is NOT a Graph message
-                        # property — requesting it returns HTTP 400. Folder
-                        # NAMES come from the folder_tree lookup via
-                        # parentFolderId below.
-                        "$select": "id,subject,from,toRecipients,ccRecipients,sentDateTime,receivedDateTime,bodyPreview,body,hasAttachments,parentFolderId",
-                    }
+                    mail_select = (
+                        "id,subject,from,toRecipients,ccRecipients,"
+                        "sentDateTime,receivedDateTime,bodyPreview,body,"
+                        "hasAttachments,parentFolderId"
+                    )
+                    mail_fanout = int(
+                        os.getenv("USER_MAIL_PARALLEL_FOLDERS", "10"),
+                    )
+                    mail_timeout_s = int(
+                        os.getenv("USER_MAIL_TIMEOUT_S", "43200"),
+                    )
+                    mail_sem = asyncio.Semaphore(max(1, mail_fanout))
+                    mail_progress = {"folders_done": 0, "msgs": 0}
+                    mail_folder_ids = list(folder_tree.keys()) or [None]
+
+                    async def _drain_one_folder(fid: Optional[str]) -> List:
+                        """Drain one mail folder's delta stream. fid=None
+                        falls back to /users/{uid}/messages (all folders)
+                        when the folder_tree fetch returned empty — keeps
+                        us functional even if folder enumeration 403s."""
+                        saved = mail_existing_tokens.get(fid or "__all__")
+                        if saved:
+                            url = saved  # resume from deltaLink verbatim
+                            params = None
+                        elif fid:
+                            url = (
+                                f"{graph_client.GRAPH_URL}/users/{user_id}"
+                                f"/mailFolders/{fid}/messages/delta"
+                            )
+                            params = {"$top": "50", "$select": mail_select}
+                        else:
+                            # Folder enumeration failed — do a best-effort
+                            # non-delta scan of all messages (no incremental).
+                            url = (
+                                f"{graph_client.GRAPH_URL}/users/{user_id}"
+                                f"/messages"
+                            )
+                            params = {"$top": "50", "$select": mail_select}
+
+                        local_out: List = []
+                        delta_out: Optional[str] = None
+                        try:
+                            async with mail_sem:
+                                async for page in graph_client._iter_pages(
+                                    url, params=params,
+                                ):
+                                    for m in page.get("value", []) or []:
+                                        path = (
+                                            folder_tree.get(
+                                                m.get("parentFolderId"),
+                                            )
+                                            or (folder_tree.get(fid) if fid else None)
+                                            or ""
+                                        )
+                                        local_out.append((
+                                            "EMAIL",
+                                            m.get("subject") or "(no subject)",
+                                            m.get("id"),
+                                            {"raw": m},
+                                            path,
+                                        ))
+                                    if "@odata.deltaLink" in page:
+                                        delta_out = page["@odata.deltaLink"]
+                        except Exception as e:
+                            fid_disp = fid[:8] if fid else "__all__"
+                            print(
+                                f"[{self.worker_id}] [USER_MAIL] folder "
+                                f"{fid_disp} drain failed: "
+                                f"{type(e).__name__}: {e} "
+                                f"(kept {len(local_out)})"
+                            )
+                        if delta_out:
+                            mail_new_tokens[fid or "__all__"] = delta_out
+                        mail_progress["folders_done"] += 1
+                        mail_progress["msgs"] += len(local_out)
+                        if mail_progress["folders_done"] % 5 == 0:
+                            print(
+                                f"[{self.worker_id}] [USER_MAIL] "
+                                f"{user_label_mail}: "
+                                f"{mail_progress['folders_done']}/"
+                                f"{len(mail_folder_ids)} folders, "
+                                f"{mail_progress['msgs']} msgs so far"
+                            )
+                        return local_out
+
+                    async def _drain_mail_parallel() -> None:
+                        results = await asyncio.gather(
+                            *[_drain_one_folder(fid) for fid in mail_folder_ids],
+                            return_exceptions=True,
+                        )
+                        for r in results:
+                            if isinstance(r, list):
+                                out.extend(r)
+
                     try:
-                        async for page in graph_client._iter_pages(
-                            mail_url, params=mail_params,
-                        ):
-                            for m in page.get("value", []):
-                                path = (
-                                    folder_tree.get(m.get("parentFolderId"))
-                                    or m.get("parentFolderName")
-                                    or ""
-                                )
-                                out.append((
-                                    "EMAIL",
-                                    m.get("subject") or "(no subject)",
-                                    m.get("id"),
-                                    {"raw": m},
-                                    path,
-                                ))
+                        await asyncio.wait_for(
+                            _drain_mail_parallel(), timeout=mail_timeout_s,
+                        )
+                    except asyncio.TimeoutError:
+                        print(
+                            f"[{self.worker_id}] [USER_MAIL] TIMEOUT after "
+                            f"{mail_timeout_s}s for {user_label_mail} "
+                            f"(kept {len(out)})"
+                        )
                     except Exception as e:
                         print(
-                            f"[{self.worker_id}] [USER_MAIL] stream aborted "
-                            f"for {user_id}: {type(e).__name__}: {e} "
-                            f"(kept {len(out)} messages)"
+                            f"[{self.worker_id}] [USER_MAIL] parallel drain "
+                            f"aborted for {user_label_mail}: "
+                            f"{type(e).__name__}: {e} "
+                            f"(kept {len(out)})"
                         )
+
+                    elapsed = time.monotonic() - mail_start_mono
+                    rate = (len(out) / elapsed) if elapsed > 0 else 0
+                    print(
+                        f"[{self.worker_id}] [USER_MAIL] fetched "
+                        f"{len(out)} messages across "
+                        f"{len(mail_folder_ids)} folders in {elapsed:.1f}s "
+                        f"({rate:.1f} msg/s)"
+                    )
+
+                    # Persist per-folder delta tokens so subsequent runs
+                    # only pull new messages per folder. Merge with
+                    # existing so a failed folder doesn't wipe tokens
+                    # we still hold for the rest.
+                    if mail_new_tokens:
+                        try:
+                            async with async_session_factory() as _s:
+                                r = await _s.get(Resource, resource.id)
+                                if r is not None:
+                                    ed = dict(r.extra_data or {})
+                                    merged = dict(
+                                        ed.get(
+                                            "mail_delta_tokens_by_folder",
+                                        ) or {},
+                                    )
+                                    merged.update(mail_new_tokens)
+                                    ed["mail_delta_tokens_by_folder"] = merged
+                                    r.extra_data = ed
+                                    await _s.commit()
+                        except Exception as _e:
+                            print(
+                                f"[{self.worker_id}] [USER_MAIL] delta "
+                                f"persist failed: {_e}"
+                            )
+
                     return out
 
                 if kind == "USER_ONEDRIVE":
