@@ -470,6 +470,32 @@ async def get_resources_by_type(
     if not includeHidden and type in UI_HIDDEN_TYPES:
         return {"items": [], "item_number": 0, "page_number": page, "next_page_token": None}
 
+    # Validate tenant exists when a tenantId filter is supplied — a stale
+    # UUID from a localStorage cache (e.g. after a DB reset) previously
+    # returned a silent 200 with empty items, which the UI rendered as
+    # "nothing discovered yet" even though 38 ENTRA_USER rows were in
+    # the DB under a different tenant id. Returning 404 gives the
+    # frontend a clear signal to clear its cache + re-fetch tenants.
+    if tenantId:
+        try:
+            tenant_uuid = UUID(tenantId)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400, detail=f"Invalid tenantId: {tenantId}",
+            )
+        exists = (await db.execute(
+            text("SELECT 1 FROM tenants WHERE id = :tid LIMIT 1"),
+            {"tid": tenant_uuid},
+        )).first()
+        if not exists:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Tenant {tenantId} not found — "
+                    "cached id may be stale; refresh tenants"
+                ),
+            )
+
     # SharePoint sub-section filter: exclude sites whose name+email
     # collides with a Microsoft 365 group / Entra group / Teams channel.
     # Those appear under the Groups & Teams tab instead, so showing them

@@ -250,7 +250,18 @@ async def _ensure_seaweed_buckets() -> None:
     session = aioboto3.Session()
     attempts = int(os.getenv("STORAGE_BUCKET_ENSURE_ATTEMPTS", "5"))
     backoff_s = float(os.getenv("STORAGE_BUCKET_ENSURE_BACKOFF_S", "4"))
+    # Two-phase: for each bucket, first verify it exists; if not,
+    # try to create it. Track which buckets are still pending AFTER
+    # each attempt and ONLY retry the ones that haven't landed yet.
+    # This fixes a subtle bug where the previous code swallowed the
+    # create_bucket exception inside the inner try/except so the
+    # outer retry never fired — cold-start still left buckets
+    # uncreated even though the loop "completed".
+    pending = set(buckets)
+    last_err: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
+        if not pending:
+            break
         try:
             async with session.client(
                 "s3", endpoint_url=endpoint,
@@ -260,34 +271,37 @@ async def _ensure_seaweed_buckets() -> None:
                     "ONPREM_S3_VERIFY_TLS", "true",
                 ).lower() == "true",
             ) as s3:
-                for bucket in buckets:
+                for bucket in list(pending):
                     try:
                         await s3.head_bucket(Bucket=bucket)
+                        pending.discard(bucket)
                         continue
-                    except Exception:
-                        pass
+                    except Exception as he:
+                        last_err = he  # record but keep trying to create
                     try:
                         await s3.create_bucket(Bucket=bucket)
+                        pending.discard(bucket)
                         log.info(
                             "[storage-bootstrap] created seaweed bucket %s",
                             bucket,
                         )
-                    except Exception as exc:
-                        log.warning(
-                            "[storage-bootstrap] create_bucket(%s) failed: "
-                            "%s", bucket, exc,
-                        )
-            return
+                    except Exception as ce:
+                        # Keep bucket in pending, retry on next round.
+                        last_err = ce
         except Exception as exc:
-            if attempt >= attempts:
-                log.warning(
-                    "[storage-bootstrap] s3 endpoint unreachable after "
-                    "%d attempts: %s", attempts, exc,
-                )
-                return
+            last_err = exc
+
+        if pending and attempt < attempts:
             log.info(
-                "[storage-bootstrap] s3 endpoint not ready (attempt "
-                "%d/%d), retrying in %.1fs",
-                attempt, attempts, backoff_s,
+                "[storage-bootstrap] bucket ensure (attempt %d/%d) "
+                "still pending %s — retrying in %.1fs",
+                attempt, attempts, sorted(pending), backoff_s,
             )
             await _asyncio.sleep(backoff_s)
+
+    if pending:
+        log.warning(
+            "[storage-bootstrap] gave up after %d attempts — "
+            "buckets still missing: %s (last error: %s)",
+            attempts, sorted(pending), last_err,
+        )
