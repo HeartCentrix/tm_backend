@@ -2650,21 +2650,39 @@ class BackupWorker:
 
         async def backup_one(resource: Resource):
             async with semaphore:
+                snapshot = None
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
                     resource_type = resource.type.value
-                    
+
                     # Route to appropriate handler
                     if resource_type.startswith("ENTRA"):
-                        return await self._backup_entra_resource(resource, tenant, snapshot, graph_client, job_id, message)
+                        result = await self._backup_entra_resource(resource, tenant, snapshot, graph_client, job_id, message)
                     elif resource_type.startswith("TEAMS"):
-                        return await self._backup_teams_resource(resource, tenant, snapshot, graph_client, job_id)
+                        result = await self._backup_teams_resource(resource, tenant, snapshot, graph_client, job_id)
                     elif resource_type == "POWER_BI":
-                        return await self.backup_power_bi_workspace(graph_client, resource, snapshot, tenant, message)
+                        result = await self.backup_power_bi_workspace(graph_client, resource, snapshot, tenant, message)
                     else:
-                        return await self._backup_metadata_only(graph_client, resource, snapshot, tenant, message)
+                        result = await self._backup_metadata_only(graph_client, resource, snapshot, tenant, message)
+
+                    # Finalize the per-resource snapshot so the Recovery UI
+                    # picks it up. Without this the snapshot stayed
+                    # IN_PROGRESS forever and the UI never listed it.
+                    if snapshot is not None and isinstance(result, dict):
+                        try:
+                            async with async_session_factory() as s:
+                                await self.complete_snapshot(s, snapshot, result)
+                        except Exception as fe:
+                            print(f"[{self.worker_id}] complete_snapshot failed for {resource.id}: {fe}")
+                    return result
                 except Exception as e:
                     print(f"[{self.worker_id}] Generic backup failed for {resource.id}: {e}")
+                    if snapshot is not None:
+                        try:
+                            async with async_session_factory() as s:
+                                await self.fail_snapshot(s, snapshot, e)
+                        except Exception:
+                            pass
                     return {"item_count": 0, "bytes_added": 0}
 
         results = await asyncio.gather(*[backup_one(r) for r in resources], return_exceptions=True)
