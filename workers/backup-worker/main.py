@@ -1130,24 +1130,58 @@ class BackupWorker:
                     _progress = {"chats_done": 0, "msgs": 0}
 
                     async def _drain_one_chat(cid: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
-                        """Drain a single chat's message delta stream. Returns
-                        (cid, messages, new_delta_link). Keeps deltaLink
-                        extraction local so parallel iterators don't race on
-                        graph_client._last_delta_link (module-level state)."""
-                        saved = existing_tokens.get(cid)
-                        url = saved or (
-                            f"{graph_client.GRAPH_URL}/chats/{cid}/messages/delta"
-                        )
+                        """Drain a single chat's messages. Returns
+                        (cid, messages, new_cursor).
+
+                        Endpoint strategy — Graph delta support varies by
+                        chat type:
+                          * oneOnOne chats → /messages/delta works
+                          * group / meeting_* / @thread.v2 chats → delta
+                            returns 400; must use non-delta /messages
+                            with a $filter for incremental
+
+                        We use /chats/{cid}/messages (non-delta) for
+                        ALL chats for uniformity — with an incremental
+                        $filter on lastModifiedDateTime when we have a
+                        saved cursor from a prior run. First run does
+                        a full fetch per chat; subsequent runs pull
+                        only modified-since the stamp.
+
+                        Keeps pagination-state extraction local so
+                        parallel iterators don't race on module-level
+                        graph_client state.
+                        """
+                        saved_cursor = existing_tokens.get(cid)
+                        url = f"{graph_client.GRAPH_URL}/chats/{cid}/messages"
+                        params: Dict[str, str] = {"$top": "50"}
+                        # If saved_cursor looks like a full URL (legacy
+                        # nextLink/deltaLink), use it verbatim so resume
+                        # still works. Otherwise treat it as an ISO
+                        # lastModifiedDateTime and apply as $filter.
+                        if saved_cursor and saved_cursor.startswith("http"):
+                            url = saved_cursor
+                            params = None  # type: ignore[assignment]
+                        elif saved_cursor:
+                            params["$filter"] = (
+                                f"lastModifiedDateTime gt {saved_cursor}"
+                            )
+                            params["$orderby"] = "lastModifiedDateTime asc"
+
                         msgs_local: List[Dict[str, Any]] = []
-                        delta_out: Optional[str] = None
+                        max_stamp: Optional[str] = None
                         try:
                             async with per_chat_sem:
                                 async for page in graph_client._iter_pages(
-                                    url, params={"$top": "50"},
+                                    url, params=params,
                                 ):
-                                    msgs_local.extend(page.get("value", []) or [])
-                                    if "@odata.deltaLink" in page:
-                                        delta_out = page["@odata.deltaLink"]
+                                    for m in (page.get("value", []) or []):
+                                        msgs_local.append(m)
+                                        stamp = m.get("lastModifiedDateTime")
+                                        if stamp and (
+                                            max_stamp is None
+                                            or stamp > max_stamp
+                                        ):
+                                            max_stamp = stamp
                         except Exception as e:
                             print(
                                 f"[{self.worker_id}] [USER_CHATS] chat {cid[:8]} "
@@ -1165,7 +1199,7 @@ class BackupWorker:
                                 f"{len(chat_ids_to_drain)} chats, "
                                 f"{_progress['msgs']} msgs so far"
                             )
-                        return cid, msgs_local, delta_out
+                        return cid, msgs_local, max_stamp
 
                     async def _drain_chats_parallel() -> None:
                         results = await asyncio.gather(
