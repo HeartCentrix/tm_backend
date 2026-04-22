@@ -623,11 +623,44 @@ class BackupWorker:
         # Process groups in parallel (workload parallelism)
         semaphore = asyncio.Semaphore(settings.WORKLOAD_CONCURRENCY)
 
+        # Live progress — publish percentage as each group finishes so the
+        # UI no longer sits at 5% until the very last resource settles (and
+        # no longer shows "RUNNING" forever if one handler hangs — there's
+        # also a per-group hard timeout below).
+        total_groups = len(groups)
+        completed_groups = 0
+        progress_lock = asyncio.Lock()
+        # Per-group hard ceiling. Sized for enterprise workloads — a single
+        # group can mean hundreds of mailboxes or multi-TB OneDrives batched
+        # together, so the default is deliberately generous (24h). The cap
+        # exists only to prevent a truly wedged Graph call from holding the
+        # whole job in RUNNING forever; operators can tune it via env.
+        group_timeout_s = int(os.getenv("BACKUP_GROUP_TIMEOUT_S", "86400"))
+
         async def process_group(group_key, group_resources):
+            nonlocal completed_groups
             async with semaphore:
                 tenant_id_str, resource_type = group_key.split(":", 1)
                 tenant = tenants_map.get(uuid.UUID(tenant_id_str))
-                return await self._backup_resource_group(group_resources, tenant, message, job_id)
+                try:
+                    res = await asyncio.wait_for(
+                        self._backup_resource_group(
+                            group_resources, tenant, message, job_id,
+                        ),
+                        timeout=group_timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    print(
+                        f"[{self.worker_id}] group {group_key} exceeded "
+                        f"{group_timeout_s}s timeout — continuing without it",
+                    )
+                    res = {"item_count": 0, "bytes_added": 0,
+                           "error": "group_timeout"}
+                async with progress_lock:
+                    completed_groups += 1
+                    pct = min(99, 5 + int(90 * completed_groups / total_groups))
+                await _update_job_pct(job_id, pct)
+                return res
 
         tasks = [process_group(key, res_list) for key, res_list in groups.items()]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -635,7 +668,11 @@ class BackupWorker:
         # Aggregate results
         total_items = sum(r.get("item_count", 0) for r in results if isinstance(r, dict))
         total_bytes = sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict))
-        failed = sum(1 for r in results if isinstance(r, Exception))
+        failed = sum(
+            1 for r in results
+            if isinstance(r, Exception)
+            or (isinstance(r, dict) and r.get("error"))
+        )
 
         async with async_session_factory() as session:
             await self.update_job_status(session, job_id, JobStatus.COMPLETED, {
@@ -958,6 +995,12 @@ class BackupWorker:
                     # panel groups chats under "chats/<friendly name>" — both
                     # 1:1 ("Vinay Chauhan") and group ("Group: Hemant, Vinay
                     # +5 more") get a meaningful folder.
+                    user_label_early = resource.display_name or user_id
+                    print(
+                        f"[{self.worker_id}] [USER_CHATS START] {user_label_early} "
+                        f"({user_id})",
+                    )
+                    chats_start_mono = time.monotonic()
                     chat_meta: Dict[str, Dict[str, Any]] = {}
                     try:
                         list_page = await graph_client._get(
@@ -1069,11 +1112,44 @@ class BackupWorker:
                             f"{graph_client.GRAPH_URL}/users/{user_id}"
                             f"/chats/getAllMessages/delta"
                         )
-                    try:
+                    # Hard per-resource cap. Enterprise chat histories can
+                    # hold years of messages across hundreds of chats, so
+                    # the default is sized to cover the legitimate upper
+                    # bound (12h) rather than "typical". The cap only
+                    # exists so a truly wedged paginator cannot keep the
+                    # batch in RUNNING forever — pages are heartbeated
+                    # every 10 pages so operators can tell it's alive.
+                    chats_timeout_s = int(
+                        os.getenv("USER_CHATS_TIMEOUT_S", "43200"),
+                    )
+
+                    async def _drain_chats() -> None:
+                        """Pull pages until the stream ends. Kept as a
+                        coroutine so we can wrap with wait_for() below."""
+                        page_count = 0
                         async for page in graph_client._iter_pages(
                             chat_url, params={"$top": "50"},
                         ):
                             all_msgs.extend(page.get("value", []))
+                            page_count += 1
+                            # Heartbeat every 10 pages so an operator can
+                            # tell the handler is alive during long runs.
+                            if page_count % 10 == 0:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"{user_label}: {page_count} pages, "
+                                    f"{len(all_msgs)} msgs so far"
+                                )
+
+                    try:
+                        await asyncio.wait_for(_drain_chats(),
+                                               timeout=chats_timeout_s)
+                    except asyncio.TimeoutError:
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] TIMEOUT after "
+                            f"{chats_timeout_s}s for {user_label} "
+                            f"(kept {len(all_msgs)})"
+                        )
                     except Exception as e:
                         print(
                             f"[{self.worker_id}] [USER_CHATS] stream aborted "
@@ -1081,9 +1157,10 @@ class BackupWorker:
                             f"(kept {len(all_msgs)})"
                         )
                     new_delta_link = getattr(graph_client, "_last_delta_link", None)
+                    elapsed = time.monotonic() - chats_start_mono
                     print(
                         f"[{self.worker_id}] [USER_CHATS] fetched "
-                        f"{len(all_msgs)} messages"
+                        f"{len(all_msgs)} messages in {elapsed:.1f}s"
                     )
 
                     # Persist the delta link so subsequent USER_CHATS runs
