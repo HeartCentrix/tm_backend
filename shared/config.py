@@ -413,16 +413,29 @@ class Settings:
         return raw_database_url
 
     def _parse_graph_apps(self) -> List[dict]:
-        """Parse multiple Graph app registrations from env vars."""
+        """Parse multiple Graph app registrations from env vars.
+
+        Each app contributes an independent 200 RPS quota against the
+        Microsoft Graph per-app-per-tenant throttle ceiling, so the
+        aggregate RPS scales linearly with the number of registered
+        apps. Enterprise-grade installs (5k users) typically run
+        20-30+ apps with dedicated admin consent per customer tenant.
+
+        Format: APP_<N>_CLIENT_ID, APP_<N>_CLIENT_SECRET,
+                APP_<N>_TENANT_ID for N in 1..GRAPH_APP_MAX (default 30).
+        Sparse configuration is supported — gaps are silently skipped,
+        so you can assign APP_1, APP_5, APP_9 without filling the
+        intermediate slots. Legacy single-app deployments fall back
+        to AZURE_AD_* env names on APP_1.
+        """
         apps = []
-        for i in range(1, 17):  # Support up to 16 app registrations
-            # Only use fallback for APP_1 (legacy single-app mode)
+        max_slots = int(os.getenv("GRAPH_APP_MAX", "30"))
+        for i in range(1, max_slots + 1):
             if i == 1:
                 client_id = os.getenv(f"APP_{i}_CLIENT_ID") or os.getenv("AZURE_AD_CLIENT_ID", "")
                 client_secret = os.getenv(f"APP_{i}_CLIENT_SECRET") or os.getenv("AZURE_AD_CLIENT_SECRET", "")
                 tenant_id = os.getenv(f"APP_{i}_TENANT_ID") or os.getenv("AZURE_AD_TENANT_ID", "common")
             else:
-                # For APP_2+, require explicit values - no fallback
                 client_id = os.getenv(f"APP_{i}_CLIENT_ID", "")
                 client_secret = os.getenv(f"APP_{i}_CLIENT_SECRET", "")
                 tenant_id = os.getenv(f"APP_{i}_TENANT_ID", "common")
@@ -434,10 +447,11 @@ class Settings:
                     "client_secret": client_secret,
                     "tenant_id": tenant_id,
                 })
-
-            # If using single app config (legacy), stop after first
-            if not os.getenv(f"APP_{i}_CLIENT_ID") and not os.getenv(f"APP_{i}_CLIENT_SECRET"):
-                break
+            # Continue scanning — don't break on gaps. Previous code
+            # stopped at the first missing slot, so sparse configs
+            # (APP_1 + APP_5 + APP_9) only registered APP_1. That
+            # silently cost customers 2/3 of the intended Graph
+            # throughput they'd provisioned.
 
         return apps or [{
             "index": 1,

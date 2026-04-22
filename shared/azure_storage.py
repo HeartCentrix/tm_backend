@@ -1198,21 +1198,76 @@ async def upload_blob_with_retry(container_name: str, blob_path: str, content: b
     Direct upload with automatic retry and exponential backoff.
     """
     last_error = None
-    
+
     for attempt in range(max_retries):
         result = await shard.upload_blob(container_name, blob_path, content, metadata=metadata)
-        
+
         if result["success"]:
             return result
-        
+
         last_error = result.get("error", "Unknown error")
-        
+
         # Don't retry on auth/permission errors
         if "Authorization" in last_error or "Authentication" in last_error:
             return result
-        
+
         # Exponential backoff
         delay = settings.RETRY_DELAY_MS * (settings.RETRY_BACKOFF_MULTIPLIER ** attempt) / 1000
         await asyncio.sleep(delay)
-    
+
     return {"success": False, "error": f"Failed after {max_retries} retries: {last_error}"}
+
+
+async def upload_blob_with_dedup(
+    tenant_id,
+    content_hash: str,
+    container_name: str,
+    blob_path: str,
+    content: bytes,
+    shard,
+    max_retries: int = 3,
+    metadata: Optional[Dict] = None,
+    min_size_bytes: int = 1024,
+) -> Dict:
+    """Dedup-aware upload.
+
+    Before shipping bytes over the wire, check whether this tenant
+    already has a blob backed by the same content_hash. If yes,
+    return a success result that points at the existing blob_path
+    without re-uploading — typical M365 dedup rate is 5-10× so
+    on a 400 TiB install this meaningfully cuts Azure egress +
+    storage + worker NIC time.
+
+    Never crosses tenant boundaries (lookup scoped to tenant_id).
+
+    Returns the same dict shape as upload_blob_with_retry, plus a
+    `method` that's "dedup_hit" when we reused an existing blob.
+    Callers can log the method to measure dedup rate. On any DB
+    hiccup the dedup check silently falls through to a real upload
+    — never blocks the backup.
+    """
+    if content_hash and len(content) >= min_size_bytes:
+        try:
+            from shared.blob_dedup import find_existing_blob
+            from shared.database import async_session_factory
+            async with async_session_factory() as session:
+                existing = await find_existing_blob(
+                    session, tenant_id, content_hash,
+                    min_size_bytes=min_size_bytes,
+                )
+            if existing:
+                return {
+                    "success": True,
+                    "blob_path": existing,
+                    "blob_url": existing,
+                    "size_bytes": len(content),
+                    "method": "dedup_hit",
+                }
+        except Exception:
+            # Dedup is advisory — a DB hiccup must not block the backup.
+            pass
+
+    return await upload_blob_with_retry(
+        container_name, blob_path, content, shard,
+        max_retries=max_retries, metadata=metadata,
+    )

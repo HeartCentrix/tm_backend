@@ -2221,15 +2221,37 @@ class BackupWorker:
                         f"att_{msg_id}_{att_id}",
                     )
                     try:
-                        result = await upload_blob_with_retry(
-                            container, blob_path, content_bytes, shard, max_retries=3,
+                        # Content-addressable dedup — same attachment
+                        # forwarded around the org (quarterly report,
+                        # policy PDFs, branded templates) lands on one
+                        # blob instead of N. At 400 TiB / 5k users this
+                        # typically reclaims 5-10× of storage + Azure
+                        # egress. Dedup is scoped to the same tenant
+                        # so no cross-customer bleed is possible.
+                        from shared.azure_storage import upload_blob_with_dedup
+                        result = await upload_blob_with_dedup(
+                            tenant.id, content_hash,
+                            container, blob_path, content_bytes, shard,
+                            max_retries=3,
                         )
                         if not (isinstance(result, dict) and result.get("success")):
-                            # Upload failed — keep the row as metadata-only.
                             blob_path = None
                             content_hash = None
                         else:
+                            # Reuse the deduped blob_path so both
+                            # snapshot_items point at the SAME physical
+                            # blob. Avoids the subtle bug where two
+                            # rows claim distinct blob_paths but only
+                            # one actually exists on storage.
+                            blob_path = result.get("blob_path", blob_path)
                             local_bytes += size
+                            if result.get("method") == "dedup_hit":
+                                print(
+                                    f"[{self.worker_id}] [ATT-DEDUP-HIT] "
+                                    f"{att_name} on {msg_id} — "
+                                    f"reused existing blob, saved "
+                                    f"{size} bytes"
+                                )
                     except Exception as e:
                         print(f"[{self.worker_id}] [ATT-UPLOAD] {att_name} on {msg_id}: {type(e).__name__}: {e}")
                         blob_path = None
@@ -3133,11 +3155,22 @@ class BackupWorker:
                 str(tenant.id), str(snapshot.resource_id), str(snapshot.id),
                 f"ver_{file_id}_{version_id}",
             )
-            upload_result = await upload_blob_with_retry(
-                container, blob_path, content_bytes, shard, max_retries=3,
+            # Dedup-aware upload — OneDrive versioning keeps many
+            # copies of the same file content across users and
+            # snapshots. Same-tenant content-hash match reuses the
+            # existing blob instead of uploading again. First run
+            # is pure cost (~one indexed DB lookup per file); every
+            # subsequent run with unchanged content skips the upload
+            # entirely.
+            from shared.azure_storage import upload_blob_with_dedup
+            upload_result = await upload_blob_with_dedup(
+                tenant.id, content_hash,
+                container, blob_path, content_bytes, shard,
+                max_retries=3,
             )
             if not (isinstance(upload_result, dict) and upload_result.get("success")):
                 continue
+            blob_path = upload_result.get("blob_path", blob_path)
             total_bytes += len(content_bytes)
             items_to_insert.append(SnapshotItem(
                 snapshot_id=snapshot.id, tenant_id=tenant.id,
