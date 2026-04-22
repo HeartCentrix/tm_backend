@@ -2649,6 +2649,219 @@ class BackupWorker:
         state = {"uploaded_count": 0, "bytes_uploaded": 0}
         updates: List[Tuple[str, str, int, str, Dict[str, Any]]] = []
         state_lock = asyncio.Lock()
+        total_files = len(ordered)
+
+        # ---- $batch download-URL pre-fetch ----
+        # Bundle /drives/{}/items/{} GETs 20-at-a-time so the serial
+        # per-file call to Graph happens once per ~20 files instead
+        # of once per file. At 10k files / ~200 ms per GET that's
+        # ~33 min of URL-fetching wire-time collapsed to ~1.5 min,
+        # without changing per-request Graph cost. If $batch errors
+        # or returns an empty URL for an item, the per-file path
+        # falls back to the original single get_download_url call
+        # so nothing regresses.
+        print(
+            f"[{self.worker_id}] [USER_ONEDRIVE] {resource.display_name}: "
+            f"{total_files} files queued; pre-fetching download URLs "
+            f"in $batch groups of 20",
+        )
+        batch_url_map: Dict[str, Tuple[Optional[str], int, Optional[str]]] = {}
+        try:
+            ordered_ids = [f["id"] for f in ordered if f.get("id") and not checkpoint.is_done(f["id"])]
+            BATCH_SIZE = 20
+            _prefetch_t0 = time.monotonic()
+            for i in range(0, len(ordered_ids), BATCH_SIZE):
+                sub = ordered_ids[i:i + BATCH_SIZE]
+                partial = await graph_client.get_download_urls_batch(
+                    drive_id, sub,
+                )
+                batch_url_map.update(partial)
+                # Progress log every 200 URLs so huge drives (10k+
+                # files) don't look frozen during pre-fetch. Short-
+                # circuits cleanly when a batch returns empty on a
+                # throttle (empty map entries fall through per-file).
+                if (i // BATCH_SIZE) % 10 == 0 and i > 0:
+                    print(
+                        f"[{self.worker_id}] [USER_ONEDRIVE] "
+                        f"url pre-fetch: "
+                        f"{min(i + BATCH_SIZE, len(ordered_ids))}/"
+                        f"{len(ordered_ids)} URLs resolved",
+                    )
+            print(
+                f"[{self.worker_id}] [USER_ONEDRIVE] url pre-fetch "
+                f"done ({len(batch_url_map)}/{len(ordered_ids)} "
+                f"urls in {time.monotonic() - _prefetch_t0:.1f}s)",
+            )
+        except Exception as exc:
+            # Non-fatal — per-file path re-fetches as needed.
+            print(
+                f"[{self.worker_id}] [USER_ONEDRIVE] batch URL "
+                f"pre-fetch failed: {type(exc).__name__}: {exc}; "
+                f"falling back to serial get_download_url",
+            )
+            batch_url_map = {}
+
+        # Large-file threshold for parallel chunk download. Configurable
+        # so operators can tune per environment.
+        large_file_threshold = getattr(
+            settings, "ONEDRIVE_LARGE_FILE_THRESHOLD_BYTES",
+            256 * 1024 * 1024,  # 256 MB
+        )
+        segment_size = getattr(
+            settings, "ONEDRIVE_LARGE_FILE_SEGMENT_BYTES",
+            64 * 1024 * 1024,
+        )
+        segment_concurrency = getattr(
+            settings, "ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY", 4,
+        )
+
+        # Peak per-file RAM for the parallel-range path is roughly
+        # `segment_concurrency × segment_size`. With `file_concurrency`
+        # of those running at once, total peak is
+        # `file_concurrency × segment_concurrency × segment_size`. To
+        # keep a 400 TiB-class enterprise worker from OOMing we cap the
+        # parallel-range concurrency globally so the product stays
+        # bounded regardless of what the operator sets individually.
+        huge_file_budget_gib = int(os.getenv(
+            "ONEDRIVE_HUGE_FILE_RAM_BUDGET_GIB", "2",
+        ))
+        max_huge_files_inflight = max(
+            1,
+            min(
+                file_concurrency,
+                (huge_file_budget_gib * 1024 * 1024 * 1024) // max(
+                    segment_concurrency * segment_size, 1,
+                ),
+            ),
+        )
+        huge_sem = asyncio.Semaphore(max_huge_files_inflight)
+
+        # ---- incremental flush infrastructure ----
+        # Peak in-memory footprint of `updates` is capped by flushing
+        # every ~30s or whenever the backlog exceeds N rows. Without
+        # this, a 50k-file drive accumulates ~50 MB of Python objects
+        # before a single DB commit lands — which is fine for RAM but
+        # hides progress from the UI (snap.item_count stays 0 until
+        # the very end) and masks mid-run failures. The flusher drops
+        # *committed* rows from Python memory immediately after the
+        # UPDATE returns so steady-state heap never grows.
+        flush_interval_s = int(os.getenv("ONEDRIVE_FLUSH_INTERVAL_S", "30"))
+        flush_backlog_cap = int(os.getenv(
+            "ONEDRIVE_FLUSH_BACKLOG_CAP", "500",
+        ))
+        flush_done_evt = asyncio.Event()
+        backlog_high_evt = asyncio.Event()
+        flush_lock = asyncio.Lock()
+
+        async def _flush_updates() -> int:
+            """Drain `updates` atomically, bulk-UPDATE blob_paths,
+            bump snapshot's live counters, and free the Python entries.
+            Safe to call repeatedly (no-op on empty backlog). Wrapped
+            in `flush_lock` so two schedulers don't race on the same
+            rows."""
+            async with flush_lock:
+                async with state_lock:
+                    if not updates:
+                        return 0
+                    pending = list(updates)
+                    updates.clear()
+                    backlog_high_evt.clear()
+                    committed_count = state["uploaded_count"]
+                    committed_bytes = state["bytes_uploaded"]
+
+                import json as _json
+                from sqlalchemy import text as _sqltext
+                async with async_session_factory() as session:
+                    BATCH = 500
+                    for i in range(0, len(pending), BATCH):
+                        chunk = pending[i:i + BATCH]
+                        values_sql = []
+                        params: Dict[str, Any] = {"snap_id": str(snapshot.id)}
+                        for idx, (ext_id, bp, size, sha, extra) in enumerate(chunk):
+                            # asyncpg is strict about VALUES-row type
+                            # inference: bare bound params inside
+                            # (VALUES (...)) come through as `text`,
+                            # and `snapshot_items.content_size` is
+                            # `bigint` — PostgreSQL refuses the
+                            # implicit text→bigint coercion. Explicit
+                            # CASTs keep psycopg + asyncpg happy and
+                            # keep the plan identical.
+                            values_sql.append(
+                                f"(:e{idx}, :bp{idx}, "
+                                f"CAST(:sz{idx} AS bigint), "
+                                f":sh{idx}, CAST(:ex{idx} AS json))"
+                            )
+                            params[f"e{idx}"] = ext_id
+                            params[f"bp{idx}"] = bp
+                            params[f"sz{idx}"] = size
+                            params[f"sh{idx}"] = sha
+                            params[f"ex{idx}"] = _json.dumps(
+                                extra, default=str,
+                            )
+                        # NOTE on column name: the Python ORM attr
+                        # is `extra_data` but maps to the DB column
+                        # `metadata` (SnapshotItem model uses
+                        # `Column("metadata", ...)`). Raw SQL MUST use
+                        # the DB name — asyncpg errors `column
+                        # "extra_data" does not exist` otherwise.
+                        stmt = _sqltext(f"""
+                            UPDATE snapshot_items AS si SET
+                                blob_path = v.blob_path,
+                                content_size = v.sz,
+                                content_hash = v.sh,
+                                content_checksum = v.sh,
+                                metadata = v.ex
+                            FROM (VALUES {','.join(values_sql)})
+                                AS v(ext_id, blob_path, sz, sh, ex)
+                            WHERE si.snapshot_id = CAST(:snap_id AS uuid)
+                              AND si.external_id = v.ext_id
+                        """)
+                        await session.execute(stmt, params)
+                    # Bump the snapshot row so the Recovery UI shows
+                    # live progress instead of sitting at 0 until
+                    # completion.
+                    snap = await session.get(Snapshot, snapshot.id)
+                    if snap is not None:
+                        snap.item_count = committed_count
+                        snap.new_item_count = committed_count
+                        snap.bytes_total = committed_bytes
+                        snap.bytes_added = committed_bytes
+                    await session.commit()
+                print(
+                    f"[{self.worker_id}] [USER_ONEDRIVE] "
+                    f"{resource.display_name}: "
+                    f"{committed_count}/{total_files} files, "
+                    f"{committed_bytes / (1024*1024):.0f} MB "
+                    f"(committed {len(pending)} blob_paths)"
+                )
+                return len(pending)
+
+        async def _periodic_flusher():
+            """Run until `flush_done_evt` fires: wake every
+            `flush_interval_s` *or* when backlog crosses the cap,
+            then flush. Exceptions logged but swallowed so flusher
+            never takes down the gather."""
+            while not flush_done_evt.is_set():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.wait(
+                            [
+                                asyncio.create_task(flush_done_evt.wait()),
+                                asyncio.create_task(backlog_high_evt.wait()),
+                            ],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        ),
+                        timeout=flush_interval_s,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    await _flush_updates()
+                except Exception as fe:
+                    print(
+                        f"[{self.worker_id}] [USER_ONEDRIVE] periodic "
+                        f"flush failed: {type(fe).__name__}: {fe}"
+                    )
 
         async def _process_one(f: Dict[str, Any]):
             file_id = f.get("id")
@@ -2678,18 +2891,27 @@ class BackupWorker:
             )
 
             async with file_sem:
-                try:
-                    download_url, real_size, qxh = await graph_client.get_download_url(drive_id, file_id)
-                except RuntimeError as e:
-                    # Whiteboards, OneNote pages, cloud-native objects have a
-                    # 'file' facet but aren't downloadable — skip silently.
-                    if "downloadurl" in str(e).lower() or "download url" in str(e).lower():
+                # Prefer the pre-fetched $batch URL; only fall back to
+                # a serial GET if $batch returned nothing for this file
+                # (or the batch call failed entirely).
+                batch_hit = batch_url_map.get(file_id)
+                if batch_hit and batch_hit[0]:
+                    download_url, real_size, qxh = batch_hit
+                    if real_size <= 0:
+                        real_size = size_hint
+                else:
+                    try:
+                        download_url, real_size, qxh = await graph_client.get_download_url(drive_id, file_id)
+                    except RuntimeError as e:
+                        # Whiteboards, OneNote pages, cloud-native objects have a
+                        # 'file' facet but aren't downloadable — skip silently.
+                        if "downloadurl" in str(e).lower() or "download url" in str(e).lower():
+                            return
+                        print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {e}")
                         return
-                    print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {e}")
-                    return
-                except Exception as e:
-                    print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {type(e).__name__}: {e}")
-                    return
+                    except Exception as e:
+                        print(f"[{self.worker_id}] [USER_ONEDRIVE] download-url fetch failed for {file_name}: {type(e).__name__}: {e}")
+                        return
 
                 # Streaming pipeline (SeaweedFS/on-prem backend) —
                 # Graph-signed URL is piped directly into the storage
@@ -2741,8 +2963,36 @@ class BackupWorker:
                     else:
                         # Cache miss → real download. Stream from
                         # Graph, hash inline, push into S3/Azure
-                        # multipart. No /tmp file anywhere.
+                        # multipart. No /tmp file anywhere. Files
+                        # above `large_file_threshold` use parallel
+                        # Range GETs for ~K× wall-time speedup on
+                        # TB-scale data; smaller files stick with
+                        # the single-connection streaming path
+                        # because the setup cost isn't worth it.
                         async def _stream_pipe():
+                            stream_meta = {
+                                "source_item_id": file_id,
+                                "source_drive_id": drive_id,
+                                "original-name": file_name,
+                                "quickxor": qxh or "",
+                            }
+                            if real_size >= large_file_threshold:
+                                # Cap concurrent parallel-range
+                                # uploads across the whole drive so a
+                                # pathological case (N huge files at
+                                # once) can't blow past the RAM budget.
+                                async with huge_sem:
+                                    return await self._parallel_range_stream_to_backend(
+                                        download_url=download_url,
+                                        expected_size=real_size,
+                                        container=container,
+                                        blob_path=blob_path,
+                                        shard=shard,
+                                        file_name=file_name,
+                                        metadata=stream_meta,
+                                        segment_size=segment_size,
+                                        segment_concurrency=segment_concurrency,
+                                    )
                             return await self._stream_graph_to_backend(
                                 download_url=download_url,
                                 expected_size=real_size,
@@ -2750,12 +3000,7 @@ class BackupWorker:
                                 blob_path=blob_path,
                                 shard=shard,
                                 file_name=file_name,
-                                metadata={
-                                    "source_item_id": file_id,
-                                    "source_drive_id": drive_id,
-                                    "original-name": file_name,
-                                    "quickxor": qxh or "",
-                                },
+                                metadata=stream_meta,
                             )
                         if per_file_timeout > 0:
                             upload_result = await asyncio.wait_for(
@@ -2787,6 +3032,13 @@ class BackupWorker:
                     updates.append((file_id, blob_path, real_size, sha256, extra_patch))
                     checkpoint.record_file_done(external_id=file_id, size=real_size)
 
+                    # Back-pressure: if the in-memory backlog grows
+                    # past the cap, nudge the flusher to drain now.
+                    # Prevents long-tail runs from holding a GB of
+                    # staged update tuples in heap.
+                    if len(updates) >= flush_backlog_cap:
+                        backlog_high_evt.set()
+
                     if v2_enabled and checkpoint.should_commit(
                         every_files=settings.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES,
                         every_bytes=settings.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES,
@@ -2795,54 +3047,36 @@ class BackupWorker:
                         # inline — commit only needs one DB round-trip.
                         await self._commit_backup_checkpoint(snapshot.job_id, checkpoint)
 
-        await asyncio.gather(*(_process_one(f) for f in ordered))
-
-        if updates:
-            # Bulk UPDATE via VALUES list — replaces the N sequential
-            # UPDATEs with one statement per 500-row chunk. At 10k
-            # files the old pattern committed one row at a time (~5 s
-            # of DB round-trips); this completes in ~500 ms. Chunked
-            # to keep the parameterized statement size sane at very
-            # large snapshots.
-            import json as _json
-            from sqlalchemy import text as _sqltext
-            async with async_session_factory() as session:
-                BATCH = 500
-                for i in range(0, len(updates), BATCH):
-                    chunk = updates[i:i + BATCH]
-                    values_sql = []
-                    params: Dict[str, Any] = {"snap_id": str(snapshot.id)}
-                    for idx, (ext_id, bp, size, sha, extra) in enumerate(chunk):
-                        values_sql.append(
-                            f"(:e{idx}, :bp{idx}, :sz{idx}, :sh{idx}, "
-                            f"CAST(:ex{idx} AS json))"
-                        )
-                        params[f"e{idx}"] = ext_id
-                        params[f"bp{idx}"] = bp
-                        params[f"sz{idx}"] = size
-                        params[f"sh{idx}"] = sha
-                        params[f"ex{idx}"] = _json.dumps(extra, default=str)
-                    stmt = _sqltext(f"""
-                        UPDATE snapshot_items AS si SET
-                            blob_path = v.blob_path,
-                            content_size = v.sz,
-                            content_hash = v.sh,
-                            content_checksum = v.sh,
-                            extra_data = v.ex
-                        FROM (VALUES {','.join(values_sql)})
-                            AS v(ext_id, blob_path, sz, sh, ex)
-                        WHERE si.snapshot_id = CAST(:snap_id AS uuid)
-                          AND si.external_id = v.ext_id
-                    """)
-                    await session.execute(stmt, params)
-                await session.commit()
+        # Spawn the periodic flusher before kicking off the file
+        # pipeline. It wakes every `flush_interval_s` OR when the
+        # backlog cap is hit, committing blob_paths + live-bumping
+        # snap counters so the UI shows progress in real time.
+        flusher_task = asyncio.create_task(_periodic_flusher())
+        try:
+            await asyncio.gather(*(_process_one(f) for f in ordered))
+        finally:
+            # Signal, wait, and do a final flush to catch any residual.
+            flush_done_evt.set()
+            backlog_high_evt.set()  # unblock a waiting flusher fast
+            try:
+                await flusher_task
+            except Exception:
+                pass
+            try:
+                await _flush_updates()
+            except Exception as fe:
+                print(
+                    f"[{self.worker_id}] [USER_ONEDRIVE] final flush "
+                    f"failed: {type(fe).__name__}: {fe}"
+                )
 
         if v2_enabled:
             await self._commit_backup_checkpoint(snapshot.job_id, checkpoint)
 
         print(
             f"[{self.worker_id}] [USER_ONEDRIVE] blobbed {state['uploaded_count']}/{len(ordered)} files "
-            f"({state['bytes_uploaded']} bytes, v2={v2_enabled}, concurrency={file_concurrency})"
+            f"({state['bytes_uploaded']} bytes, v2={v2_enabled}, "
+            f"concurrency={file_concurrency}, huge_parallel={max_huge_files_inflight})"
         )
         return state["uploaded_count"], state["bytes_uploaded"]
 
@@ -3260,6 +3494,153 @@ class BackupWorker:
                 await session.commit()
         return len(items_to_insert), total_bytes
 
+    async def _parallel_range_stream_to_backend(
+        self,
+        download_url: str,
+        expected_size: int,
+        container: str,
+        blob_path: str,
+        shard,
+        file_name: str,
+        metadata: Dict[str, str],
+        segment_size: int = 64 * 1024 * 1024,
+        segment_concurrency: int = 4,
+        chunk_size: int = 8 * 1024 * 1024,
+        max_parallel_parts: int = 4,
+    ) -> Dict[str, Any]:
+        """Parallel Range GET → ordered multipart upload. For huge
+        files (TB-scale VMs, GB-sized media) a single TCP stream from
+        Graph/CDN caps around 50–100 MB/s. Splitting the file into K
+        segments and fetching K of them in parallel multiplies
+        effective bandwidth by ~K on enterprise networks.
+
+        In-order handoff: segments complete in arbitrary order but
+        are yielded to the storage backend strictly by index, so the
+        S3 multipart / Azure block-list sees the exact byte stream it
+        would have seen from a serial download. Dedup, sha256 and
+        resume semantics remain identical to `_stream_graph_to_backend`.
+
+        Peak memory per file ≈ `segment_concurrency * segment_size`;
+        at the default 4 × 64 MB that's 256 MB per large-file upload.
+        With ONEDRIVE_BACKUP_FILE_CONCURRENCY concurrent files, total
+        peak is bounded — chosen to fit comfortably on a 16 GB worker.
+        """
+        import httpx as _httpx
+
+        if expected_size <= 0:
+            raise RuntimeError(
+                f"parallel range requires known size (got "
+                f"{expected_size} for {file_name})"
+            )
+
+        # Build segment list [(idx, lo, hi), ...] covering [0, size).
+        segments: List[Tuple[int, int, int]] = []
+        offset = 0
+        while offset < expected_size:
+            end = min(offset + segment_size, expected_size) - 1
+            segments.append((len(segments), offset, end))
+            offset = end + 1
+
+        # If the file would only produce a single segment, fall back
+        # to the simpler serial streaming pipeline.
+        if len(segments) <= 1:
+            return await self._stream_graph_to_backend(
+                download_url=download_url, expected_size=expected_size,
+                container=container, blob_path=blob_path, shard=shard,
+                file_name=file_name, metadata=metadata,
+                chunk_size=chunk_size,
+                max_parallel_parts=max_parallel_parts,
+            )
+
+        timeout = _httpx.Timeout(
+            connect=15.0, read=300.0, write=60.0, pool=15.0,
+        )
+        limits = _httpx.Limits(
+            max_keepalive_connections=segment_concurrency * 2,
+            max_connections=segment_concurrency * 2,
+        )
+
+        completed: Dict[int, bytes] = {}
+        ready = asyncio.Event()
+        worker_err: List[BaseException] = []
+
+        async def _byte_iter():
+            sem = asyncio.Semaphore(segment_concurrency)
+            async with _httpx.AsyncClient(
+                timeout=timeout, limits=limits,
+                follow_redirects=True, http2=False,
+            ) as client:
+                async def _fetch(idx: int, lo: int, hi: int):
+                    try:
+                        async with sem:
+                            headers = {"Range": f"bytes={lo}-{hi}"}
+                            async with client.stream(
+                                "GET", download_url, headers=headers,
+                            ) as resp:
+                                if resp.status_code not in (200, 206):
+                                    body = await resp.aread()
+                                    raise RuntimeError(
+                                        f"Range {lo}-{hi} HTTP "
+                                        f"{resp.status_code} for "
+                                        f"{file_name}: {body[:200]!r}"
+                                    )
+                                buf = bytearray()
+                                async for part in resp.aiter_bytes(chunk_size):
+                                    if part:
+                                        buf.extend(part)
+                        completed[idx] = bytes(buf)
+                    except BaseException as exc:
+                        worker_err.append(exc)
+                    finally:
+                        ready.set()
+
+                tasks = [
+                    asyncio.create_task(_fetch(idx, lo, hi))
+                    for idx, lo, hi in segments
+                ]
+                try:
+                    next_idx = 0
+                    transferred = 0
+                    last_heartbeat = 0
+                    while next_idx < len(segments):
+                        while next_idx not in completed:
+                            if worker_err:
+                                raise worker_err[0]
+                            ready.clear()
+                            await ready.wait()
+                        buf = completed.pop(next_idx)
+                        next_idx += 1
+                        off = 0
+                        while off < len(buf):
+                            yield buf[off:off + chunk_size]
+                            off += chunk_size
+                        transferred += len(buf)
+                        if transferred - last_heartbeat >= 256 * 1024 * 1024:
+                            print(
+                                f"[{self.worker_id}] [USER_ONEDRIVE] "
+                                f"{file_name}: "
+                                f"{transferred/(1024**2):.0f} MB "
+                                f"(parallel segs "
+                                f"{next_idx}/{len(segments)})"
+                            )
+                            last_heartbeat = transferred
+                finally:
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    for t in tasks:
+                        try:
+                            await t
+                        except (asyncio.CancelledError, Exception):
+                            pass
+
+        return await shard.upload_blob_stream(
+            container, blob_path, _byte_iter(), expected_size,
+            metadata=metadata,
+            chunk_size=chunk_size,
+            max_parallel_parts=max_parallel_parts,
+        )
+
     async def _stream_graph_to_backend(
         self,
         download_url: str,
@@ -3488,63 +3869,257 @@ class BackupWorker:
 
     async def _backup_mailboxes_parallel(self, resources: List[Resource], graph_client: GraphClient,
                                          tenant: Tenant, message: Dict, job_id: uuid.UUID) -> Dict:
-        """Backup multiple mailboxes in parallel"""
+        """Backup MAILBOX / SHARED_MAILBOX / ROOM_MAILBOX resources.
+
+        Optimised identically to the USER_MAIL path:
+          * Per-folder parallel delta drain — each folder pulls only
+            its own deltaLink so subsequent runs fetch just the
+            changes (30-50× wall-time win on incrementals).
+          * Streaming persist — each folder's messages bulk-insert
+            as soon as it drains; snapshot.item_count bumps live so
+            the UI shows progress instead of a 0 ticker until
+            completion, and worker heap stays O(biggest folder)
+            instead of O(whole mailbox).
+          * blake3 + orjson — replaces hashlib.sha256 + json.dumps,
+            which was the per-message bottleneck at ~40 MB/s on
+            stdlib hashing.
+          * `_bulk_upsert_snapshot_items` — single INSERT…ON CONFLICT
+            per folder instead of N AsyncSession.add()+commit calls.
+        """
         semaphore = asyncio.Semaphore(settings.BACKUP_CONCURRENCY)
+
+        mbx_select = (
+            "id,subject,from,toRecipients,ccRecipients,"
+            "sentDateTime,receivedDateTime,bodyPreview,body,"
+            "hasAttachments,parentFolderId"
+        )
+        mbx_fanout = int(os.getenv("MAILBOX_PARALLEL_FOLDERS", "10"))
+        mbx_timeout_s = int(os.getenv("MAILBOX_TIMEOUT_S", "43200"))
 
         async def backup_one_mailbox(resource: Resource):
             async with semaphore:
+                snapshot = None
+                user_label = resource.display_name or resource.external_id
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
-                    delta_token = (resource.extra_data or {}).get("mail_delta_token")
 
-                    messages = await graph_client.get_messages_delta(resource.external_id, delta_token)
-                    items = messages.get("value", [])
-
-                    # Resolve parentFolderId → full hierarchical path (e.g.
-                    # "/Inbox/Project X") once per mailbox. MAILBOX /
-                    # SHARED_MAILBOX / ROOM_MAILBOX all come through here;
-                    # without this the left-panel folder list collapses to a
-                    # single "All" bucket because parentFolderName isn't a
-                    # real Graph field.
-                    folder_tree: Dict[str, str] = {}
                     try:
                         folder_tree = await graph_client.get_mail_folder_tree(resource.external_id)
                     except Exception as e:
-                        print(f"[{self.worker_id}] [MAILBOX] folder tree fetch failed for {resource.external_id}: {type(e).__name__}: {e}")
-                    for m in items:
-                        m["_full_folder_path"] = folder_tree.get(m.get("parentFolderId", ""), "")
+                        print(
+                            f"[{self.worker_id}] [MAILBOX] folder tree "
+                            f"fetch failed for {resource.external_id}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        folder_tree = {}
 
-                    # Process ALL messages in parallel batches — complete backup
-                    batch_tasks = [
-                        self.backup_message_batch(resource, tenant, snapshot, items[i:i+50], job_id)
-                        for i in range(0, len(items), 50)
-                    ]
-                    batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                    existing_tokens: Dict[str, str] = dict(
+                        (resource.extra_data or {}).get(
+                            "mail_delta_tokens_by_folder", {},
+                        ) or {},
+                    )
+                    new_tokens: Dict[str, str] = {}
+                    # Backwards-compat: an older deploy may have written
+                    # a single `mail_delta_token` for the whole mailbox.
+                    # Seed that into the "__all__" slot so we don't lose
+                    # the resume point on the first run after upgrade.
+                    legacy_tok = (resource.extra_data or {}).get("mail_delta_token")
+                    if legacy_tok and "__all__" not in existing_tokens:
+                        existing_tokens["__all__"] = legacy_tok
 
-                    total_items = sum(r.get("item_count", 0) for r in batch_results if isinstance(r, dict))
-                    total_bytes = sum(r.get("bytes_added", 0) for r in batch_results if isinstance(r, dict))
+                    folder_ids = list(folder_tree.keys()) or [None]
+                    mbx_sem = asyncio.Semaphore(max(1, mbx_fanout))
+                    persist_lock = asyncio.Lock()
+                    totals = {"items": 0, "bytes": 0, "folders_done": 0}
+                    start = time.monotonic()
 
-                    # Update delta token
-                    new_delta = messages.get("@odata.deltaLink")
-                    if new_delta:
-                        resource.extra_data = resource.extra_data or {}
-                        resource.extra_data["mail_delta_token"] = new_delta
-                        async with async_session_factory() as sess:
-                            sess.merge(resource)
-                            await sess.commit()
-                            
-                            # Update resource backup info (storage_bytes, last_backup_*)
-                            await self.update_resource_backup_info(sess, resource, job_id, snapshot.id, {
-                                "item_count": total_items,
-                                "bytes_added": total_bytes,
+                    print(
+                        f"[{self.worker_id}] [MAILBOX START] {user_label} "
+                        f"({resource.type.value}) — "
+                        f"{len(folder_ids)} folders"
+                    )
+
+                    async def _stream_persist(msgs: List[Dict[str, Any]], folder_path: str) -> Tuple[int, int]:
+                        if not msgs:
+                            return 0, 0
+                        rows: List[Dict[str, Any]] = []
+                        local_bytes = 0
+                        for m in msgs:
+                            body = _json_dumps_bytes(m)
+                            local_bytes += len(body)
+                            rows.append({
+                                "id": uuid.uuid4(),
+                                "snapshot_id": snapshot.id,
+                                "tenant_id": tenant.id,
+                                "external_id": str(m.get("id") or uuid.uuid4()),
+                                "item_type": "EMAIL",
+                                "name": (m.get("subject") or "(no subject)")[:255],
+                                "folder_path": folder_path or None,
+                                "content_size": len(body),
+                                "content_hash": _fast_hash_hex(body),
+                                "extra_data": {"raw": m},
+                                "content_checksum": None,
                             })
+                        async with persist_lock:
+                            async with async_session_factory() as _sess:
+                                await _bulk_upsert_snapshot_items(_sess, rows)
+                        return len(rows), local_bytes
 
-                    return {"item_count": total_items, "bytes_added": total_bytes}
+                    async def _drain_folder(fid: Optional[str]) -> None:
+                        saved = existing_tokens.get(fid or "__all__")
+                        if saved:
+                            url = saved
+                            params = None
+                        elif fid:
+                            url = (
+                                f"{graph_client.GRAPH_URL}/users/"
+                                f"{resource.external_id}/mailFolders/"
+                                f"{fid}/messages/delta"
+                            )
+                            params = {"$top": "50", "$select": mbx_select}
+                        else:
+                            url = (
+                                f"{graph_client.GRAPH_URL}/users/"
+                                f"{resource.external_id}/messages"
+                            )
+                            params = {"$top": "50", "$select": mbx_select}
+
+                        folder_path = (folder_tree.get(fid) if fid else "") or ""
+                        folder_msgs: List[Dict[str, Any]] = []
+                        delta_out: Optional[str] = None
+                        try:
+                            async with mbx_sem:
+                                async for page in graph_client._iter_pages(
+                                    url, params=params,
+                                ):
+                                    for m in page.get("value", []) or []:
+                                        folder_msgs.append(m)
+                                    if "@odata.deltaLink" in page:
+                                        delta_out = page["@odata.deltaLink"]
+                        except Exception as e:
+                            fid_disp = fid[:8] if fid else "__all__"
+                            print(
+                                f"[{self.worker_id}] [MAILBOX] "
+                                f"folder {fid_disp} drain failed: "
+                                f"{type(e).__name__}: {e} "
+                                f"(kept {len(folder_msgs)})"
+                            )
+                        if delta_out:
+                            new_tokens[fid or "__all__"] = delta_out
+
+                        if folder_msgs:
+                            try:
+                                n, b = await _stream_persist(folder_msgs, folder_path)
+                                totals["items"] += n
+                                totals["bytes"] += b
+                                try:
+                                    async with async_session_factory() as _s2:
+                                        snap = await _s2.get(Snapshot, snapshot.id)
+                                        if snap is not None:
+                                            snap.item_count = totals["items"]
+                                            snap.new_item_count = totals["items"]
+                                            snap.bytes_total = totals["bytes"]
+                                            snap.bytes_added = totals["bytes"]
+                                            await _s2.commit()
+                                except Exception as bump_err:
+                                    print(
+                                        f"[{self.worker_id}] [MAILBOX] "
+                                        f"live item_count bump failed: "
+                                        f"{bump_err}"
+                                    )
+                            except Exception as persist_err:
+                                print(
+                                    f"[{self.worker_id}] [MAILBOX] "
+                                    f"folder "
+                                    f"{fid[:8] if fid else '__all__'} "
+                                    f"streaming persist failed: "
+                                    f"{type(persist_err).__name__}: "
+                                    f"{persist_err}"
+                                )
+
+                        totals["folders_done"] += 1
+                        if totals["folders_done"] % 5 == 0:
+                            print(
+                                f"[{self.worker_id}] [MAILBOX] "
+                                f"{user_label}: "
+                                f"{totals['folders_done']}/"
+                                f"{len(folder_ids)} folders, "
+                                f"{totals['items']} msgs so far"
+                            )
+
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(
+                                *[_drain_folder(fid) for fid in folder_ids],
+                                return_exceptions=True,
+                            ),
+                            timeout=mbx_timeout_s,
+                        )
+                    except asyncio.TimeoutError:
+                        print(
+                            f"[{self.worker_id}] [MAILBOX] TIMEOUT after "
+                            f"{mbx_timeout_s}s for {user_label} "
+                            f"(kept {totals['items']})"
+                        )
+
+                    elapsed = time.monotonic() - start
+                    rate = (totals["items"] / elapsed) if elapsed > 0 else 0
+                    print(
+                        f"[{self.worker_id}] [MAILBOX] {user_label}: "
+                        f"fetched {totals['items']} messages across "
+                        f"{len(folder_ids)} folders in {elapsed:.1f}s "
+                        f"({rate:.1f} msg/s)"
+                    )
+
+                    # Persist per-folder delta tokens (merge, don't
+                    # overwrite — failed folders keep their old tok).
+                    if new_tokens:
+                        try:
+                            async with async_session_factory() as _s:
+                                r = await _s.get(Resource, resource.id)
+                                if r is not None:
+                                    ed = dict(r.extra_data or {})
+                                    merged = dict(
+                                        ed.get("mail_delta_tokens_by_folder", {}) or {},
+                                    )
+                                    merged.update(new_tokens)
+                                    ed["mail_delta_tokens_by_folder"] = merged
+                                    # Drop the legacy single-token so
+                                    # subsequent runs only use the
+                                    # per-folder map.
+                                    ed.pop("mail_delta_token", None)
+                                    r.extra_data = ed
+                                    await _s.commit()
+                        except Exception as _e:
+                            print(
+                                f"[{self.worker_id}] [MAILBOX] delta "
+                                f"persist failed: {_e}"
+                            )
+
+                    async with async_session_factory() as sess:
+                        await self.update_resource_backup_info(
+                            sess, resource, job_id, snapshot.id,
+                            {"item_count": totals["items"],
+                             "bytes_added": totals["bytes"]},
+                        )
+
+                    return {"item_count": totals["items"], "bytes_added": totals["bytes"]}
                 except Exception as e:
-                    print(f"[{self.worker_id}] Mailbox backup failed for {resource.id}: {e}")
+                    print(
+                        f"[{self.worker_id}] Mailbox backup failed for "
+                        f"{resource.id}: {type(e).__name__}: {e}"
+                    )
+                    if snapshot is not None:
+                        try:
+                            async with async_session_factory() as s:
+                                await self.fail_snapshot(s, snapshot, e)
+                        except Exception:
+                            pass
                     return {"item_count": 0, "bytes_added": 0}
 
-        results = await asyncio.gather(*[backup_one_mailbox(r) for r in resources], return_exceptions=True)
+        results = await asyncio.gather(
+            *[backup_one_mailbox(r) for r in resources], return_exceptions=True,
+        )
         return {
             "item_count": sum(r.get("item_count", 0) for r in results if isinstance(r, dict)),
             "bytes_added": sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict)),
@@ -3808,18 +4383,17 @@ class BackupWorker:
 
             if backup_group_mailbox and group_mail_enabled and is_unified:
                 try:
-                    group_mailbox_items, mailbox_bytes = await self.backup_group_mailbox_content(
+                    # backup_group_mailbox_content now persists inline
+                    # via _bulk_upsert_snapshot_items — returns counts,
+                    # no list to re-add.
+                    mbx_count, mailbox_bytes = await self.backup_group_mailbox_content(
                         resource,
                         tenant,
                         snapshot,
                         graph_client,
                     )
                     bytes_added += mailbox_bytes
-                    item_count += len(group_mailbox_items)
-                    if group_mailbox_items:
-                        async with async_session_factory() as session:
-                            session.add_all(group_mailbox_items)
-                            await session.commit()
+                    item_count += mbx_count
                 except Exception as mbx_exc:
                     logger.warning(
                         "[%s] Group mailbox backup skipped for %s: %s",
@@ -4204,14 +4778,12 @@ class BackupWorker:
             #
             # Group mailbox.
             try:
-                mbx_items, mbx_bytes = await self.backup_group_mailbox_content(
+                # New signature: (count, bytes). Items persist inline
+                # via _bulk_upsert_snapshot_items.
+                mbx_count, mbx_bytes = await self.backup_group_mailbox_content(
                     resource, tenant, snapshot, graph_client,
                 )
-                if mbx_items:
-                    async with async_session_factory() as session:
-                        session.add_all(mbx_items)
-                        await session.commit()
-                    item_count += len(mbx_items)
+                item_count += mbx_count
                 bytes_added += mbx_bytes
             except Exception as mbx_exc:
                 logger.warning(
@@ -7773,115 +8345,292 @@ class BackupWorker:
         tenant: Tenant,
         snapshot: Snapshot,
         graph_client: GraphClient,
-    ) -> tuple[List[SnapshotItem], int]:
-        """Back up Microsoft 365 group mailbox threads and posts."""
+    ) -> tuple[int, int]:
+        """Back up Microsoft 365 group mailbox threads + posts.
+
+        Returns ``(item_count, bytes_added)``. Items are persisted
+        inline via `_bulk_upsert_snapshot_items` — callers no longer
+        need to do `session.add_all(returned_items)`.
+
+        Optimisations over the legacy per-thread pattern:
+          * `$batch` bundles 20 `/groups/{gid}/threads/{tid}/posts`
+            calls per HTTP request, collapsing the thread-fanout
+            round-trip count by 20×.
+          * Incremental fetch: only threads whose
+            `lastDeliveredDateTime` exceeds the saved watermark are
+            drained; the rest skip entirely. First run does a full
+            scan (no watermark yet).
+          * orjson + blake3 replace json.dumps + hashlib.sha256 —
+            the latter caps ~40 MB/s on cold hashing; blake3 is
+            7-10× faster on the same bytes.
+          * Bulk pg insert per chunk instead of N `add_all` commits.
+        """
+        from shared.graph_batch import BatchRequest
+        import re as _re
+
         group_id = resource.external_id
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "group-mailbox")
-        db_items: List[SnapshotItem] = []
-        bytes_added = 0
+
+        # Incremental watermark — `lastDeliveredDateTime` on the
+        # thread is Graph's authoritative "most recent activity" stamp.
+        # Saved after a successful run so subsequent runs only process
+        # threads touched since.
+        existing_ed = dict(resource.extra_data or {})
+        watermark = existing_ed.get("group_mailbox_watermark")
 
         threads = await graph_client.get_group_threads(group_id)
-        thread_list = threads.get("value", [])
-        logger.info("[%s] [GROUP_MAILBOX] %s threads found for %s", self.worker_id, len(thread_list), resource.display_name)
+        thread_list = threads.get("value", []) or []
 
-        async def backup_thread(thread: Dict[str, Any]) -> tuple[List[SnapshotItem], int]:
-            local_items: List[SnapshotItem] = []
-            local_bytes = 0
-            thread_id = thread.get("id", str(uuid.uuid4()))
+        def _thread_stamp(t: Dict[str, Any]) -> str:
+            return (
+                t.get("lastDeliveredDateTime")
+                or t.get("lastModifiedDateTime")
+                or ""
+            )
+
+        # Keep only threads newer than the saved watermark. First run
+        # (no watermark) processes everything.
+        if watermark:
+            active_threads = [
+                t for t in thread_list if _thread_stamp(t) > watermark
+            ]
+        else:
+            active_threads = thread_list
+
+        logger.info(
+            "[%s] [GROUP_MAILBOX] %s/%s threads to process for %s "
+            "(watermark=%s)",
+            self.worker_id, len(active_threads), len(thread_list),
+            resource.display_name, watermark or "(none)",
+        )
+
+        # Compute next watermark = max stamp across the whole thread
+        # list (including ones we skipped) — so if all threads are
+        # already archived we still advance past any old cursor.
+        next_watermark = max(
+            (_thread_stamp(t) for t in thread_list), default=watermark,
+        ) or watermark
+
+        totals = {"items": 0, "bytes": 0}
+        totals_lock = asyncio.Lock()
+
+        async def _bulk_persist(rows: List[Dict[str, Any]]) -> None:
+            if not rows:
+                return
+            async with async_session_factory() as _sess:
+                await _bulk_upsert_snapshot_items(_sess, rows)
+
+        # ---- Step 1: persist thread envelopes ----
+        thread_rows: List[Dict[str, Any]] = []
+        thread_bytes_total = 0
+        thread_uploads: List[Tuple[str, str, bytes, str]] = []  # (thread_id, blob_path, bytes, hash)
+        for thread in active_threads:
+            thread_id = thread.get("id") or str(uuid.uuid4())
             conversation_id = thread.get("conversationId")
-            thread_bytes = json.dumps(thread).encode()
-            thread_hash = hashlib.sha256(thread_bytes).hexdigest()
-            thread_blob_path = azure_storage_manager.build_blob_path(
-                str(tenant.id),
-                str(resource.id),
-                str(snapshot.id),
+            t_body = _json_dumps_bytes(thread)
+            t_hash = _fast_hash_hex(t_body)
+            t_blob = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id),
                 f"group_thread_{thread_id}",
             )
-            thread_upload = await upload_blob_with_retry(container, thread_blob_path, thread_bytes, shard)
-            if thread_upload.get("success"):
-                local_items.append(SnapshotItem(
-                    snapshot_id=snapshot.id,
-                    tenant_id=tenant.id,
-                    external_id=thread_id,
-                    item_type="GROUP_MAILBOX_THREAD",
-                    name=thread.get("topic") or thread.get("id", thread_id),
-                    folder_path="group-mailbox/threads",
-                    content_hash=thread_hash,
-                    content_size=len(thread_bytes),
-                    blob_path=thread_blob_path,
-                    extra_data={"raw": thread, "conversationId": conversation_id},
-                    content_checksum=thread_hash,
-                ))
-                local_bytes += len(thread_bytes)
+            thread_uploads.append((thread_id, t_blob, t_body, t_hash))
+            thread_rows.append({
+                "id": uuid.uuid4(),
+                "snapshot_id": snapshot.id,
+                "tenant_id": tenant.id,
+                "external_id": thread_id,
+                "item_type": "GROUP_MAILBOX_THREAD",
+                "name": (thread.get("topic") or thread_id)[:255],
+                "folder_path": "group-mailbox/threads",
+                "content_hash": t_hash,
+                "content_size": len(t_body),
+                "blob_path": t_blob,
+                "extra_data": {
+                    "raw": thread,
+                    "conversationId": conversation_id,
+                },
+                "content_checksum": t_hash,
+            })
+            thread_bytes_total += len(t_body)
 
+        async def _upload_thread_envelope(tid: str, path: str, body: bytes, hh: str) -> bool:
             try:
-                posts = await graph_client.get_group_thread_posts(group_id, thread_id)
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 404:
-                    logger.warning("[%s] [GROUP_MAILBOX] Thread %s disappeared while fetching posts", self.worker_id, thread_id)
-                    return local_items, local_bytes
-                raise
-
-            # Posts carry body + from + receivedDateTime but NOT the subject —
-            # the subject lives on the parent thread as `topic`. Enrich each
-            # post so the frontend (EmailItemRow / EmailPreview) gets the
-            # same shape as a user's EMAIL item: raw.subject + raw.bodyPreview.
-            thread_topic = thread.get("topic") or ""
-            for post in posts.get("value", []):
-                post_id = post.get("id", str(uuid.uuid4()))
-                # Inject subject + a short bodyPreview if missing so the UI
-                # mirrors user-mail rendering without frontend special-casing.
-                if not post.get("subject") and thread_topic:
-                    post["subject"] = thread_topic
-                if not post.get("bodyPreview"):
-                    raw_body = (post.get("body") or {}).get("content") or ""
-                    # Strip HTML tags for a plain-text preview.
-                    import re as _re
-                    post["bodyPreview"] = _re.sub(r"<[^>]+>", " ", raw_body).strip()[:180]
-                # Normalise sentDateTime for EmailItemRow which prefers it.
-                if not post.get("sentDateTime"):
-                    post["sentDateTime"] = post.get("receivedDateTime")
-
-                post_bytes = json.dumps(post).encode()
-                post_hash = hashlib.sha256(post_bytes).hexdigest()
-                post_blob_path = azure_storage_manager.build_blob_path(
-                    str(tenant.id),
-                    str(resource.id),
-                    str(snapshot.id),
-                    f"group_post_{thread_id}_{post_id}",
+                r = await upload_blob_with_retry(container, path, body, shard)
+                return bool(r.get("success"))
+            except Exception as e:
+                logger.warning(
+                    "[%s] [GROUP_MAILBOX] thread envelope upload "
+                    "failed for %s: %s", self.worker_id, tid, e,
                 )
-                post_upload = await upload_blob_with_retry(container, post_blob_path, post_bytes, shard)
-                if post_upload.get("success"):
-                    local_items.append(SnapshotItem(
-                        snapshot_id=snapshot.id,
-                        tenant_id=tenant.id,
-                        external_id=post_id,
-                        item_type="GROUP_MAILBOX_POST",
-                        name=post.get("subject") or thread_topic or post_id,
-                        folder_path=f"group-mailbox/threads/{thread_topic or thread_id}",
-                        content_hash=post_hash,
-                        content_size=len(post_bytes),
-                        blob_path=post_blob_path,
-                        extra_data={"raw": post, "threadId": thread_id, "conversationId": conversation_id, "threadTopic": thread_topic},
-                        content_checksum=post_hash,
-                    ))
-                    local_bytes += len(post_bytes)
+                return False
 
-            return local_items, local_bytes
+        if thread_uploads:
+            upload_results = await asyncio.gather(
+                *[_upload_thread_envelope(tid, p, b, h) for tid, p, b, h in thread_uploads],
+                return_exceptions=True,
+            )
+            kept = [row for row, ok in zip(thread_rows, upload_results) if ok is True]
+            await _bulk_persist(kept)
+            totals["items"] += len(kept)
+            totals["bytes"] += thread_bytes_total
 
-        thread_results = await asyncio.gather(
-            *[backup_thread(thread) for thread in thread_list],
-            return_exceptions=True,
+        # ---- Step 2: fetch posts in $batch groups of 20 ----
+        thread_topics = {
+            t.get("id"): (t.get("topic") or "") for t in active_threads
+        }
+        thread_convs = {
+            t.get("id"): t.get("conversationId") for t in active_threads
+        }
+
+        BATCH = 20
+
+        async def _process_batch(batch_threads: List[Dict[str, Any]]) -> None:
+            reqs = [
+                BatchRequest(
+                    id=t["id"], method="GET",
+                    url=f"/groups/{group_id}/threads/{t['id']}/posts",
+                )
+                for t in batch_threads if t.get("id")
+            ]
+            if not reqs:
+                return
+            try:
+                responses = await graph_client.batch(reqs)
+            except Exception as e:
+                logger.warning(
+                    "[%s] [GROUP_MAILBOX] $batch posts failed for %s: "
+                    "%s — retrying per-thread",
+                    self.worker_id, resource.display_name, e,
+                )
+                # Per-thread fallback so one bad thread doesn't poison
+                # the whole batch.
+                responses = {}
+                for t in batch_threads:
+                    tid = t.get("id")
+                    if not tid:
+                        continue
+                    try:
+                        resp_body = await graph_client.get_group_thread_posts(group_id, tid)
+                        class _R: status = 200; body = resp_body  # noqa: E701,E702
+                        responses[tid] = _R()
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code == 404:
+                            continue
+                        logger.warning(
+                            "[%s] [GROUP_MAILBOX] posts fallback "
+                            "failed for %s: %s",
+                            self.worker_id, tid, exc,
+                        )
+
+            post_rows: List[Dict[str, Any]] = []
+            post_uploads: List[Tuple[str, str, bytes]] = []
+            post_idx: List[int] = []
+            batch_bytes = 0
+
+            for tid, resp in responses.items():
+                if resp is None or getattr(resp, "status", 200) != 200:
+                    continue
+                body = getattr(resp, "body", None) or {}
+                posts = body.get("value", []) or []
+                topic = thread_topics.get(tid, "")
+                conv = thread_convs.get(tid)
+                for post in posts:
+                    post_id = post.get("id") or str(uuid.uuid4())
+                    if not post.get("subject") and topic:
+                        post["subject"] = topic
+                    if not post.get("bodyPreview"):
+                        raw_body = (post.get("body") or {}).get("content") or ""
+                        post["bodyPreview"] = _re.sub(
+                            r"<[^>]+>", " ", raw_body,
+                        ).strip()[:180]
+                    if not post.get("sentDateTime"):
+                        post["sentDateTime"] = post.get("receivedDateTime")
+
+                    p_body = _json_dumps_bytes(post)
+                    p_hash = _fast_hash_hex(p_body)
+                    p_blob = azure_storage_manager.build_blob_path(
+                        str(tenant.id), str(resource.id), str(snapshot.id),
+                        f"group_post_{tid}_{post_id}",
+                    )
+                    post_rows.append({
+                        "id": uuid.uuid4(),
+                        "snapshot_id": snapshot.id,
+                        "tenant_id": tenant.id,
+                        "external_id": post_id,
+                        "item_type": "GROUP_MAILBOX_POST",
+                        "name": (post.get("subject") or topic or post_id)[:255],
+                        "folder_path": (
+                            f"group-mailbox/threads/{topic or tid}"
+                        )[:255],
+                        "content_hash": p_hash,
+                        "content_size": len(p_body),
+                        "blob_path": p_blob,
+                        "extra_data": {
+                            "raw": post,
+                            "threadId": tid,
+                            "conversationId": conv,
+                            "threadTopic": topic,
+                        },
+                        "content_checksum": p_hash,
+                    })
+                    post_uploads.append((post_id, p_blob, p_body))
+                    batch_bytes += len(p_body)
+
+            if not post_uploads:
+                return
+
+            up_results = await asyncio.gather(
+                *[upload_blob_with_retry(container, p, b, shard) for _pid, p, b in post_uploads],
+                return_exceptions=True,
+            )
+            kept_rows = []
+            kept_bytes = 0
+            for row, (_pid, _p, b), res in zip(post_rows, post_uploads, up_results):
+                if isinstance(res, dict) and res.get("success"):
+                    kept_rows.append(row)
+                    kept_bytes += len(b)
+            await _bulk_persist(kept_rows)
+            async with totals_lock:
+                totals["items"] += len(kept_rows)
+                totals["bytes"] += kept_bytes
+
+        # Fan out $batch groups in parallel — 4 groups × 20 threads
+        # per HTTP call lets a 1000-thread group finish in ~13 HTTP
+        # calls instead of 1000.
+        batch_sem = asyncio.Semaphore(4)
+        batches = [
+            active_threads[i:i + BATCH]
+            for i in range(0, len(active_threads), BATCH)
+        ]
+
+        async def _run_batch(b: List[Dict[str, Any]]) -> None:
+            async with batch_sem:
+                await _process_batch(b)
+
+        await asyncio.gather(
+            *[_run_batch(b) for b in batches], return_exceptions=True,
         )
-        for result in thread_results:
-            if isinstance(result, tuple):
-                db_items.extend(result[0])
-                bytes_added += result[1]
-            elif isinstance(result, Exception):
-                logger.warning("[%s] [GROUP_MAILBOX] Thread backup failed for %s: %s", self.worker_id, resource.display_name, result)
 
-        return db_items, bytes_added
+        # Advance the watermark so next run processes only fresh
+        # activity. Written even on 0-new-item runs so a quiet group
+        # doesn't re-enumerate forever.
+        if next_watermark and next_watermark != watermark:
+            try:
+                async with async_session_factory() as _s:
+                    r = await _s.get(Resource, resource.id)
+                    if r is not None:
+                        ed = dict(r.extra_data or {})
+                        ed["group_mailbox_watermark"] = next_watermark
+                        r.extra_data = ed
+                        await _s.commit()
+            except Exception as _e:
+                logger.warning(
+                    "[%s] [GROUP_MAILBOX] watermark persist failed "
+                    "for %s: %s", self.worker_id, resource.display_name, _e,
+                )
+
+        return totals["items"], totals["bytes"]
 
     async def create_snapshot(
         self,

@@ -164,6 +164,15 @@ class Settings:
         self.ONEDRIVE_RESTORE_CONCURRENCY = int(os.getenv("ONEDRIVE_RESTORE_CONCURRENCY", "16"))
         self.ONEDRIVE_RESTORE_CHUNK_BYTES = int(os.getenv("ONEDRIVE_RESTORE_CHUNK_BYTES", str(10 * 1024 * 1024)))
         self.ONEDRIVE_RESTORE_PER_TARGET_USER_CAP = int(os.getenv("ONEDRIVE_RESTORE_PER_TARGET_USER_CAP", "5"))
+        # Files above this size restore via uploadSession fed directly
+        # by the backend's download_stream — avoids materialising the
+        # whole blob in worker RAM. Below this, stay on the simpler
+        # buffered path for backwards-compatibility with existing
+        # restore tests.
+        self.ONEDRIVE_RESTORE_STREAMING_THRESHOLD_BYTES = int(os.getenv(
+            "ONEDRIVE_RESTORE_STREAMING_THRESHOLD_BYTES",
+            str(64 * 1024 * 1024),
+        ))
         # ---- Entra Restore v2 ----
         # Default on; set to "false" in env to disable EntraRestoreEngine
         # + EntraExportPipeline and fall back to the legacy PATCH-only
@@ -217,6 +226,21 @@ class Settings:
         self.ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS = int(os.getenv("ONEDRIVE_BACKUP_FILE_TIMEOUT_SECONDS", "21600"))
         self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_FILES", "500"))
         self.ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES = int(os.getenv("ONEDRIVE_BACKUP_CHECKPOINT_EVERY_BYTES", str(1024 * 1024 * 1024)))
+        # Parallel Range-GET for huge files: files above this size use
+        # N concurrent Range requests against the Graph pre-signed URL
+        # to saturate enterprise bandwidth (single TCP caps ~80 MB/s).
+        # Peak mem per file ≈ segment_concurrency * segment_size.
+        self.ONEDRIVE_LARGE_FILE_THRESHOLD_BYTES = int(os.getenv(
+            "ONEDRIVE_LARGE_FILE_THRESHOLD_BYTES",
+            str(256 * 1024 * 1024),
+        ))
+        self.ONEDRIVE_LARGE_FILE_SEGMENT_BYTES = int(os.getenv(
+            "ONEDRIVE_LARGE_FILE_SEGMENT_BYTES",
+            str(64 * 1024 * 1024),
+        ))
+        self.ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY = int(os.getenv(
+            "ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY", "4",
+        ))
 
         # ── Heavy backup pool ──
         # Default on: route OneDrive drives above the heavy threshold to

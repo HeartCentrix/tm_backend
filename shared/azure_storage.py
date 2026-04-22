@@ -12,6 +12,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import os
 import re
 import time
 import uuid
@@ -758,25 +759,57 @@ class AzureStorageManager:
         self._initialize_shards()
     
     def _initialize_shards(self):
-        """Initialize storage shards from configuration"""
-        # If sharding is configured, use multiple accounts
+        """Initialize storage shards from configuration.
+
+        The Azure shard objects are constructed eagerly so the toggle-
+        worker can flip the router back to Azure without a process
+        restart. However, when the router is on the on-prem backend
+        (SeaweedFS), the Azure shard is **never used** for I/O — all
+        calls go through `_router_facade`. We still build the shard
+        (so the toggle path works), but we demote the init log to
+        DEBUG-style so operators running exclusively on-prem don't
+        get confused by an "Initialized ... azure account" banner
+        that implies Azure traffic.
+        """
+        # Decide whether to emit the "active" banner. Treat the log as
+        # interesting only if the operator hasn't explicitly marked
+        # on-prem via ACTIVE_STORAGE_BACKEND=seaweedfs. The router
+        # load path overrides this later anyway.
+        active_pref = (os.getenv("ACTIVE_STORAGE_BACKEND") or "").lower()
+        azure_is_active_hint = active_pref not in ("seaweedfs", "onprem", "on_prem")
+
         if settings.STORAGE_SHARD_ACCOUNTS and settings.STORAGE_SHARD_KEYS:
             for i, (account, key) in enumerate(zip(
-                settings.STORAGE_SHARD_ACCOUNTS, 
+                settings.STORAGE_SHARD_ACCOUNTS,
                 settings.STORAGE_SHARD_KEYS
             )):
                 shard = AzureStorageShard(account, key, shard_index=i)
                 self.shards.append(shard)
-                print(f"[AzureStorage] Initialized shard {i}: {account}")
-        # Fall back to single account
+                if azure_is_active_hint:
+                    print(f"[AzureStorage] Initialized shard {i}: {account}")
+                else:
+                    print(
+                        f"[AzureStorage] (standby) shard {i}: {account} — "
+                        f"router active on on-prem backend, not in use",
+                    )
         elif settings.AZURE_STORAGE_ACCOUNT_NAME and settings.AZURE_STORAGE_ACCOUNT_KEY:
             shard = AzureStorageShard(
-                settings.AZURE_STORAGE_ACCOUNT_NAME, 
+                settings.AZURE_STORAGE_ACCOUNT_NAME,
                 settings.AZURE_STORAGE_ACCOUNT_KEY,
                 shard_index=0
             )
             self.shards.append(shard)
-            print(f"[AzureStorage] Initialized single shard: {settings.AZURE_STORAGE_ACCOUNT_NAME}")
+            if azure_is_active_hint:
+                print(
+                    f"[AzureStorage] Initialized single shard: "
+                    f"{settings.AZURE_STORAGE_ACCOUNT_NAME}",
+                )
+            else:
+                print(
+                    f"[AzureStorage] (standby) single shard "
+                    f"{settings.AZURE_STORAGE_ACCOUNT_NAME} — "
+                    f"router active on on-prem backend, not in use",
+                )
         else:
             print("[AzureStorage] WARNING: No Azure Storage configured")
     

@@ -117,8 +117,40 @@ class OneDriveRestoreEngine:
                   f"{blob_path} failed: {type(exc).__name__}: {exc}", flush=True)
             return None
 
+    async def _iter_blob_stream(
+        self, item: SnapshotItem, chunk_size: int = 8 * 1024 * 1024,
+    ):
+        """Async-iterate blob bytes from the active storage backend
+        (SeaweedFS or Azure Blob via the facade) in bounded chunks.
+        Used by the streaming large-file restore path so a 100 GB
+        file never materialises in worker RAM.
+        """
+        blob_path = getattr(item, "blob_path", None)
+        if not blob_path:
+            return
+        shard = azure_storage_manager.get_shard_for_resource(
+            str(getattr(self.source, "id", "")), str(self.tenant_id),
+        )
+        container = azure_storage_manager.get_container_name(
+            str(self.tenant_id), "files",
+        )
+        async for chunk in shard.download_blob_stream(
+            container, blob_path, chunk_size=chunk_size,
+        ):
+            if chunk:
+                yield chunk
+
     async def upload_one(self, item: SnapshotItem) -> ItemOutcome:
-        """Upload one SnapshotItem to the target drive."""
+        """Upload one SnapshotItem to the target drive.
+
+        Three size regimes:
+          * < 4 MiB — Graph simple PUT, fully buffered (Graph requires)
+          * 4 MiB ≤ size ≤ STREAMING_THRESHOLD — uploadSession w/
+            buffered bytes (backwards-compatible)
+          * > STREAMING_THRESHOLD — uploadSession fed directly by
+            the backend's download_stream, so a 100 GB restore
+            never materialises 100 GB in worker RAM.
+        """
         name = getattr(item, "name", None) or getattr(item, "external_id", "item")
         size = int(getattr(item, "content_size", 0) or 0)
 
@@ -126,16 +158,36 @@ class OneDriveRestoreEngine:
             item, self.mode, self.separate_folder_root,
         )
 
-        body = await self._read_blob_bytes(item)
-        if body is None:
-            return ItemOutcome(
-                item_id=str(getattr(item, "id", "")),
-                external_id=getattr(item, "external_id", ""),
-                name=name, outcome="skipped", reason="blob_missing",
-            )
+        streaming_threshold = getattr(
+            settings, "ONEDRIVE_RESTORE_STREAMING_THRESHOLD_BYTES",
+            64 * 1024 * 1024,
+        )
+        streaming_eligible = size > streaming_threshold
+
+        body: Optional[bytes] = None
+        if not streaming_eligible:
+            body = await self._read_blob_bytes(item)
+            if body is None:
+                return ItemOutcome(
+                    item_id=str(getattr(item, "id", "")),
+                    external_id=getattr(item, "external_id", ""),
+                    name=name, outcome="skipped", reason="blob_missing",
+                )
 
         try:
-            if size < SMALL_FILE_MAX_BYTES:
+            if streaming_eligible:
+                created = await self.graph.upload_large_file_stream_to_drive(
+                    drive_id=self.target_user_id,
+                    drive_path=drive_path,
+                    byte_iter=self._iter_blob_stream(
+                        item,
+                        chunk_size=settings.ONEDRIVE_RESTORE_CHUNK_BYTES,
+                    ),
+                    total_size=size,
+                    chunk_size=settings.ONEDRIVE_RESTORE_CHUNK_BYTES,
+                    conflict_behavior=conflict,
+                )
+            elif size < SMALL_FILE_MAX_BYTES:
                 created = await self.graph.upload_small_file_to_drive(
                     drive_id=self.target_user_id,
                     drive_path=drive_path,
@@ -180,10 +232,11 @@ class OneDriveRestoreEngine:
         outcome_label = "overwritten" if conflict == "replace" else (
             "renamed" if (created or {}).get("name") != name else "created"
         )
+        bytes_moved = len(body) if body is not None else size
         return ItemOutcome(
             item_id=str(getattr(item, "id", "")),
             external_id=getattr(item, "external_id", ""),
-            name=name, outcome=outcome_label, size_bytes=len(body),
+            name=name, outcome=outcome_label, size_bytes=bytes_moved,
         )
 
     # ---------- orchestrator ----------
