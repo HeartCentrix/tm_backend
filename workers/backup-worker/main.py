@@ -43,6 +43,30 @@ except ImportError:
         return _stdlib_json.dumps(obj, default=str).encode("utf-8")
 
 
+# BLAKE3 is ~7-10× faster than SHA-256 on modern CPUs (no SHA-NI needed,
+# uses SIMD everywhere). Same 256-bit digest length as SHA-256 so the
+# DB column stays the same size. We use it ONLY for the per-item
+# integrity hash (content_hash) where there is no cross-release
+# comparison concern.
+#
+# content_checksum (used by the idx_snapshot_items_tenant_checksum
+# cross-snapshot dedup index) still uses SHA-256 on the file/attachment
+# paths so existing dedup doesn't silently break. Inline items (chat
+# msgs, mail bodies) set content_checksum=None because Graph's own
+# message id is the real dedup key — no value in hashing the JSON
+# payload for those.
+try:
+    from blake3 import blake3 as _blake3  # type: ignore
+
+    def _fast_hash_hex(body: bytes) -> str:
+        return _blake3(body).hexdigest()
+except ImportError:
+    import hashlib as _stdlib_hash
+
+    def _fast_hash_hex(body: bytes) -> str:
+        return _stdlib_hash.sha256(body).hexdigest()
+
+
 # Chunk size for multi-row INSERTs. 2000 rows × ~2 KB each keeps a single
 # statement well under Postgres' 1 GB protocol limit while being large
 # enough to amortize per-statement overhead (10-50× faster than per-row
@@ -1565,11 +1589,14 @@ class BackupWorker:
                         # directly so we skip the .encode("utf-8") hop.
                         body = _json_dumps_bytes(extra.get("raw", extra))
                         bytes_total += len(body)
-                        # Compute the hash ONCE — the previous code ran
-                        # sha256 twice per item for identical content
-                        # (content_hash + content_checksum both read the
-                        # same bytes), doubling CPU for zero benefit.
-                        body_hash = hashlib.sha256(body).hexdigest()
+                        # blake3 for the per-item integrity hash — ~7-10×
+                        # faster than sha256 on modern CPUs. We store it
+                        # in content_hash only; content_checksum (the
+                        # cross-snapshot dedup index target) is left None
+                        # for inline items since Graph's own id is the
+                        # real dedup key and hashing inline JSON didn't
+                        # actually contribute to dedup.
+                        body_hash = _fast_hash_hex(body)
                         db_rows.append({
                             "id": uuid.uuid4(),
                             "snapshot_id": snapshot.id,
@@ -1581,7 +1608,7 @@ class BackupWorker:
                             "content_size": len(body),
                             "content_hash": body_hash,
                             "extra_data": extra,
-                            "content_checksum": body_hash,
+                            "content_checksum": None,
                         })
                     if db_rows:
                         await _bulk_upsert_snapshot_items(session, db_rows)
