@@ -12,3 +12,17 @@ pydantic>=2.5
 pydantic-settings>=2.1
 python-dotenv>=1.0.0
 apscheduler>=3.10
+# orjson: 5-10× faster than stdlib json on the hot per-item serialize
+# path (snapshot_items.extra_data for chats/mail). Defensive import in
+# main.py falls back to stdlib json if not installed.
+orjson>=3.10
+# blake3: ~7-10× faster than sha256 on modern CPUs for the per-item
+# integrity hash path. Defensive import falls back to hashlib.sha256
+# when not available. Kept scoped to content_hash only — content_checksum
+# (cross-snapshot dedup index target) stays sha256 so existing indexed
+# rows continue to match.
+blake3>=1.0
+# On-prem storage backend (SeaweedFS) — pulled in by shared.storage
+aioboto3>=15.5.0,<16
+aiobotocore>=2.25.0,<3
+boto3>=1.40.0,<2

@@ -8,6 +8,8 @@ services:
       POSTGRES_USER: ${DB_USERNAME}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     command: postgres -c max_connections=300 -c shared_buffers=256MB
+    ports:
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -73,6 +75,41 @@ services:
     profiles:
       - test
     restart: unless-stopped
+
+  # SeaweedFS — local S3-compatible object store used for on-prem backend
+  # contract tests. Started only under the `test` profile.
+  # Object Lock + versioning enabled at bucket creation — see
+  # tests/fixtures/seaweedfs-s3.json and the _ensure_test_bucket fixture.
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.71
+    container_name: tm_vault_seaweedfs
+    command:
+      - "server"
+      - "-dir=/data"
+      - "-ip=0.0.0.0"
+      - "-s3"
+      - "-s3.config=/config/s3.json"
+      - "-filer"
+      # Volume size + preallocation sized for dev hosts with tight disk.
+      # 1024 MB + default preallocation refuses all writes on a machine
+      # with <1 GB free (preflight probe fails with "no free volumes").
+      # Smaller volumes + no preallocation makes writes work on any host;
+      # throughput impact is negligible for per-backup object patterns.
+      - "-master.volumeSizeLimitMB=256"
+      - "-volume.max=0"
+      - "-volume.preStopSeconds=1"
+      - "-master.volumePreallocate=false"
+    volumes:
+      - ./tests/fixtures/seaweedfs-s3.json:/config/s3.json:ro
+      - seaweedfs_data:/data
+    ports:
+      - "8333:8333"
+      - "9333:9333"
+    profiles:
+      - test
+    restart: unless-stopped
+    networks:
+      - tm-network
 
   api-gateway:
     build:
@@ -659,6 +696,7 @@ volumes:
   postgres_data:
   redis_data:
   azurite_data:
+  seaweedfs_data:
 
 networks:
   tm-network:

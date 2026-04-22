@@ -343,7 +343,20 @@ class AzureStorageShard:
         instance.shard_index = shard_index
         instance._async_client = AsyncBlobServiceClient.from_connection_string(connection_string)
         instance._sync_client = None
-        instance.account_name = "devstoreaccount1"
+        # Parse AccountName + AccountKey out of the connection string so SAS
+        # generation works. Falls back to the Azurite well-known pair when
+        # omitted (enables Azurite's default creds via short conn strings).
+        parts = {}
+        for kv in connection_string.split(";"):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                parts[k.strip()] = v.strip()
+        instance.account_name = parts.get("AccountName", "devstoreaccount1")
+        instance.account_key = parts.get(
+            "AccountKey",
+            # Azurite well-known account key
+            "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
+        )
         return instance
 
     async def ensure_container(self, container_name: str) -> None:
@@ -499,7 +512,8 @@ class AzureStorageShard:
             return {
                 "name": props.name,
                 "size": props.size,
-                "content_type": props.content_type,
+                "etag": getattr(props, "etag", None),
+                "content_type": props.content_settings.content_type if props.content_settings else None,
                 "last_modified": props.last_modified,
                 "copy_status": props.copy.status if props.copy else None,
                 "copy_progress": props.copy.progress if props.copy else None,
@@ -544,6 +558,149 @@ class AzureStorageShard:
         return {"success": False, "error": "Copy timed out", "status": "timeout"}
 
 
+class _StoreFacade:
+    """Backward-compat shim: exposes AzureStorageShard-shaped methods
+    (upload_blob, download_blob, get_blob_properties, etc.) backed by
+    any BackendStore so legacy workers honor the active backend without
+    code changes.
+
+    Return values match the dict shapes that AzureStorageShard uses, so
+    retry helpers (upload_blob_with_retry etc.) work unchanged.
+    """
+
+    def __init__(self, store):
+        self._store = store
+        # Attributes callers print / inspect.
+        self.account_name = getattr(store, "name", "unknown")
+        self.shard_index = 0
+        # Expose the backend id so callers that want to stamp
+        # snapshot.backend_id can do so without looking up the router.
+        self.backend_id = getattr(store, "backend_id", None)
+        self.kind = getattr(store, "kind", "unknown")
+
+    async def upload_blob(self, container_name, blob_path, content,
+                          overwrite=True, metadata=None):
+        try:
+            info = await self._store.upload(
+                container_name, blob_path, content,
+                metadata=metadata, overwrite=overwrite,
+            )
+            return {
+                "success": True,
+                "blob_url": info.url,
+                "blob_path": info.path,
+                "size_bytes": info.size,
+                "method": "direct_upload",
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e), "method": "direct_upload"}
+
+    async def upload_blob_from_file(self, container_name, blob_path, file_path,
+                                     file_size=0, overwrite=True, metadata=None):
+        try:
+            import os
+            size = file_size or os.path.getsize(file_path)
+            info = await self._store.upload_from_file(
+                container_name, blob_path, file_path, size,
+                metadata=metadata, overwrite=overwrite,
+            )
+            return {
+                "success": True,
+                "blob_url": info.url,
+                "blob_path": info.path,
+                "size_bytes": info.size,
+                "method": "stream_upload",
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e), "method": "stream_upload"}
+
+    async def download_blob(self, container_name, blob_path):
+        return await self._store.download(container_name, blob_path)
+
+    async def download_blob_stream(self, container_name, blob_path,
+                                   chunk_size=4 * 1024 * 1024):
+        async for chunk in self._store.download_stream(
+            container_name, blob_path, chunk_size=chunk_size,
+        ):
+            yield chunk
+
+    async def get_blob_properties(self, container_name, blob_path):
+        p = await self._store.get_properties(container_name, blob_path)
+        if p is None:
+            return None
+        return {
+            "name": blob_path,
+            "size": p.size,
+            "etag": "",
+            "content_type": p.content_type,
+            "last_modified": p.last_modified,
+            "copy_status": p.copy_status,
+            "copy_progress": p.copy_progress,
+            "metadata": p.metadata,
+        }
+
+    async def delete_blob(self, container_name, blob_path):
+        await self._store.delete(container_name, blob_path)
+
+    async def get_blob_sas_url(self, container_name, blob_path, valid_for_hours=6):
+        return await self._store.presigned_url(
+            container_name, blob_path, valid_for_hours,
+        )
+
+    async def list_blobs(self, container_name):
+        async for name in self._store.list_blobs(container_name):
+            yield name
+
+    async def list_blobs_with_properties(self, container_name):
+        async for name, p in self._store.list_with_props(container_name):
+            yield name, {
+                "last_modified": p.last_modified,
+                "size": p.size,
+            }
+
+    async def ensure_container(self, container_name):
+        await self._store.ensure_container(container_name)
+
+    async def copy_from_url_sync(self, source_url, container_name, blob_path,
+                                 source_size, metadata=None):
+        # Same-backend SSC only — _StoreFacade delegates to the active store.
+        # If the URL isn't on the active backend (e.g. cross-cloud), the
+        # impl raises NotImplementedError and callers fall back to streaming.
+        info = await self._store.server_side_copy(
+            source_url, container_name, blob_path, source_size, metadata,
+        )
+        return {
+            "size": info.size,
+            "etag": info.etag,
+            "content_md5": info.content_md5,
+            "last_modified": info.last_modified.isoformat() if info.last_modified else None,
+        }
+
+    # Azure-specific ops that aren't portable — raise so callers notice.
+    async def stage_block(self, *a, **kw):
+        if hasattr(self._store, "stage_block"):
+            return await self._store.stage_block(*a, **kw)
+        raise NotImplementedError(f"stage_block not supported by {self.kind}")
+
+    async def commit_block_list_manual(self, *a, **kw):
+        if hasattr(self._store, "commit_blocks"):
+            return await self._store.commit_blocks(*a, **kw)
+        raise NotImplementedError(f"commit_blocks not supported by {self.kind}")
+
+    async def put_block_from_url(self, *a, **kw):
+        if hasattr(self._store, "put_block_from_url"):
+            return await self._store.put_block_from_url(*a, **kw)
+        raise NotImplementedError(f"put_block_from_url not supported by {self.kind}")
+
+    async def get_blob_url(self, container_name, blob_path):
+        return await self._store.presigned_url(container_name, blob_path, valid_hours=1)
+
+    async def close(self):
+        close = getattr(self._store, "close", None)
+        if close:
+            await close()
+
+
 class AzureStorageManager:
     """
     Manages multiple Azure Storage Accounts for sharding.
@@ -577,36 +734,67 @@ class AzureStorageManager:
         else:
             print("[AzureStorage] WARNING: No Azure Storage configured")
     
-    def get_shard_for_resource(self, resource_id: str, tenant_id: str) -> AzureStorageShard:
+    def _router_facade(self, tenant_id: str, resource_id: str):
+        """Return a _StoreFacade over the router's active backend, if loaded.
+        Returns None if the router isn't ready yet (service still booting,
+        or test contexts) so the caller falls back to direct shards."""
+        try:
+            from shared.storage.router import router as _router
+            if not _router.active_backend_id():
+                return None
+            store = _router.get_active_store().shard_for(tenant_id, resource_id)
+            return _StoreFacade(store)
+        except Exception:
+            return None
+
+    def get_shard_for_resource(self, resource_id: str, tenant_id: str):
+        """Deterministically assign a storage shard based on resource/tenant ID.
+
+        Now router-aware: returns a facade over the currently-active backend
+        (Azure or SeaweedFS) so callers honor the Storage toggle without
+        changing their code. Falls back to the raw AzureStorageShard when
+        the router hasn't loaded yet.
         """
-        Deterministically assign a storage shard based on resource/tenant ID.
-        Ensures consistent placement for the same resource.
-        """
+        facade = self._router_facade(tenant_id, resource_id)
+        if facade is not None:
+            return facade
         if not self.shards:
             raise RuntimeError("No storage shards configured")
-        
-        # Use hash to deterministically assign shard
         hash_input = f"{tenant_id}:{resource_id}"
         hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
         shard_index = hash_value % len(self.shards)
         return self.shards[shard_index]
-    
+
     def get_shard_by_index(self, index: int) -> AzureStorageShard:
-        """Get a specific shard by index"""
+        """Get a specific shard by index. Remains raw-Azure — only used by
+        the DR replication worker which operates on Azure shards directly."""
         if not self.shards:
             raise RuntimeError("No storage shards configured")
         return self.shards[index % len(self.shards)]
 
-    def get_default_shard(self) -> AzureStorageShard:
-        """Get the first/default storage shard"""
+    def get_default_shard(self):
+        """Get the default storage shard — router-aware."""
+        facade = self._router_facade("default", "default")
+        if facade is not None:
+            return facade
         if not self.shards:
             raise RuntimeError("No storage shards configured — set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY")
         return self.shards[0]
 
-    def get_shard_for_item(self, item) -> AzureStorageShard:
+    def get_shard_for_item(self, item):
         """Resolve the shard that owns the source data for the given item.
-        Delegates to get_shard_for_resource with the item's tenant + resource
-        IDs. Falls back to the default shard when attributes are missing."""
+        Uses item.backend_id when present so RESTORE paths hit the right
+        backend even after a toggle. Falls back to active-backend routing."""
+        try:
+            backend_id = getattr(item, "backend_id", None)
+            if backend_id:
+                from shared.storage.router import router as _router
+                store = _router.get_store_by_id(str(backend_id)).shard_for(
+                    str(item.tenant_id), str(item.resource_id),
+                )
+                return _StoreFacade(store)
+        except Exception:
+            pass
         try:
             return self.get_shard_for_resource(str(item.resource_id), str(item.tenant_id))
         except Exception:

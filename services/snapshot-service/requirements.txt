@@ -9,3 +9,7 @@ pydantic-settings==2.1.0
 python-dotenv==1.0.0
 azure-storage-blob==12.19.0
 aiohttp>=3.9
+# On-prem storage backend (SeaweedFS) — pulled in by shared.storage
+aioboto3>=15.5.0,<16
+aiobotocore>=2.25.0,<3
+boto3>=1.40.0,<2

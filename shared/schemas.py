@@ -649,3 +649,69 @@ class PowerBIReadinessResponse(BaseModel):
     discoveredWorkspaceCount: int
     checks: List[PowerBIReadinessCheckResponse]
     recommendedActions: List[str]
+
+
+# ============ Storage toggle (2026-04-21) ============
+
+class StorageBackendOut(BaseModel):
+    id: UUID
+    kind: str
+    name: str
+    endpoint: str
+    is_enabled: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SystemConfigOut(BaseModel):
+    active_backend_id: UUID
+    active_backend_name: Optional[str] = None
+    transition_state: str
+    last_toggle_at: Optional[datetime] = None
+    cooldown_until: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ToggleRequest(BaseModel):
+    target_backend_id: UUID
+    reason: str = Field(..., min_length=10)
+    confirmation_text: str
+
+
+class PreflightCheckOut(BaseModel):
+    name: str
+    ok: bool
+    detail: Optional[str] = None
+
+
+class PreflightResultOut(BaseModel):
+    ok: bool
+    checks: List[PreflightCheckOut]
+
+
+class ToggleEventOut(BaseModel):
+    id: UUID
+    actor_id: UUID
+    from_backend_id: UUID
+    to_backend_id: UUID
+    reason: Optional[str] = None
+    status: str
+    started_at: datetime
+    drain_completed_at: Optional[datetime] = None
+    flip_completed_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    drained_job_count: Optional[int] = None
+    retried_job_count: Optional[int] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ToggleStatusOut(BaseModel):
+    active_backend: StorageBackendOut
+    transition_state: str
+    last_toggle_at: Optional[datetime] = None
+    cooldown_until: Optional[datetime] = None
+    inflight_jobs_count: int
+    preflight: Optional[PreflightResultOut] = None

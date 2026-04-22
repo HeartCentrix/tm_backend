@@ -84,13 +84,18 @@ async def _backfill_folder_paths():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from shared.storage.startup import startup_router, shutdown_router
     await init_db()
     try:
         await _backfill_folder_paths()
     except Exception as e:
         print(f"[SNAPSHOT] folder backfill failed (non-fatal): {e}")
-    yield
-    await close_db()
+    await startup_router()
+    try:
+        yield
+    finally:
+        await shutdown_router()
+        await close_db()
 
 
 app = FastAPI(title="Snapshot Service", version="1.0.0", lifespan=lifespan)

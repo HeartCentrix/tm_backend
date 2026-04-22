@@ -13,7 +13,7 @@ build/
 secrets/
 .env.bak
 
-
+docs/
 # Virtual environments
 venv/
 .venv/
@@ -50,3 +50,9 @@ htmlcov/
 .DS_Store
 Thumbs.db
 graphify-out/
+
+
+.claude/
+.agents/
+.qwen/
+skills-lock.json

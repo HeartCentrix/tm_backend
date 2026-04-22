@@ -39,6 +39,12 @@ REQUIRED_TABLES = (
     "sla_exclusions",
     "resource_groups",
     "group_policy_assignments",
+    # On-prem storage toggle (2026-04-21). Required so a cold-boot service
+    # waits for the bootstrapper instead of racing ahead and erroring out on
+    # missing system_config during router.load().
+    "storage_backends",
+    "system_config",
+    "storage_toggle_events",
 )
 
 REQUIRED_COLUMNS = {
@@ -51,7 +57,9 @@ REQUIRED_COLUMNS = {
         "retention_mode",
     ),
     "resources": ("resource_hash",),
-    "snapshot_items": ("parent_external_id",),
+    "snapshot_items": ("parent_external_id", "backend_id"),
+    "snapshots": ("backend_id",),
+    "jobs": ("retry_reason", "pre_toggle_job_id"),
     "resource_discovery_staging": (
         "azure_subscription_id",
         "azure_resource_group",
@@ -724,6 +732,51 @@ async def init_db() -> None:
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """,
+        # On-prem storage toggle tables. Must exist before add_column_statements
+        # runs so downstream ADD COLUMN ... REFERENCES storage_backends(id)
+        # can resolve the FK target.
+        """
+        CREATE TABLE IF NOT EXISTS storage_backends (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            kind VARCHAR NOT NULL,
+            name VARCHAR NOT NULL UNIQUE,
+            endpoint VARCHAR NOT NULL,
+            config JSONB NOT NULL DEFAULT '{}'::jsonb,
+            secret_ref VARCHAR NOT NULL,
+            is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS system_config (
+            id SMALLINT PRIMARY KEY CHECK (id = 1),
+            active_backend_id UUID NOT NULL REFERENCES storage_backends(id),
+            transition_state VARCHAR NOT NULL DEFAULT 'stable',
+            last_toggle_at TIMESTAMPTZ,
+            cooldown_until TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS storage_toggle_events (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            actor_id UUID NOT NULL,
+            actor_ip INET,
+            from_backend_id UUID NOT NULL REFERENCES storage_backends(id),
+            to_backend_id UUID NOT NULL REFERENCES storage_backends(id),
+            reason VARCHAR,
+            status VARCHAR NOT NULL DEFAULT 'started',
+            started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            drain_completed_at TIMESTAMPTZ,
+            flip_completed_at TIMESTAMPTZ,
+            completed_at TIMESTAMPTZ,
+            error_message TEXT,
+            pre_flight_checks JSONB,
+            drained_job_count INTEGER,
+            retried_job_count INTEGER
+        )
+        """,
     ]
 
     index_statements = [
@@ -862,6 +915,25 @@ async def init_db() -> None:
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS key_name VARCHAR;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS key_version VARCHAR;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS auto_apply_to_matching BOOLEAN DEFAULT FALSE NOT NULL;",
+        # On-prem storage toggle plumbing (migrations 2026-04-21 / 2026-04-22).
+        # Ship these via ADD COLUMN IF NOT EXISTS so a fresh DB boot ends up
+        # with the full schema even when the raw .sql migrations are never
+        # invoked. Everything is idempotent.
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS retry_reason TEXT;",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pre_toggle_job_id UUID REFERENCES jobs(id);",
+        "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS backend_id UUID REFERENCES storage_backends(id);",
+        "ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS backend_id UUID REFERENCES storage_backends(id);",
+        "CREATE INDEX IF NOT EXISTS idx_snapshots_backend ON snapshots(backend_id);",
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_items_backend ON snapshot_items(backend_id);",
+        # Idempotency guard — pairs with the idempotent create_snapshot()
+        # resume path in backup-worker. When a RabbitMQ message is
+        # redelivered (worker killed mid-batch / redeploy), the resume
+        # path reuses the existing IN_PROGRESS snapshot row; without
+        # this unique constraint, both deliveries could write duplicate
+        # snapshot_items. On conflict the insert IntegrityErrors and
+        # rolls back, the next redelivery picks up cleanly.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_snapshot_items_snap_ext "
+        "ON snapshot_items(snapshot_id, external_id);",
     ]
 
     # Indexes that must be created AFTER alter_statements runs, because they
@@ -941,6 +1013,12 @@ async def init_db() -> None:
         async with engine.begin() as conn:
             await _execute_batch(conn, post_alter_index_statements)
         await _seed_preset_policies_for_existing_tenants()
+        try:
+            from shared.storage_bootstrap import ensure_storage_bootstrap
+            await ensure_storage_bootstrap(engine)
+        except Exception as sb_exc:
+            logger.error("[DB INIT] storage bootstrap failed: %s", sb_exc)
+            raise
     except Exception as exc:
         logger.warning("[DB INIT] Schema sync phase failed: %s", exc)
         if await wait_for_schema_ready(timeout_seconds=30):

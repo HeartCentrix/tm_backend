@@ -6,6 +6,7 @@ from sqlalchemy import (
     Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func, LargeBinary
 )
 from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID
 import enum
 
@@ -242,6 +243,10 @@ class Resource(Base):
     # under one card.
     parent_resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id", ondelete="CASCADE"), nullable=True, index=True)
 
+    # Eager-load target for the scheduler dispatcher
+    # (backup-scheduler uses selectinload(Resource.tenant)).
+    tenant = relationship("Tenant", foreign_keys=[tenant_id], lazy="raise")
+
 
 class SlaPolicy(Base):
     __tablename__ = "sla_policies"
@@ -397,6 +402,9 @@ class Job(Base):
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     completed_at = Column(DateTime)
+    # Storage toggle retry plumbing (2026-04-21)
+    retry_reason = Column(Text)
+    pre_toggle_job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id"))
 
 
 class Snapshot(Base):
@@ -428,6 +436,9 @@ class Snapshot(Base):
     dr_replicated_at = Column(DateTime, nullable=True)
     dr_error = Column(Text, nullable=True)
     dr_replication_attempts = Column(Integer, default=0, nullable=False)
+    # Storage backend that holds this snapshot's blobs (2026-04-21).
+    # NOT NULL enforced after backfill migration.
+    backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
     created_at = Column(DateTime, default=utcnow)
 
 
@@ -450,6 +461,9 @@ class SnapshotItem(Base):
     extra_data = Column("metadata", JSON, default=dict)
     is_deleted = Column(Boolean, default=False)
     indexed_at = Column(DateTime)
+    # Storage backend that holds this item's blob. Permanent — wins over
+    # system_config.active_backend_id during passthrough restores.
+    backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
     created_at = Column(DateTime, default=utcnow)
 
 
@@ -688,33 +702,90 @@ class VmFileIndex(Base):
     __tablename__ = "vm_file_index"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False, index=True)
-    # Which AZURE_VM_VOLUME SnapshotItem this file belongs to — the
-    # Recovery UI picks a volume first, then lists files from that
-    # volume only. NOT a FK into snapshot_items because the index may
-    # be produced before (or after) that table is populated.
     volume_item_id = Column(UUID(as_uuid=True), nullable=False, index=True)
-    # Directory containing this entry. Forward-slash normalised so SQL
-    # queries don't have to care about Windows vs Linux sources.
     parent_path = Column(String, nullable=False, index=True)
     name = Column(String, nullable=False)
     is_directory = Column(Boolean, default=False, nullable=False)
     size_bytes = Column(BigInteger, default=0, nullable=False)
     modified_at = Column(DateTime, nullable=True)
-    # Filesystem-level identifier (NTFS MFT record number, ext4 inode
-    # number, etc). Stable across the same VHD snapshot so we can
-    # re-open the file later for extraction without doing a path walk.
     fs_inode = Column(BigInteger, nullable=True)
-    # Filesystem kind ("ntfs", "ext4", "fat32", ...) — influences how
-    # the downloader parses the VHD.
     fs_type = Column(String, nullable=True)
-    # VHD partition byte offset the file lives in (start of the
-    # partition containing the FS, NOT the file's data offset). Used
-    # by the downloader to hand pytsk3 the right slice of the image.
     partition_offset = Column(BigInteger, nullable=True)
-    # Path to the VHD blob so the downloader can range-read from the
-    # right backup artifact.
     blob_path = Column(String, nullable=True)
-    # Optional extent list for very-large or fragmented files. Omitted
-    # for typical files — pytsk3 can reconstruct the runs from the MFT.
     extents_json = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=utcnow, nullable=False)
+
+
+# ==================== Storage backend abstraction (2026-04-21) ====================
+
+
+class StorageBackendKind(str, enum.Enum):
+    azure_blob = "azure_blob"
+    seaweedfs = "seaweedfs"
+
+
+class TransitionState(str, enum.Enum):
+    stable = "stable"
+    draining = "draining"
+    flipping = "flipping"
+
+
+class ToggleStatus(str, enum.Enum):
+    started = "started"
+    drain_started = "drain_started"
+    drain_completed = "drain_completed"
+    db_promoted = "db_promoted"
+    dns_flipped = "dns_flipped"
+    workers_restarted = "workers_restarted"
+    smoke_passed = "smoke_passed"
+    completed = "completed"
+    aborted = "aborted"
+    failed = "failed"
+
+
+# Import extras used only by these new classes; placed here instead of at the
+# top so unrelated code doesn't pay the import tax until storage is imported.
+from sqlalchemy import SmallInteger
+from sqlalchemy.dialects.postgresql import INET, JSONB
+
+
+class StorageBackend(Base):
+    __tablename__ = "storage_backends"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    kind = Column(String, nullable=False)
+    name = Column(String, unique=True, nullable=False)
+    endpoint = Column(String, nullable=False)
+    config = Column(JSONB, nullable=False, default=dict)
+    secret_ref = Column(String, nullable=False)
+    is_enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class SystemConfig(Base):
+    __tablename__ = "system_config"
+    id = Column(SmallInteger, primary_key=True)
+    active_backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    transition_state = Column(String, nullable=False, default="stable")
+    last_toggle_at = Column(DateTime(timezone=True))
+    cooldown_until = Column(DateTime(timezone=True))
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class StorageToggleEvent(Base):
+    __tablename__ = "storage_toggle_events"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    actor_id = Column(UUID(as_uuid=True), nullable=False)
+    actor_ip = Column(INET)
+    from_backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    to_backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    reason = Column(String)
+    status = Column(String, nullable=False, default="started")
+    started_at = Column(DateTime(timezone=True), default=utcnow)
+    drain_completed_at = Column(DateTime(timezone=True))
+    flip_completed_at = Column(DateTime(timezone=True))
+    completed_at = Column(DateTime(timezone=True))
+    error_message = Column(Text)
+    pre_flight_checks = Column(JSONB)
+    drained_job_count = Column(Integer)
+    retried_job_count = Column(Integer)

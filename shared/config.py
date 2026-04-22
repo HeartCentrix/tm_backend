@@ -65,6 +65,19 @@ class Settings:
         self.AZURE_STORAGE_ACCOUNT_KEY = os.getenv("AZURE_STORAGE_ACCOUNT_KEY", "")
         self.AZURE_STORAGE_BLOB_ENDPOINT = os.getenv("AZURE_STORAGE_BLOB_ENDPOINT", "https://blob.core.windows.net")
 
+        # On-prem SeaweedFS backend (enabled when a storage_backends row exists)
+        self.ONPREM_S3_ENDPOINT = os.getenv("ONPREM_S3_ENDPOINT", "")
+        self.ONPREM_S3_ACCESS_KEY = os.getenv("ONPREM_S3_ACCESS_KEY", "")
+        self.ONPREM_S3_SECRET_KEY = os.getenv("ONPREM_S3_SECRET_KEY", "")
+        onprem_buckets = os.getenv("ONPREM_S3_BUCKETS", "")
+        self.ONPREM_S3_BUCKETS = [b.strip() for b in onprem_buckets.split(",") if b.strip()]
+        self.ONPREM_S3_REGION = os.getenv("ONPREM_S3_REGION", "us-east-1")
+        self.ONPREM_S3_VERIFY_TLS = os.getenv("ONPREM_S3_VERIFY_TLS", "true").lower() in ("true", "1", "yes")
+        self.ONPREM_S3_CA_BUNDLE = os.getenv("ONPREM_S3_CA_BUNDLE", "") or None
+        self.ONPREM_UPLOAD_CONCURRENCY = int(os.getenv("ONPREM_UPLOAD_CONCURRENCY", "8"))
+        self.ONPREM_MULTIPART_THRESHOLD_MB = int(os.getenv("ONPREM_MULTIPART_THRESHOLD_MB", "100"))
+        self.ONPREM_RETRY_MAX = int(os.getenv("ONPREM_RETRY_MAX", "3"))
+
         # Azure ARM (Azure Resource Manager) credentials for VM/SQL/PostgreSQL backup
         # Service Principal for ARM API access
         self.AZURE_ARM_CLIENT_ID = os.getenv("AZURE_ARM_CLIENT_ID", "")

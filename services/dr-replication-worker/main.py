@@ -549,6 +549,8 @@ async def reconcile_dr_lifecycle_policies():
 
 
 async def main():
+    from shared.storage.startup import startup_router
+    await startup_router()
     logger.info("=== DR Replication Worker Starting ===")
     logger.info("DB: %s@%s:%s/%s", settings.DB_USERNAME, settings.DB_HOST, settings.DB_PORT, settings.DB_NAME)
     logger.info("RABBITMQ_ENABLED: %s", settings.RABBITMQ_ENABLED)

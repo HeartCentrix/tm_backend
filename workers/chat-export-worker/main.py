@@ -33,12 +33,14 @@ async def health_server() -> None:
 
 
 async def main() -> None:
+    from shared.storage.startup import startup_router
     logging.basicConfig(
         level=logging.INFO,
         format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s","svc":"chat-export-worker"}',
     )
     start_http_server(9102)
     await health_server()
+    await startup_router()
 
     conn = await aio_pika.connect_robust(
         settings.RABBITMQ_URL,

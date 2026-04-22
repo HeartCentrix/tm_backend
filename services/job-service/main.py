@@ -225,12 +225,17 @@ async def _create_batch_backup_jobs(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from shared.storage.startup import startup_router, shutdown_router
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
     await message_bus.connect()
-    yield
-    await message_bus.disconnect()
-    await close_db()
+    await startup_router()
+    try:
+        yield
+    finally:
+        await shutdown_router()
+        await message_bus.disconnect()
+        await close_db()
 
 
 app = FastAPI(title="Job Service", version="1.0.0", lifespan=lifespan)
@@ -362,10 +367,38 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
             text("UPDATE resources SET last_backup_status = 'CANCELLED', last_backup_job_id = :jid WHERE id = ANY(:ids)"),
             {"jid": job.id, "ids": resource_ids},
         )
-        # Mark any in-flight snapshots for this job as FAILED so the
-        # Recovery page doesn't show a permanently-spinning row.
+        # Close out in-flight snapshots so the Recovery page doesn't
+        # show a permanently-spinning row. If the handler already
+        # persisted items to snapshot_items, promote the snapshot to
+        # COMPLETED with a note — blindly flipping to FAILED would
+        # hide real data that is already in the blob store / DB.
+        # Snapshots with zero items are marked FAILED (nothing to keep).
+        # All updates stamp completed_at + duration_secs so the row is
+        # in a valid terminal state.
         await db.execute(
-            text("UPDATE snapshots SET status = 'FAILED' WHERE job_id = :jid AND status = 'IN_PROGRESS'"),
+            text("""
+                WITH counts AS (
+                    SELECT s.id,
+                           s.started_at,
+                           (SELECT count(*) FROM snapshot_items si
+                            WHERE si.snapshot_id = s.id) AS n_items
+                    FROM snapshots s
+                    WHERE s.job_id = :jid AND s.status = 'IN_PROGRESS'
+                )
+                UPDATE snapshots s SET
+                    status = CASE WHEN c.n_items > 0 THEN 'COMPLETED'
+                                  ELSE 'FAILED' END,
+                    item_count = c.n_items,
+                    new_item_count = COALESCE(s.new_item_count, c.n_items),
+                    completed_at = NOW(),
+                    duration_secs = EXTRACT(EPOCH FROM (NOW() - c.started_at))::int,
+                    extra_data = COALESCE(s.extra_data, '{}'::json)::jsonb
+                                 || jsonb_build_object(
+                                    'job_cancelled', true,
+                                    'cancel_note', 'job was cancelled mid-run')
+                FROM counts c
+                WHERE s.id = c.id
+            """),
             {"jid": job.id},
         )
 

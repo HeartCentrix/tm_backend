@@ -13,3 +13,8 @@ weasyprint==61.2
 opentelemetry-api==1.24.0
 opentelemetry-sdk==1.24.0
 opentelemetry-instrumentation-aiohttp-client==0.45b0
+
+# On-prem storage backend (SeaweedFS) — pulled in by shared.storage
+aioboto3>=15.5.0,<16
+aiobotocore>=2.25.0,<3
+boto3>=1.40.0,<2
