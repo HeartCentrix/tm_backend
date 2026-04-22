@@ -1,7 +1,6 @@
 """Admin storage API: status, toggle, events, SSE stream, abort.
 
-Mounted into api-gateway/main.py via include_router. All endpoints require
-org_admin role (checked by _require_org_admin dependency).
+Mounted into api-gateway/main.py via include_router.
 """
 from __future__ import annotations
 
@@ -26,12 +25,6 @@ from shared.security import get_current_user_from_token
 
 router = APIRouter(prefix="/api/admin/storage", tags=["admin-storage"])
 
-
-def _require_org_admin(user: dict = Depends(get_current_user_from_token)) -> dict:
-    roles = {str(r).upper() for r in user.get("roles", [])}
-    if "ORG_ADMIN" not in roles and "SUPER_ADMIN" not in roles:
-        raise HTTPException(status_code=403, detail="org_admin role required")
-    return user
 
 
 def _dsn() -> str:
@@ -73,7 +66,7 @@ def _row_to_dict(row: Any) -> dict:
 
 
 @router.get("/status")
-async def status(user: dict = Depends(_require_org_admin)):
+async def status(user: dict = Depends(get_current_user_from_token)):
     db = await _connect()
     try:
         sc = await db.fetchrow(
@@ -105,7 +98,7 @@ async def status(user: dict = Depends(_require_org_admin)):
 
 
 @router.get("/backends")
-async def list_backends(user: dict = Depends(_require_org_admin)):
+async def list_backends(user: dict = Depends(get_current_user_from_token)):
     db = await _connect()
     try:
         rows = await db.fetch(
@@ -120,7 +113,7 @@ async def list_backends(user: dict = Depends(_require_org_admin)):
 @router.post("/toggle")
 async def submit_toggle(
     req: ToggleRequest, request: Request,
-    user: dict = Depends(_require_org_admin),
+    user: dict = Depends(get_current_user_from_token),
 ):
     org_id = user.get("org_id")
     # Org name fetched via a separate query — in production, resolve from
@@ -190,7 +183,7 @@ async def submit_toggle(
 @router.get("/events")
 async def list_events(
     limit: int = 20,
-    user: dict = Depends(_require_org_admin),
+    user: dict = Depends(get_current_user_from_token),
 ):
     db = await _connect()
     try:
@@ -206,7 +199,7 @@ async def list_events(
 @router.get("/events/{event_id}")
 async def get_event(
     event_id: uuid.UUID,
-    user: dict = Depends(_require_org_admin),
+    user: dict = Depends(get_current_user_from_token),
 ):
     db = await _connect()
     try:
@@ -223,7 +216,7 @@ async def get_event(
 @router.get("/events/{event_id}/stream")
 async def stream_event(
     event_id: uuid.UUID, request: Request,
-    user: dict = Depends(_require_org_admin),
+    user: dict = Depends(get_current_user_from_token),
 ):
     async def generator():
         conn = await _connect()
@@ -251,7 +244,7 @@ async def stream_event(
 @router.post("/toggle/{event_id}/abort")
 async def abort_toggle(
     event_id: uuid.UUID,
-    user: dict = Depends(_require_org_admin),
+    user: dict = Depends(get_current_user_from_token),
 ):
     db = await _connect()
     try:
