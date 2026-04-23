@@ -386,8 +386,14 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
                     WHERE s.job_id = :jid AND s.status = 'IN_PROGRESS'
                 )
                 UPDATE snapshots s SET
-                    status = CASE WHEN c.n_items > 0 THEN 'COMPLETED'
-                                  ELSE 'FAILED' END,
+                    -- Cast the CASE result to the snapshotstatus enum.
+                    -- Postgres types the bare THEN/ELSE branches as text
+                    -- and refuses the implicit text→enum coercion inside
+                    -- an UPDATE … SET assignment, raising
+                    -- DatatypeMismatchError: column "status" is of type
+                    -- snapshotstatus but expression is of type text.
+                    status = (CASE WHEN c.n_items > 0 THEN 'COMPLETED'
+                                   ELSE 'FAILED' END)::snapshotstatus,
                     item_count = c.n_items,
                     new_item_count = COALESCE(s.new_item_count, c.n_items),
                     completed_at = NOW(),
