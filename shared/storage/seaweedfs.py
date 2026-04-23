@@ -159,7 +159,7 @@ class SeaweedStore:
         total_size: int,
         metadata=None,
         chunk_size: int = 8 * 1024 * 1024,
-        max_parallel_parts: int = 4,
+        max_parallel_parts: Optional[int] = None,
     ) -> BlobInfo:
         """Stream-upload bytes arriving from an async iterator directly
         into an S3 multipart upload — never touches the worker's /tmp.
@@ -182,7 +182,16 @@ class SeaweedStore:
             and complete the multipart regardless of total_size.
           * Computes sha256 incrementally as bytes flow past so the
             snapshot_items row can be stamped without a re-read.
+
+        `max_parallel_parts` defaults to None → falls back to
+        self._upload_concurrency (set by __init__ from the
+        ONPREM_UPLOAD_CONCURRENCY env / config field). Previously
+        the signature had a hardcoded 4, which silently ignored the
+        env knob and capped every backup-worker at 4 concurrent
+        multipart segments per file regardless of configuration.
         """
+        if max_parallel_parts is None:
+            max_parallel_parts = self._upload_concurrency
         import hashlib as _hl
         bucket = self._bucket(container)
         key = self._key(container, path)
