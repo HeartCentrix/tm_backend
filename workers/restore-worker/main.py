@@ -1416,6 +1416,28 @@ class RestoreWorker:
         print(f"[{self.worker_id}] PST export requested - exporting as ZIP instead")
         return await self.export_as_zip(session, items, message, spec)
 
+    # Pure tree-navigation rows — folder / list / channel definitions
+    # with no content (no blob_path AND no payload in metadata.raw).
+    # The frontend includes them in the user's selection so the
+    # selection tree renders, but they have nothing to emit into the
+    # export. Leaving them in `items` also flips the v2 path's
+    # `all(type in file-set)` guard to false → execution falls through
+    # to the legacy zipfile loop, which hard-codes an Azure Blob
+    # client and breaks on-prem (SeaweedFS) deployments. Strip them
+    # before any dispatch so the file-family v2 pipeline stays
+    # reachable on SharePoint / Teams / Groups downloads.
+    #
+    # Note: SHAREPOINT_LIST_ITEM is NOT here. Those are real list rows
+    # with their column values in `metadata.raw`; the legacy path
+    # serialises them to JSON files inside the ZIP (no blob fetch,
+    # so no storage-backend concern).
+    _EXPORT_CONTAINER_ONLY_TYPES = frozenset({
+        "SHAREPOINT_FOLDER",
+        "SHAREPOINT_LIST",
+        "TEAMS_CHANNEL_INFO",
+        "GROUP_INFO",
+    })
+
     async def export_as_zip(
         self,
         session: AsyncSession,
@@ -1424,7 +1446,45 @@ class RestoreWorker:
         spec: Dict
     ) -> Dict:
         """Export items as downloadable ZIP file"""
+        original_count = len(items)
+        # Drop container-only rows early. They're tree-nav markers without
+        # a blob; downstream pipelines treat them as corrupted files or
+        # bail out of the v2 path altogether. See
+        # _EXPORT_CONTAINER_ONLY_TYPES above for the exhaustive list.
+        stripped_counts: Dict[str, int] = {}
+        keep: List[SnapshotItem] = []
+        for it in items:
+            it_type = getattr(it, "item_type", None) or ""
+            if it_type in self._EXPORT_CONTAINER_ONLY_TYPES:
+                stripped_counts[it_type] = stripped_counts.get(it_type, 0) + 1
+                continue
+            keep.append(it)
+        if stripped_counts:
+            print(
+                f"[{self.worker_id}] export_as_zip dropped "
+                f"{sum(stripped_counts.values())} container-only rows "
+                f"({stripped_counts}); {len(keep)}/{original_count} items remain",
+                flush=True,
+            )
+        items = keep
         print(f"[{self.worker_id}] export_as_zip ENTER items={len(items)}", flush=True)
+
+        # If the user's selection was entirely container rows, there's
+        # nothing to put in the ZIP. The frontend is expected to send the
+        # folderPaths alongside itemIds so the resolver expands them —
+        # when it doesn't, we'd otherwise produce an empty ZIP silently.
+        if not items:
+            return {
+                "exported_count": 0,
+                "failed_count": 0,
+                "export_type": (spec or {}).get("exportFormat") or "ZIP",
+                "manual_actions": [
+                    "Nothing to export — selection contained only folder / list / "
+                    "channel container rows. Re-run with folderPaths set so the "
+                    "server can expand them to the underlying files."
+                ],
+            }
+
         # Entra export v2 fast-path — new section-scoped ZIP pipeline.
         if (
             settings.ENTRA_EXPORT_V2_ENABLED
