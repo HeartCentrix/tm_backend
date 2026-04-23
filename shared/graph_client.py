@@ -2461,6 +2461,7 @@ class GraphClient:
         site_web_url: str,
         list_id: str,
         page_size: int = 1000,
+        all_fields: bool = True,
     ):
         """Streaming page-by-page iterator over SP REST list items.
 
@@ -2469,6 +2470,13 @@ class GraphClient:
         iterator yields row-by-row as pages arrive and honours 429 /
         Retry-After so we cooperate with SP throttling instead of stampeding
         it on restart.
+
+        ``all_fields=True`` drops the narrow $select and asks SP to $expand
+        FieldValuesAsText so every custom column comes back as a readable
+        string. Needed for catalog lists (Composed Looks, Master Page
+        Gallery, Theme Gallery, …) where the interesting data lives in
+        columns like MasterPageUrl / ThemeUrl / ImageUrl / FontSchemeUrl,
+        not the underlying file bytes.
         """
         token = await self._get_sharepoint_token(hostname)
         url = f"{site_web_url.rstrip('/')}/_api/web/lists(guid'{list_id}')/items"
@@ -2488,10 +2496,19 @@ class GraphClient:
         # include the file-reference fields — they're defined on every
         # list type. Extras like Length / Title / Modified have
         # fire-tested as absent on catalog / hidden / tasks lists.
-        params: Optional[Dict[str, str]] = {
-            "$top": str(page_size),
-            "$select": "Id,FileRef,FileLeafRef,FileSystemObjectType",
-        }
+        if all_fields:
+            # Catalog lists: drop $select so every declared column comes
+            # back, and $expand FieldValuesAsText so lookup/url columns
+            # render as strings (not OData shells).
+            params: Optional[Dict[str, str]] = {
+                "$top": str(page_size),
+                "$expand": "FieldValuesAsText",
+            }
+        else:
+            params = {
+                "$top": str(page_size),
+                "$select": "Id,FileRef,FileLeafRef,FileSystemObjectType",
+            }
         next_url: Optional[str] = url
         backoff = 1.0  # seconds; doubled per consecutive transient failure
         async with httpx.AsyncClient(timeout=120.0) as client:

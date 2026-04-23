@@ -313,7 +313,15 @@ async def datasource_callback(
     from shared.security import encrypt_secret
     encrypted_secret = encrypt_secret(settings.MICROSOFT_CLIENT_SECRET)
 
-    stmt = select(Tenant).where(Tenant.external_tenant_id == external_tenant_id)
+    # Scope by type=M365 so that an M365 onboarding against a Microsoft tenant
+    # that was already onboarded as AZURE creates a SEPARATE M365 tenant row
+    # (mirrors the Azure callback at line ~512). Before this, the M365 flow
+    # silently merged its creds onto an existing AZURE row, leaving the
+    # Tenants page showing only one row with the wrong badge.
+    stmt = select(Tenant).where(
+        Tenant.external_tenant_id == external_tenant_id,
+        Tenant.type.cast(String) == "M365",
+    )
     tenant = (await db.execute(stmt)).scalar_one_or_none()
 
     if tenant is None:
@@ -356,9 +364,6 @@ async def datasource_callback(
         tenant.graph_client_id = settings.MICROSOFT_CLIENT_ID
         tenant.graph_client_secret_encrypted = encrypted_secret
         tenant.status = TenantStatus.ACTIVE
-        # If an existing AZURE tenant is being re-onboarded through the M365 flow,
-        # it remains an AZURE tenant — we no longer flip to a combined type.
-        # To back up M365 on the same Microsoft tenant, create a second tenant row.
 
     await db.flush()
     tenant_id = tenant.id

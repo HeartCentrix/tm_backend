@@ -7585,10 +7585,53 @@ class BackupWorker:
                     continue
                 display = lst.get("displayName") or lst.get("name") or lst_id
                 list_meta = lst.get("list") or {}
-                is_library = str(list_meta.get("template") or "").lower() in (
-                    "documentlibrary", "masterpagecatalog", "webtemplatecatalog",
-                    "webpartcatalog", "themecatalog", "solutioncatalog",
-                )
+                # SharePoint's Graph API returns ListTemplateType as either
+                # the classic string name ("masterpagecatalog") OR a numeric
+                # ListTemplate id ("124"). Normalize both to a single logical
+                # name used downstream (worker + frontend catalog column
+                # dispatcher) so a tenant that returns one form doesn't
+                # silently fall off the catalog path.
+                TEMPLATE_NUM_TO_NAME = {
+                    100: "genericlist",
+                    101: "documentlibrary",
+                    102: "survey",
+                    103: "links",
+                    104: "announcements",
+                    105: "contacts",
+                    106: "events",
+                    107: "tasks",
+                    108: "discussion",
+                    109: "picturelibrary",
+                    113: "webpartcatalog",
+                    114: "webtemplatecatalog",
+                    116: "masterpagecatalog",
+                    119: "sitepages",
+                    121: "solutioncatalog",
+                    123: "themecatalog",
+                    124: "composedlooks",    # Design Gallery — Composed Looks rows
+                    125: "appdatacatalog",
+                    126: "appfilescatalog",
+                    171: "tasks",            # modern tasks template
+                    175: "maintenancelog",
+                }
+                _template_raw = list_meta.get("template")
+                _template_str = str(_template_raw or "").strip().lower()
+                try:
+                    template = TEMPLATE_NUM_TO_NAME.get(int(_template_str), _template_str)
+                except (TypeError, ValueError):
+                    template = _template_str
+                # Catalog lists are technically document libraries (they hold
+                # .master / .spcolor / .webpart files) but the user-visible
+                # data lives in list-item columns (Title, MasterPageUrl,
+                # ThemeUrl, ImageUrl, FontSchemeUrl, …). We still need the
+                # drive producer to grab the underlying file bytes, and also
+                # need the REST pass so those columns make it into the snapshot.
+                catalog_templates = {
+                    "masterpagecatalog", "themecatalog", "solutioncatalog",
+                    "webtemplatecatalog", "webpartcatalog", "composedlooks",
+                }
+                is_catalog = template in catalog_templates
+                is_library = template == "documentlibrary" or is_catalog
 
                 # Persist the list folder row immediately (small, bounded by
                 # list count — not file count).
@@ -7607,10 +7650,15 @@ class BackupWorker:
                         "raw": lst,
                         "site_id": site_id,
                         "site_label": site_label,
-                        "template": list_meta.get("template"),
+                        # Normalized logical name (see TEMPLATE_NUM_TO_NAME
+                        # above) — frontend keys its catalog-column map on
+                        # this. `template_raw` preserves whatever SP gave us
+                        # for debugging / future diagnostics.
+                        "template": template,
+                        "template_raw": list_meta.get("template"),
                         "system": bool(lst.get("system")) or bool(list_meta.get("hidden")),
                         "hidden": bool(list_meta.get("hidden")),
-                        "is_catalog": "_catalogs" in (lst.get("webUrl") or ""),
+                        "is_catalog": is_catalog,
                         "is_library": is_library,
                         "web_url": lst.get("webUrl"),
                         "last_modified": lst.get("lastModifiedDateTime"),
@@ -7624,16 +7672,23 @@ class BackupWorker:
                 except Exception as exc:
                     logger.warning("list-folder persist failed for %s/%s: %s", site_label, display, exc)
 
-                if is_library:
-                    # Library files are already picked up by the drive
-                    # producer — re-enqueueing them via SP REST would
+                if is_library and not is_catalog:
+                    # Plain document libraries are already picked up by the
+                    # drive producer — re-enqueueing them via SP REST would
                     # duplicate bytes and double the Graph/SP REST cost.
+                    # Catalog libraries fall through: their file bytes still
+                    # come from the drive producer, and this REST pass adds
+                    # the list-item columns on top.
                     continue
                 if not (sp_hostname and sp_site_web_url):
                     logger.warning("Cannot derive SP site URL for %s, skipping list items", site_label)
                     continue
 
                 try:
+                    # all_fields defaults to True now — every list returns
+                    # FieldValuesAsText so the frontend can render each list's
+                    # native column set (Tasks → AssignedTo/Due Date/Status,
+                    # Events → Start/End, Composed Looks → MasterPageUrl…).
                     async for row in graph_client.iter_sharepoint_list_items_via_rest(
                         sp_hostname, sp_site_web_url, lst_id,
                     ):
@@ -7645,6 +7700,8 @@ class BackupWorker:
                             "site_label": site_label,
                             "sp_hostname": sp_hostname,
                             "sp_site_web_url": sp_site_web_url,
+                            "is_catalog": is_catalog,
+                            "template": template,
                         })
                 except Exception as exc:
                     logger.warning("SP REST stream failed for list %s/%s: %s", site_label, display, exc)
@@ -7814,18 +7871,45 @@ class BackupWorker:
         site_label = work["site_label"]
         sp_hostname = work["sp_hostname"]
         sp_site_web_url = work["sp_site_web_url"]
+        is_catalog = bool(work.get("is_catalog"))
+        template = work.get("template") or ""
 
         it_id = str(row.get("Id") or row.get("ID") or "")
         if not it_id:
             return
-        srv_rel = row.get("FileRef") or ""
-        leaf = row.get("FileLeafRef") or ""
-        obj_type = int(row.get("FileSystemObjectType") or 0)
+        # FieldValuesAsText is now requested for every list (see
+        # graph_client.iter_sharepoint_list_items_via_rest — default
+        # all_fields=True). Every declared column comes back as a
+        # readable string so the Recovery UI can render whatever the
+        # list has — Title/MasterPageUrl/ThemeUrl for Composed Looks,
+        # AssignedTo/DueDate/Status for Tasks, plus any custom column
+        # the site owner added.
+        fvat = row.get("FieldValuesAsText") if isinstance(row.get("FieldValuesAsText"), dict) else {}
+        # File-reference fields used to live at the top level; on tenants
+        # where the default projection drops them, they're still present
+        # inside FieldValuesAsText. Read both so the bytes-streaming
+        # branch below kicks in regardless of which form SP returned.
+        srv_rel = row.get("FileRef") or fvat.get("FileRef") or ""
+        leaf = row.get("FileLeafRef") or fvat.get("FileLeafRef") or ""
+        obj_type_raw = row.get("FileSystemObjectType")
+        if obj_type_raw is None:
+            obj_type_raw = fvat.get("FileSystemObjectType")
+        try:
+            obj_type = int(obj_type_raw or 0)
+        except (TypeError, ValueError):
+            obj_type = 0
         is_folder = (obj_type == 1)
-        name = leaf or row.get("Title") or (srv_rel.rsplit("/", 1)[-1] if srv_rel else f"Item-{it_id}")
+        row_title = fvat.get("Title") or row.get("Title")
+        name = leaf or row_title or (srv_rel.rsplit("/", 1)[-1] if srv_rel else f"Item-{it_id}")
 
         # Nest folder_path by server-relative path so Recovery mirrors real layout.
-        if srv_rel:
+        # For catalog lists we flatten to `{site_label}/lists/{display}` — the
+        # server-relative URL lives in /_catalogs/design/... which is noise to
+        # the user; the catalog row IS the list row, not a separately-nested
+        # file. Non-catalog lists keep the full server-relative nesting.
+        if is_catalog or not srv_rel:
+            item_folder_path = f"{site_label}/lists/{display}"
+        else:
             trail = srv_rel.lstrip("/")
             parts = trail.split("/")
             if len(parts) >= 2 and parts[0] == "sites":
@@ -7834,8 +7918,6 @@ class BackupWorker:
             item_folder_path = f"{site_label}/lists/{display}"
             if path_parts:
                 item_folder_path += "/" + "/".join(path_parts)
-        else:
-            item_folder_path = f"{site_label}/lists/{display}"
 
         blob_path: Optional[str] = None
         content_hash: Optional[str] = None
@@ -7962,11 +8044,21 @@ class BackupWorker:
                         "server_relative_url": srv_rel,
                         "file": file_info,
                         "is_folder": is_folder,
-                        "title": row.get("Title"),
+                        "title": row_title,
                         "created": row.get("Created") or (file_info or {}).get("TimeCreated"),
                         "modified": row.get("Modified") or (file_info or {}).get("TimeLastModified"),
                         "version": (file_info or {}).get("UIVersionLabel"),
                         "source": "sp_rest",
+                        # Every list row ships its full FieldValuesAsText
+                        # dictionary (Title / Modified / custom columns / …)
+                        # so the Recovery UI can render AFI-style column
+                        # grids dynamically per-list without any schema
+                        # baked into the client. Catalog lists just happen
+                        # to have the richest columns (MasterPageUrl etc.),
+                        # but Tasks / Events / custom lists benefit too.
+                        "is_catalog": is_catalog,
+                        "template": template,
+                        "columns": fvat if fvat else None,
                     },
                 ))
                 await sess.commit()
