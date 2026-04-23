@@ -4,15 +4,19 @@ Uses Job.type (not job_type), Job.spec (not input_params),
 Job.result (not output_params). JobType.EXPORT + spec["kind"]="chat_export_thread"
 is the discriminator.
 """
-import io
 import json
 import logging
+import os
+import tempfile
 import aio_pika
 from sqlalchemy import select, update
 
 from shared.database import async_session_factory
 from shared.models import Job, JobStatus, Resource
-from shared.azure_storage import azure_storage_manager, upload_blob_with_retry
+from shared.azure_storage import (
+    azure_storage_manager,
+    upload_blob_with_retry_from_file,
+)
 from shared.config import settings
 
 from workers.chat_export_worker.blob_shard import sign_download_url
@@ -107,46 +111,67 @@ async def consume_thread(message: aio_pika.IncomingMessage) -> None:
                 await publish(job_id, "error", {"code": str(e)})
                 return
 
-            await publish(
-                job_id, "progress",
-                {"stage": "rendering", "percent": 20,
-                 "messagesTotal": len(scope.messages)},
-            )
+            # The rest of the pipeline (normalize → render → package → upload
+            # → sign) is wrapped in a try/except so an unexpected exception
+            # transitions the Job row to FAILED instead of leaving it stuck
+            # in RUNNING. RabbitMQ acks the message on exit (requeue=False
+            # on message.process) but does not touch the DB, so without
+            # this block the UI would poll forever after any failure.
+            try:
+                await _run_pipeline(sess, job_id, spec, scope, job)
+            except Exception as exc:
+                log.exception("job_failed id=%s", job_id)
+                await _update_job(
+                    sess, job_id, status=JobStatus.FAILED,
+                    result={"error": {"code": "pipeline_error", "message": str(exc)}},
+                )
+                await publish(job_id, "error", {"code": "pipeline_error", "message": str(exc)})
 
-            hosted_by_msg = {
-                mid: [
-                    {"hc_id": h["hc_id"],
-                     "local_path": f"./{scope.thread_path.split('/')[-1]}-attachments/inline/{h['hc_id']}{h.get('ext', '.bin')}"}
-                    for h in hs
-                ]
-                for mid, hs in scope.hosted_map.items()
-            }
 
-            render_messages = normalize_messages(
-                scope.messages,
-                attachments_by_msg={},
-                hosted_by_msg=hosted_by_msg,
-                layout=scope.layout,
-            )
+async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
+    await publish(
+        job_id, "progress",
+        {"stage": "rendering", "percent": 20,
+         "messagesTotal": len(scope.messages)},
+    )
 
-            resource = (await sess.execute(
-                select(Resource).where(Resource.id == spec["resourceId"])
-            )).scalar_one()
-            pkg_ctx = {
-                "job_id": str(job_id),
-                "user_email": spec.get("userEmail", ""),
-                "tenant_name": str(resource.tenant_id),
-                "resource_name": resource.display_name,
-                "scope": f"{scope.layout} - {scope.thread_path}",
-                "snapshot_at": job.created_at,
-            }
+    hosted_by_msg = {
+        mid: [
+            {"hc_id": h["hc_id"],
+             "local_path": f"./{scope.thread_path.split('/')[-1]}-attachments/inline/{h['hc_id']}{h.get('ext', '.bin')}"}
+            for h in hs
+        ]
+        for mid, hs in scope.hosted_map.items()
+    }
 
-            if await _check_cancelled(sess, job_id):
-                await _update_job(sess, job_id, status=JobStatus.CANCELLED)
-                await publish(job_id, "cancelled", {})
-                return
+    render_messages = normalize_messages(
+        scope.messages,
+        attachments_by_msg={},
+        hosted_by_msg=hosted_by_msg,
+        layout=scope.layout,
+    )
 
-            buf = io.BytesIO()
+    resource = (await sess.execute(
+        select(Resource).where(Resource.id == spec["resourceId"])
+    )).scalar_one()
+    pkg_ctx = {
+        "job_id": str(job_id),
+        "user_email": spec.get("userEmail", ""),
+        "tenant_name": str(resource.tenant_id),
+        "resource_name": resource.display_name,
+        "scope": f"{scope.layout} - {scope.thread_path}",
+        "snapshot_at": job.created_at,
+    }
+
+    if await _check_cancelled(sess, job_id):
+        await _update_job(sess, job_id, status=JobStatus.CANCELLED)
+        await publish(job_id, "cancelled", {})
+        return
+
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix=f"chat-export-{job_id}-", suffix=".zip")
+    os.close(tmp_fd)
+    try:
+        with open(tmp_path, "wb") as buf:
             pkg = ThreadPackager(
                 layout=scope.layout,
                 thread_name=scope.thread_path.rsplit("/", 1)[-1],
@@ -162,50 +187,46 @@ async def consume_thread(message: aio_pika.IncomingMessage) -> None:
                 context=pkg_ctx,
             )
 
-            await publish(job_id, "progress", {"stage": "uploading", "percent": 85})
-            if await _check_cancelled(sess, job_id):
-                await _update_job(sess, job_id, status=JobStatus.CANCELLED)
-                await publish(job_id, "cancelled", {})
-                return
+        await publish(job_id, "progress", {"stage": "uploading", "percent": 85})
+        if await _check_cancelled(sess, job_id):
+            await _update_job(sess, job_id, status=JobStatus.CANCELLED)
+            await publish(job_id, "cancelled", {})
+            return
 
-            account = settings.AZURE_STORAGE_ACCOUNT_NAME
-            container = "exports"
-            blob_path = f"{job_id}/export.zip"
-            buf.seek(0)
-            shard = azure_storage_manager.get_default_shard()
-            up_result = await upload_blob_with_retry(
-                container, blob_path, buf.getvalue(),
-                shard=shard, max_retries=3,
-            )
-            if not up_result.get("success"):
-                raise RuntimeError(f"blob upload failed: {up_result.get('error')}")
-            # Sign via the shard — not via blob_shard.sign_download_url.
-            # The legacy helper hard-codes
-            # https://{account}.blob.core.windows.net/… with an Azure
-            # SAS signature regardless of the active backend, so
-            # on-prem SeaweedFS deployments were handing users
-            # download links that pointed at the unreachable Azure
-            # hostname. `shard.get_blob_sas_url` delegates to the
-            # active backend's presigned_url — Azure SAS on
-            # azure_blob, S3 presigned GET on seaweedfs — so the URL
-            # always matches where the ZIP actually landed.
-            ttl = getattr(settings, "chat_export_sas_ttl_hours", 168)
-            url = await shard.get_blob_sas_url(container, blob_path, valid_for_hours=ttl)
+        account = settings.AZURE_STORAGE_ACCOUNT_NAME
+        container = "exports"
+        blob_path = f"{job_id}/export.zip"
+        shard = azure_storage_manager.get_default_shard()
+        up_result = await upload_blob_with_retry_from_file(
+            container, blob_path, tmp_path,
+            shard=shard, max_retries=3,
+        )
+        if not up_result.get("success"):
+            raise RuntimeError(f"blob upload failed: {up_result.get('error')}")
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
-            await _update_job(
-                sess, job_id, status=JobStatus.COMPLETED,
-                result={
-                    "export_zip_blob_path": f"{account}/{container}/{blob_path}",
-                    "signed_url": url,
-                    "total_msgs": len(render_messages),
-                    "total_bytes": summary["total_bytes"],
-                    "sha256": summary["sha256"],
-                },
-            )
-            await publish(
-                job_id, "complete",
-                {"url": url,
-                 "sizeBytes": summary["total_bytes"],
-                 "sha256": summary["sha256"]},
-            )
-            log.info("job_completed id=%s bytes=%d", job_id, summary["total_bytes"])
+    ttl = getattr(settings, "chat_export_sas_ttl_hours", 168)
+    url = await shard.get_blob_sas_url(container, blob_path, valid_for_hours=ttl)
+
+    await _update_job(
+        sess, job_id, status=JobStatus.COMPLETED,
+        result={
+            "export_zip_blob_path": f"{account}/{container}/{blob_path}",
+            "signed_url": url,
+            "total_msgs": len(render_messages),
+            "total_bytes": summary["total_bytes"],
+            "sha256": summary["sha256"],
+        },
+    )
+    await publish(
+        job_id, "complete",
+        {"url": url,
+         "sizeBytes": summary["total_bytes"],
+         "sha256": summary["sha256"]},
+    )
+    log.info("job_completed id=%s bytes=%d", job_id, summary["total_bytes"])

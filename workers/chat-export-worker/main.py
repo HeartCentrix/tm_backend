@@ -19,6 +19,44 @@ log = logging.getLogger("chat-export-worker")
 Q_THREAD = "q.export.chat.thread"
 
 
+async def _reclaim_orphan_jobs() -> None:
+    """Mark chat-export jobs left in RUNNING/PENDING as FAILED on startup.
+
+    If the worker was OOM-killed or crashed mid-job, the row stays in RUNNING
+    and the UI polls forever. There is exactly one chat-export-worker per
+    deployment, so on startup any RUNNING chat-export job has no live owner
+    and should be failed so the client sees a terminal state.
+    """
+    from sqlalchemy import and_, or_, select, update as sa_update
+    from shared.database import async_session_factory
+    from shared.models import Job, JobStatus, JobType
+    async with async_session_factory() as sess:
+        q = select(Job.id, Job.spec).where(
+            and_(
+                Job.type == JobType.EXPORT,
+                Job.status.in_([JobStatus.RUNNING, JobStatus.PENDING, JobStatus.QUEUED]),
+            )
+        )
+        rows = (await sess.execute(q)).all()
+        ids_to_fail: list = []
+        for jid, spec in rows:
+            if isinstance(spec, dict) and spec.get("kind") == "chat_export_thread":
+                ids_to_fail.append(jid)
+        if not ids_to_fail:
+            return
+        await sess.execute(
+            sa_update(Job)
+            .where(Job.id.in_(ids_to_fail))
+            .values(
+                status=JobStatus.FAILED,
+                result={"error": {"code": "worker_restart",
+                                   "message": "chat-export-worker restarted before the job finished"}},
+            )
+        )
+        await sess.commit()
+        log.info("reclaimed %d orphan chat-export job(s)", len(ids_to_fail))
+
+
 async def health_server() -> None:
     async def ok(_r):
         return web.Response(text="ok")
@@ -41,6 +79,10 @@ async def main() -> None:
     start_http_server(9102)
     await health_server()
     await startup_router()
+    try:
+        await _reclaim_orphan_jobs()
+    except Exception:
+        log.exception("orphan-job reclaim failed; continuing")
 
     conn = await aio_pika.connect_robust(
         settings.RABBITMQ_URL,
