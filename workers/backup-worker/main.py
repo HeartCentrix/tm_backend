@@ -517,6 +517,59 @@ class BackupWorker:
                     except Exception:
                         pass
 
+    async def _emit_backup_audit(
+        self,
+        action: str,
+        outcome: str,
+        tenant,
+        resource,
+        snapshot,
+        job_id,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        # Fire-and-forget lifecycle audit for mass-backup sub-handlers.
+        # _process_single_backup inlines the same 3 emissions; mass paths
+        # use this helper so every resource backup has start/end coverage
+        # regardless of which dispatch path it took. Wrapped so a slow or
+        # down audit-service never masks the real backup outcome.
+        #
+        # `snapshot` may be the live Snapshot ORM row OR a raw str/UUID —
+        # mass-path completion emits don't carry the ORM row back out of
+        # the inner closure, just its id captured earlier.
+        try:
+            resource_type = (
+                resource.type.value if hasattr(resource.type, "value")
+                else str(resource.type)
+            )
+            if snapshot is None:
+                snap_id = None
+            elif hasattr(snapshot, "id"):
+                snap_id = str(snapshot.id)
+            else:
+                snap_id = str(snapshot)
+            await self.audit_logger.log(
+                action=action,
+                tenant_id=str(tenant.id) if tenant else None,
+                org_id=(
+                    str(tenant.org_id)
+                    if tenant and getattr(tenant, "org_id", None)
+                    else None
+                ),
+                actor_type="WORKER",
+                resource_id=str(resource.id),
+                resource_type=resource_type,
+                resource_name=(
+                    resource.display_name or getattr(resource, "email", None)
+                    or str(resource.id)
+                ),
+                outcome=outcome,
+                job_id=str(job_id),
+                snapshot_id=snap_id,
+                details=details or {},
+            )
+        except Exception as audit_err:
+            print(f"[{self.worker_id}] [AuditLogger] lifecycle emit failed: {audit_err}")
+
     async def process_backup_message(self, message: Dict[str, Any]):
         job_id = uuid.UUID(message["jobId"])
         resource_ids = message.get("resourceIds", [])
@@ -1905,9 +1958,19 @@ class BackupWorker:
                 return []
             return []
 
+        # resource.id -> snapshot.id, populated inside _backup_one so the
+        # outer gather-result loop can emit BACKUP_FAILED / BACKUP_COMPLETED
+        # with the right snapshot reference without reindenting 190 lines.
+        _snap_by_resource: Dict[str, str] = {}
+
         async def _backup_one(resource: Resource) -> Dict:
             async with semaphore:
                 snapshot = await self.create_snapshot(resource, message, job_id)
+                _snap_by_resource[str(resource.id)] = str(snapshot.id)
+                await self._emit_backup_audit(
+                    "BACKUP_STARTED", "IN_PROGRESS",
+                    tenant, resource, snapshot, job_id,
+                )
                 # Pass snapshot into the fetcher so handlers (USER_CHATS
                 # today, USER_MAIL next) can stream-persist their items
                 # inline and return a lightweight attachment-candidate
@@ -2099,6 +2162,33 @@ class BackupWorker:
                 return {"item_count": total_items, "bytes_added": bytes_total}
 
         results = await asyncio.gather(*[_backup_one(r) for r in resources], return_exceptions=True)
+
+        # Emit BACKUP_COMPLETED / BACKUP_FAILED for each resource now that
+        # we know its outcome. gather(return_exceptions=True) gave us dicts
+        # for success and Exception instances for failure — _snap_by_resource
+        # lets us attach the snapshot_id either way (populated right after
+        # create_snapshot inside _backup_one).
+        for res, outcome in zip(resources, results):
+            snap_id = _snap_by_resource.get(str(res.id))
+            if isinstance(outcome, Exception):
+                await self._emit_backup_audit(
+                    "BACKUP_FAILED", "FAILURE",
+                    tenant, res, snap_id, job_id,
+                    details={
+                        "error": str(outcome)[:500],
+                        "error_type": type(outcome).__name__,
+                    },
+                )
+            elif isinstance(outcome, dict):
+                await self._emit_backup_audit(
+                    "BACKUP_COMPLETED", "SUCCESS",
+                    tenant, res, snap_id, job_id,
+                    details={
+                        "item_count": outcome.get("item_count", 0),
+                        "bytes_added": outcome.get("bytes_added", 0),
+                    },
+                )
+
         item_count = sum(r.get("item_count", 0) for r in results if isinstance(r, dict))
         bytes_added = sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict))
         return {"item_count": item_count, "bytes_added": bytes_added}
@@ -3158,8 +3248,13 @@ class BackupWorker:
 
         async def backup_one_resource(resource: Resource):
             async with semaphore:
+                snapshot = None
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
+                    await self._emit_backup_audit(
+                        "BACKUP_STARTED", "IN_PROGRESS",
+                        tenant, resource, snapshot, job_id,
+                    )
                     delta_token = (resource.extra_data or {}).get("delta_token")
 
                     if resource_type == "ONEDRIVE":
@@ -3238,9 +3333,25 @@ class BackupWorker:
                             "bytes_added": res_bytes,
                         })
 
+                    await self._emit_backup_audit(
+                        "BACKUP_COMPLETED", "SUCCESS",
+                        tenant, resource, snapshot, job_id,
+                        details={
+                            "item_count": total_success,
+                            "bytes_added": res_bytes,
+                        },
+                    )
                     return {"item_count": total_success, "bytes_added": res_bytes}
                 except Exception as e:
                     print(f"[{self.worker_id}] File backup failed for {resource.id}: {e}")
+                    await self._emit_backup_audit(
+                        "BACKUP_FAILED", "FAILURE",
+                        tenant, resource, snapshot, job_id,
+                        details={
+                            "error": str(e)[:500],
+                            "error_type": type(e).__name__,
+                        },
+                    )
                     return {"item_count": 0, "bytes_added": 0}
 
         results = await asyncio.gather(*[backup_one_resource(r) for r in resources], return_exceptions=True)
@@ -3951,6 +4062,10 @@ class BackupWorker:
                 user_label = resource.display_name or resource.external_id
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
+                    await self._emit_backup_audit(
+                        "BACKUP_STARTED", "IN_PROGRESS",
+                        tenant, resource, snapshot, job_id,
+                    )
 
                     try:
                         folder_tree = await graph_client.get_mail_folder_tree(resource.external_id)
@@ -4182,6 +4297,14 @@ class BackupWorker:
                              "bytes_added": totals["bytes"]},
                         )
 
+                    await self._emit_backup_audit(
+                        "BACKUP_COMPLETED", "SUCCESS",
+                        tenant, resource, snapshot, job_id,
+                        details={
+                            "item_count": totals["items"],
+                            "bytes_added": totals["bytes"],
+                        },
+                    )
                     return {"item_count": totals["items"], "bytes_added": totals["bytes"]}
                 except Exception as e:
                     print(
@@ -4194,6 +4317,14 @@ class BackupWorker:
                                 await self.fail_snapshot(s, snapshot, e)
                         except Exception:
                             pass
+                    await self._emit_backup_audit(
+                        "BACKUP_FAILED", "FAILURE",
+                        tenant, resource, snapshot, job_id,
+                        details={
+                            "error": str(e)[:500],
+                            "error_type": type(e).__name__,
+                        },
+                    )
                     return {"item_count": 0, "bytes_added": 0}
 
         results = await asyncio.gather(
@@ -4263,6 +4394,10 @@ class BackupWorker:
                 snapshot = None
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
+                    await self._emit_backup_audit(
+                        "BACKUP_STARTED", "IN_PROGRESS",
+                        tenant, resource, snapshot, job_id,
+                    )
                     resource_type = resource.type.value
 
                     # Route to appropriate handler
@@ -4284,6 +4419,14 @@ class BackupWorker:
                                 await self.complete_snapshot(s, snapshot, result)
                         except Exception as fe:
                             print(f"[{self.worker_id}] complete_snapshot failed for {resource.id}: {fe}")
+                    await self._emit_backup_audit(
+                        "BACKUP_COMPLETED", "SUCCESS",
+                        tenant, resource, snapshot, job_id,
+                        details={
+                            "item_count": (result or {}).get("item_count", 0) if isinstance(result, dict) else 0,
+                            "bytes_added": (result or {}).get("bytes_added", 0) if isinstance(result, dict) else 0,
+                        },
+                    )
                     return result
                 except Exception as e:
                     print(f"[{self.worker_id}] Generic backup failed for {resource.id}: {e}")
@@ -4293,6 +4436,14 @@ class BackupWorker:
                                 await self.fail_snapshot(s, snapshot, e)
                         except Exception:
                             pass
+                    await self._emit_backup_audit(
+                        "BACKUP_FAILED", "FAILURE",
+                        tenant, resource, snapshot, job_id,
+                        details={
+                            "error": str(e)[:500],
+                            "error_type": type(e).__name__,
+                        },
+                    )
                     return {"item_count": 0, "bytes_added": 0}
 
         results = await asyncio.gather(*[backup_one(r) for r in resources], return_exceptions=True)
