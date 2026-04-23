@@ -932,8 +932,23 @@ async def init_db() -> None:
         # this unique constraint, both deliveries could write duplicate
         # snapshot_items. On conflict the insert IntegrityErrors and
         # rolls back, the next redelivery picks up cleanly.
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_snapshot_items_snap_ext "
-        "ON snapshot_items(snapshot_id, external_id);",
+        #
+        # The triple includes item_type because the same external_id
+        # can legitimately appear under multiple types in one snapshot:
+        # a user is commonly both GROUP_MEMBER and GROUP_OWNER of the
+        # same M365 group (Microsoft Graph returns them separately,
+        # backup-worker emits a row for each role). The earlier
+        # (snapshot_id, external_id) pair rejected the whole batch with
+        # a UniqueViolationError and the scheduler looped on the same
+        # group indefinitely, burning CPU.
+        #
+        # Drop any pre-existing pair-form index so upgrades re-use the
+        # slot for the correct triple form.
+        "DROP INDEX IF EXISTS uq_snapshot_items_snap_ext;",
+        "ALTER TABLE snapshot_items "
+        "  DROP CONSTRAINT IF EXISTS uq_snapshot_items_snap_ext;",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_snapshot_items_snap_ext_type "
+        "ON snapshot_items(snapshot_id, external_id, item_type);",
         # Hot-path composite index — tenant-scoped time-range scans of
         # a specific item type (e.g. "all EMAILs for tenant X in the
         # last 30 days" for the Recovery tab). Covers the dominant
