@@ -40,10 +40,18 @@ class SeaweedStore:
         ca_bundle: Optional[str] = None,
         upload_concurrency: int = 8,
         multipart_threshold_mb: int = 100,
+        public_endpoint: Optional[str] = None,
     ):
         self.backend_id = backend_id
         self.name = name
         self._endpoint = endpoint
+        # `public_endpoint` is the browser-reachable URL host. Internal
+        # S3 calls (uploads, deletes, head) use self._endpoint (the
+        # docker-network hostname, e.g. `http://seaweedfs:8333`). Presigned
+        # URLs are handed to the browser, which cannot resolve docker-only
+        # names — so we rewrite the host in the generated URL to
+        # `public_endpoint` when it differs. Falls back to self._endpoint.
+        self._public_endpoint = (public_endpoint or endpoint).rstrip("/")
         self._access = access_key
         self._secret = secret_key
         self._buckets = buckets
@@ -63,6 +71,16 @@ class SeaweedStore:
             raise ValueError(f"Unsupported secret_ref scheme: {secret_ref}")
         access_env = config.get("access_key_env", "ONPREM_S3_ACCESS_KEY")
         access = os.getenv(access_env, "")
+        # public_endpoint resolution order:
+        #   1. config["public_endpoint"] (explicit in tm.storage_backends row)
+        #   2. env var named by config["public_endpoint_env"]
+        #   3. default env var ONPREM_S3_PUBLIC_ENDPOINT
+        #   4. fall back to endpoint (internal docker host)
+        public_endpoint = (
+            config.get("public_endpoint")
+            or os.getenv(config.get("public_endpoint_env", "ONPREM_S3_PUBLIC_ENDPOINT"))
+            or None
+        )
         return cls(
             backend_id=backend_id, name=name, endpoint=endpoint,
             access_key=access, secret_key=secret,
@@ -72,6 +90,7 @@ class SeaweedStore:
             ca_bundle=config.get("ca_bundle"),
             upload_concurrency=config.get("upload_concurrency", 8),
             multipart_threshold_mb=config.get("multipart_threshold_mb", 100),
+            public_endpoint=public_endpoint,
         )
 
     def shard_for(self, tenant_id: str, resource_id: str) -> "SeaweedStore":
@@ -406,10 +425,27 @@ class SeaweedStore:
     async def presigned_url(self, container, path, valid_hours=6) -> str:
         bucket, key = self._bucket(container), self._key(container, path)
         async with self._client_ctx() as s3:
-            return await s3.generate_presigned_url(
+            url = await s3.generate_presigned_url(
                 "get_object", Params={"Bucket": bucket, "Key": key},
                 ExpiresIn=valid_hours * 3600,
             )
+        # boto3 builds the URL with the client's endpoint
+        # (self._endpoint — docker-internal hostname). Browsers can't
+        # resolve `seaweedfs`, so we swap the signed-URL host for the
+        # configured public endpoint. The path-style key + query
+        # parameters (Signature, Expires, AWSAccessKeyId) are preserved,
+        # which keeps the SigV2 signature valid because SeaweedFS signs
+        # over the path + query, not the hostname.
+        if self._public_endpoint and self._public_endpoint != self._endpoint.rstrip("/"):
+            from urllib.parse import urlsplit, urlunsplit
+            pub = urlsplit(self._public_endpoint)
+            orig = urlsplit(url)
+            url = urlunsplit((
+                pub.scheme or orig.scheme,
+                pub.netloc or orig.netloc,
+                orig.path, orig.query, orig.fragment,
+            ))
+        return url
 
     async def apply_immutability(self, container, path, until, mode="Unlocked") -> None:
         bucket, key = self._bucket(container), self._key(container, path)
