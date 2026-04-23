@@ -35,6 +35,34 @@ from shared.power_platform_client import PowerPlatformClient
 from shared.azure_storage import azure_storage_manager
 from mail_restore import MailRestoreEngine, MODE_OVERWRITE, MODE_SEPARATE
 from entra_restore import EntraRestoreEngine
+from contact_restore import (
+    ContactRestoreEngine,
+    MODE_OVERWRITE as CONTACT_MODE_OVERWRITE,
+    MODE_SEPARATE as CONTACT_MODE_SEPARATE,
+)
+
+# Per-worker shared semaphores — bound Graph pressure across every
+# in-flight contact restore job on this process. Sized off settings so
+# operators can tune without a code change.
+_CONTACT_GLOBAL_SEM: Optional[asyncio.Semaphore] = None
+# user_id -> Semaphore. Lazily seeded so a cold worker doesn't allocate
+# 5k semaphores up front; evicted with the module lifetime.
+_CONTACT_PER_USER_SEMS: Dict[str, asyncio.Semaphore] = {}
+
+
+def _contact_global_sem() -> asyncio.Semaphore:
+    global _CONTACT_GLOBAL_SEM
+    if _CONTACT_GLOBAL_SEM is None:
+        _CONTACT_GLOBAL_SEM = asyncio.Semaphore(settings.CONTACT_RESTORE_GLOBAL_POOL)
+    return _CONTACT_GLOBAL_SEM
+
+
+def _contact_per_user_sem(user_id: str) -> asyncio.Semaphore:
+    sem = _CONTACT_PER_USER_SEMS.get(user_id)
+    if sem is None:
+        sem = asyncio.Semaphore(settings.CONTACT_RESTORE_PER_USER)
+        _CONTACT_PER_USER_SEMS[user_id] = sem
+    return sem
 
 
 def _mail_graph_user_id(resource) -> str:
@@ -57,6 +85,29 @@ def _mail_graph_user_id(resource) -> str:
         raw = str(resource.external_id or "")
         if raw.endswith(":mail"):
             return raw[: -len(":mail")]
+        return raw
+    return str(resource.external_id or "")
+
+
+def _contact_graph_user_id(resource) -> str:
+    """Return the Graph user id for a contact-bearing resource.
+
+    Tier 1 mailbox rows carry the Graph user id in `external_id`.
+
+    Tier 2 USER_CONTACTS rows append a `:contacts` suffix (see
+    `graph_client.py:1695`) so the row is unique per user. The real
+    Graph user id lives in `extra_data.user_id`; stripping the suffix is
+    the defensive fallback. Without this, the restore URL becomes
+    `/users/<uuid>:contacts/contacts` and Graph returns 404."""
+    rtype = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+    if rtype == "USER_CONTACTS":
+        meta = resource.extra_data or {}
+        uid = meta.get("user_id")
+        if uid:
+            return str(uid)
+        raw = str(resource.external_id or "")
+        if raw.endswith(":contacts"):
+            return raw[: -len(":contacts")]
         return raw
     return str(resource.external_id or "")
 
@@ -719,6 +770,50 @@ class RestoreWorker:
                             flush=True,
                         )
 
+            # Contact restore engine — folder-aware, Graph-$batch-backed
+            # pipeline for USER_CONTACT items. Fixes the prior 404-bug
+            # where USER_CONTACTS tier-2 rows (external_id has a
+            # `:contacts` suffix) were dispatched with the raw
+            # external_id, yielding /users/<uuid>:contacts/contacts.
+            contact_items: List[SnapshotItem] = []
+            if settings.CONTACT_RESTORE_ENGINE_ENABLED and resource_type in (
+                "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX", "USER_CONTACTS", "ENTRA_USER"
+            ):
+                remaining_ct: List[SnapshotItem] = []
+                for it in resource_items:
+                    if it.item_type == "USER_CONTACT":
+                        contact_items.append(it)
+                    else:
+                        remaining_ct.append(it)
+                resource_items = remaining_ct
+
+            if contact_items:
+                contact_overwrite = conflict_mode == "OVERWRITE" or bool(spec.get("overwrite"))
+                contact_user_id = _contact_graph_user_id(resource)
+                ct_engine = ContactRestoreEngine(
+                    graph_client,
+                    resource,
+                    mode=CONTACT_MODE_OVERWRITE if contact_overwrite else CONTACT_MODE_SEPARATE,
+                    graph_user_id=contact_user_id,
+                    worker_id=self.worker_id,
+                    separate_folder_root=spec.get("targetFolder"),
+                    global_sem=_contact_global_sem(),
+                    per_user_sem=_contact_per_user_sem(contact_user_id),
+                    max_retries=settings.CONTACT_RESTORE_MAX_RETRIES,
+                )
+                ct_summary = await ct_engine.run(contact_items)
+                restored_count += ct_summary.get("created", 0)
+                failed_count += ct_summary.get("failed", 0)
+                for o in ct_summary.get("items", []):
+                    if o.get("outcome") == "failed":
+                        print(
+                            f"[{self.worker_id}] [CONTACT-RESTORE FAIL] "
+                            f"ext_id={o.get('external_id')} "
+                            f"name={o.get('display_name')!r} "
+                            f"reason={o.get('reason')}",
+                            flush=True,
+                        )
+
             # OneDrive restore v2 — streaming engine with per-target-user
             # concurrency cap. Routes FILE / ONEDRIVE_FILE items out of the
             # per-item loop below so they go through resumable upload
@@ -967,6 +1062,40 @@ class RestoreWorker:
             mail_summary = await engine.run(mail_items)
             restored_count += mail_summary["created"] + mail_summary["updated"]
             failed_count += mail_summary["failed"]
+
+        # Contact cross-user — same batched engine as IN_PLACE. Target
+        # user id resolves through _contact_graph_user_id, which strips
+        # the tier-2 `:contacts` suffix when the UI happens to pick a
+        # USER_CONTACTS row as the destination.
+        contact_items: List[SnapshotItem] = []
+        if settings.CONTACT_RESTORE_ENGINE_ENABLED and target_type in (
+            "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX", "USER_CONTACTS", "ENTRA_USER"
+        ):
+            remaining_ct: List[SnapshotItem] = []
+            for it in items:
+                if it.item_type == "USER_CONTACT":
+                    contact_items.append(it)
+                else:
+                    remaining_ct.append(it)
+            items = remaining_ct
+
+        if contact_items:
+            contact_overwrite = bool(spec.get("overwrite"))
+            contact_user_id = _contact_graph_user_id(target_resource)
+            ct_engine = ContactRestoreEngine(
+                graph_client,
+                target_resource,
+                mode=CONTACT_MODE_OVERWRITE if contact_overwrite else CONTACT_MODE_SEPARATE,
+                graph_user_id=contact_user_id,
+                worker_id=self.worker_id,
+                separate_folder_root=spec.get("targetFolder"),
+                global_sem=_contact_global_sem(),
+                per_user_sem=_contact_per_user_sem(contact_user_id),
+                max_retries=settings.CONTACT_RESTORE_MAX_RETRIES,
+            )
+            ct_summary = await ct_engine.run(contact_items)
+            restored_count += ct_summary.get("created", 0)
+            failed_count += ct_summary.get("failed", 0)
 
         # OneDrive cross-user v2 — route FILE / ONEDRIVE_FILE items
         # through the streaming engine against the chosen target drive.
@@ -2178,8 +2307,14 @@ class RestoreWorker:
             display_name = contact_item.name or "Restored contact"
             payload = {"displayName": display_name}
 
+        # USER_CONTACTS tier-2 rows carry a `:contacts` suffix in
+        # external_id; sending that raw to Graph yields
+        # /users/<uuid>:contacts/contacts → 404. Resolve through the
+        # same helper the ContactRestoreEngine uses so a disabled
+        # engine still hits a valid URL.
+        user_id = _contact_graph_user_id(resource)
         try:
-            created = await graph_client.create_user_contact(resource.external_id, payload)
+            created = await graph_client.create_user_contact(user_id, payload)
             print(f"[{self.worker_id}] [CONTACT RESTORE] {payload.get('displayName', contact_item.id)} → {created.get('id', '?')}")
         except Exception as e:
             print(f"[{self.worker_id}] contact create failed: {type(e).__name__}: {e}")
