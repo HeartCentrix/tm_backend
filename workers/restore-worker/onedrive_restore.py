@@ -66,8 +66,43 @@ class OneDriveRestoreEngine:
 
     # ---------- path derivation ----------
 
-    @staticmethod
+    # OneDrive reserves these characters inside file/folder names.
+    # Graph docs: " * : < > ? / \ | plus leading/trailing whitespace and
+    # a trailing dot. Any of them in a path segment blows up the
+    # /drives/{id}/root:/…:/content URL parser with a 400 "Resource not
+    # found for the segment 'root:'" — it's not a permission failure,
+    # it's a URL-syntax failure. The common real-world trigger is the
+    # default separate-folder root which contains a colon from the
+    # timestamp ("Restored by AFI/2026-04-23 08:57").
+    _ONEDRIVE_RESERVED_CHARS = '"*:<>?\\|'
+
+    @classmethod
+    def _sanitize_onedrive_segment(cls, segment: str) -> str:
+        """Return a version of ``segment`` that's safe inside a OneDrive
+        path component. Replaces reserved characters with ``-`` and
+        trims leading/trailing whitespace. ``/`` is intentionally NOT
+        replaced — callers split on ``/`` before calling us so the
+        segment never contains one."""
+        if not segment:
+            return segment
+        cleaned = segment
+        for ch in cls._ONEDRIVE_RESERVED_CHARS:
+            cleaned = cleaned.replace(ch, "-")
+        cleaned = cleaned.strip().rstrip(".")
+        return cleaned or "_"
+
+    @classmethod
+    def _sanitize_onedrive_path(cls, path: str) -> str:
+        """Apply ``_sanitize_onedrive_segment`` to every ``/``-separated
+        segment. Empty input stays empty so the caller keeps control of
+        root-vs-subpath semantics."""
+        if not path:
+            return path
+        return "/".join(cls._sanitize_onedrive_segment(p) for p in path.split("/") if p)
+
+    @classmethod
     def resolve_drive_path(
+        cls,
         item: Any,
         mode: Mode,
         separate_folder_root: Optional[str],
@@ -77,16 +112,27 @@ class OneDriveRestoreEngine:
         folder_path captured by the backup can be either "/drive/root:/A/B"
         or "/drives/{driveId}/root:/A/B". Either form strips to the user-
         visible trail. None / "" = file at the drive root.
-        """
+
+        Every path segment is sanitized against OneDrive's reserved-
+        character set before the URL is assembled — otherwise a colon
+        inside the separate-folder timestamp ("2026-04-23 08:57") breaks
+        Graph's /root:/…:/content path parser with a 400."""
         name = getattr(item, "name", "") or getattr(item, "external_id", "item")
         raw = (getattr(item, "folder_path", None) or "").strip()
         trail = raw
-        if ":" in trail:
+        if ":" in trail and trail.lower().startswith(("/drive", "/drives")):
+            # Strip the "/drive/root:" or "/drives/{id}/root:" prefix.
+            # Guard against plain folder paths that legitimately contain
+            # a colon (e.g. a user-created "Budget : Q4" folder).
             trail = trail.split(":", 1)[1]
         trail = trail.strip("/")
         root = (separate_folder_root or "").strip("/")
-        parts = [p for p in (root, trail, name) if p]
-        path = "/".join(parts)
+        parts = [
+            cls._sanitize_onedrive_path(p)
+            for p in (root, trail, cls._sanitize_onedrive_segment(name))
+            if p
+        ]
+        path = "/".join(p for p in parts if p)
         conflict = "replace" if mode == Mode.OVERWRITE else "rename"
         return path, conflict
 
