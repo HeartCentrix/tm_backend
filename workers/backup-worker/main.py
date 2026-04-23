@@ -95,8 +95,14 @@ async def _bulk_upsert_snapshot_items(
     total = 0
     for i in range(0, len(rows), _BULK_INSERT_CHUNK):
         chunk = rows[i:i + _BULK_INSERT_CHUNK]
+        # ON CONFLICT target must match an existing unique index column
+        # set exactly. The snapshot_items unique index is
+        # uq_snapshot_items_snap_ext_type on
+        # (snapshot_id, external_id, item_type) — see shared/database.py:950.
+        # A 2-column spec raises InvalidColumnReferenceError and rolls back
+        # every batched insert, landing every bulk-backup with 0 items.
         stmt = _pg_insert(SnapshotItem).values(chunk).on_conflict_do_nothing(
-            index_elements=["snapshot_id", "external_id"],
+            index_elements=["snapshot_id", "external_id", "item_type"],
         )
         await session.execute(stmt)
         total += len(chunk)
