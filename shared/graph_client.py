@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import httpx
-from typing import AsyncGenerator, List, Optional, Dict, Any, Tuple
+from typing import AsyncGenerator, AsyncIterator, List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 import hashlib
 import time
@@ -3774,6 +3774,144 @@ class GraphClient:
                 offset = end + 1
             return last_json
 
+    async def upload_large_file_stream_to_drive(
+        self,
+        drive_id: str,
+        drive_path: str,
+        byte_iter: "AsyncIterator[bytes]",
+        total_size: int,
+        chunk_size: int = 10 * 1024 * 1024,
+        conflict_behavior: str = "rename",
+    ) -> Dict[str, Any]:
+        """Streaming analogue of upload_large_file_to_drive: takes an
+        async byte iterator instead of a fully-buffered `bytes`.
+        Pipes the iterator directly into Graph's uploadSession so a
+        100 GB restore never materialises 100 GB of Python heap.
+
+        Buffering: the caller's iterator may yield arbitrary-sized
+        chunks (S3 range reads produce variable pieces), but the
+        uploadSession requires each PUT to be a multiple of 320 KiB
+        *except the last*. We accumulate into a bytearray and flush
+        exactly `chunk_size` at a time, with whatever remains going
+        out as the tail PUT.
+
+        Retries: per-PUT retry on 429/5xx/transient TCP with the
+        uploadSession URL staying valid across attempts — identical
+        semantics to the buffered variant. If the iterator raises,
+        we propagate; Graph garbage-collects the stale uploadSession
+        within ~24h.
+        """
+        from urllib.parse import quote as _qseg
+        quoted_path_lg = "/".join(
+            _qseg(seg, safe="") for seg in drive_path.split("/") if seg
+        )
+        create_url = (
+            f"{self.GRAPH_URL}/drives/{drive_id}/root:/"
+            f"{quoted_path_lg}:/createUploadSession"
+        )
+        token = await self._get_token()
+        create_headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        create_payload = {
+            "item": {
+                "@microsoft.graph.conflictBehavior": conflict_behavior,
+            }
+        }
+
+        # Enforce Graph's 320 KiB alignment requirement. Round the
+        # caller's chunk_size down to the nearest multiple.
+        CHUNK_ALIGN = 320 * 1024
+        aligned = max(CHUNK_ALIGN, (chunk_size // CHUNK_ALIGN) * CHUNK_ALIGN)
+
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as c:
+            session_resp = await c.post(
+                create_url, headers=create_headers, json=create_payload,
+            )
+            if session_resp.status_code >= 400:
+                raise RuntimeError(
+                    f"createUploadSession {session_resp.status_code}: "
+                    f"{session_resp.text[:300]}"
+                )
+            upload_url = session_resp.json().get("uploadUrl")
+            if not upload_url:
+                raise RuntimeError(
+                    "createUploadSession returned no uploadUrl"
+                )
+
+            async def _put_one(chunk_bytes: bytes, offset: int, is_last: bool) -> Dict[str, Any]:
+                end = offset + len(chunk_bytes) - 1
+                put_headers = {
+                    "Content-Length": str(len(chunk_bytes)),
+                    "Content-Range": (
+                        f"bytes {offset}-{end}/{total_size}"
+                    ),
+                }
+                attempt = 0
+                while True:
+                    attempt += 1
+                    try:
+                        resp = await c.put(
+                            upload_url, headers=put_headers,
+                            content=chunk_bytes,
+                        )
+                    except (httpx.ConnectError, httpx.ReadTimeout,
+                            httpx.RemoteProtocolError):
+                        if attempt >= 3:
+                            raise
+                        await asyncio.sleep(min(2 ** attempt, 30))
+                        continue
+                    if resp.status_code in (429, 503):
+                        await asyncio.sleep(_parse_retry_after(resp))
+                        continue
+                    if resp.status_code >= 500 and attempt < 3:
+                        await asyncio.sleep(min(2 ** attempt, 30))
+                        continue
+                    if resp.status_code >= 400:
+                        raise RuntimeError(
+                            f"upload chunk {offset}-{end} "
+                            f"{resp.status_code}: {resp.text[:300]}"
+                        )
+                    if resp.status_code in (200, 201):
+                        return resp.json()
+                    return {}
+
+            buf = bytearray()
+            offset = 0
+            bytes_seen = 0
+            last_json: Dict[str, Any] = {}
+
+            async for piece in byte_iter:
+                if not piece:
+                    continue
+                bytes_seen += len(piece)
+                buf.extend(piece)
+                while len(buf) >= aligned:
+                    chunk = bytes(buf[:aligned])
+                    del buf[:aligned]
+                    is_last_put = (
+                        offset + len(chunk) >= total_size and not buf
+                    )
+                    last_json = await _put_one(chunk, offset, is_last_put)
+                    offset += len(chunk)
+
+            # Flush tail (may be 0..aligned-1 bytes). If total_size
+            # was mis-specified smaller than what the iterator
+            # produced, we still send what we have; Graph will 400
+            # and raise.
+            if buf:
+                tail = bytes(buf)
+                last_json = await _put_one(tail, offset, True)
+                offset += len(tail)
+
+            if offset != total_size:
+                raise RuntimeError(
+                    f"upload stream size mismatch: sent {offset}, "
+                    f"declared {total_size} (iter yielded {bytes_seen})"
+                )
+            return last_json
+
     async def patch_drive_item_file_system_info(
         self,
         drive_id: str,
@@ -4089,6 +4227,69 @@ class GraphClient:
         Graph API: GET /users/{id}/drive
         """
         return await self._get(f"{self.GRAPH_URL}/users/{user_id}/drive")
+
+    async def get_download_urls_batch(
+        self,
+        drive_id: str,
+        item_ids: "List[str]",
+    ) -> "Dict[str, Tuple[Optional[str], int, Optional[str]]]":
+        """Bulk-fetch downloadUrl + size + quickXorHash for up to N items
+        via /v1.0/$batch. Returns a map {item_id: (download_url, size,
+        quickXorHash)} — download_url may be None when the item is a
+        cloud-native object (Whiteboard, OneNote, Loop component) with
+        no downloadable bytes.
+
+        Enterprise win: the per-file GET /drives/{}/items/{} call is
+        the serial bottleneck on many-small-files drives. For 10k
+        files at ~200 ms/GET that's ~33 min of wall time just for
+        URL-fetching even with worker-side concurrency, because each
+        GET counts against the per-app RPS ceiling. $batch bundles
+        20 requests per HTTP call and each sub-request is still billed
+        separately — but wire-time drops ~20×, freeing worker
+        connection slots for actual file downloads.
+
+        Errors per-item (404 deleted, 403 restricted) are surfaced as
+        `(None, 0, None)` entries rather than aborting the whole batch,
+        so one bad file doesn't poison the drive's URL map.
+        """
+        from shared.graph_batch import BatchRequest
+        if not item_ids:
+            return {}
+        reqs = [
+            BatchRequest(
+                id=iid, method="GET",
+                url=f"/drives/{drive_id}/items/{iid}",
+            )
+            for iid in item_ids
+        ]
+        out: Dict[str, Tuple[Optional[str], int, Optional[str]]] = {}
+        try:
+            responses = await self.batch(reqs)
+        except Exception as exc:
+            # Batch call itself failed — fall back to per-item GETs
+            # so throughput degrades gracefully instead of erroring
+            # the whole drive. Caller keeps working.
+            print(
+                f"[GraphClient] get_download_urls_batch failed: "
+                f"{type(exc).__name__}: {exc}; caller should fall "
+                f"back to per-item get_download_url",
+            )
+            return {}
+        for iid in item_ids:
+            resp = responses.get(iid)
+            if resp is None or resp.status != 200:
+                out[iid] = (None, 0, None)
+                continue
+            body = resp.body or {}
+            du = body.get("@microsoft.graph.downloadUrl")
+            size = int(body.get("size", 0) or 0)
+            qxh = (
+                (body.get("file") or {})
+                .get("hashes", {})
+                .get("quickXorHash")
+            )
+            out[iid] = (du, size, qxh)
+        return out
 
     async def get_download_url(self, drive_id: str, item_id: str,
                                max_attempts: int = 3) -> Tuple[str, int, Optional[str]]:

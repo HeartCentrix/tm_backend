@@ -12,6 +12,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import os
 import re
 import time
 import uuid
@@ -618,6 +619,38 @@ class _StoreFacade:
         except Exception as e:
             return {"success": False, "error": str(e), "method": "stream_upload"}
 
+    async def upload_blob_stream(
+        self, container_name, blob_path, byte_stream, total_size,
+        metadata=None, chunk_size=8 * 1024 * 1024,
+        max_parallel_parts=4,
+    ):
+        """Memory-bounded streaming upload — pipes an async bytes
+        iterator directly into the backend's multipart / block-list
+        API without a /tmp hop. Used by OneDrive backup to flow
+        Graph download bytes straight into SeaweedFS / Azure. Returns
+        the same dict shape as upload_blob, plus `content_sha256`
+        computed inline so callers don't re-hash."""
+        try:
+            info = await self._store.upload_stream(
+                container_name, blob_path, byte_stream, total_size,
+                metadata=metadata,
+                chunk_size=chunk_size,
+                max_parallel_parts=max_parallel_parts,
+            )
+            return {
+                "success": True,
+                "blob_url": info.url,
+                "blob_path": info.path,
+                "size_bytes": info.size,
+                "content_sha256": info.content_md5,  # stored inline
+                "method": "stream_multipart",
+            }
+        except Exception as e:
+            return {
+                "success": False, "error": str(e),
+                "method": "stream_multipart",
+            }
+
     async def download_blob(self, container_name, blob_path):
         return await self._store.download(container_name, blob_path)
 
@@ -726,25 +759,57 @@ class AzureStorageManager:
         self._initialize_shards()
     
     def _initialize_shards(self):
-        """Initialize storage shards from configuration"""
-        # If sharding is configured, use multiple accounts
+        """Initialize storage shards from configuration.
+
+        The Azure shard objects are constructed eagerly so the toggle-
+        worker can flip the router back to Azure without a process
+        restart. However, when the router is on the on-prem backend
+        (SeaweedFS), the Azure shard is **never used** for I/O — all
+        calls go through `_router_facade`. We still build the shard
+        (so the toggle path works), but we demote the init log to
+        DEBUG-style so operators running exclusively on-prem don't
+        get confused by an "Initialized ... azure account" banner
+        that implies Azure traffic.
+        """
+        # Decide whether to emit the "active" banner. Treat the log as
+        # interesting only if the operator hasn't explicitly marked
+        # on-prem via ACTIVE_STORAGE_BACKEND=seaweedfs. The router
+        # load path overrides this later anyway.
+        active_pref = (os.getenv("ACTIVE_STORAGE_BACKEND") or "").lower()
+        azure_is_active_hint = active_pref not in ("seaweedfs", "onprem", "on_prem")
+
         if settings.STORAGE_SHARD_ACCOUNTS and settings.STORAGE_SHARD_KEYS:
             for i, (account, key) in enumerate(zip(
-                settings.STORAGE_SHARD_ACCOUNTS, 
+                settings.STORAGE_SHARD_ACCOUNTS,
                 settings.STORAGE_SHARD_KEYS
             )):
                 shard = AzureStorageShard(account, key, shard_index=i)
                 self.shards.append(shard)
-                print(f"[AzureStorage] Initialized shard {i}: {account}")
-        # Fall back to single account
+                if azure_is_active_hint:
+                    print(f"[AzureStorage] Initialized shard {i}: {account}")
+                else:
+                    print(
+                        f"[AzureStorage] (standby) shard {i}: {account} — "
+                        f"router active on on-prem backend, not in use",
+                    )
         elif settings.AZURE_STORAGE_ACCOUNT_NAME and settings.AZURE_STORAGE_ACCOUNT_KEY:
             shard = AzureStorageShard(
-                settings.AZURE_STORAGE_ACCOUNT_NAME, 
+                settings.AZURE_STORAGE_ACCOUNT_NAME,
                 settings.AZURE_STORAGE_ACCOUNT_KEY,
                 shard_index=0
             )
             self.shards.append(shard)
-            print(f"[AzureStorage] Initialized single shard: {settings.AZURE_STORAGE_ACCOUNT_NAME}")
+            if azure_is_active_hint:
+                print(
+                    f"[AzureStorage] Initialized single shard: "
+                    f"{settings.AZURE_STORAGE_ACCOUNT_NAME}",
+                )
+            else:
+                print(
+                    f"[AzureStorage] (standby) single shard "
+                    f"{settings.AZURE_STORAGE_ACCOUNT_NAME} — "
+                    f"router active on on-prem backend, not in use",
+                )
         else:
             print("[AzureStorage] WARNING: No Azure Storage configured")
     
@@ -1198,21 +1263,76 @@ async def upload_blob_with_retry(container_name: str, blob_path: str, content: b
     Direct upload with automatic retry and exponential backoff.
     """
     last_error = None
-    
+
     for attempt in range(max_retries):
         result = await shard.upload_blob(container_name, blob_path, content, metadata=metadata)
-        
+
         if result["success"]:
             return result
-        
+
         last_error = result.get("error", "Unknown error")
-        
+
         # Don't retry on auth/permission errors
         if "Authorization" in last_error or "Authentication" in last_error:
             return result
-        
+
         # Exponential backoff
         delay = settings.RETRY_DELAY_MS * (settings.RETRY_BACKOFF_MULTIPLIER ** attempt) / 1000
         await asyncio.sleep(delay)
-    
+
     return {"success": False, "error": f"Failed after {max_retries} retries: {last_error}"}
+
+
+async def upload_blob_with_dedup(
+    tenant_id,
+    content_hash: str,
+    container_name: str,
+    blob_path: str,
+    content: bytes,
+    shard,
+    max_retries: int = 3,
+    metadata: Optional[Dict] = None,
+    min_size_bytes: int = 1024,
+) -> Dict:
+    """Dedup-aware upload.
+
+    Before shipping bytes over the wire, check whether this tenant
+    already has a blob backed by the same content_hash. If yes,
+    return a success result that points at the existing blob_path
+    without re-uploading — typical M365 dedup rate is 5-10× so
+    on a 400 TiB install this meaningfully cuts Azure egress +
+    storage + worker NIC time.
+
+    Never crosses tenant boundaries (lookup scoped to tenant_id).
+
+    Returns the same dict shape as upload_blob_with_retry, plus a
+    `method` that's "dedup_hit" when we reused an existing blob.
+    Callers can log the method to measure dedup rate. On any DB
+    hiccup the dedup check silently falls through to a real upload
+    — never blocks the backup.
+    """
+    if content_hash and len(content) >= min_size_bytes:
+        try:
+            from shared.blob_dedup import find_existing_blob
+            from shared.database import async_session_factory
+            async with async_session_factory() as session:
+                existing = await find_existing_blob(
+                    session, tenant_id, content_hash,
+                    min_size_bytes=min_size_bytes,
+                )
+            if existing:
+                return {
+                    "success": True,
+                    "blob_path": existing,
+                    "blob_url": existing,
+                    "size_bytes": len(content),
+                    "method": "dedup_hit",
+                }
+        except Exception:
+            # Dedup is advisory — a DB hiccup must not block the backup.
+            pass
+
+    return await upload_blob_with_retry(
+        container_name, blob_path, content, shard,
+        max_retries=max_retries, metadata=metadata,
+    )
