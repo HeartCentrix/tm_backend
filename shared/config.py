@@ -140,6 +140,18 @@ class Settings:
         self.EXPORT_BLOCK_SIZE_BYTES = int(os.getenv("EXPORT_BLOCK_SIZE_BYTES", str(4 * 1024 * 1024)))
         self.EXPORT_FOLDER_QUEUE_MAXSIZE = int(os.getenv("EXPORT_FOLDER_QUEUE_MAXSIZE", "20"))
         self.MAX_CONCURRENT_EXPORTS_PER_WORKER = int(os.getenv("MAX_CONCURRENT_EXPORTS_PER_WORKER", "2"))
+        # Deployment-wide default for the per-tenant chat-export gate.
+        # Legacy behaviour (SaaS canary rollout) kept /api/v1/exports/chat
+        # locked behind `tenant.extra_data.limits.chat_export_enabled` —
+        # every new tenant had to be opted in by hand via
+        # scripts/flip_chat_export_flag.py, and on-prem single-tenant
+        # installs tripped 503 FEATURE_NOT_ENABLED on the first click.
+        # With this flag true (default) the gate honours an explicit
+        # tenant-level opt-out (limits.chat_export_enabled=false) but
+        # otherwise allows. SaaS operators running a progressive rollout
+        # can set CHAT_EXPORT_DEFAULT_ENABLED=false to restore the old
+        # "explicit opt-in per tenant" behaviour.
+        self.CHAT_EXPORT_DEFAULT_ENABLED = os.getenv("CHAT_EXPORT_DEFAULT_ENABLED", "true").lower() == "true"
         # Mail Restore v2 — AFI-parity pipeline. Default on; set
         # MAIL_RESTORE_V2_ENABLED=false in env to roll back to the legacy
         # _restore_email_to_mailbox path if the engine misbehaves.

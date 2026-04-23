@@ -959,6 +959,27 @@ async def init_db() -> None:
         # otherwise invisible.
         "CREATE INDEX IF NOT EXISTS idx_snapshot_items_tenant_type_time "
         "ON snapshot_items (tenant_id, item_type, created_at DESC);",
+        # Backfill chat_export_enabled on every existing tenant whose
+        # limits dict doesn't mention the flag. Safe to re-run: the
+        # ?| operator filters out rows that already have the key set
+        # (true OR false — explicit opt-out stays honoured). Without
+        # this, /api/v1/exports/chat would 503 FEATURE_NOT_ENABLED on
+        # every first-time click for any tenant that predates the
+        # three-state gate introduced in chat_export.py:~229.
+        #
+        # SaaS operators running a progressive rollout can skip this
+        # by setting CHAT_EXPORT_DEFAULT_ENABLED=false in env before
+        # first boot — the gate then still denies for tenants whose
+        # limits doesn't mention the flag, matching the old behaviour.
+        "UPDATE tenants "
+        "  SET extra_data = jsonb_set("
+        "    COALESCE(extra_data::jsonb, '{}'::jsonb),"
+        "    '{limits,chat_export_enabled}',"
+        "    'true'::jsonb,"
+        "    true"
+        "  )::json "
+        "  WHERE extra_data IS NULL "
+        "     OR NOT (COALESCE(extra_data::jsonb, '{}'::jsonb) -> 'limits' ? 'chat_export_enabled');",
     ]
 
     # Indexes that must be created AFTER alter_statements runs, because they
