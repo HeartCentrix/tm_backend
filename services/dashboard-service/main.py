@@ -128,7 +128,11 @@ async def get_overview(
     total = (await db.execute(select(func.count(Resource.id)).where(*filters))).scalar() or 0
     protected = (await db.execute(select(func.count(Resource.id)).where(Resource.sla_policy_id.isnot(None), *filters))).scalar() or 0
     
-    yesterday = datetime.now(timezone.utc) - timedelta(hours=24)
+    # Use naive datetime to match Job.created_at declared as
+    # TIMESTAMP WITHOUT TIME ZONE. asyncpg raises DataError on a
+    # tz-aware >= naive-column compare. Sibling queries in this file
+    # (status/24hour, status/7day, …) already follow this pattern.
+    yesterday = datetime.utcnow() - timedelta(hours=24)
     failed = (await db.execute(select(func.count(Job.id)).where(Job.status == JobStatus.FAILED, Job.type == JobType.BACKUP, Job.created_at >= yesterday, *filters))).scalar() or 0
     pending = (await db.execute(select(func.count(Job.id)).where(Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]), Job.type == JobType.BACKUP, *filters))).scalar() or 0
     
