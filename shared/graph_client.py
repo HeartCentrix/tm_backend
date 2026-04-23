@@ -4522,6 +4522,44 @@ class GraphClient:
         result["value"] = all_value
         return result
 
+    # GROUP_MAILBOX conversation restore — same identity-bound problem as
+    # calendar / chat: the sender of a group conversation post is a
+    # mailbox-owner attribute Graph won't let an app-only token
+    # impersonate. On create, Graph stamps the post's `from` as the
+    # calling service principal. Any `from` / `sender` field we send
+    # back is ignored at best, 403'd at worst, so we strip them —
+    # same afi-parity tactic as the calendar restore helper. Provenance
+    # (original sender, attendees, conversation subject) is preserved in
+    # body.content as a banner by the caller.
+    _GROUP_POST_READONLY_FIELDS = {
+        "id", "createdDateTime", "lastModifiedDateTime", "changeKey",
+        "conversationId", "conversationThreadId", "receivedDateTime",
+        "hasAttachments", "newParticipants",
+        "@odata.etag", "@odata.context", "@odata.type",
+        "from", "sender",
+    }
+
+    async def create_group_thread(
+        self, group_id: str, topic: str, post_body: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """POST /groups/{id}/threads — start a new conversation thread.
+
+        `post_body` should match Graph's `post` resource: at minimum
+        `body: {contentType, content}`. The server mints the thread id,
+        post id, createdDateTime, and sets `from` to the calling SP.
+
+        Needs Group.ReadWrite.All (Application permission)."""
+        url = f"{self.GRAPH_URL}/groups/{group_id}/threads"
+        clean_post = {
+            k: v for k, v in (post_body or {}).items()
+            if k not in self._GROUP_POST_READONLY_FIELDS
+        }
+        payload = {
+            "topic": topic,
+            "posts": [clean_post] if clean_post else [{"body": {"contentType": "html", "content": ""}}],
+        }
+        return await self._post(url, payload)
+
     async def get_planner_tasks(self, user_id: str = None, plan_id: str = None) -> Dict[str, Any]:
         """
         Get Planner tasks.

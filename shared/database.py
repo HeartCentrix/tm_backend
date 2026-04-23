@@ -932,8 +932,23 @@ async def init_db() -> None:
         # this unique constraint, both deliveries could write duplicate
         # snapshot_items. On conflict the insert IntegrityErrors and
         # rolls back, the next redelivery picks up cleanly.
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_snapshot_items_snap_ext "
-        "ON snapshot_items(snapshot_id, external_id);",
+        #
+        # The triple includes item_type because the same external_id
+        # can legitimately appear under multiple types in one snapshot:
+        # a user is commonly both GROUP_MEMBER and GROUP_OWNER of the
+        # same M365 group (Microsoft Graph returns them separately,
+        # backup-worker emits a row for each role). The earlier
+        # (snapshot_id, external_id) pair rejected the whole batch with
+        # a UniqueViolationError and the scheduler looped on the same
+        # group indefinitely, burning CPU.
+        #
+        # Drop any pre-existing pair-form index so upgrades re-use the
+        # slot for the correct triple form.
+        "DROP INDEX IF EXISTS uq_snapshot_items_snap_ext;",
+        "ALTER TABLE snapshot_items "
+        "  DROP CONSTRAINT IF EXISTS uq_snapshot_items_snap_ext;",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_snapshot_items_snap_ext_type "
+        "ON snapshot_items(snapshot_id, external_id, item_type);",
         # Hot-path composite index — tenant-scoped time-range scans of
         # a specific item type (e.g. "all EMAILs for tenant X in the
         # last 30 days" for the Recovery tab). Covers the dominant
@@ -944,6 +959,27 @@ async def init_db() -> None:
         # otherwise invisible.
         "CREATE INDEX IF NOT EXISTS idx_snapshot_items_tenant_type_time "
         "ON snapshot_items (tenant_id, item_type, created_at DESC);",
+        # Backfill chat_export_enabled on every existing tenant whose
+        # limits dict doesn't mention the flag. Safe to re-run: the
+        # ?| operator filters out rows that already have the key set
+        # (true OR false — explicit opt-out stays honoured). Without
+        # this, /api/v1/exports/chat would 503 FEATURE_NOT_ENABLED on
+        # every first-time click for any tenant that predates the
+        # three-state gate introduced in chat_export.py:~229.
+        #
+        # SaaS operators running a progressive rollout can skip this
+        # by setting CHAT_EXPORT_DEFAULT_ENABLED=false in env before
+        # first boot — the gate then still denies for tenants whose
+        # limits doesn't mention the flag, matching the old behaviour.
+        "UPDATE tenants "
+        "  SET extra_data = jsonb_set("
+        "    COALESCE(extra_data::jsonb, '{}'::jsonb),"
+        "    '{limits,chat_export_enabled}',"
+        "    'true'::jsonb,"
+        "    true"
+        "  )::json "
+        "  WHERE extra_data IS NULL "
+        "     OR NOT (COALESCE(extra_data::jsonb, '{}'::jsonb) -> 'limits' ? 'chat_export_enabled');",
     ]
 
     # Indexes that must be created AFTER alter_statements runs, because they

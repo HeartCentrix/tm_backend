@@ -63,6 +63,7 @@ ROLE_IDS=(
   "9492366f-7969-46a4-8d15-ed1a20078fff"
   "741f803b-c850-494e-b5df-cde7c675a1ca"
   "19dbc75e-c2e2-444c-a770-ec69d8559fc7"
+  "62a82d76-70ea-41e2-9197-370581804d09"
 )
 SCOPE_NAMES=(
   "Calendars.ReadWrite"
@@ -72,6 +73,7 @@ SCOPE_NAMES=(
   "Sites.ReadWrite.All"
   "User.ReadWrite.All"
   "Directory.ReadWrite.All"
+  "Group.ReadWrite.All"
 )
 
 # ---- FLAGS ------------------------------------------------------------------

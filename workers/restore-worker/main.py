@@ -1129,6 +1129,10 @@ class RestoreWorker:
                         await self._restore_user_direct_report(graph_client, resource, item)
                     elif item.item_type == "USER_GROUP_MEMBERSHIP":
                         await self._restore_user_group_membership(graph_client, resource, item)
+                    elif item.item_type in ("GROUP_MAILBOX_THREAD", "GROUP_MAILBOX_POST"):
+                        await self._restore_group_thread_to_conversation(
+                            graph_client, resource, item,
+                        )
                     else:
                         print(f"[{self.worker_id}] Unknown item type for in-place restore: {item.item_type}")
                         failed_count += 1
@@ -1416,6 +1420,28 @@ class RestoreWorker:
         print(f"[{self.worker_id}] PST export requested - exporting as ZIP instead")
         return await self.export_as_zip(session, items, message, spec)
 
+    # Pure tree-navigation rows — folder / list / channel definitions
+    # with no content (no blob_path AND no payload in metadata.raw).
+    # The frontend includes them in the user's selection so the
+    # selection tree renders, but they have nothing to emit into the
+    # export. Leaving them in `items` also flips the v2 path's
+    # `all(type in file-set)` guard to false → execution falls through
+    # to the legacy zipfile loop, which hard-codes an Azure Blob
+    # client and breaks on-prem (SeaweedFS) deployments. Strip them
+    # before any dispatch so the file-family v2 pipeline stays
+    # reachable on SharePoint / Teams / Groups downloads.
+    #
+    # Note: SHAREPOINT_LIST_ITEM is NOT here. Those are real list rows
+    # with their column values in `metadata.raw`; the legacy path
+    # serialises them to JSON files inside the ZIP (no blob fetch,
+    # so no storage-backend concern).
+    _EXPORT_CONTAINER_ONLY_TYPES = frozenset({
+        "SHAREPOINT_FOLDER",
+        "SHAREPOINT_LIST",
+        "TEAMS_CHANNEL_INFO",
+        "GROUP_INFO",
+    })
+
     async def export_as_zip(
         self,
         session: AsyncSession,
@@ -1424,7 +1450,45 @@ class RestoreWorker:
         spec: Dict
     ) -> Dict:
         """Export items as downloadable ZIP file"""
+        original_count = len(items)
+        # Drop container-only rows early. They're tree-nav markers without
+        # a blob; downstream pipelines treat them as corrupted files or
+        # bail out of the v2 path altogether. See
+        # _EXPORT_CONTAINER_ONLY_TYPES above for the exhaustive list.
+        stripped_counts: Dict[str, int] = {}
+        keep: List[SnapshotItem] = []
+        for it in items:
+            it_type = getattr(it, "item_type", None) or ""
+            if it_type in self._EXPORT_CONTAINER_ONLY_TYPES:
+                stripped_counts[it_type] = stripped_counts.get(it_type, 0) + 1
+                continue
+            keep.append(it)
+        if stripped_counts:
+            print(
+                f"[{self.worker_id}] export_as_zip dropped "
+                f"{sum(stripped_counts.values())} container-only rows "
+                f"({stripped_counts}); {len(keep)}/{original_count} items remain",
+                flush=True,
+            )
+        items = keep
         print(f"[{self.worker_id}] export_as_zip ENTER items={len(items)}", flush=True)
+
+        # If the user's selection was entirely container rows, there's
+        # nothing to put in the ZIP. The frontend is expected to send the
+        # folderPaths alongside itemIds so the resolver expands them —
+        # when it doesn't, we'd otherwise produce an empty ZIP silently.
+        if not items:
+            return {
+                "exported_count": 0,
+                "failed_count": 0,
+                "export_type": (spec or {}).get("exportFormat") or "ZIP",
+                "manual_actions": [
+                    "Nothing to export — selection contained only folder / list / "
+                    "channel container rows. Re-run with folderPaths set so the "
+                    "server can expand them to the underlying files."
+                ],
+            }
+
         # Entra export v2 fast-path — new section-scoped ZIP pipeline.
         if (
             settings.ENTRA_EXPORT_V2_ENABLED
@@ -1616,7 +1680,27 @@ class RestoreWorker:
         # and the selected items are all file-like types, route to
         # FileExportOrchestrator. Supports single-file ORIGINAL raw-stream via
         # the orchestrator's output_mode="raw_single" shortcut.
-        _FILE_V2_TYPES = {"FILE", "ONEDRIVE_FILE", "SHAREPOINT_FILE", "FILE_VERSION"}
+        # File-family row types routed through FileExportOrchestrator.
+        # SHAREPOINT_LIST_ITEM carries its payload in metadata.raw (no
+        # object-storage blob); the orchestrator serialises those to
+        # inline JSON members inside the same streamed ZIP, so mixed
+        # SHAREPOINT_FILE + SHAREPOINT_LIST_ITEM selections assemble in
+        # one pass instead of falling back to the legacy Azure-pinned
+        # zipfile loop.
+        #
+        # GROUP_MAILBOX_THREAD / _POST are blob-backed (each thread /
+        # post lands as a separate object during backup). Including
+        # them here makes Group Mail download round-trip through the
+        # streaming ZIP pipeline end-to-end — same shape as SharePoint
+        # files. Teams channel message downloads have a dedicated
+        # chat-export path (/api/v1/exports/chat → chat-export-worker)
+        # that renders HTML/JSON/PDF with reply trees and attachments,
+        # so they're intentionally NOT in this set.
+        _FILE_V2_TYPES = {
+            "FILE", "ONEDRIVE_FILE", "SHAREPOINT_FILE", "FILE_VERSION",
+            "SHAREPOINT_LIST_ITEM",
+            "GROUP_MAILBOX_THREAD", "GROUP_MAILBOX_POST",
+        }
         _file_items = [it for it in items if getattr(it, "item_type", None) in _FILE_V2_TYPES]
         if (
             _mail_export_settings.EXPORT_ONEDRIVE_V2_ENABLED
@@ -2394,6 +2478,130 @@ class RestoreWorker:
             return target.external_id
 
         return None
+
+    async def _restore_group_thread_to_conversation(
+        self,
+        graph_client: GraphClient,
+        resource: Resource,
+        thread_item: SnapshotItem,
+    ) -> None:
+        """Restore a captured GROUP_MAILBOX_THREAD (and any embedded post)
+        back to the source / target M365 group as a new conversation thread.
+
+        Microsoft Graph exposes POST /groups/{id}/threads with topic +
+        posts as the atomic create. Unlike user mail, there's no
+        app-only impersonation of the original sender — Graph stamps
+        `from` as the calling service principal on create. Mirroring
+        the afi-parity pattern from calendar restore, we prepend a
+        provenance banner to body.content identifying the original
+        sender + conversation subject so the restored row is still
+        evidentiary.
+
+        Requires Group.ReadWrite.All (Application permission) granted
+        on every app in the multi-app rotation. If it's missing, Graph
+        returns 403 ErrorAccessDenied and this raises so the outer
+        restore_in_place loop counts it as failed (correct accounting —
+        contrast with the silent-skip bug we hit on calendar earlier).
+        """
+        meta = self._get_item_metadata(thread_item)
+        raw = meta.get("raw") or {}
+        if not raw:
+            print(
+                f"[{self.worker_id}] GROUP_MAILBOX_THREAD {thread_item.id} has no raw payload",
+                flush=True,
+            )
+            raise RuntimeError(f"no raw payload for {thread_item.id}")
+
+        # Resolve the target group id. For an M365_GROUP / ENTRA_GROUP
+        # resource, external_id IS the group id. For any other shape
+        # (cross-resource restore to a different group), the caller
+        # has already swapped in the target resource.
+        rtype = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+        group_id = str(resource.external_id or "")
+        if rtype not in ("M365_GROUP", "ENTRA_GROUP"):
+            print(
+                f"[{self.worker_id}] group thread restore on non-group resource "
+                f"type={rtype} — refusing",
+                flush=True,
+            )
+            raise RuntimeError(f"cannot restore GROUP_MAILBOX_THREAD to {rtype}")
+
+        topic = raw.get("topic") or thread_item.name or "Restored thread"
+        # Thread payload typically embeds the first post under
+        # posts[0] or preview. Prefer the explicit first post; fall
+        # back to a preview-only body if that's all we captured.
+        first_post = {}
+        posts_list = raw.get("posts")
+        if isinstance(posts_list, list) and posts_list:
+            first_post = posts_list[0] if isinstance(posts_list[0], dict) else {}
+        if not first_post:
+            preview = raw.get("preview")
+            if isinstance(preview, str) and preview:
+                first_post = {"body": {"contentType": "text", "content": preview}}
+
+        body_obj = first_post.get("body") or {}
+        original_content = body_obj.get("content") or ""
+        original_type = (body_obj.get("contentType") or "html").lower()
+        # Afi-parity provenance banner — same shape as calendar.
+        sender = first_post.get("from") or first_post.get("sender") or {}
+        sender_email = (sender.get("emailAddress") or {}) if isinstance(sender, dict) else {}
+        sender_name = sender_email.get("name") or ""
+        sender_addr = sender_email.get("address") or ""
+        restored_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+        banner = (
+            '<div style="background:#fff3cd;border-left:4px solid #f0b429;'
+            'padding:10px 12px;margin-bottom:10px;font-family:Segoe UI,Arial,'
+            'sans-serif;font-size:13px;color:#5a4b00;">'
+            '<div style="font-weight:600;margin-bottom:4px;">'
+            'Restored from TMvault backup'
+            '</div>'
+            + (
+                f'<div>Originally posted by <strong>'
+                f'{_html_escape(sender_name) or _html_escape(sender_addr)}'
+                '</strong>'
+                + (f' &lt;{_html_escape(sender_addr)}&gt;' if sender_addr else '')
+                + '</div>'
+                if (sender_name or sender_addr) else ''
+            )
+            + f'<div style="margin-top:6px;color:#8a6d3b;">Restored {restored_at}. '
+              'The service principal that ran this restore is the new '
+              '`from` field on Graph — Microsoft platform constraint, not '
+              'a TMvault limit.</div>'
+            '</div>'
+        )
+        if original_type == "text":
+            original_html = f'<pre style="white-space:pre-wrap;">{_html_escape(original_content)}</pre>'
+        else:
+            original_html = original_content
+        new_post = {
+            "body": {
+                "contentType": "html",
+                "content": banner + original_html,
+            },
+        }
+        try:
+            created = await graph_client.create_group_thread(group_id, topic, new_post)
+        except Exception as e:
+            body_snippet = ""
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    body_snippet = (resp.text or "")[:400]
+                except Exception:
+                    body_snippet = ""
+            print(
+                f"[{self.worker_id}] group thread create failed: {type(e).__name__}: {e} "
+                f"| body={body_snippet!r}",
+                flush=True,
+            )
+            raise
+        new_id = created.get("id") or ""
+        print(
+            f"[{self.worker_id}] [GROUP THREAD RESTORE] {topic!r} → "
+            f"group={group_id} thread_id={new_id[:30]}",
+            flush=True,
+        )
 
     async def _restore_event_to_calendar(
         self,

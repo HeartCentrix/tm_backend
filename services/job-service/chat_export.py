@@ -226,10 +226,21 @@ async def trigger(
     res = await _ensure_ownership(sess, user, req.resourceId)
     user_tenant = _user_tenant_id(user) or res.tenant_id
 
-    # Feature flag gate — resource's tenant must be opted in via extra_data.limits.
+    # Feature flag gate — three-state logic so a fresh tenant doesn't
+    # default-deny and trip 503 FEATURE_NOT_ENABLED on the first click.
+    #
+    #   tenant.limits.chat_export_enabled == True   → allow
+    #   tenant.limits.chat_export_enabled == False  → deny (explicit opt-out honoured)
+    #   tenant.limits.chat_export_enabled missing   → fall back to
+    #       settings.CHAT_EXPORT_DEFAULT_ENABLED (True on-prem,
+    #       operators running a SaaS canary can flip to False to
+    #       restore the old "explicit opt-in per tenant" behaviour).
     tenant = (await sess.execute(select(Tenant).where(Tenant.id == res.tenant_id))).scalar_one_or_none()
     limits = (tenant.extra_data or {}).get("limits", {}) if tenant and hasattr(tenant, "extra_data") else {}
-    if not limits.get("chat_export_enabled"):
+    flag = limits.get("chat_export_enabled")
+    if flag is None:
+        flag = settings.CHAT_EXPORT_DEFAULT_ENABLED
+    if not flag:
         raise HTTPException(503, detail={"error": "FEATURE_NOT_ENABLED",
                                          "hint": "Chat export is in rollout; contact support to enable."})
 
