@@ -605,6 +605,23 @@ class BackupWorker:
         # Live-progress tick — snapshot row now exists, handler about to run.
         await _update_job_pct(job_id, 15)
 
+        # Audit event — emit BACKUP_STARTED now that the snapshot row
+        # exists but before the handler does any real work, so Activity
+        # shows the kick-off even when the handler later fails or gets
+        # cancelled. Mirrors tenant-service's DISCOVERY_STARTED pattern.
+        await self.audit_logger.log(
+            action="BACKUP_STARTED",
+            tenant_id=str(tenant.id),
+            org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
+            actor_type="WORKER",
+            resource_id=str(resource.id),
+            resource_type=resource_type,
+            resource_name=resource.display_name or resource.email or str(resource.id),
+            outcome="IN_PROGRESS",
+            job_id=str(job_id),
+            snapshot_id=str(snapshot.id),
+        )
+
         handler_name = self._HANDLER_TABLE.get(resource_type)
         if not handler_name:
             if str(resource_type).startswith("AZURE_"):
@@ -657,6 +674,32 @@ class BackupWorker:
             print(f"[{self.worker_id}] Handler FAILED for {resource_type}: {resource.display_name} — {e}")
             import traceback
             traceback.print_exc()
+
+            # Audit — emit BACKUP_FAILED before re-raising so the
+            # Activity feed always has a terminal event per resource.
+            # Fire-and-forget via AuditLogger.log (swallows its own
+            # transport errors), so a slow / down audit-service can't
+            # mask the original handler exception we're about to raise.
+            try:
+                await self.audit_logger.log(
+                    action="BACKUP_FAILED",
+                    tenant_id=str(tenant.id),
+                    org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
+                    actor_type="WORKER",
+                    resource_id=str(resource.id),
+                    resource_type=resource_type,
+                    resource_name=resource.display_name or resource.email or str(resource.id),
+                    outcome="FAILURE",
+                    job_id=str(job_id),
+                    snapshot_id=str(snapshot.id),
+                    details={
+                        "error": str(e)[:500],
+                        "error_type": type(e).__name__,
+                        "inaccessible": is_inaccessible,
+                    },
+                )
+            except Exception:
+                pass
             raise
 
         # ── Step 3b: success finalization — short sessions per write ──────
