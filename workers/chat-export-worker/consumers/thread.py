@@ -179,9 +179,18 @@ async def consume_thread(message: aio_pika.IncomingMessage) -> None:
             )
             if not up_result.get("success"):
                 raise RuntimeError(f"blob upload failed: {up_result.get('error')}")
-            url = sign_download_url(
-                account=account, container=container, blob_path=blob_path,
-            )
+            # Sign via the shard — not via blob_shard.sign_download_url.
+            # The legacy helper hard-codes
+            # https://{account}.blob.core.windows.net/… with an Azure
+            # SAS signature regardless of the active backend, so
+            # on-prem SeaweedFS deployments were handing users
+            # download links that pointed at the unreachable Azure
+            # hostname. `shard.get_blob_sas_url` delegates to the
+            # active backend's presigned_url — Azure SAS on
+            # azure_blob, S3 presigned GET on seaweedfs — so the URL
+            # always matches where the ZIP actually landed.
+            ttl = getattr(settings, "chat_export_sas_ttl_hours", 168)
+            url = await shard.get_blob_sas_url(container, blob_path, valid_for_hours=ttl)
 
             await _update_job(
                 sess, job_id, status=JobStatus.COMPLETED,
