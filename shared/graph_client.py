@@ -3457,6 +3457,72 @@ class GraphClient:
         await asyncio.gather(*[walk(r, "") for r in roots], return_exceptions=False)
         return tree
 
+    async def resolve_mail_folder_path(
+        self, user_id: str, folder_id: str, max_depth: int = 20,
+    ) -> Optional[str]:
+        """Resolve a single mailFolder id to a path like "/Inbox/Subfolder"
+        by walking up via parentFolderId.
+
+        Why: `get_mail_folder_tree` uses the list endpoint
+        (`/users/{id}/mailFolders`) which 403s on shared and room
+        mailboxes under common Application Access Policy scopes, even
+        when the same token can still read an individual folder by id.
+        Backup-worker falls back to this per-message resolver when the
+        top-down tree comes back empty so mail still lands with a
+        meaningful folder_path.
+
+        Results are cached per-instance keyed by (user_id, folder_id)
+        so a mailbox with N messages across K folders does K lookups,
+        not N. Returns None when even the single-id read is forbidden.
+        """
+        if not hasattr(self, "_mail_folder_idpath_cache") or self._mail_folder_idpath_cache is None:
+            self._mail_folder_idpath_cache = {}
+        root_key = (user_id, folder_id)
+        if root_key in self._mail_folder_idpath_cache:
+            return self._mail_folder_idpath_cache[root_key]
+
+        segments: List[str] = []
+        current: Optional[str] = folder_id
+        visited: set = set()
+        for _ in range(max_depth):
+            if not current or current in visited:
+                break
+            visited.add(current)
+            ck = (user_id, current)
+            if ck in self._mail_folder_idpath_cache:
+                # Hit on an ancestor — prepend its resolved path and stop.
+                ancestor = self._mail_folder_idpath_cache[ck]
+                if ancestor:
+                    return "/".join([ancestor.rstrip("/")] + segments) if segments else ancestor
+                break
+            try:
+                info = await self._get(
+                    f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{current}",
+                    params={"$select": "id,displayName,parentFolderId"},
+                )
+            except httpx.HTTPStatusError as e:
+                # Tenant policy blocks even per-id reads, or folder
+                # doesn't exist. Cache the failure so we don't hammer
+                # Graph for every message in the same dead chain.
+                if e.response.status_code in (403, 404):
+                    self._mail_folder_idpath_cache[root_key] = None
+                    return None
+                raise
+            name = (info.get("displayName") or "").strip()
+            parent = info.get("parentFolderId")
+            if name:
+                segments.insert(0, name)
+            # Graph reports the hidden root folder ("Top of Information
+            # Store") as having no parentFolderId, or parentFolderId
+            # pointing back at itself. Either way: stop walking.
+            if not parent or parent == current:
+                break
+            current = parent
+
+        path = ("/" + "/".join(segments)) if segments else None
+        self._mail_folder_idpath_cache[root_key] = path
+        return path
+
     # Tier label → mailFolders well-known root used as the starting
     # container for path resolution.
     _MAIL_TIER_ROOTS = {

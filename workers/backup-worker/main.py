@@ -3912,6 +3912,18 @@ class BackupWorker:
                             f"{type(e).__name__}: {e}"
                         )
                         folder_tree = {}
+                    if not folder_tree:
+                        # get_mail_folder_tree swallows 403/404 silently — common
+                        # on shared and room mailboxes whose tenant policy blocks
+                        # /mailFolders listing but still permits /messages +
+                        # /mailFolders/{id}. Surface the empty result so the
+                        # operator knows the per-message parentFolderId fallback
+                        # in _stream_persist is what's doing the folder work.
+                        print(
+                            f"[{self.worker_id}] [MAILBOX] empty folder tree for "
+                            f"{user_label} ({resource.type.value}) — falling back "
+                            f"to per-message parentFolderId resolution"
+                        )
 
                     existing_tokens: Dict[str, str] = dict(
                         (resource.extra_data or {}).get(
@@ -3947,6 +3959,24 @@ class BackupWorker:
                         for m in msgs:
                             body = _json_dumps_bytes(m)
                             local_bytes += len(body)
+                            # Folder-path fallback: when the top-down
+                            # /mailFolders tree returned nothing (shared
+                            # and room mailboxes under Application
+                            # Access Policies that permit /messages but
+                            # block /mailFolders listing), walk up from
+                            # the message's parentFolderId. GraphClient
+                            # caches resolved folder ids so this is one
+                            # lookup per distinct folder, not per msg.
+                            per_msg_path = folder_path
+                            if not per_msg_path:
+                                pfid = m.get("parentFolderId")
+                                if pfid:
+                                    try:
+                                        per_msg_path = await graph_client.resolve_mail_folder_path(
+                                            resource.external_id, pfid,
+                                        ) or ""
+                                    except Exception:
+                                        per_msg_path = ""
                             rows.append({
                                 "id": uuid.uuid4(),
                                 "snapshot_id": snapshot.id,
@@ -3954,7 +3984,7 @@ class BackupWorker:
                                 "external_id": str(m.get("id") or uuid.uuid4()),
                                 "item_type": "EMAIL",
                                 "name": (m.get("subject") or "(no subject)")[:255],
-                                "folder_path": folder_path or None,
+                                "folder_path": per_msg_path or None,
                                 "content_size": len(body),
                                 "content_hash": _fast_hash_hex(body),
                                 "extra_data": {"raw": m},
