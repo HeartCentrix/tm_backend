@@ -3,7 +3,8 @@
     {
       "name": "tmvault-local",
       "credentials": [
-        { "accessKey": "tmvault-local-access", "secretKey": "tmvault-local-secret" }
+        { "accessKey": "tmvault-local-access", "secretKey": "tmvault-local-secret" },
+        { "accessKey": "testaccess", "secretKey": "testsecret" }
       ],
       "actions": ["Admin"]
     }
