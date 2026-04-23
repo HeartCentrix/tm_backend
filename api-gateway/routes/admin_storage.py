@@ -1,9 +1,10 @@
 """Admin storage API: status, toggle, events, SSE stream, abort.
 
-Mounted into api-gateway/main.py via include_router. All endpoints require
-ORG_ADMIN/SUPER_ADMIN. On a fresh install where no admin exists yet, the
-first authenticated caller is auto-bootstrapped as ORG_ADMIN so the app is
-usable out of the box without a separate provisioning step.
+Mounted into api-gateway/main.py via include_router. Role-gating removed
+— any authenticated user (valid JWT) can read status / submit toggles /
+stream phase events. The SSE endpoint also accepts the JWT via a
+`?token=<jwt>` query param since browsers' EventSource() API cannot set
+custom Authorization headers.
 """
 from __future__ import annotations
 
@@ -25,62 +26,29 @@ from shared.schemas import (
     ToggleRequest,
     ToggleStatusOut,
 )
-from shared.security import get_current_user_from_token
+from shared.security import _get_user_from_token
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin/storage", tags=["admin-storage"])
 
 
-_ADMIN_ROLES = {"ORG_ADMIN", "SUPER_ADMIN"}
-
-
-async def _require_org_admin(
-    user: dict = Depends(get_current_user_from_token),
-) -> dict:
-    """Allow ORG_ADMIN/SUPER_ADMIN. On fresh installs where user_roles has
-    no admin rows yet, auto-grant ORG_ADMIN to the first caller (bootstrap)
-    so the system is reachable without a separate CLI step."""
-    token_roles = {str(r).upper() for r in user.get("roles", [])}
-    if token_roles & _ADMIN_ROLES:
-        return user
-
-    actor_id = user.get("id")
-    if not actor_id:
-        raise HTTPException(status_code=401, detail="invalid token subject")
-
-    db = await _connect()
-    try:
-        # DB-backed role check — token may be stale after a role was just
-        # assigned, so we re-read the source of truth.
-        db_roles = await db.fetch(
-            "SELECT role FROM user_roles WHERE user_id = $1",
-            uuid.UUID(str(actor_id)),
-        )
-        db_role_set = {str(r["role"]).upper() for r in db_roles}
-        if db_role_set & _ADMIN_ROLES:
-            return user
-
-        admin_exists = await db.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM user_roles "
-            "WHERE UPPER(role::text) IN ('ORG_ADMIN','SUPER_ADMIN'))"
-        )
-        if admin_exists:
-            raise HTTPException(status_code=403, detail="org_admin role required")
-
-        # Bootstrap — no admin anywhere in the system yet.
-        await db.execute(
-            "INSERT INTO user_roles (user_id, role) VALUES ($1, 'ORG_ADMIN') "
-            "ON CONFLICT DO NOTHING",
-            uuid.UUID(str(actor_id)),
-        )
-        log.warning(
-            "[admin-storage] bootstrap: granted ORG_ADMIN to first caller %s",
-            actor_id,
-        )
-        return user
-    finally:
-        await db.close()
+async def _require_user_from_header_or_query(request: Request) -> dict:
+    """Auth dep that reads the JWT from either the Authorization header or
+    a `?token=<jwt>` query param. The query-param fallback exists so the
+    SSE `/events/{id}/stream` endpoint can be consumed by browser
+    EventSource() objects, which cannot attach custom Authorization
+    headers. Role checks are intentionally omitted — any authenticated
+    user is allowed to read storage status and submit toggles."""
+    auth = request.headers.get("authorization") or ""
+    token: str | None = None
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+    if not token:
+        token = request.query_params.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    return _get_user_from_token(token)
 
 
 def _dsn() -> str:
@@ -122,7 +90,7 @@ def _row_to_dict(row: Any) -> dict:
 
 
 @router.get("/status")
-async def status(user: dict = Depends(_require_org_admin)):
+async def status(user: dict = Depends(_require_user_from_header_or_query)):
     db = await _connect()
     try:
         sc = await db.fetchrow(
@@ -154,7 +122,7 @@ async def status(user: dict = Depends(_require_org_admin)):
 
 
 @router.get("/backends")
-async def list_backends(user: dict = Depends(_require_org_admin)):
+async def list_backends(user: dict = Depends(_require_user_from_header_or_query)):
     db = await _connect()
     try:
         rows = await db.fetch(
@@ -169,7 +137,7 @@ async def list_backends(user: dict = Depends(_require_org_admin)):
 @router.post("/toggle")
 async def submit_toggle(
     req: ToggleRequest, request: Request,
-    user: dict = Depends(_require_org_admin),
+    user: dict = Depends(_require_user_from_header_or_query),
 ):
     org_id = user.get("org_id")
     # Org name fetched via a separate query — in production, resolve from
@@ -239,7 +207,7 @@ async def submit_toggle(
 @router.get("/events")
 async def list_events(
     limit: int = 20,
-    user: dict = Depends(_require_org_admin),
+    user: dict = Depends(_require_user_from_header_or_query),
 ):
     db = await _connect()
     try:
@@ -255,7 +223,7 @@ async def list_events(
 @router.get("/events/{event_id}")
 async def get_event(
     event_id: uuid.UUID,
-    user: dict = Depends(_require_org_admin),
+    user: dict = Depends(_require_user_from_header_or_query),
 ):
     db = await _connect()
     try:
@@ -272,7 +240,7 @@ async def get_event(
 @router.get("/events/{event_id}/stream")
 async def stream_event(
     event_id: uuid.UUID, request: Request,
-    user: dict = Depends(_require_org_admin),
+    user: dict = Depends(_require_user_from_header_or_query),
 ):
     async def generator():
         conn = await _connect()
@@ -300,7 +268,7 @@ async def stream_event(
 @router.post("/toggle/{event_id}/abort")
 async def abort_toggle(
     event_id: uuid.UUID,
-    user: dict = Depends(_require_org_admin),
+    user: dict = Depends(_require_user_from_header_or_query),
 ):
     db = await _connect()
     try:
