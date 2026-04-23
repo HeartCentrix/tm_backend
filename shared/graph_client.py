@@ -3278,10 +3278,19 @@ class GraphClient:
     # in practice for typical attachments under 3MB).
 
     async def create_calendar_event(self, user_id: str, event_payload: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /users/{id}/events — restore a calendar event.
-        Strip server-managed fields the caller might still have in the payload."""
+        """POST /users/{id}/events. Strips server-set read-only fields
+        so Graph re-mints them on create.
+
+        The restore-worker's ``_afi_transform_event_for_restore`` is the
+        layer that handles identity-bound stripping (organizer /
+        isOrganizer / responseStatus / attendees) and re-renders those
+        fields into a provenance banner inside ``body.content``. That
+        transformation is restore-specific and stays out of this
+        generic Graph helper so other callers (e.g. future
+        programmatic-create paths) aren't forced into restore
+        semantics.
+        """
         url = f"{self.GRAPH_URL}/users/{user_id}/events"
-        # Graph rejects creates that include these read-only / server-set fields.
         readonly = {
             "id", "createdDateTime", "lastModifiedDateTime", "changeKey",
             "iCalUId", "webLink", "onlineMeeting", "transactionId",

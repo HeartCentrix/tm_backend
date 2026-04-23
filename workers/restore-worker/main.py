@@ -112,6 +112,28 @@ def _contact_graph_user_id(resource) -> str:
     return str(resource.external_id or "")
 
 
+def _calendar_graph_user_id(resource) -> str:
+    """Return the Graph user id for a calendar-bearing resource.
+
+    Mirrors `_contact_graph_user_id` / `_mail_graph_user_id`. Tier 2
+    USER_CALENDAR rows carry a `:calendar` suffix (see discovery in
+    `graph_client.py` `_calendar()`), so a naive `resource.external_id`
+    produces `/users/<uuid>:calendar/events` and Graph returns 404. We
+    prefer `extra_data.user_id` when present (populated at discovery)
+    and strip the suffix as the defensive fallback."""
+    rtype = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+    if rtype == "USER_CALENDAR":
+        meta = resource.extra_data or {}
+        uid = meta.get("user_id")
+        if uid:
+            return str(uid)
+        raw = str(resource.external_id or "")
+        if raw.endswith(":calendar"):
+            return raw[: -len(":calendar")]
+        return raw
+    return str(resource.external_id or "")
+
+
 def _safe_name(name: str) -> str:
     """Sanitize a string for use as a filename inside the ZIP — strip
     path separators and colons, collapse whitespace, cap length."""
@@ -120,6 +142,150 @@ def _safe_name(name: str) -> str:
     s = re.sub(r"[\\/:*?\"<>|]+", "_", s)
     s = re.sub(r"\s+", " ", s).strip() or "event"
     return s[:120]
+
+
+def _html_escape(value: Any) -> str:
+    """Minimal HTML escape for calendar provenance banners.
+    We only ship four chars into rendered HTML (name, email, subject,
+    timestamp) so avoid pulling in the stdlib html module for this."""
+    if value is None:
+        return ""
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+# Event fields Graph rejects (server-set or identity-bound) plus two
+# fields afi-style restores move from the event envelope into the body:
+# `attendees` (so Graph doesn't send meeting invitations to every
+# original attendee on restore) and `organizer` (which Graph overrides
+# with the target mailbox user — keeping it in the payload triggers
+# 403 "ErrorAccessDenied" when the original organizer is someone else).
+_EVENT_STRIP_FIELDS = {
+    # server-minted / server-managed
+    "id", "createdDateTime", "lastModifiedDateTime", "changeKey",
+    "iCalUId", "webLink", "onlineMeeting", "transactionId",
+    "@odata.etag", "@odata.context",
+    # identity-bound — owned by the target user after restore
+    "organizer", "isOrganizer", "responseStatus",
+    # series relationship — only valid on the original series
+    "seriesMasterId", "occurrenceId",
+    # attendees go into the body banner (afi-parity: no invite storm)
+    "attendees",
+}
+
+
+def _afi_transform_event_for_restore(
+    raw_event: Dict[str, Any],
+    restored_by: str = "TMvault",
+) -> Dict[str, Any]:
+    """Return a Graph-accepted event payload with a provenance banner
+    prepended to ``body.content``.
+
+    Microsoft Graph forces the target mailbox user to be the organizer
+    of events created in their own calendar — there is no scope,
+    delegate flag, or header that overrides this. Every M365 backup
+    vendor (afi.ai, Druva, Spanning, Keepit) handles the round-trip the
+    same way: strip the identity-bound fields, strip the attendee list
+    (so Graph doesn't silently send meeting invitations to everyone on
+    the original invite), and document the original context in the
+    event body so the restored row is readable-back.
+
+    This helper reproduces afi.ai's transformation step-for-step:
+
+    * ``organizer`` / ``isOrganizer`` / ``responseStatus`` removed.
+    * ``attendees`` removed and re-rendered as a plain-text list inside
+      a styled HTML banner at the top of ``body.content``.
+    * Server-set fields (``id``, ``iCalUId``, timestamps, etc.)
+      removed so Graph re-mints them.
+    * ``body.content`` is transformed in place — the result is always
+      HTML (contentType="html") because the banner uses markup.
+    """
+    cleaned: Dict[str, Any] = {}
+    for k, v in (raw_event or {}).items():
+        if k in _EVENT_STRIP_FIELDS:
+            continue
+        cleaned[k] = v
+
+    # Compose the banner from the fields we stripped.
+    organizer = ((raw_event or {}).get("organizer") or {}).get("emailAddress") or {}
+    organizer_name = organizer.get("name") or ""
+    organizer_addr = organizer.get("address") or ""
+    attendees = (raw_event or {}).get("attendees") or []
+    restored_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    parts: List[str] = [
+        '<div style="background:#fff3cd;border-left:4px solid #f0b429;'
+        'padding:10px 12px;margin-bottom:10px;font-family:Segoe UI,Arial,'
+        'sans-serif;font-size:13px;color:#5a4b00;">'
+        f'<div style="font-weight:600;margin-bottom:4px;">'
+        f'Restored from {_html_escape(restored_by)} backup'
+        '</div>'
+    ]
+    if organizer_name or organizer_addr:
+        parts.append(
+            '<div>Originally organized by <strong>'
+            f'{_html_escape(organizer_name) or _html_escape(organizer_addr)}'
+            '</strong>'
+            + (f' &lt;{_html_escape(organizer_addr)}&gt;' if organizer_addr else '')
+            + '</div>'
+        )
+    if attendees:
+        rendered_attendees = []
+        for a in attendees:
+            if not isinstance(a, dict):
+                continue
+            ea = (a.get("emailAddress") or {})
+            name = ea.get("name") or ""
+            addr = ea.get("address") or ""
+            atype = (a.get("type") or "").lower()  # required | optional | resource
+            status = ((a.get("status") or {}).get("response") or "").lower()
+            label = f'{_html_escape(name)}' if name else f'{_html_escape(addr)}'
+            if addr and name:
+                label += f' &lt;{_html_escape(addr)}&gt;'
+            meta_bits = []
+            if atype and atype != "required":
+                meta_bits.append(_html_escape(atype))
+            if status and status not in ("none", "notresponded"):
+                meta_bits.append(_html_escape(status))
+            if meta_bits:
+                label += f' <span style="color:#8a6d3b;">({", ".join(meta_bits)})</span>'
+            rendered_attendees.append(f'<li>{label}</li>')
+        if rendered_attendees:
+            parts.append(
+                '<div style="margin-top:6px;">Original attendees:</div>'
+                '<ul style="margin:4px 0 0 18px;padding:0;">'
+                + "".join(rendered_attendees)
+                + '</ul>'
+            )
+    parts.append(
+        f'<div style="margin-top:6px;color:#8a6d3b;">Restored {restored_at}. '
+        'The target mailbox is now the organizer of this restored copy '
+        '(Microsoft Graph constraint).</div>'
+    )
+    parts.append('</div>')
+    banner = "".join(parts)
+
+    original_body = cleaned.get("body") or {}
+    if not isinstance(original_body, dict):
+        original_body = {}
+    original_content = original_body.get("content") or ""
+    original_type = (original_body.get("contentType") or "html").lower()
+    if original_type == "text":
+        # Wrap plain text in <pre> so the banner + original text render
+        # consistently in HTML-only Outlook clients.
+        original_content_html = f'<pre style="white-space:pre-wrap;">{_html_escape(original_content)}</pre>'
+    else:
+        original_content_html = original_content
+    cleaned["body"] = {
+        "contentType": "html",
+        "content": banner + original_content_html,
+    }
+    return cleaned
 
 
 def _ics_escape(value: str) -> str:
@@ -2241,14 +2407,47 @@ class RestoreWorker:
             return
 
         original_event_id = raw_event.get("id")
+        # Tier 2 USER_CALENDAR resources carry external_id = "{user}:calendar";
+        # route through the helper so /users/<uuid>:calendar/events 404s
+        # stop happening.
+        graph_user_id = _calendar_graph_user_id(resource)
+        # afi-parity transformation: move organizer + attendees into a
+        # provenance banner inside body.content, strip identity-bound
+        # fields so Graph accepts the POST, and prevent an invitation
+        # storm to every original attendee. See
+        # _afi_transform_event_for_restore for the full rationale.
+        restore_payload = _afi_transform_event_for_restore(raw_event)
         try:
-            created = await graph_client.create_calendar_event(resource.external_id, raw_event)
+            created = await graph_client.create_calendar_event(graph_user_id, restore_payload)
         except Exception as e:
-            print(f"[{self.worker_id}] event create failed: {type(e).__name__}: {e}")
-            return
+            # Capture Graph's response body so the operator can see which
+            # specific check failed (InsufficientPermissions vs
+            # ErrorApplicationAccessPolicy vs ErrorAccessDenied). Without
+            # the body, a 403 is indistinguishable from a missing scope,
+            # an ApplicationAccessPolicy restriction, an Exchange mailbox
+            # hold, or a payload-validation rejection that Graph
+            # classifies as 403 instead of 400.
+            body_snippet = ""
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    body_snippet = (resp.text or "")[:600]
+                except Exception:
+                    body_snippet = ""
+            print(
+                f"[{self.worker_id}] event create failed: {type(e).__name__}: {e} "
+                f"| body={body_snippet!r}"
+            )
+            raise
         new_event_id = created.get("id")
         if not new_event_id:
-            return
+            # Graph accepted the POST but gave us no id — treat as a
+            # soft failure so attachments aren't replayed against
+            # nothing, and the outer loop counts it correctly.
+            raise RuntimeError(
+                f"create_calendar_event returned no id for "
+                f"{raw_event.get('subject', original_event_id)}"
+            )
 
         # Find captured EVENT_ATTACHMENT rows linked to the original event.
         # External ID convention from backup-worker._backup_event_attachments:
@@ -2275,7 +2474,7 @@ class RestoreWorker:
                 continue
             try:
                 await graph_client.attach_file_to_event(
-                    user_id=resource.external_id,
+                    user_id=graph_user_id,
                     event_id=new_event_id,
                     name=att.name or "attachment",
                     content_bytes=content,
