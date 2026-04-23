@@ -106,6 +106,12 @@ class SeaweedStore:
             ca_bundle=self._verify if isinstance(self._verify, str) else None,
             upload_concurrency=self._upload_concurrency,
             multipart_threshold_mb=self._multipart_threshold // (1024 * 1024),
+            # Must propagate public_endpoint — the clone is what callers
+            # actually use to sign URLs (via _StoreFacade → presigned_url),
+            # and SeaweedStore.__init__ defaults _public_endpoint to
+            # self._endpoint when public_endpoint is None, which would
+            # hand the browser the docker-internal hostname.
+            public_endpoint=self._public_endpoint,
         )
         clone._forced_bucket = chosen
         return clone
