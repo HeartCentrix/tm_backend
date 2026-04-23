@@ -35,6 +35,7 @@ from shared.message_bus import (
 )
 from shared.config import settings
 from shared.power_bi_client import PowerBIClient
+from shared.audit import emit_backup_triggered
 
 app = FastAPI(title="Backup Scheduler Service", version="3.0.0")
 
@@ -647,6 +648,10 @@ async def trigger_single_backup(resource_id: str, full_backup: bool = False):
             priority=1
         )
 
+        await emit_backup_triggered(
+            job=job, resource=resource,
+            trigger_label="MANUAL", full_backup=full_backup,
+        )
         return {"status": "queued", "job_id": str(job_id)}
 
 
@@ -874,6 +879,19 @@ async def dispatch_policy_backups(policy_id: str):
                     priority=message["priority"],
                 )
 
+                await emit_backup_triggered(
+                    job=job, resource=None, tenant=None,
+                    trigger_label="SCHEDULED",
+                    actor_type="SYSTEM",
+                    full_backup=effective_full_backup,
+                    batch_resource_count=len(resource_ids),
+                    extra_details={
+                        "sla_policy_id": str(policy.id),
+                        "sla_policy_name": policy.name,
+                        "resource_type": resource_type,
+                    },
+                )
+
                 total_dispatched += len(resource_ids)
 
                 # Stagger dispatch to prevent overwhelming Graph API
@@ -1050,6 +1068,13 @@ async def trigger_preemptive_backup_for_resource(
     }
     await message_bus.publish("backup.urgent", payload, priority=1)
     print(f"[PREEMPTIVE] queued backup for resource={resource.display_name} ({resource.id}), job={job_id}, reason={reason}")
+    await emit_backup_triggered(
+        job=job, resource=resource,
+        trigger_label="PREEMPTIVE",
+        actor_type="SYSTEM",
+        full_backup=False,
+        extra_details={"reason": reason, "preemptive": True},
+    )
     return str(job_id)
 
 
@@ -1114,6 +1139,19 @@ async def trigger_preemptive_backup(session: AsyncSession, tenant: Tenant, reaso
         message["reason"] = reason
 
         await message_bus.publish("backup.urgent", message, priority=1)
+
+        await emit_backup_triggered(
+            job=job, resource=None, tenant=tenant,
+            trigger_label="PREEMPTIVE",
+            actor_type="SYSTEM",
+            full_backup=True,
+            batch_resource_count=len(resource_ids),
+            extra_details={
+                "reason": reason,
+                "preemptive": True,
+                "resource_type": rtype,
+            },
+        )
 
     await session.commit()
 

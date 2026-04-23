@@ -18,6 +18,7 @@ from shared.schemas import (
     JobResponse, JobListResponse, TriggerBackupRequest, TriggerBulkBackupRequest, TriggerDatasourceBackupRequest
 )
 from shared.message_bus import message_bus, create_backup_message, create_restore_message
+from shared.audit import emit_backup_triggered
 
 # AZ-4: Azure workload resources go to dedicated queues (not backup.*)
 AZURE_WORKLOAD_QUEUES = {
@@ -154,6 +155,11 @@ async def _create_batch_backup_jobs(
 
     jobs_created = []
     pending_publishes: List[tuple] = []   # (routing_key, msg)
+    # Keep the ORM Job objects alive alongside jobs_created so we can
+    # emit one BACKUP_TRIGGERED per queued job below — Activity groups
+    # these per-job so a single batch request becomes one row per
+    # (tenant, routing_key) split.
+    job_objects: List[Job] = []
 
     for (tenant_id, routing_key), resource_ids in tenant_queue_groups.items():
         has_previous_backup = any(resources_map[rid].last_backup_at is not None for rid in resource_ids)
@@ -175,6 +181,7 @@ async def _create_batch_backup_jobs(
             },
         )
         db.add(job)
+        job_objects.append(job)
         jobs_created.append({
             "jobId": str(job.id),
             "status": "QUEUED",
@@ -202,23 +209,15 @@ async def _create_batch_backup_jobs(
         print(f"[JOB_SERVICE] batch backup → {routing_key} ({len(msg.get('resource_ids', []))} resources)")
         await message_bus.publish(routing_key, msg, priority=priority)
 
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
-                "action": "BACKUP_TRIGGERED",
-                "tenant_id": str(list(tenant_groups.keys())[0]),
-                "org_id": None,
-                "actor_type": "USER",
-                "resource_id": None,
-                "resource_type": "BATCH",
-                "resource_name": f"Batch backup: {len(resources_map)} resources",
-                "outcome": "SUCCESS",
-                "job_id": jobs_created[0]["jobId"] if jobs_created else None,
-                "details": {"resourceCount": len(resources_map), "batch": True, "fullBackup": full_backup, "note": note},
-            })
-    except Exception:
-        pass
+    for queued_job in job_objects:
+        await emit_backup_triggered(
+            job=queued_job,
+            tenant=None,  # BATCH rows carry tenant_id via the Job itself
+            trigger_label=trigger_label,
+            full_backup=full_backup or False,
+            batch_resource_count=len(queued_job.batch_resource_ids or []),
+            extra_details={"note": note, "batch": True} if note else {"batch": True},
+        )
 
     return jobs_created
 
@@ -540,24 +539,11 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
     else:
         print(f"[JOB_SERVICE] RabbitMQ not enabled, skipping publish. RABBITMQ_ENABLED={settings.RABBITMQ_ENABLED}")
 
-    # Log audit event: BACKUP_TRIGGERED
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log", json={
-                "action": "BACKUP_TRIGGERED",
-                "tenant_id": str(resource.tenant_id),
-                "org_id": None,  # Would need tenant org lookup
-                "actor_type": "USER",
-                "resource_id": request.resourceId,
-                "resource_type": resource.type.value if hasattr(resource.type, 'value') else resource.type,
-                "resource_name": resource.display_name,
-                "outcome": "SUCCESS",
-                "job_id": str(job.id),
-                "details": {"fullBackup": effective_full_backup, "note": request.note},
-            })
-    except Exception:
-        pass  # Don't fail the trigger if audit logging fails
+    await emit_backup_triggered(
+        job=job, resource=resource,
+        trigger_label="MANUAL", full_backup=effective_full_backup,
+        extra_details={"note": request.note} if request.note else None,
+    )
 
     return JobResponse(
         id=str(job.id), type="BACKUP", status="QUEUED", progress=0,
@@ -661,6 +647,10 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
                 tenant_id=str(res.tenant_id), full_backup=effective_full_backup
             ), priority=1)
 
+        await emit_backup_triggered(
+            job=job, resource=res,
+            trigger_label="MANUAL", full_backup=effective_full_backup,
+        )
         return {"jobId": str(job.id), "status": "QUEUED", "resourceId": resource_id}
     return {"error": "No resources provided"}
 
