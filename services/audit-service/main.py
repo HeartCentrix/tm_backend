@@ -810,9 +810,13 @@ def _normalize_event(event: dict) -> dict:
     if actor_type not in ("USER", "SYSTEM", "WORKER"):
         actor_type = "SYSTEM"
 
-    # Normalize outcome based on action context
+    # Normalize outcome based on action context. IN_PROGRESS covers the
+    # STARTED bookend emitted by backup/discovery workers (Activity page
+    # keys off this to show a live spinner); CANCELLED covers job-service
+    # cancel emissions. Anything unrecognised still falls through to
+    # SUCCESS so genuinely unknown values don't poison the row.
     outcome = event.get("outcome", "SUCCESS")
-    if outcome not in ("SUCCESS", "FAILURE", "PARTIAL"):
+    if outcome not in ("SUCCESS", "FAILURE", "PARTIAL", "IN_PROGRESS", "CANCELLED", "WARNING"):
         outcome = "SUCCESS"
 
     # Normalize resource_type to uppercase

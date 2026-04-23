@@ -614,6 +614,24 @@ class RestoreWorker:
             async with async_session_factory() as session:
                 print(f"[{self.worker_id}] DB session opened job={job_id}", flush=True)
                 try:
+                    # Drop CANCELLED messages at intake. Without this,
+                    # update_job_status below reverses the user's cancel
+                    # back to RUNNING and the restore runs to completion.
+                    # cancel_job doesn't purge RMQ, so a message enqueued
+                    # before the cancel still lands here.
+                    _existing = await session.get(Job, job_id)
+                    if _existing is not None:
+                        _status_name = (
+                            _existing.status.name
+                            if hasattr(_existing.status, "name")
+                            else str(_existing.status)
+                        )
+                        if _status_name == "CANCELLED":
+                            print(
+                                f"[{self.worker_id}] Skipping CANCELLED restore job {job_id}",
+                                flush=True,
+                            )
+                            return
                     # Update job status — flip to RUNNING and seed
                     # progress=5 so the Activity bar moves the moment
                     # the worker accepts the message.

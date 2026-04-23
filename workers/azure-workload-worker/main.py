@@ -164,6 +164,15 @@ class AzureWorkloadWorker:
                 logger.warning("[%s] Restore job %s not found", self.worker_id, job_id)
                 return
 
+            # Drop CANCELLED messages at intake — see backup-worker for
+            # the full reasoning. cancel_job only flips DB state; the
+            # RMQ message can still arrive, and without this check we'd
+            # flip status back to RUNNING and re-run the restore.
+            _status_name = job.status.name if hasattr(job.status, "name") else str(job.status)
+            if _status_name == "CANCELLED":
+                logger.info("[%s] Skipping CANCELLED restore job %s", self.worker_id, job_id)
+                return
+
             snapshot = await session.get(Snapshot, snapshot_id)
             if not snapshot:
                 job.status = JobStatus.FAILED
@@ -314,6 +323,16 @@ class AzureWorkloadWorker:
             if not job:
                 logger.warning("[%s] Job %s not found, skipping stale message for %s",
                                self.worker_id, job_id, resource_id)
+                return
+
+            # Drop CANCELLED messages at intake — cancel_job leaves the
+            # RMQ message in the queue, and without this guard the
+            # `status = RUNNING` assignment below would silently reverse
+            # the user's cancel and re-run the backup.
+            _status_name = job.status.name if hasattr(job.status, "name") else str(job.status)
+            if _status_name == "CANCELLED":
+                logger.info("[%s] Skipping CANCELLED Azure backup job %s for resource %s",
+                            self.worker_id, job_id, resource_id)
                 return
 
             # Fetch resource

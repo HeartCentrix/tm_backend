@@ -630,6 +630,16 @@ class BackupWorker:
             if not job:
                 print(f"[{self.worker_id}] Job {job_id} not found, skipping stale message for {resource_id}")
                 return
+            # Drop CANCELLED messages at intake. cancel_job only flips
+            # DB state; the RMQ message sits in the queue until a worker
+            # consumes it. Without this guard we'd overwrite CANCELLED
+            # back to RUNNING via update_job_status, create a fresh
+            # snapshot, and fully re-run a backup the user explicitly
+            # stopped. Ack-and-drop so the message doesn't requeue.
+            job_status_name = job.status.name if hasattr(job.status, "name") else str(job.status)
+            if job_status_name == "CANCELLED":
+                print(f"[{self.worker_id}] Skipping CANCELLED job {job_id} for resource {resource_id}")
+                return
             resource = await session.get(Resource, uuid.UUID(resource_id))
             if not resource:
                 print(f"[{self.worker_id}] Resource {resource_id} not found, skipping")
@@ -792,6 +802,18 @@ class BackupWorker:
         async with async_session_factory() as session:
             job = await session.get(Job, job_id)
             if not job:
+                return
+
+            # Drop CANCELLED messages at intake. Without this, the
+            # unconditional `status = RUNNING` below reverses a user's
+            # cancel and the whole mass backup re-runs from scratch —
+            # the exact symptom behind "my cancelled backups restart
+            # when I start a new one". cancel_job doesn't purge RMQ
+            # messages, so a message enqueued before the cancel still
+            # lands here; ack-and-drop without touching job state.
+            job_status_name = job.status.name if hasattr(job.status, "name") else str(job.status)
+            if job_status_name == "CANCELLED":
+                print(f"[{self.worker_id}] Skipping CANCELLED mass job {job_id} ({len(resource_ids)} resources)")
                 return
 
             job.status = JobStatus.RUNNING
