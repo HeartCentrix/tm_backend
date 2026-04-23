@@ -23,7 +23,7 @@ CMD ["server", \
      "-s3", \
      "-s3.config=/config/s3.json", \
      "-filer", \
-     "-master.volumeSizeLimitMB=256", \
-     "-volume.max=0", \
+     "-master.volumeSizeLimitMB=5120", \
+     "-volume.max=2", \
      "-volume.preStopSeconds=1", \
      "-master.volumePreallocate=false"]
