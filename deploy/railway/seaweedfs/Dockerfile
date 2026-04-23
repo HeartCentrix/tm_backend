@@ -24,6 +24,8 @@ CMD ["server", \
      "-s3.config=/config/s3.json", \
      "-filer", \
      "-master.volumeSizeLimitMB=5120", \
-     "-volume.max=2", \
+     "-volume.max=12", \
+     "-volume.disk=ssd", \
+     "-volume.index=leveldb2", \
      "-volume.preStopSeconds=1", \
      "-master.volumePreallocate=false"]
