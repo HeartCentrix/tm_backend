@@ -416,28 +416,58 @@ async def stream_zip_to_block_blob(
     manifest_bytes: bytes,
     block_size: int,
 ) -> None:
-    """Build a ZIP64 archive chunk-by-chunk and stage blocks on the destination
-    blob as bytes flow out. Memory stays at ~block_size regardless of archive
-    size.
+    """Build a ZIP64 archive chunk-by-chunk and push it to object storage.
 
-    `members` is a list of (arcname, container, blob_path) tuples. Each
-    member's bytes are fetched via `member_source_shard.download_blob_stream`
-    (chunked), so no single member materializes in RAM.
+    Two sinks, auto-selected by destination-shard capability:
 
-    Cross-shard members should be copied to the destination shard first
-    (see MailExportOrchestrator._assemble_zip_multi_shard) — this function
-    pulls ALL members from `member_source_shard`.
+    * **Azure Blob (native stage_block path)** — memory stays at ~block_size
+      regardless of archive size. Each `block_size`-aligned slice of the ZIP
+      stream is staged as a block via ``dest_shard.stage_block`` and
+      committed in one go at the end via ``commit_block_list_manual``.
+      The original mail-v2 behaviour; unchanged on Azure deployments.
+
+    * **SeaweedFS / S3-compat fallback** — Seaweed deliberately refuses
+      the Azure stage_block shape (``NotImplementedError``) and steers
+      callers to S3 multipart. Rather than drag a second streaming
+      assembler in, we buffer the ZIP to a bounded-size ``bytearray``
+      and single-PUT via ``upload_blob`` at the end. Memory ceiling =
+      archive size (SharePoint list / small-file exports are usually
+      MB-scale, not GB). For very large on-prem exports a future
+      upgrade swaps this branch for ``upload_stream`` with a live
+      byte-iterator so the ceiling drops back to block_size; keeping
+      it simple for now unblocks the file-family + metadata-mix
+      SharePoint/Teams/Group download paths on Seaweed.
+
+    `members` is a list of tuples in one of three shapes:
+      (arcname, container, blob_path)  — pull bytes from member_source_shard
+      (arcname, bytes_or_bytearray)    — inline bytes (EML / JSON members)
+      (arcname, "inline", bytes)       — tagged inline form
     """
     import zipstream  # package: zipstream-ng
 
-    print(f"[stream_zip] START dest={dest_blob_path} members={len(members)} block_size={block_size}", flush=True)
+    # Probe: pick the sink by destination-shard "kind". Only azure_blob
+    # supports the stage_block + commit_block_list_manual flow. Every
+    # non-Azure backend (SeaweedFS, any future S3-compat) has a
+    # stage_block method on the wrapped store but raises
+    # NotImplementedError from it, so we must NOT call it and instead
+    # take the buffered-single-PUT branch.
+    kind = (getattr(dest_shard, "kind", None)
+            or getattr(getattr(dest_shard, "_store", None), "kind", None)
+            or "unknown")
+    azure_mode = kind == "azure_blob"
+
+    print(
+        f"[stream_zip] START dest={dest_blob_path} members={len(members)} "
+        f"block_size={block_size} mode={'azure-stage_block' if azure_mode else 'buffered-single-put'}",
+        flush=True,
+    )
     zs = zipstream.ZipStream(compress_type=zipstream.ZIP_STORED)
 
     block_ids: list = []
     staged = bytearray()
     block_index = 0
 
-    async def _flush_to_block(final: bool = False):
+    async def _flush_azure(final: bool = False):
         nonlocal block_index
         while len(staged) >= block_size or (final and staged):
             take = min(block_size, len(staged))
@@ -448,11 +478,14 @@ async def stream_zip_to_block_blob(
             block_ids.append(bid)
             block_index += 1
 
+    # For the buffered sink we just append to `staged` and flush once at end.
+    async def _flush_buffered(final: bool = False):
+        # no-op during the member loop; content accumulates in `staged`.
+        return None
+
+    _flush_to_block = _flush_azure if azure_mode else _flush_buffered
+
     print(f"[stream_zip] adding {len(members)} members to zipstream", flush=True)
-    # Member tuple is either:
-    #   (arcname, container, blob_path)        — pull bytes from Azure
-    #   (arcname, bytes_or_bytearray)          — inline bytes (EML path)
-    #   (arcname, "inline", bytes)             — tagged inline form
     for m in members:
         if len(m) == 2:
             arcname, content = m
@@ -470,8 +503,6 @@ async def stream_zip_to_block_blob(
         zs.add(iter(chunks), arcname=arcname)
         del chunks
 
-        # Drain only this member's bytes from zs using file(). Keeps memory
-        # bounded to one member at a time.
         for zchunk in zs.file():
             staged.extend(zchunk)
             await _flush_to_block()
@@ -483,12 +514,25 @@ async def stream_zip_to_block_blob(
         staged.extend(final_chunk)
         await _flush_to_block()
 
-    await _flush_to_block(final=True)
-    print(f"[stream_zip] committing {len(block_ids)} blocks to {dest_blob_path}", flush=True)
-    await dest_shard.commit_block_list_manual(
-        dest_container, dest_blob_path, block_ids,
-        metadata={"streamed": "true"},
-    )
+    if azure_mode:
+        await _flush_azure(final=True)
+        print(f"[stream_zip] committing {len(block_ids)} blocks to {dest_blob_path}", flush=True)
+        await dest_shard.commit_block_list_manual(
+            dest_container, dest_blob_path, block_ids,
+            metadata={"streamed": "true"},
+        )
+    else:
+        # Single-PUT the whole ZIP buffer. For large archives this will
+        # delegate to S3 multipart on the Seaweed side automatically.
+        print(
+            f"[stream_zip] buffered single-PUT to {dest_blob_path} "
+            f"bytes={len(staged)}",
+            flush=True,
+        )
+        await dest_shard.upload_blob(
+            dest_container, dest_blob_path, bytes(staged),
+            metadata={"streamed": "true"},
+        )
     print(f"[stream_zip] DONE dest={dest_blob_path}", flush=True)
 
 

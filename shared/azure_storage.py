@@ -51,6 +51,11 @@ def _sanitize_metadata(metadata: Optional[Dict]) -> Dict:
 
 class AzureStorageShard:
     """Represents a single Azure Storage Account shard"""
+    # Kind tag so downstream generic code (e.g. stream_zip_to_block_blob)
+    # can pick the right sink without isinstance checks. Matches the
+    # `kind = "azure_blob"` / `kind = "seaweedfs"` pattern on the router
+    # stores so _StoreFacade's `self.kind` passes through transparently.
+    kind = "azure_blob"
     
     def __init__(self, account_name: str, account_key: str, shard_index: int = 0):
         self.account_name = account_name
@@ -845,8 +850,27 @@ class AzureStorageManager:
         return self.shards[shard_index]
 
     def get_shard_by_index(self, index: int) -> AzureStorageShard:
-        """Get a specific shard by index. Remains raw-Azure — only used by
-        the DR replication worker which operates on Azure shards directly."""
+        """Get a specific shard by index.
+
+        Router-aware: when the active backend is non-Azure (SeaweedFS
+        / on-prem S3-compat), returns a _StoreFacade over that backend
+        instead of the raw Azure shard. The caller-side interface stays
+        identical (upload_blob / stage_block / commit_block_list_manual
+        / ensure_container / download_blob_stream / download_blob — all
+        proxied onto the router-owned store).
+
+        Fall back to the raw AzureStorageShard when the router hasn't
+        loaded yet (process boot window) or when running the DR
+        replication worker which is Azure-pinned by design. Returns
+        self.shards[0] as a last resort when no shards are configured
+        at all (test envs)."""
+        facade = self._router_facade("default", f"idx-{index}")
+        if facade is not None:
+            # Router active — return the facade regardless of `index`.
+            # Non-Azure backends have a single logical shard today; the
+            # caller's per-folder partitioning still buys us parallel
+            # write streams on the facade's underlying bucket(s).
+            return facade
         if not self.shards:
             raise RuntimeError("No storage shards configured")
         return self.shards[index % len(self.shards)]

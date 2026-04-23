@@ -1676,7 +1676,17 @@ class RestoreWorker:
         # and the selected items are all file-like types, route to
         # FileExportOrchestrator. Supports single-file ORIGINAL raw-stream via
         # the orchestrator's output_mode="raw_single" shortcut.
-        _FILE_V2_TYPES = {"FILE", "ONEDRIVE_FILE", "SHAREPOINT_FILE", "FILE_VERSION"}
+        # File-family row types routed through FileExportOrchestrator.
+        # SHAREPOINT_LIST_ITEM carries its payload in metadata.raw (no
+        # object-storage blob); the orchestrator serialises those to
+        # inline JSON members inside the same streamed ZIP, so mixed
+        # SHAREPOINT_FILE + SHAREPOINT_LIST_ITEM selections assemble in
+        # one pass instead of falling back to the legacy Azure-pinned
+        # zipfile loop.
+        _FILE_V2_TYPES = {
+            "FILE", "ONEDRIVE_FILE", "SHAREPOINT_FILE", "FILE_VERSION",
+            "SHAREPOINT_LIST_ITEM",
+        }
         _file_items = [it for it in items if getattr(it, "item_type", None) in _FILE_V2_TYPES]
         if (
             _mail_export_settings.EXPORT_ONEDRIVE_V2_ENABLED

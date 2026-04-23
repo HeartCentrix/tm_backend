@@ -113,6 +113,63 @@ class FileFolderExportTask:
 
             blob_path = await self._resolve_blob_path(item)
             if not blob_path:
+                # No blob_path doesn't always mean "not backed up" — some
+                # item types hold their payload directly in
+                # metadata.raw with no object-storage side (SharePoint
+                # list items, calendar events, contacts, group mailbox
+                # posts when stored metadata-only). Before falling into
+                # the missing-blob failure path, try to serialise the
+                # in-row JSON as an inline ZIP member so mixed
+                # selections (files + list items in one folder) produce
+                # a complete archive.
+                raw_payload = None
+                extra = getattr(item, "extra_data", None) or getattr(item, "metadata", None) or {}
+                if isinstance(extra, dict):
+                    candidate = extra.get("raw")
+                    if isinstance(candidate, (dict, list)) and candidate:
+                        raw_payload = candidate
+                if raw_payload is not None:
+                    item_folder = (getattr(item, "folder_path", None) or self.folder_name or "").strip("/")
+                    item_name = name or ext_id
+                    # Metadata-only items land as .json inside the ZIP
+                    # at the same logical path the file would have used.
+                    raw_arcname = (
+                        f"{item_folder}/{item_name}.json" if item_folder
+                        else f"{item_name}.json"
+                    )
+                    safe = sanitize_arcname(
+                        raw_arcname, max_len=self.path_max_len, replace_chars=self.sanitize_chars,
+                    )
+                    unique = resolve_arcname_collision(safe, external_id=ext_id, used=used_arcnames)
+                    try:
+                        body = json.dumps(raw_payload, ensure_ascii=False, indent=2).encode("utf-8")
+                    except Exception as exc:
+                        print(
+                            f"[FileFolderExportTask/{self.folder_name}] serialise failed "
+                            f"ext_id={ext_id}: {exc}", flush=True,
+                        )
+                        result.failed_items.append({
+                            "id": ext_id, "name": name, "folder": self.folder_name,
+                            "status": "skipped", "reason": f"json_serialise: {exc}",
+                        })
+                        if self.manifest:
+                            self.manifest.record_failure(
+                                item_id=ext_id, name=name, folder=self.folder_name,
+                                error="json_serialise", error_class="SerialiseError",
+                            )
+                        continue
+                    # Inline-bytes member tuple shape accepted by
+                    # stream_zip_to_block_blob — no shard fetch.
+                    result.produced_members.append((unique, body))
+                    result.exported_count += 1
+                    if self.manifest:
+                        self.manifest.record_success(
+                            item_id=ext_id, name=name, folder=self.folder_name,
+                            size_bytes=len(body),
+                        )
+                    continue
+                # Truly missing — no blob AND no metadata.raw. Fall
+                # through to the legacy not_yet_backed_up handling.
                 reason = "not_yet_backed_up"
                 print(
                     f"[FileFolderExportTask/{self.folder_name}] blob_path=NULL ext_id={ext_id} policy={self.missing_policy}",
