@@ -3295,10 +3295,19 @@ class GraphClient:
     # in practice for typical attachments under 3MB).
 
     async def create_calendar_event(self, user_id: str, event_payload: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /users/{id}/events — restore a calendar event.
-        Strip server-managed fields the caller might still have in the payload."""
+        """POST /users/{id}/events. Strips server-set read-only fields
+        so Graph re-mints them on create.
+
+        The restore-worker's ``_afi_transform_event_for_restore`` is the
+        layer that handles identity-bound stripping (organizer /
+        isOrganizer / responseStatus / attendees) and re-renders those
+        fields into a provenance banner inside ``body.content``. That
+        transformation is restore-specific and stays out of this
+        generic Graph helper so other callers (e.g. future
+        programmatic-create paths) aren't forced into restore
+        semantics.
+        """
         url = f"{self.GRAPH_URL}/users/{user_id}/events"
-        # Graph rejects creates that include these read-only / server-set fields.
         readonly = {
             "id", "createdDateTime", "lastModifiedDateTime", "changeKey",
             "iCalUId", "webLink", "onlineMeeting", "transactionId",
@@ -3307,20 +3316,59 @@ class GraphClient:
         clean = {k: v for k, v in event_payload.items() if k not in readonly}
         return await self._post(url, clean)
 
-    async def create_user_contact(self, user_id: str, contact_payload: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /users/{id}/contacts — restore a personal contact.
+    CONTACT_READONLY_FIELDS = {
+        "id", "createdDateTime", "lastModifiedDateTime", "changeKey",
+        "@odata.etag", "@odata.context", "parentFolderId",
+    }
 
-        Same read-only shape as events: the server re-mints id/timestamps/etag.
-        Nested @odata.type entries inside emailAddresses / phones are kept since
-        Graph requires them on create.
-        """
-        url = f"{self.GRAPH_URL}/users/{user_id}/contacts"
-        readonly = {
-            "id", "createdDateTime", "lastModifiedDateTime", "changeKey",
-            "@odata.etag", "@odata.context",
+    @classmethod
+    def clean_contact_payload(cls, contact_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Strip server-minted fields so Graph re-derives them on POST."""
+        return {
+            k: v for k, v in contact_payload.items()
+            if k not in cls.CONTACT_READONLY_FIELDS
         }
-        clean = {k: v for k, v in contact_payload.items() if k not in readonly}
-        return await self._post(url, clean)
+
+    async def create_user_contact(self, user_id: str, contact_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /users/{id}/contacts — restore a personal contact to the
+        default Contacts folder. For folder-aware routing use
+        ``create_user_contact_in_folder``."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/contacts"
+        return await self._post(url, self.clean_contact_payload(contact_payload))
+
+    async def create_user_contact_in_folder(
+        self, user_id: str, folder_id: str, contact_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """POST /users/{id}/contactFolders/{fid}/contacts — folder-scoped create."""
+        url = f"{self.GRAPH_URL}/users/{user_id}/contactFolders/{folder_id}/contacts"
+        return await self._post(url, self.clean_contact_payload(contact_payload))
+
+    async def list_contact_folders(self, user_id: str) -> List[Dict[str, Any]]:
+        """GET /users/{id}/contactFolders — used by the restore engine to
+        map snapshot `folder_path` values to folder ids. Single page is
+        always enough in practice (Outlook caps custom contact folders at
+        128 per mailbox); the $top=100 limit follows the discovery
+        probe."""
+        resp = await self._get(
+            f"{self.GRAPH_URL}/users/{user_id}/contactFolders",
+            params={"$top": "100", "$select": "id,displayName,parentFolderId"},
+        )
+        return (resp or {}).get("value", []) or []
+
+    async def create_contact_folder(
+        self, user_id: str, name: str, parent_folder_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """POST /users/{id}/contactFolders — idempotency is the caller's
+        responsibility (check list_contact_folders first). Nested folders
+        are supported via parent_folder_id → /contactFolders/{pid}/childFolders."""
+        if parent_folder_id:
+            url = (
+                f"{self.GRAPH_URL}/users/{user_id}"
+                f"/contactFolders/{parent_folder_id}/childFolders"
+            )
+        else:
+            url = f"{self.GRAPH_URL}/users/{user_id}/contactFolders"
+        return await self._post(url, {"displayName": name})
 
     async def attach_file_to_event(
         self, user_id: str, event_id: str, name: str,

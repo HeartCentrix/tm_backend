@@ -156,6 +156,18 @@ class Settings:
         # Small-attachment threshold. >= this size uses Graph's upload-session
         # endpoint (chunked PUT). Units = megabytes.
         self.MAIL_RESTORE_ATTACH_LARGE_MB = int(os.getenv("MAIL_RESTORE_ATTACH_LARGE_MB", "3"))
+        # ---- Contact Restore engine ----
+        # Batches up to 20 contacts per Graph /$batch call, resolves target
+        # contactFolder from snapshot_item.folder_path, and caps concurrency
+        # globally + per-user so a 5k-user restore stays inside Graph throttle
+        # envelopes. Flag off → legacy per-item POST path (one POST per contact,
+        # default Contacts folder only).
+        self.CONTACT_RESTORE_ENGINE_ENABLED = os.getenv("CONTACT_RESTORE_ENGINE_ENABLED", "true").lower() == "true"
+        self.CONTACT_RESTORE_GLOBAL_POOL = int(os.getenv("CONTACT_RESTORE_GLOBAL_POOL", "32"))
+        # Outlook serializes Contacts sub-requests 4-at-a-time per mailbox; any
+        # value >4 triggers 429s faster than the retry loop absorbs them.
+        self.CONTACT_RESTORE_PER_USER = int(os.getenv("CONTACT_RESTORE_PER_USER", "4"))
+        self.CONTACT_RESTORE_MAX_RETRIES = int(os.getenv("CONTACT_RESTORE_MAX_RETRIES", "5"))
         # ---- OneDrive Restore engine ----
         # Streams files back via Graph upload-session for ≥ 4 MB, simple PUT
         # otherwise. Flag off → legacy _restore_file_to_onedrive shim (still
