@@ -495,11 +495,21 @@ class BackupWorker:
         queue = await message_bus.channel.get_queue(queue_name)
         print(f"[{self.worker_id}] Listening on {queue_name}...")
 
+        # Graph-rate-limit priority is derived from the queue: a single
+        # backup-worker handles backup.urgent (HIGH) + backup.normal
+        # (NORMAL) concurrently; each job's Graph calls run at its
+        # queue's priority via the ContextVar scope. See
+        # shared/graph_priority.py for the queue→priority map.
+        from shared.graph_client import graph_priority
+        from shared.graph_priority import priority_for_queue
+        queue_priority = priority_for_queue(queue_name)
+
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
                 try:
                     body = json.loads(message.body.decode())
-                    await self.process_backup_message(body)
+                    with graph_priority(queue_priority):
+                        await self.process_backup_message(body)
                     await message.ack()
                 except Exception as e:
                     print(f"[{self.worker_id}] Error: {e}")

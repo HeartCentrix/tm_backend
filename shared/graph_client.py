@@ -2,7 +2,9 @@
 import asyncio
 import logging
 import httpx
-from typing import AsyncGenerator, AsyncIterator, List, Optional, Dict, Any, Tuple
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import AsyncGenerator, AsyncIterator, Iterator, List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 import hashlib
 import time
@@ -13,6 +15,39 @@ from shared.graph_ratelimit import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Task-scoped Graph-rate-limit priority. ContextVar because a single
+# cached GraphClient often services multiple concurrent jobs (e.g.
+# backup-worker with MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER>1) —
+# each asyncio task gets its own context and its own priority.
+# 0=NORMAL, 1=HIGH, 2=URGENT. See shared/graph_priority.py for mapping.
+_current_priority: ContextVar[int] = ContextVar("graph_priority", default=0)
+
+
+@contextmanager
+def graph_priority(priority: int) -> Iterator[None]:
+    """Set the Graph-rate-limit priority for all calls made inside the
+    `with` block (and all asyncio tasks spawned from it). Reverts on
+    exit, even on exception.
+
+    Usage in a worker's job handler::
+
+        from shared.graph_client import graph_priority
+        from shared.graph_priority import priority_for_queue
+
+        async def process(self, msg, queue_name):
+            with graph_priority(priority_for_queue(queue_name)):
+                # every Graph call here runs at the queue's priority
+                ...
+
+    No-op cost when the feature flag is off (the ContextVar is set but
+    `GraphClient._effective_priority` short-circuits to 0).
+    """
+    token = _current_priority.set(max(0, int(priority)))
+    try:
+        yield
+    finally:
+        _current_priority.reset(token)
 
 # Timeout constants — tuned for Graph API and token endpoint behavior
 _DEFAULT_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=10.0)
@@ -58,6 +93,21 @@ class GraphClient:
         self.power_bi_refresh_token = power_bi_refresh_token
         self._access_token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
+
+    def _effective_priority(self) -> int:
+        """Return the priority for the current asyncio task.
+
+        Uses a task-scoped ContextVar so concurrent jobs sharing this
+        GraphClient instance (common pattern: worker caches one client
+        per tenant and runs many jobs against it) each see their own
+        priority without race conditions.
+
+        Ignored — returns 0 — when the feature flag is off.
+        """
+        from shared.config import settings as _s
+        if not getattr(_s, "GRAPH_PRIORITY_SCHEDULING_ENABLED", False):
+            return 0
+        return _current_priority.get()
 
     @property
     def app_client_id(self) -> str:
@@ -219,8 +269,11 @@ class GraphClient:
 
         async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
             while next_url:
-                await policy.stream_bucket.acquire()
-                await multi_app_manager.acquire_app_token(self.client_id)
+                prio = self._effective_priority()
+                await policy.stream_bucket.acquire(priority=prio)
+                await multi_app_manager.acquire_app_token(
+                    self.client_id, priority=prio
+                )
                 if params and params.get("$count") == "true":
                     headers = {"Authorization": f"Bearer {token}",
                                "ConsistencyLevel": "eventual"}
@@ -400,8 +453,11 @@ class GraphClient:
 
         async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
             while next_url:
-                await policy.stream_bucket.acquire()
-                await multi_app_manager.acquire_app_token(current_app)
+                prio = self._effective_priority()
+                await policy.stream_bucket.acquire(priority=prio)
+                await multi_app_manager.acquire_app_token(
+                    current_app, priority=prio
+                )
                 if params and params.get("$count") == "true":
                     headers = {"Authorization": f"Bearer {token}",
                                "ConsistencyLevel": "eventual"}

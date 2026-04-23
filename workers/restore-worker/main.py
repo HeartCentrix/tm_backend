@@ -590,13 +590,23 @@ class RestoreWorker:
         queue = await message_bus.channel.get_queue(queue_name)
         print(f"[{self.worker_id}] Subscribed to queue '{queue_name}' (prefetch={prefetch_count})", flush=True)
 
+        # Graph-rate-limit priority: restore.urgent → URGENT (2), which
+        # makes every Graph call in this restore job jump the per-app
+        # token-bucket queue ahead of concurrent backup traffic. Scoped
+        # per-message via ContextVar so sibling jobs on other queues
+        # keep their own priority.
+        from shared.graph_client import graph_priority
+        from shared.graph_priority import priority_for_queue
+        queue_priority = priority_for_queue(queue_name)
+
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
                 print(f"[{self.worker_id}] Received message on '{queue_name}' (delivery_tag={message.delivery_tag})", flush=True)
                 async with message.process():
                     try:
                         body = json.loads(message.body.decode())
-                        await self.process_restore_message(body)
+                        with graph_priority(queue_priority):
+                            await self.process_restore_message(body)
                     except Exception as e:
                         print(f"[{self.worker_id}] Error processing restore message: {e}", flush=True)
                         import traceback

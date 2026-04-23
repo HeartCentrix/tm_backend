@@ -305,6 +305,15 @@ class Settings:
         self.GRAPH_STREAM_PACE_REQS_PER_SEC = float(
             os.getenv("GRAPH_STREAM_PACE_REQS_PER_SEC", "1.0")
         )
+        # Priority scheduling on the Graph rate limiter. When true, HIGH/
+        # URGENT callers (user-triggered restores, interactive UI ops)
+        # jump the per-app token-bucket queue ahead of NORMAL (scheduled
+        # backups). When false, all callers are served at NORMAL priority
+        # (byte-identical to pre-priority behaviour).
+        # Mapping of queue -> priority lives in shared/graph_priority.py.
+        self.GRAPH_PRIORITY_SCHEDULING_ENABLED = os.getenv(
+            "GRAPH_PRIORITY_SCHEDULING_ENABLED", "true"
+        ).lower() in ("true", "1", "yes")
         self.GRAPH_MAX_RETRIES = int(os.getenv("GRAPH_MAX_RETRIES", "5"))
         # Sequence walked when 429/503 arrives without a Retry-After header.
         # Loops back to the start on exhaustion; the real ceiling is the

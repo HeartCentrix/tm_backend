@@ -108,7 +108,16 @@ class AsyncTokenBucket:
         self._last_refill = time.monotonic()
         self._lock = asyncio.Lock()
 
-    async def acquire(self, cost: float = 1.0) -> None:
+    async def acquire(self, cost: float = 1.0, priority: int = 0) -> None:
+        """Acquire `cost` tokens. Blocks until available.
+
+        priority=0 (NORMAL) is the default and byte-identical to the
+        pre-priority behaviour. priority>0 shortens the re-check sleep
+        by 1/(1+3*priority), so HIGH/URGENT callers wake up sooner when
+        the bucket is contended and grab the next refilled token ahead
+        of NORMAL callers. This is a best-effort priority scheduler —
+        it does not preempt in-flight work.
+        """
         if self._rate <= 0:
             return
         while True:
@@ -124,6 +133,11 @@ class AsyncTokenBucket:
                     return
                 deficit = cost - self._tokens
                 wait = deficit / self._rate
+            # Priority-aware backoff: HIGH/URGENT callers re-check
+            # sooner, so they grab the next refilled token before
+            # NORMAL callers waiting on the same bucket.
+            if priority > 0:
+                wait = wait / (1 + 3 * priority)
             await asyncio.sleep(wait)
 
     def rate(self) -> float:
