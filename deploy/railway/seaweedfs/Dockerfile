@@ -17,7 +17,9 @@ COPY deploy/railway/seaweedfs/s3.json /config/s3.json
 
 EXPOSE 8333 9333
 
-CMD ["server", \
+CMD ["-logtostderr=true", \
+     "-stderrthreshold=WARNING", \
+     "server", \
      "-dir=/data", \
      "-ip=0.0.0.0", \
      "-s3", \
@@ -25,7 +27,6 @@ CMD ["server", \
      "-filer", \
      "-master.volumeSizeLimitMB=5120", \
      "-volume.max=12", \
-     "-volume.disk=ssd", \
      "-volume.index=leveldb2", \
      "-volume.preStopSeconds=1", \
      "-master.volumePreallocate=false"]
