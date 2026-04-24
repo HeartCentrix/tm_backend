@@ -817,6 +817,12 @@ class BackupWorker:
         async with async_session_factory() as s:
             await self.complete_snapshot(s, snapshot, result)
 
+        # Safety reaper — catches any sibling snapshot left IN_PROGRESS by
+        # a fire-and-forget background task inside the handler (e.g. the
+        # USER_CHATS hosted-content / chat-attachment phase) before we
+        # flip the job to COMPLETED. See _reap_orphan_snapshots_for_job.
+        await self._reap_orphan_snapshots_for_job(job_id, "single-backup finalize")
+
         async with async_session_factory() as s:
             await self.update_job_status(s, job_id, JobStatus.COMPLETED, result)
 
@@ -946,6 +952,17 @@ class BackupWorker:
             if isinstance(r, Exception)
             or (isinstance(r, dict) and r.get("error"))
         )
+
+        # Safety reaper — before marking the job terminal, close out any
+        # snapshot still stuck IN_PROGRESS for this job. Normal paths flip
+        # snapshots to COMPLETED/FAILED inside their per-resource handlers,
+        # but exception paths (a handler that throws mid-attachment, a
+        # gather() that captured an exception, a group_timeout) can leave
+        # the snapshot row in IN_PROGRESS forever — the Recovery UI then
+        # shows a permanently-spinning row and subsequent resume logic in
+        # create_snapshot latches onto it. Mark them PARTIAL with a clear
+        # note so downstream state stays coherent.
+        await self._reap_orphan_snapshots_for_job(job_id, "mass-backup finalize")
 
         async with async_session_factory() as session:
             await self.update_job_status(session, job_id, JobStatus.COMPLETED, {
@@ -8437,6 +8454,89 @@ class BackupWorker:
             )
         )
         await session.commit()
+
+    async def _reap_orphan_snapshots_for_job(self, job_id, reason: str) -> int:
+        """Close out any snapshot still `IN_PROGRESS` for this job.
+
+        Called from both single- and mass-backup finalize paths right
+        before `update_job_status(..., COMPLETED)`. Normal paths flip
+        each snapshot to COMPLETED inside its per-resource handler, but
+        we've seen rows get stranded IN_PROGRESS when:
+          * a handler raises mid-attachment-phase and the outer gather
+            catches the exception without finalising,
+          * a fire-and-forget background task (chat hosted-contents /
+            chat attachments) outlives the main handler's return,
+          * a `group_timeout` fires inside `_process_mass_backup` and
+            cancels the handler before it reaches its finalize block,
+          * the worker process restarts mid-run and the new replica
+            picks up a redelivered RMQ message that already had work
+            committed against a pre-restart snapshot id.
+
+        Stranded rows make the Recovery UI spin forever on that
+        resource, and `create_snapshot`'s resume-first logic
+        (at main.py ~9023) latches onto them on the next job — causing
+        items from two different jobs to pile into the same snapshot.
+
+        We flip to PARTIAL with bytes_total/item_count derived directly
+        from the snapshot_items actually written so the numbers don't
+        lie. Returns the count of rows we reaped."""
+        try:
+            async with async_session_factory() as session:
+                rows = (await session.execute(
+                    text("""
+                        SELECT s.id
+                        FROM snapshots s
+                        WHERE s.job_id = :jid AND s.status = 'IN_PROGRESS'
+                    """),
+                    {"jid": job_id},
+                )).all()
+                if not rows:
+                    return 0
+                reaped = 0
+                for (sid,) in rows:
+                    # Derive real counts from snapshot_items so the
+                    # numbers match storage, not whatever the in-memory
+                    # counter on a dead task last wrote.
+                    actual = (await session.execute(
+                        text("""
+                            SELECT count(*) AS n,
+                                   COALESCE(sum(content_size), 0) AS b
+                            FROM snapshot_items WHERE snapshot_id = :sid
+                        """),
+                        {"sid": sid},
+                    )).first()
+                    n_items = int(actual[0] or 0) if actual else 0
+                    b_bytes = int(actual[1] or 0) if actual else 0
+                    await session.execute(
+                        text("""
+                            UPDATE snapshots
+                            SET status = 'PARTIAL'::snapshotstatus,
+                                completed_at = NOW(),
+                                item_count = :n,
+                                new_item_count = COALESCE(new_item_count, :n),
+                                bytes_total = :b,
+                                bytes_added = COALESCE(bytes_added, :b),
+                                duration_secs = COALESCE(duration_secs,
+                                    EXTRACT(EPOCH FROM (NOW() - started_at))::int),
+                                extra_data = COALESCE(extra_data, '{}'::json)::jsonb
+                                             || jsonb_build_object(
+                                                'reaped', true,
+                                                'reap_reason', :r)
+                            WHERE id = :sid
+                        """),
+                        {"sid": sid, "n": n_items, "b": b_bytes, "r": reason},
+                    )
+                    reaped += 1
+                    print(
+                        f"[{self.worker_id}] [REAPER] snapshot {sid} → "
+                        f"PARTIAL ({n_items} items, {b_bytes} B) — {reason}"
+                    )
+                await session.commit()
+                return reaped
+        except Exception as exc:
+            # Reaper is a safety net — it must never fail a backup.
+            print(f"[{self.worker_id}] [REAPER] skipped: {type(exc).__name__}: {exc}")
+            return 0
 
     async def complete_snapshot(self, session: AsyncSession, snapshot: Snapshot, result: Dict):
         """Mark snapshot as completed with result data"""
