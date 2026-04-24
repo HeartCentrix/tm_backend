@@ -340,12 +340,18 @@ async def _revert_snapshot_storage(db: AsyncSession, snapshot) -> dict:
     import logging as _logging
     _log = _logging.getLogger(__name__)
 
+    # Snapshot has no tenant_id column — pull both type + tenant_id off
+    # the owning resource in one round-trip. Falls back to the snapshot's
+    # own resource_id only if the resource row is gone (shouldn't happen
+    # in a normal cancel, but keeps the helper crash-free either way).
     res_row = (await db.execute(
-        text("SELECT type::text FROM resources WHERE id = :rid"),
+        text("SELECT type::text, tenant_id::text FROM resources WHERE id = :rid"),
         {"rid": snapshot.resource_id},
     )).first()
     resource_type = (res_row[0] if res_row else "generic").lower().replace("_", "-")
-    tenant_short = str(snapshot.tenant_id or snapshot.resource_id or "").replace("-", "")[:8]
+    tenant_id_str = (res_row[1] if res_row and res_row[1]
+                     else str(snapshot.resource_id or ""))
+    tenant_short = tenant_id_str.replace("-", "")[:8]
     container = f"backup-{resource_type}-{tenant_short}"
 
     items = (await db.execute(
