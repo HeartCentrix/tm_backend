@@ -74,6 +74,18 @@ except ImportError:
 _BULK_INSERT_CHUNK = int(os.getenv("BULK_INSERT_CHUNK", "2000"))
 
 
+class SnapshotVanishedError(Exception):
+    """Raised by the snapshot_items bulk insert when the parent snapshot
+    row was deleted out from under us — typically because cancel_job's
+    revert helper, an admin purge, or stale-snapshot cleanup removed it
+    while a long-running handler (chats, mail, onedrive) was still
+    streaming items. Without this signal, every subsequent batch in the
+    handler hits the same FK violation and the catch-all `except
+    Exception` in each per-item loop logs hundreds of failures while
+    burning Graph API quota for nothing. Handlers catch this once,
+    abort the resource cleanly, and let the outer worker move on."""
+
+
 async def _bulk_upsert_snapshot_items(
     session, rows: List[Dict[str, Any]],
 ) -> int:
@@ -88,10 +100,15 @@ async def _bulk_upsert_snapshot_items(
 
     Returns the number of rows attempted (not necessarily inserted —
     conflicts are dropped silently by design).
+
+    Raises SnapshotVanishedError if the FK to snapshots fails — see the
+    class doc; other IntegrityError subtypes (tenant_id FK, unexpected
+    constraints) re-raise unchanged.
     """
     if not rows:
         return 0
     from sqlalchemy.dialects.postgresql import insert as _pg_insert
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
     total = 0
     for i in range(0, len(rows), _BULK_INSERT_CHUNK):
         chunk = rows[i:i + _BULK_INSERT_CHUNK]
@@ -104,7 +121,20 @@ async def _bulk_upsert_snapshot_items(
         stmt = _pg_insert(SnapshotItem).values(chunk).on_conflict_do_nothing(
             index_elements=["snapshot_id", "external_id", "item_type"],
         )
-        await session.execute(stmt)
+        try:
+            await session.execute(stmt)
+        except _IntegrityError as e:
+            # Detect "parent snapshot row deleted mid-flight" specifically
+            # and surface as SnapshotVanishedError so handlers can break
+            # cleanly. Match on the FK constraint name, not the message
+            # text, to stay robust across asyncpg / driver wording.
+            if "snapshot_items_snapshot_id_fkey" in str(e):
+                await session.rollback()
+                snap_id = chunk[0].get("snapshot_id") if chunk else None
+                raise SnapshotVanishedError(
+                    f"snapshot {snap_id} no longer exists; aborting handler"
+                ) from e
+            raise
         total += len(chunk)
     await session.commit()
     return total
@@ -1195,6 +1225,19 @@ class BackupWorker:
                                         f"live item_count bump failed: "
                                         f"{_bump_err}"
                                     )
+                            except SnapshotVanishedError as snap_gone:
+                                # Same race as USER_CHATS — abort the
+                                # whole handler instead of plowing
+                                # through every remaining folder with
+                                # the same FK violation. Re-raise so
+                                # the outer per-resource try/except
+                                # closes the resource cleanly.
+                                print(
+                                    f"[{self.worker_id}] [USER_MAIL] "
+                                    f"{user_label_mail}: {snap_gone} — "
+                                    f"aborting handler"
+                                )
+                                raise
                             except Exception as persist_err:
                                 print(
                                     f"[{self.worker_id}] [USER_MAIL] "
@@ -1806,6 +1849,20 @@ class BackupWorker:
                                         f"[{self.worker_id}] [USER_CHATS] "
                                         f"live item_count bump failed: "
                                         f"{_bump_err}"
+                                    )
+                            except SnapshotVanishedError as snap_gone:
+                                # Snapshot row was deleted out from under
+                                # us (admin purge or user-cancel revert).
+                                # Trip the fanout-cancelled flag so the
+                                # remaining ~N chats short-circuit at the
+                                # next semaphore boundary instead of each
+                                # logging the same FK violation.
+                                if not _chat_fanout_cancelled:
+                                    _chat_fanout_cancelled = True
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"{user_label}: {snap_gone} — "
+                                        f"short-circuiting remaining chats"
                                     )
                             except Exception as persist_err:
                                 print(
@@ -4264,6 +4321,17 @@ class BackupWorker:
                                         f"live item_count bump failed: "
                                         f"{bump_err}"
                                     )
+                            except SnapshotVanishedError as snap_gone:
+                                # Same race as USER_CHATS / USER_MAIL —
+                                # snapshot deleted mid-flight, abort the
+                                # handler instead of looping through every
+                                # remaining folder hitting the same FK.
+                                print(
+                                    f"[{self.worker_id}] [MAILBOX] "
+                                    f"{user_label}: {snap_gone} — "
+                                    f"aborting handler"
+                                )
+                                raise
                             except Exception as persist_err:
                                 print(
                                     f"[{self.worker_id}] [MAILBOX] "
