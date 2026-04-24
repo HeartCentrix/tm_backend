@@ -3246,7 +3246,14 @@ class GraphClient:
                 f"{self.GRAPH_URL}/shares/{share_id}/driveItem",
             )
         except httpx.HTTPStatusError as e:
-            if e.response.status_code in (400, 403, 404):
+            # Fast-fail on permanent failures. 423 = resource locked by
+            # owner (typical for cross-user OneDrive Personal file refs
+            # in Teams chats — app can't access other users' drives
+            # without per-user delegation). 410 = tombstoned/deleted.
+            # 401 = auth scope missing. All non-retryable — return None
+            # so the caller records the item as metadata-only without
+            # burning rate-limit budget on retries that will never work.
+            if e.response.status_code in (400, 401, 403, 404, 410, 423):
                 return None
             raise
         except Exception:

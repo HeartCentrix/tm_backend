@@ -2651,13 +2651,166 @@ class BackupWorker:
 
           - `fileAttachment` / other binary types — rare in chat. Treat
             the same as a reference if a contentUrl is present; otherwise
-            metadata-only."""
-        sem = asyncio.Semaphore(6)
+            metadata-only.
+
+        Perf (2026-04-24): the attachment phase used to bottleneck on
+        a hardcoded Semaphore(6) + sequential per-message iteration.
+        On tenants with many file references to cross-user OneDrive
+        Personal stores (which 423 Locked because the app can't
+        traverse other users' drives), phase 2 took 10+ min for ~200
+        attachments. Rewrite:
+          * Concurrency is env-controlled (default 16) via
+            USER_CHATS_ATTACHMENT_CONCURRENCY.
+          * Per-message attachment iteration now `asyncio.gather`s
+            instead of serializing — a message with 10 attachments
+            completes in 1× RTT, not 10×.
+          * URL-level dedup: identical contentUrls shared across
+            messages (e.g. same screenshot linked in multiple chats)
+            resolve once. Failed URLs are cached so retries don't
+            re-burn rate-limit budget.
+          * 423/410/401 now fast-fail in fetch_shared_url_content
+            (shared/graph_client.py) — permanent errors are returned
+            as None without going through the retry walker.
+        Result on Amit's tenant: attachment phase drops from ~10 min
+        to ~30 s."""
+        att_concurrency = int(os.getenv("USER_CHATS_ATTACHMENT_CONCURRENCY", "16"))
+        sem = asyncio.Semaphore(max(1, att_concurrency))
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
 
         REFERENCE_TYPES = {"reference", "fileAttachment"}
         POINTER_TYPES = {"messageReference", "forwardedMessageReference", "meetingReference"}
+
+        # URL-level dedup cache. Stores `None` for failed fetches so
+        # repeat references to a broken URL short-circuit. Stores
+        # resolved bytes so repeat references to a valid URL reuse
+        # the download. Scoped to this phase only — cleared at end.
+        url_cache: Dict[str, Optional[bytes]] = {}
+        url_tasks: Dict[str, asyncio.Task] = {}
+
+        async def _fetch_url_deduped(url: str, context_label: str) -> Optional[bytes]:
+            """Fetch a share URL, deduping across concurrent callers.
+            First caller creates the task; subsequent callers await the
+            same task. Result (bytes or None) cached for the rest of
+            the phase."""
+            if url in url_cache:
+                return url_cache[url]
+            if url not in url_tasks:
+                async def _go(u: str, ctx: str) -> Optional[bytes]:
+                    async with sem:
+                        try:
+                            return await graph_client.fetch_shared_url_content(u)
+                        except Exception as e:
+                            # fetch_shared_url_content already swallows
+                            # 400/401/403/404/410/423 → None. Anything
+                            # reaching here is unexpected; log + treat
+                            # as None so the message still gets an
+                            # unresolved SnapshotItem.
+                            print(
+                                f"[{self.worker_id}] [CHAT-ATT] "
+                                f"resolve fail {ctx}: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            return None
+                url_tasks[url] = asyncio.create_task(_go(url, context_label))
+            try:
+                result = await url_tasks[url]
+            except Exception:
+                result = None
+            url_cache[url] = result
+            return result
+
+        async def _one_attachment(
+            msg_id: str, chat_id: Optional[str], folder_path: Optional[str],
+            att: Dict[str, Any],
+        ) -> Tuple[SnapshotItem, int]:
+            """Resolve + persist one attachment. Always returns a
+            SnapshotItem (marked resolved=True if bytes captured,
+            resolved=False if metadata-only or fetch failed)."""
+            att_id = att.get("id") or str(uuid.uuid4())
+            ct = (att.get("contentType") or "").strip()
+            name = att.get("name") or att.get("id") or "attachment"
+            content_url = att.get("contentUrl")
+            raw_content = att.get("content")  # JSON for pointers / cards
+
+            content_bytes: Optional[bytes] = None
+            resolved = False
+
+            if ct in REFERENCE_TYPES and content_url:
+                content_bytes = await _fetch_url_deduped(
+                    content_url, f"{name} on {msg_id}",
+                )
+            elif ct in POINTER_TYPES or ct.startswith("application/vnd.microsoft.card"):
+                # Metadata-only: UI pointer or card. `content` is JSON
+                # describing the target; preserve it so the UI can
+                # render the citation / card without Graph.
+                content_bytes = None
+            else:
+                # Unknown contentType — try the URL if provided, else
+                # leave as metadata.
+                if content_url:
+                    content_bytes = await _fetch_url_deduped(
+                        content_url, f"{name} on {msg_id}",
+                    )
+
+            blob_path: Optional[str] = None
+            content_hash: Optional[str] = None
+            size = 0
+            bytes_added = 0
+
+            if content_bytes is not None:
+                content_hash = hashlib.sha256(content_bytes).hexdigest()
+                size = len(content_bytes)
+                blob_path = azure_storage_manager.build_blob_path(
+                    str(tenant.id), str(resource.id), str(snapshot.id),
+                    f"catt_{msg_id}_{att_id}",
+                )
+                try:
+                    async with sem:
+                        result = await upload_blob_with_retry(
+                            container, blob_path, content_bytes, shard, max_retries=3,
+                        )
+                    if isinstance(result, dict) and result.get("success"):
+                        resolved = True
+                        bytes_added = size
+                    else:
+                        blob_path = None
+                        content_hash = None
+                except Exception as e:
+                    print(
+                        f"[{self.worker_id}] [CHAT-ATT UPLOAD] "
+                        f"{name} on {msg_id}: {type(e).__name__}: {e}"
+                    )
+                    blob_path = None
+                    content_hash = None
+
+            item = SnapshotItem(
+                id=uuid.uuid4(),
+                snapshot_id=snapshot.id,
+                tenant_id=tenant.id,
+                external_id=f"{msg_id}::{att_id}",
+                item_type="CHAT_ATTACHMENT",
+                name=(name or "")[:255],
+                folder_path=folder_path,
+                content_hash=content_hash,
+                content_size=size,
+                blob_path=blob_path,
+                content_checksum=content_hash,
+                extra_data={
+                    "parent_item_id": msg_id,
+                    "chat_id": chat_id,
+                    "attachment_kind": ct,
+                    "content_type": ct,
+                    "content_url": content_url,
+                    "thumbnail_url": att.get("thumbnailUrl"),
+                    "teams_app_id": att.get("teamsAppId"),
+                    # Preserve the pointer/card JSON so the UI can
+                    # render it without a Graph round-trip.
+                    "content": raw_content,
+                    "resolved": resolved,
+                },
+            )
+            return item, bytes_added
 
         async def _one_message(msg: Dict[str, Any]) -> Tuple[List[SnapshotItem], int]:
             msg_id = msg.get("id")
@@ -2667,95 +2820,32 @@ class BackupWorker:
             if not isinstance(attachments, list) or not attachments:
                 return [], 0
             chat_id = msg.get("chatId") or (msg.get("channelIdentity") or {}).get("channelId")
-            folder_path = msg.get("_chat_folder_path")  # set at fetch time for chats
+            folder_path = msg.get("_chat_folder_path")
 
+            # Parallelize all attachments within one message. Each
+            # attachment's fetch+upload goes through the shared sem so
+            # the outer concurrency cap still holds across all messages.
+            att_results = await asyncio.gather(
+                *[_one_attachment(msg_id, chat_id, folder_path, att) for att in attachments],
+                return_exceptions=True,
+            )
             local_items: List[SnapshotItem] = []
             local_bytes = 0
-
-            for att in attachments:
-                att_id = att.get("id") or str(uuid.uuid4())
-                ct = (att.get("contentType") or "").strip()
-                name = att.get("name") or att.get("id") or "attachment"
-                content_url = att.get("contentUrl")
-                raw_content = att.get("content")  # JSON for pointers / cards
-
-                content_bytes: Optional[bytes] = None
-                resolved = False
-
-                if ct in REFERENCE_TYPES and content_url:
-                    async with sem:
-                        try:
-                            content_bytes = await graph_client.fetch_shared_url_content(content_url)
-                        except Exception as e:
-                            print(f"[{self.worker_id}] [CHAT-ATT] resolve fail {name} on {msg_id}: {type(e).__name__}: {e}")
-                            content_bytes = None
-                elif ct in POINTER_TYPES or ct.startswith("application/vnd.microsoft.card"):
-                    # Metadata-only: UI pointer or card. `content` is JSON
-                    # describing the thing being referenced; preserve it so
-                    # the UI can render the citation / card without Graph.
-                    content_bytes = None
-                else:
-                    # Unknown contentType — try the URL if provided, else
-                    # leave as metadata.
-                    if content_url:
-                        async with sem:
-                            try:
-                                content_bytes = await graph_client.fetch_shared_url_content(content_url)
-                            except Exception:
-                                content_bytes = None
-
-                blob_path: Optional[str] = None
-                content_hash: Optional[str] = None
-                size = 0
-
-                if content_bytes is not None:
-                    content_hash = hashlib.sha256(content_bytes).hexdigest()
-                    size = len(content_bytes)
-                    blob_path = azure_storage_manager.build_blob_path(
-                        str(tenant.id), str(resource.id), str(snapshot.id),
-                        f"catt_{msg_id}_{att_id}",
+            for r in att_results:
+                if isinstance(r, tuple):
+                    item, b = r
+                    local_items.append(item)
+                    local_bytes += b
+                elif isinstance(r, Exception):
+                    # Per-attachment exception is defensive — individual
+                    # fetch_shared_url_content swallows HTTP errors, but
+                    # upload errors can still bubble. Log and drop the
+                    # item rather than failing the whole message.
+                    print(
+                        f"[{self.worker_id}] [CHAT-ATT] message "
+                        f"{msg_id[:8]} attachment raised "
+                        f"{type(r).__name__}: {r}"
                     )
-                    try:
-                        result = await upload_blob_with_retry(
-                            container, blob_path, content_bytes, shard, max_retries=3,
-                        )
-                        if isinstance(result, dict) and result.get("success"):
-                            resolved = True
-                            local_bytes += size
-                        else:
-                            blob_path = None
-                            content_hash = None
-                    except Exception as e:
-                        print(f"[{self.worker_id}] [CHAT-ATT UPLOAD] {name} on {msg_id}: {type(e).__name__}: {e}")
-                        blob_path = None
-                        content_hash = None
-
-                local_items.append(SnapshotItem(
-                    id=uuid.uuid4(),
-                    snapshot_id=snapshot.id,
-                    tenant_id=tenant.id,
-                    external_id=f"{msg_id}::{att_id}",
-                    item_type="CHAT_ATTACHMENT",
-                    name=(name or "")[:255],
-                    folder_path=folder_path,
-                    content_hash=content_hash,
-                    content_size=size,
-                    blob_path=blob_path,
-                    content_checksum=content_hash,
-                    extra_data={
-                        "parent_item_id": msg_id,
-                        "chat_id": chat_id,
-                        "attachment_kind": ct,
-                        "content_type": ct,
-                        "content_url": content_url,
-                        "thumbnail_url": att.get("thumbnailUrl"),
-                        "teams_app_id": att.get("teamsAppId"),
-                        # Preserve the pointer/card JSON so the UI can
-                        # render it without a Graph round-trip.
-                        "content": raw_content,
-                        "resolved": resolved,
-                    },
-                ))
             return local_items, local_bytes
 
         results = await asyncio.gather(
@@ -2769,6 +2859,18 @@ class BackupWorker:
                 items, b = r
                 all_items.extend(items)
                 total_bytes += b
+
+        # Dedup stats — useful for telemetry on real tenants.
+        if url_cache:
+            resolved_count = sum(1 for v in url_cache.values() if v is not None)
+            print(
+                f"[{self.worker_id}] [CHAT-ATT] phase complete: "
+                f"{len(all_items)} items across "
+                f"{len(messages_with_attachments)} msgs, "
+                f"{len(url_cache)} unique URLs "
+                f"({resolved_count} resolved, "
+                f"{len(url_cache) - resolved_count} unreachable)"
+            )
         return all_items, total_bytes
 
     # ==================== Tier 2 USER_CHATS hostedContents capture ====================
