@@ -1051,7 +1051,12 @@ class BackupWorker:
                     _mail_streaming_enabled = snapshot is not None
                     _mail_persisted_total = 0
                     _mail_persisted_bytes = 0
-                    _mail_persist_lock = asyncio.Lock()
+                    # Lock removed: _bulk_upsert_snapshot_items opens its own
+                    # session and commits atomically, ON CONFLICT handles
+                    # idempotency, and Postgres MVCC serializes concurrent
+                    # INSERTs safely. The lock was collapsing folder-parallel
+                    # fetch into sequential DB writes — removing it restores
+                    # the intended pipeline-overlap speedup.
 
                     async def _stream_persist_folder_items(
                         folder_msgs: List[Dict[str, Any]],
@@ -1082,11 +1087,8 @@ class BackupWorker:
                                 "extra_data": ext,
                                 "content_checksum": None,
                             })
-                        async with _mail_persist_lock:
-                            async with async_session_factory() as _sess:
-                                await _bulk_upsert_snapshot_items(
-                                    _sess, rows,
-                                )
+                        async with async_session_factory() as _sess:
+                            await _bulk_upsert_snapshot_items(_sess, rows)
                         return len(rows), local_bytes
 
                     async def _drain_one_folder(fid: Optional[str]) -> List:
@@ -1632,7 +1634,21 @@ class BackupWorker:
                     _streaming_enabled = snapshot is not None
                     _persisted_total = 0
                     _persisted_bytes = 0
-                    _persist_lock = asyncio.Lock()
+                    # Lock removed 2026-04-24: it serialized DB writes across
+                    # 20 parallel chat drains (line 1690), which collapsed
+                    # the "pipeline overlap" this handler was designed for.
+                    # Safe because:
+                    #   * Each _bulk_upsert_snapshot_items opens its own
+                    #     session and commits atomically.
+                    #   * ON CONFLICT (snapshot_id, external_id, item_type)
+                    #     makes concurrent INSERTs idempotent.
+                    #   * Graph message IDs are globally unique across
+                    #     chats for a user, so no cross-chat key collisions.
+                    #   * Postgres MVCC + row-level locks handle parallel
+                    #     INSERTs without deadlocks.
+                    # Counters below (_persisted_total / _persisted_bytes)
+                    # race under concurrent updates but are advisory-only
+                    # (UI progress bump); see line 1776.
 
                     async def _stream_persist_chat_items(
                         cid: str,
@@ -1687,11 +1703,8 @@ class BackupWorker:
                                 "extra_data": ext,
                                 "content_checksum": None,
                             })
-                        async with _persist_lock:
-                            async with async_session_factory() as _sess:
-                                await _bulk_upsert_snapshot_items(
-                                    _sess, rows,
-                                )
+                        async with async_session_factory() as _sess:
+                            await _bulk_upsert_snapshot_items(_sess, rows)
                         return len(rows), local_bytes
 
                     async def _drain_one_chat(cid: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
