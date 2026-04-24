@@ -916,6 +916,13 @@ async def consume_discovery_queue():
     queue = await message_bus.channel.get_queue("discovery.m365")
     logger.info("[discovery-worker] Listening on discovery.m365...")
 
+    # Discovery is low-volume, high-leverage (feeds every downstream
+    # backup job). Runs at HIGH priority on the Graph rate limiter so
+    # a backlog of backup.normal traffic can't delay new-tenant onboarding.
+    from shared.graph_client import graph_priority
+    from shared.graph_priority import priority_for_queue
+    queue_priority = priority_for_queue("discovery.m365")
+
     async with queue.iterator() as queue_iter:
         async for message in queue_iter:
             try:
@@ -927,7 +934,8 @@ async def consume_discovery_queue():
                     tenant_id, body.get("jobId"), discovery_scope or "FULL",
                 )
                 # Process discovery and commit within this message scope
-                result_count = await discover_tenant(tenant_id, discovery_scope=discovery_scope)
+                with graph_priority(queue_priority):
+                    result_count = await discover_tenant(tenant_id, discovery_scope=discovery_scope)
                 # ONLY ack after successful DB commit
                 await message.ack()
                 logger.info(
@@ -1082,13 +1090,19 @@ async def consume_azure_discovery_queue():
 
     logger.info("[azure-discovery] Listening on discovery.azure...")
 
+    # Same elevated priority as m365 discovery — low volume, high leverage.
+    from shared.graph_client import graph_priority
+    from shared.graph_priority import priority_for_queue
+    queue_priority = priority_for_queue("discovery.azure")
+
     async with queue.iterator() as queue_iter:
         async for message in queue_iter:
             try:
                 body = json.loads(message.body.decode())
                 tenant_id = UUID(body["tenantId"])
                 logger.info("[azure-discovery] Consumed discovery.azure for tenant %s (jobId=%s)", tenant_id, body.get("jobId"))
-                result_count = await discover_azure_tenant(tenant_id)
+                with graph_priority(queue_priority):
+                    result_count = await discover_azure_tenant(tenant_id)
                 await message.ack()
                 logger.info("[azure-discovery] Azure discovery complete for tenant %s: %d resources upserted, message acked", tenant_id, result_count)
             except Exception as e:

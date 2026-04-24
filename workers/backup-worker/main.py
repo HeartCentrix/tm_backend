@@ -543,11 +543,21 @@ class BackupWorker:
         queue = await message_bus.channel.get_queue(queue_name)
         print(f"[{self.worker_id}] Listening on {queue_name}...")
 
+        # Graph-rate-limit priority is derived from the queue: a single
+        # backup-worker handles backup.urgent (HIGH) + backup.normal
+        # (NORMAL) concurrently; each job's Graph calls run at its
+        # queue's priority via the ContextVar scope. See
+        # shared/graph_priority.py for the queue→priority map.
+        from shared.graph_client import graph_priority
+        from shared.graph_priority import priority_for_queue
+        queue_priority = priority_for_queue(queue_name)
+
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
                 try:
                     body = json.loads(message.body.decode())
-                    await self.process_backup_message(body)
+                    with graph_priority(queue_priority):
+                        await self.process_backup_message(body)
                     await message.ack()
                 except Exception as e:
                     print(f"[{self.worker_id}] Error: {e}")
@@ -1106,7 +1116,12 @@ class BackupWorker:
                     _mail_streaming_enabled = snapshot is not None
                     _mail_persisted_total = 0
                     _mail_persisted_bytes = 0
-                    _mail_persist_lock = asyncio.Lock()
+                    # Lock removed: _bulk_upsert_snapshot_items opens its own
+                    # session and commits atomically, ON CONFLICT handles
+                    # idempotency, and Postgres MVCC serializes concurrent
+                    # INSERTs safely. The lock was collapsing folder-parallel
+                    # fetch into sequential DB writes — removing it restores
+                    # the intended pipeline-overlap speedup.
 
                     async def _stream_persist_folder_items(
                         folder_msgs: List[Dict[str, Any]],
@@ -1137,11 +1152,8 @@ class BackupWorker:
                                 "extra_data": ext,
                                 "content_checksum": None,
                             })
-                        async with _mail_persist_lock:
-                            async with async_session_factory() as _sess:
-                                await _bulk_upsert_snapshot_items(
-                                    _sess, rows,
-                                )
+                        async with async_session_factory() as _sess:
+                            await _bulk_upsert_snapshot_items(_sess, rows)
                         return len(rows), local_bytes
 
                     async def _drain_one_folder(fid: Optional[str]) -> List:
@@ -1700,7 +1712,111 @@ class BackupWorker:
                     _streaming_enabled = snapshot is not None
                     _persisted_total = 0
                     _persisted_bytes = 0
-                    _persist_lock = asyncio.Lock()
+                    # Lock removed 2026-04-24: it serialized DB writes across
+                    # 20 parallel chat drains (line 1690), which collapsed
+                    # the "pipeline overlap" this handler was designed for.
+                    # Safe because:
+                    #   * Each _bulk_upsert_snapshot_items opens its own
+                    #     session and commits atomically.
+                    #   * ON CONFLICT (snapshot_id, external_id, item_type)
+                    #     makes concurrent INSERTs idempotent.
+                    #   * Graph message IDs are globally unique across
+                    #     chats for a user, so no cross-chat key collisions.
+                    #   * Postgres MVCC + row-level locks handle parallel
+                    #     INSERTs without deadlocks.
+                    # Counters below (_persisted_total / _persisted_bytes)
+                    # race under concurrent updates but are advisory-only
+                    # (UI progress bump); see line 1776.
+
+                    # ─── Stage 2: hostedContent interleave (opt-in) ───
+                    # Normally, inline-image/card bytes are fetched in a
+                    # SEPARATE phase AFTER all chat drains complete
+                    # (main.py line ~2114). For rich-content-heavy tenants
+                    # that phase can dominate wall-clock. When the flag is
+                    # on, we instead spawn per-chat hostedContent fetch
+                    # tasks as soon as each chat's drain finishes — they
+                    # run concurrently with the remaining drains and with
+                    # the attachment pass, collapsing two sequential
+                    # phases into one overlapped pipeline.
+                    #
+                    # Flag defaults OFF so the legacy 2-phase path runs
+                    # unchanged until the interleaved path is validated
+                    # in prod on a real tenant. Turn on with
+                    #   USER_CHATS_INTERLEAVE_HOSTED_CONTENT=true
+                    # Knob for concurrency stays the existing env:
+                    #   CHAT_HOSTED_CONTENT_CONCURRENCY (default 8)
+                    _interleave_hc = os.getenv(
+                        "USER_CHATS_INTERLEAVE_HOSTED_CONTENT", "false",
+                    ).lower() in ("true", "1", "yes")
+                    _hc_concurrency = int(os.getenv(
+                        "CHAT_HOSTED_CONTENT_CONCURRENCY", "8",
+                    ))
+                    _hc_sem: Optional[asyncio.Semaphore] = (
+                        asyncio.Semaphore(_hc_concurrency) if _interleave_hc else None
+                    )
+                    _hc_tasks: List[asyncio.Task] = []
+                    _hc_items_total = 0
+                    _hc_bytes_total = 0
+                    _hc_interleaved_msg_ids: set = set()
+                    # Signal key mutated on each successfully-fetched
+                    # message so Phase 2's filter (line ~2127) skips it.
+                    # Safe because persist (line ~1785) already ran before
+                    # the mutation — the stored blob/row is unaffected.
+                    # Pre-bind the active GraphClient on self for
+                    # _userchats_backup_hosted_contents, which reads
+                    # self.graph. The legacy code sets this in Phase 2
+                    # (line ~2128); we bind earlier so the interleaved
+                    # tasks see it. No new race — still one active backup
+                    # per asyncio task on this worker.
+                    if _interleave_hc:
+                        self.graph = graph_client
+
+                    async def _kick_hosted_content_for_chat(
+                        cid: str, msgs: List[Dict[str, Any]],
+                    ) -> None:
+                        """Fetch hostedContents for a chat's messages in
+                        parallel with ongoing drains of other chats.
+                        Counters and Phase-2-skip set are advisory —
+                        safe under concurrent increments because the
+                        Python `+=` on ints is a single-bytecode update
+                        under the asyncio event loop (no threads)."""
+                        nonlocal _hc_items_total, _hc_bytes_total
+                        for m in msgs:
+                            if not m.get("hostedContents"):
+                                continue
+                            m_id = m.get("id")
+                            m_chat_id = (
+                                m.get("chatId")
+                                or (m.get("channelIdentity") or {}).get("channelId")
+                                or cid
+                            )
+                            if not m_id or not m_chat_id:
+                                continue
+                            async with _hc_sem:
+                                try:
+                                    n, b = await self._userchats_backup_hosted_contents(
+                                        snapshot_id=str(snapshot.id),
+                                        user_id=user_id,
+                                        chat_id=m_chat_id,
+                                        message_id=m_id,
+                                        hosted_contents=m["hostedContents"],
+                                    )
+                                    _hc_items_total += n
+                                    _hc_bytes_total += b
+                                    _hc_interleaved_msg_ids.add(m_id)
+                                    # Mark the message dict so Phase 2
+                                    # filter (line ~2127) excludes it.
+                                    m["_hc_interleaved"] = True
+                                except Exception as _e:
+                                    # Leave msg OUT of the done-set so
+                                    # Phase 2 can retry it from items_data.
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"hc interleave failed "
+                                        f"msg={str(m_id)[:8]} "
+                                        f"chat={str(m_chat_id)[:8]}: "
+                                        f"{type(_e).__name__}: {_e}"
+                                    )
 
                     async def _stream_persist_chat_items(
                         cid: str,
@@ -1755,11 +1871,8 @@ class BackupWorker:
                                 "extra_data": ext,
                                 "content_checksum": None,
                             })
-                        async with _persist_lock:
-                            async with async_session_factory() as _sess:
-                                await _bulk_upsert_snapshot_items(
-                                    _sess, rows,
-                                )
+                        async with async_session_factory() as _sess:
+                            await _bulk_upsert_snapshot_items(_sess, rows)
                         return len(rows), local_bytes
 
                     async def _drain_one_chat(cid: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
@@ -1889,6 +2002,14 @@ class BackupWorker:
                                     f"{persist_err}"
                                 )
 
+                        # Fire hostedContent fetch for this chat's msgs
+                        # as a background task — runs in parallel with
+                        # remaining drains. No-op when flag is off.
+                        if _interleave_hc and msgs_local and not _chat_fanout_cancelled:
+                            _hc_tasks.append(asyncio.create_task(
+                                _kick_hosted_content_for_chat(cid, msgs_local),
+                            ))
+
                         _progress["chats_done"] += 1
                         _progress["msgs"] += len(msgs_local)
                         # Heartbeat every 10 chats so operators can see
@@ -1941,6 +2062,23 @@ class BackupWorker:
                             f"aborted for {user_label}: "
                             f"{type(e).__name__}: {e} "
                             f"(kept {len(all_msgs)})"
+                        )
+
+                    # Drain barrier reached — all chats' messages are
+                    # in all_msgs + persisted. If interleaved hc tasks
+                    # are still in flight, wait for them now so Phase 2
+                    # sees a consistent _hc_interleaved_msg_ids set
+                    # before deciding what to skip.
+                    if _interleave_hc and _hc_tasks:
+                        hc_started_mono = time.monotonic()
+                        await asyncio.gather(*_hc_tasks, return_exceptions=True)
+                        hc_elapsed = time.monotonic() - hc_started_mono
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] hc interleave "
+                            f"drained {len(_hc_interleaved_msg_ids)} msgs "
+                            f"({_hc_items_total} items, "
+                            f"{_hc_bytes_total} bytes) in {hc_elapsed:.1f}s "
+                            f"(overlapped with drain phase)"
                         )
 
                     elapsed = time.monotonic() - chats_start_mono
@@ -2181,10 +2319,20 @@ class BackupWorker:
                     # so each (message, hosted_content) pair gets its own
                     # CHAT_HOSTED_CONTENT SnapshotItem, streamed straight to
                     # blob under users/<uid>/chats/<cid>/messages/<mid>/hosted/<hid>.
+                    #
+                    # Skip messages already handled by the Stage-2
+                    # interleave (USER_CHATS_INTERLEAVE_HOSTED_CONTENT=true).
+                    # Each successfully-interleaved message is marked with
+                    # `_hc_interleaved=True` on the raw dict — see
+                    # _kick_hosted_content_for_chat in the USER_CHATS
+                    # handler. Messages that FAILED the interleave stay
+                    # unmarked and fall through to this phase as a
+                    # natural retry path.
                     msgs_with_hc = [
                         extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
                         if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
                         and extra["raw"].get("hostedContents")
+                        and not extra["raw"].get("_hc_interleaved")
                     ]
                     if msgs_with_hc and user_id:
                         # Bind self so _one_msg can reach the BackupWorker
@@ -2225,6 +2373,19 @@ class BackupWorker:
                                 # SnapshotItem list committed below).
                                 bytes_total += hc_bytes
                                 total_hosted_items += hc_items
+
+                    # Fold in anything the Stage-2 interleave already
+                    # processed so snapshot.item_count + bytes_added
+                    # reflect the full hostedContent pipeline regardless
+                    # of which path did the work. These nonlocals live in
+                    # the USER_CHATS branch scope above (same outer func)
+                    # and are 0 when the flag is off.
+                    try:
+                        bytes_total += _hc_bytes_total
+                        total_hosted_items += _hc_items_total
+                    except NameError:
+                        # Flag off or non-CHATS code path — nothing to fold.
+                        pass
                 elif resource.type.value == "USER_ONEDRIVE":
                     drive_id = (resource.extra_data or {}).get("drive_id")
                     file_items = [

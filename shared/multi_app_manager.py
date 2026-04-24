@@ -102,14 +102,23 @@ class MultiAppManager:
         app = self._app_map.get(client_id)
         return bool(app and app.is_throttled)
 
-    async def acquire_app_token(self, client_id: str, cost: float = 1.0) -> None:
+    async def acquire_app_token(
+        self, client_id: str, cost: float = 1.0, priority: int = 0
+    ) -> None:
         """Block on this app's per-app pace bucket until a token is available.
-        Unknown client_id is a silent no-op so fallback / legacy paths keep
-        working."""
+
+        priority=0 (NORMAL) is the default — matches pre-priority
+        behaviour. priority>0 (HIGH/URGENT) jumps ahead of NORMAL
+        callers waiting on the same bucket. See shared/graph_priority.py
+        for the priority constants and queue→priority mapping.
+
+        Unknown client_id is a silent no-op so fallback / legacy paths
+        keep working.
+        """
         app = self._app_map.get(client_id)
         if app is None:
             return
-        await app.bucket.acquire(cost)
+        await app.bucket.acquire(cost, priority=priority)
 
     def get_stats(self) -> List[dict]:
         """Get usage stats for all apps"""
