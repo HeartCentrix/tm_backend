@@ -135,6 +135,24 @@ async def _is_job_cancelled(job_id) -> bool:
         return False
 
 
+class JobCancelledMidFlight(Exception):
+    """Raised from the per-resource backup loop when the DB job row flips
+    to CANCELLED. Propagates through upload_stream (which already aborts
+    any in-flight multipart in its except block), so orphan part bytes are
+    released on the backend. Already-uploaded singlepart blobs are reaped
+    by cancel_job's `_revert_snapshot_storage` — cancel is a full revert,
+    not a soft-close, which keeps ghost bytes out of SeaweedFS / Azure."""
+
+
+async def _raise_if_job_cancelled(job_id) -> None:
+    """Call between resources (and optionally between large item batches)
+    so a user cancel becomes effective within one resource instead of one
+    whole batch. Transient DB errors never cancel — only a confirmed
+    CANCELLED status does."""
+    if await _is_job_cancelled(job_id):
+        raise JobCancelledMidFlight(f"job {job_id} cancelled mid-flight")
+
+
 async def _update_job_pct(job_id, pct: int) -> None:
     """Write live `jobs.progress_pct` on a short-lived session so the
     Protection / Activity UI can animate during long M365 backups. Best-
@@ -1987,6 +2005,7 @@ class BackupWorker:
 
         async def _backup_one(resource: Resource) -> Dict:
             async with semaphore:
+                await _raise_if_job_cancelled(job_id)
                 snapshot = await self.create_snapshot(resource, message, job_id)
                 _snap_by_resource[str(resource.id)] = str(snapshot.id)
                 await self._emit_backup_audit(
@@ -3270,6 +3289,7 @@ class BackupWorker:
 
         async def backup_one_resource(resource: Resource):
             async with semaphore:
+                await _raise_if_job_cancelled(job_id)
                 snapshot = None
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
@@ -4080,6 +4100,7 @@ class BackupWorker:
 
         async def backup_one_mailbox(resource: Resource):
             async with semaphore:
+                await _raise_if_job_cancelled(job_id)
                 snapshot = None
                 user_label = resource.display_name or resource.external_id
                 try:
@@ -4413,6 +4434,7 @@ class BackupWorker:
 
         async def backup_one(resource: Resource):
             async with semaphore:
+                await _raise_if_job_cancelled(job_id)
                 snapshot = None
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)

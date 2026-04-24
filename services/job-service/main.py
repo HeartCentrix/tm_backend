@@ -324,23 +324,93 @@ async def get_job_progress(job_id: str, token: Optional[str] = Query(None)):
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+async def _revert_snapshot_storage(db: AsyncSession, snapshot) -> dict:
+    """Delete every blob written for `snapshot`, then delete its DB rows.
+
+    Called on cancel and on backup failure. Idempotent: unknown blobs are
+    swallowed (NoSuchKey / 404) so a partial second call finishes cleanly.
+    Returns a summary {items_reverted, bytes_reverted, blobs_deleted,
+    blob_errors} the caller folds into its audit event.
+
+    The container for Azure shards is derived from the owning resource's
+    type (matches AzureStorageManager.get_container_name). SeaweedFS
+    ignores the container arg (forced_bucket), so passing an Azure-shaped
+    name there is harmless."""
+    from shared.storage.router import router as _storage_router
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    res_row = (await db.execute(
+        text("SELECT type::text FROM resources WHERE id = :rid"),
+        {"rid": snapshot.resource_id},
+    )).first()
+    resource_type = (res_row[0] if res_row else "generic").lower().replace("_", "-")
+    tenant_short = str(snapshot.tenant_id or snapshot.resource_id or "").replace("-", "")[:8]
+    container = f"backup-{resource_type}-{tenant_short}"
+
+    items = (await db.execute(
+        text(
+            "SELECT id, blob_path, backend_id, COALESCE(content_size,0) "
+            "FROM snapshot_items WHERE snapshot_id = :sid"
+        ),
+        {"sid": snapshot.id},
+    )).all()
+
+    bytes_total = 0
+    blobs_deleted = 0
+    blob_errors = 0
+    for _item_id, blob_path, backend_id, size in items:
+        bytes_total += int(size or 0)
+        if not blob_path or not backend_id:
+            continue
+        try:
+            store = _storage_router.get_store_by_id(str(backend_id))
+            await store.delete(container, blob_path)
+            blobs_deleted += 1
+        except Exception as exc:
+            blob_errors += 1
+            _log.warning(
+                "cancel-revert: delete failed backend=%s path=%s: %s",
+                backend_id, blob_path, exc,
+            )
+
+    # Wipe snapshot_items first (FK: snapshot_items.snapshot_id → snapshots)
+    await db.execute(
+        text("DELETE FROM snapshot_items WHERE snapshot_id = :sid"),
+        {"sid": snapshot.id},
+    )
+    # Then the snapshot row itself. vm_file_index CASCADEs automatically.
+    await db.execute(
+        text("DELETE FROM snapshots WHERE id = :sid"),
+        {"sid": snapshot.id},
+    )
+
+    return {
+        "items_reverted": len(items),
+        "bytes_reverted": bytes_total,
+        "blobs_deleted": blobs_deleted,
+        "blob_errors": blob_errors,
+    }
+
+
 @app.post("/api/v1/jobs/{job_id}/cancel", status_code=204)
 async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
-    """Cancel a job and cascade the cancellation to its dependents.
+    """Cancel a job and fully revert any partial work.
 
-    Cascade:
-      1. Job.status → CANCELLED.
-      2. Every related Resource (single resource_id OR each id in
-         batch_resource_ids) gets last_backup_status='CANCELLED' so the
-         Protection page reflects the cancellation immediately, matching
-         what the Activity page shows for the same job.
-      3. Any IN_PROGRESS snapshot tied to this job is flipped to FAILED —
-         SnapshotStatus has no CANCELLED value, and FAILED is closer to the
-         truth than leaving it permanently 'in progress'.
+    Cancel is a *revert*, not a soft-close — to keep backing storage
+    consistent with the DB and to avoid ghost bytes piling up on
+    SeaweedFS / Azure. See `_revert_snapshot_storage` for the per-
+    snapshot cleanup. After this call:
+      * `jobs.status` = CANCELLED, `completed_at` stamped.
+      * Every resource touched has `last_backup_status='CANCELLED'`.
+      * Every IN_PROGRESS snapshot this job owned is **deleted** —
+        along with its `snapshot_items` rows and underlying blobs.
+      * Audit event BACKUP_CANCELLED / RESTORE_CANCELLED emitted with
+        a summary of what was reverted.
 
-    The worker's batch loop doesn't poll mid-flight, so an already-running
-    backup may still complete its current resource — but downstream state is
-    consistent the moment the cancel returns."""
+    In-flight workers poll `_is_job_cancelled()` between items and
+    raise early, so the window between "cancel issued" and "no more new
+    blobs written" is bounded by one item, not one resource."""
     job = (await db.execute(select(Job).where(Job.id == UUID(job_id)))).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -361,56 +431,39 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
         except (ValueError, TypeError):
             continue
 
+    revert_totals = {"items_reverted": 0, "bytes_reverted": 0,
+                     "blobs_deleted": 0, "blob_errors": 0,
+                     "snapshots_reverted": 0}
+
     if resource_ids:
         await db.execute(
             text("UPDATE resources SET last_backup_status = 'CANCELLED', last_backup_job_id = :jid WHERE id = ANY(:ids)"),
             {"jid": job.id, "ids": resource_ids},
         )
-        # Close out in-flight snapshots so the Recovery page doesn't
-        # show a permanently-spinning row. If the handler already
-        # persisted items to snapshot_items, promote the snapshot to
-        # COMPLETED with a note — blindly flipping to FAILED would
-        # hide real data that is already in the blob store / DB.
-        # Snapshots with zero items are marked FAILED (nothing to keep).
-        # All updates stamp completed_at + duration_secs so the row is
-        # in a valid terminal state.
-        await db.execute(
-            text("""
-                WITH counts AS (
-                    SELECT s.id,
-                           s.started_at,
-                           (SELECT count(*) FROM snapshot_items si
-                            WHERE si.snapshot_id = s.id) AS n_items
-                    FROM snapshots s
-                    WHERE s.job_id = :jid AND s.status = 'IN_PROGRESS'
-                )
-                UPDATE snapshots s SET
-                    -- Cast the CASE result to the snapshotstatus enum.
-                    -- Postgres types the bare THEN/ELSE branches as text
-                    -- and refuses the implicit text→enum coercion inside
-                    -- an UPDATE … SET assignment, raising
-                    -- DatatypeMismatchError: column "status" is of type
-                    -- snapshotstatus but expression is of type text.
-                    status = (CASE WHEN c.n_items > 0 THEN 'COMPLETED'
-                                   ELSE 'FAILED' END)::snapshotstatus,
-                    item_count = c.n_items,
-                    new_item_count = COALESCE(s.new_item_count, c.n_items),
-                    completed_at = NOW(),
-                    duration_secs = EXTRACT(EPOCH FROM (NOW() - c.started_at))::int,
-                    extra_data = COALESCE(s.extra_data, '{}'::json)::jsonb
-                                 || jsonb_build_object(
-                                    'job_cancelled', true,
-                                    'cancel_note', 'job was cancelled mid-run')
-                FROM counts c
-                WHERE s.id = c.id
-            """),
-            {"jid": job.id},
-        )
+        # Fully revert every IN_PROGRESS snapshot this job owned:
+        # delete the blobs from storage, then the DB rows. This is how
+        # we stop partial-upload bytes from accumulating on SeaweedFS /
+        # Azure. The audit event below carries a summary of what went.
+        in_flight_snaps = (await db.execute(
+            select(Snapshot).where(
+                Snapshot.job_id == job.id,
+                Snapshot.status == SnapshotStatus.IN_PROGRESS,
+            )
+        )).scalars().all()
+        for snap in in_flight_snaps:
+            summary = await _revert_snapshot_storage(db, snap)
+            revert_totals["items_reverted"] += summary["items_reverted"]
+            revert_totals["bytes_reverted"] += summary["bytes_reverted"]
+            revert_totals["blobs_deleted"] += summary["blobs_deleted"]
+            revert_totals["blob_errors"] += summary["blob_errors"]
+        revert_totals["snapshots_reverted"] = len(in_flight_snaps)
 
     await db.flush()
 
     # Audit trail — emit a CANCELLED event whose action mirrors the
     # job kind so the Audit feed groups restore vs backup correctly.
+    # Details now include the revert summary so the Activity drill-down
+    # tells the user exactly what was rolled back.
     try:
         import httpx as _httpx
         action = "RESTORE_CANCELLED" if job.type == JobType.RESTORE else "BACKUP_CANCELLED"
@@ -422,7 +475,10 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
                 "resource_id": str(job.resource_id) if job.resource_id else None,
                 "outcome": "CANCELLED",
                 "job_id": str(job.id),
-                "details": {"resource_count": len(resource_ids)},
+                "details": {
+                    "resource_count": len(resource_ids),
+                    **revert_totals,
+                },
             })
     except Exception:
         pass

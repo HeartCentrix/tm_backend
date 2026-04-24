@@ -72,8 +72,10 @@ class OneDriveRestoreEngine:
     # /drives/{id}/root:/…:/content URL parser with a 400 "Resource not
     # found for the segment 'root:'" — it's not a permission failure,
     # it's a URL-syntax failure. The common real-world trigger is the
-    # default separate-folder root which contains a colon from the
-    # timestamp ("Restored by AFI/2026-04-23 08:57").
+    # default separate-folder root timestamp (frontend now uses
+    # "Restored by/2026-04-23 08-57", but historical paths and any
+    # user-typed override may still contain colons / other reserved
+    # chars).
     _ONEDRIVE_RESERVED_CHARS = '"*:<>?\\|'
 
     @classmethod
