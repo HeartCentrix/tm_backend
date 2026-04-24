@@ -2409,9 +2409,57 @@ class BackupWorker:
                             )
 
                 if att_items:
-                    async with async_session_factory() as session:
-                        session.add_all(att_items)
-                        await session.commit()
+                    # Guard against IntegrityError on session.add_all(). If
+                    # a rogue duplicate sneaks past the phase-level dedup
+                    # (e.g., cross-resource race across parallel _backup_one
+                    # calls, or a Graph re-paginator quirk), a UNIQUE
+                    # violation on (snapshot_id, external_id, item_type)
+                    # would roll back the WHOLE session — taking the
+                    # finalize block below with it and leaving the snapshot
+                    # IN_PROGRESS forever. Catching here keeps the
+                    # snapshot reachable even if a handful of attachments
+                    # can't be persisted. Observed 2026-04-24.
+                    try:
+                        async with async_session_factory() as session:
+                            session.add_all(att_items)
+                            await session.commit()
+                    except Exception as _att_commit_err:
+                        print(
+                            f"[{self.worker_id}] [CHAT-ATT COMMIT] "
+                            f"session.add_all of {len(att_items)} items "
+                            f"failed: {type(_att_commit_err).__name__}: "
+                            f"{_att_commit_err}. Retrying per-row with "
+                            f"ON CONFLICT DO NOTHING fallback."
+                        )
+                        # Per-row fallback via the same upsert helper
+                        # Phase 1 uses. Any row that legitimately conflicts
+                        # is silently skipped.
+                        att_rows = []
+                        for it in att_items:
+                            att_rows.append({
+                                "id": it.id,
+                                "snapshot_id": it.snapshot_id,
+                                "tenant_id": it.tenant_id,
+                                "external_id": it.external_id,
+                                "item_type": it.item_type,
+                                "name": it.name,
+                                "folder_path": it.folder_path,
+                                "content_hash": it.content_hash,
+                                "content_size": it.content_size,
+                                "content_checksum": it.content_checksum,
+                                "extra_data": it.extra_data,
+                            })
+                        try:
+                            async with async_session_factory() as session:
+                                await _bulk_upsert_snapshot_items(session, att_rows)
+                        except Exception as _retry_err:
+                            print(
+                                f"[{self.worker_id}] [CHAT-ATT COMMIT] "
+                                f"bulk-upsert fallback ALSO failed: "
+                                f"{type(_retry_err).__name__}: "
+                                f"{_retry_err} — proceeding to finalize "
+                                f"without att items."
+                            )
 
                 total_items = len(items_data) + len(att_items) + total_hosted_items
                 bytes_total += att_bytes
@@ -2945,15 +2993,38 @@ class BackupWorker:
             *[_one_message(m) for m in messages_with_attachments],
             return_exceptions=True,
         )
-        all_items: List[SnapshotItem] = []
+        raw_items: List[SnapshotItem] = []
         total_bytes = 0
         for r in results:
             if isinstance(r, tuple):
                 items, b = r
-                all_items.extend(items)
+                raw_items.extend(items)
                 total_bytes += b
 
-        # Dedup stats — useful for telemetry on real tenants.
+        # Dedup on external_id. The phase's unique constraint is
+        # (snapshot_id, external_id, item_type); all items here share
+        # snapshot_id + item_type=CHAT_ATTACHMENT, so external_id alone
+        # is the dedup key. Duplicates can arise when the same message
+        # appears more than once in items_data (e.g., a forwarded chat
+        # message that surfaces in both the source and target chat's
+        # delta stream) — without dedup, session.add_all + commit hits
+        # IntegrityError on the unique index and the caller's WHOLE
+        # finalize block rolls back (snapshot stays IN_PROGRESS,
+        # attachment items lost). Seen in production 2026-04-24 on
+        # Amit tenant: 4213 items generated, 0 committed, snapshot
+        # stuck IN_PROGRESS.
+        seen_keys: set = set()
+        all_items: List[SnapshotItem] = []
+        dup_count = 0
+        for item in raw_items:
+            key = item.external_id
+            if key in seen_keys:
+                dup_count += 1
+                continue
+            seen_keys.add(key)
+            all_items.append(item)
+
+        # Phase-end telemetry.
         if url_cache:
             resolved_count = sum(1 for v in url_cache.values() if v is not None)
             print(
@@ -2963,6 +3034,8 @@ class BackupWorker:
                 f"{len(url_cache)} unique URLs "
                 f"({resolved_count} resolved, "
                 f"{len(url_cache) - resolved_count} unreachable)"
+                + (f" [deduped {dup_count} in-memory collision(s)]"
+                   if dup_count else "")
             )
         return all_items, total_bytes
 
