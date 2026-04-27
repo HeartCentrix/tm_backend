@@ -169,26 +169,23 @@ class PstWriterBase:
     def _build_folder_cache(self, pst) -> dict:
         """Initialise the folder cache for a freshly-created PST.
 
-        The cache maps normalised path strings → Aspose folder handles. The
-        empty-string key points at the user-visible root ('Top of Personal
-        Folders'). For predefined Outlook folders (Inbox / Sent Items /
-        Drafts / Deleted Items / Calendar / Contacts) we pre-create the
-        STANDARD typed variant so Outlook recognises them as native folders;
-        the cache aliases their canonical name → that handle.
+        The cache maps normalised path strings → Aspose folder handles.
+        Aspose's ``create_predefined_folder`` for any one Outlook IPM type
+        auto-creates the rest of the standard folder tree (Inbox, Sent
+        Items, Drafts, Deleted Items, Outbox, Junk Email under "Top of
+        Personal Folders"; Calendar, Contacts as siblings). We pre-cache
+        ALL of those so subsequent ``_resolve_target_folder`` calls hit
+        the cache instead of trying to re-create them and crashing with
+        "folder with same name already exists".
         """
         import importlib
         aspose_pst = importlib.import_module("aspose.email.storage.pst")
         StandardIpmFolder = aspose_pst.StandardIpmFolder
 
         cache: dict = {}
-        # Seed with the PST root so items lacking folder_path still land
-        # somewhere sensible.
         root = pst.root_folder
         cache[""] = root
 
-        # Pre-create the type-appropriate predefined folder so Outlook gets
-        # the correct icon / IPM class. Per-type writers override
-        # ``standard_folder_type``; the predefined call returns the folder.
         type_map = {
             "Inbox": StandardIpmFolder.INBOX,
             "Sent Items": StandardIpmFolder.SENT_ITEMS,
@@ -202,14 +199,51 @@ class PstWriterBase:
             "Notes": StandardIpmFolder.NOTES,
             "Journal": StandardIpmFolder.JOURNAL,
         }
+
+        # Pre-create the type-appropriate predefined folder. Aspose auto-
+        # generates the rest of the standard folder set under "Top of
+        # Personal Folders" as a side effect.
         try:
             primary = pst.create_predefined_folder(
                 self.standard_folder_type,
                 type_map.get(self.standard_folder_type, StandardIpmFolder.INBOX),
             )
             cache[self.standard_folder_type] = primary
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("create_predefined_folder(%s) skipped: %s",
+                         self.standard_folder_type, exc)
+
+        # Discover all auto-created predefined folders by walking the
+        # PST's "Top of Personal Folders" container and registering each
+        # by display name. After this, every standard Outlook folder is
+        # in the cache, so resolve_target_folder for paths like
+        # "/Drafts", "/Sent Items" gets a hit instead of trying to
+        # add_sub_folder a name that already exists.
+        try:
+            for top_level in root.get_sub_folders():
+                # Walk one level deep — that's where the user-visible
+                # standard folders live (under "Top of Personal Folders").
+                try:
+                    name = top_level.display_name or ""
+                except Exception:
+                    name = ""
+                if not name:
+                    continue
+                # Cache the top-level container itself (rare edge case
+                # where folder_path begins with it).
+                cache.setdefault(name, top_level)
+                try:
+                    for sub in top_level.get_sub_folders():
+                        try:
+                            sub_name = sub.display_name or ""
+                        except Exception:
+                            continue
+                        if sub_name and sub_name not in cache:
+                            cache[sub_name] = sub
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.debug("folder cache enumeration failed: %s", exc)
         return cache
 
     def _resolve_target_folder(self, cache: dict, pst, item):
@@ -253,18 +287,42 @@ class PstWriterBase:
             # First-segment promotion to a predefined folder type when the
             # name matches a standard Outlook folder (Inbox, Sent Items, …).
             ipm_type = type_map.get(seg) if running == seg else None
+            new_folder = None
             if ipm_type is not None:
                 try:
-                    current = pst.create_predefined_folder(seg, ipm_type)
+                    new_folder = pst.create_predefined_folder(seg, ipm_type)
                 except Exception:
-                    current = current.add_sub_folder(seg)
-            else:
-                # Custom or nested folder — plain sub-folder.
+                    pass
+            if new_folder is None:
                 try:
-                    current = current.add_sub_folder(seg)
+                    new_folder = current.add_sub_folder(seg)
                 except Exception as exc:
-                    logger.error("add_sub_folder(%s) failed: %s", seg, exc)
-                    return cache.get(self.standard_folder_type) or cache[""]
+                    # Aspose auto-creates standard folders under "Top of
+                    # Personal Folders" as a side effect of the first
+                    # ``create_predefined_folder`` call, so a follow-up
+                    # ``add_sub_folder`` for that same name fails with
+                    # "folder with same name already exists". Recover by
+                    # navigating to the existing child.
+                    found = None
+                    try:
+                        for sub in current.get_sub_folders():
+                            try:
+                                if (sub.display_name or "") == seg:
+                                    found = sub
+                                    break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                    if found is not None:
+                        new_folder = found
+                    else:
+                        logger.error(
+                            "add_sub_folder(%s) failed and no matching child found: %s",
+                            seg, exc,
+                        )
+                        return cache.get(self.standard_folder_type) or cache[""]
+            current = new_folder
             cache[running] = current
         return current
 
