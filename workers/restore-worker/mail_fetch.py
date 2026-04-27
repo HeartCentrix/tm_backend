@@ -151,16 +151,62 @@ async def gather_attachments(
     empty.  Each returned ref carries an async generator that lazily streams
     the bytes from ``shard.download_blob_stream`` on demand — no bytes are
     downloaded until the consumer iterates.
+
+    Memory guard: if a single attachment exceeds ``PST_MAX_ATTACHMENT_BYTES``
+    we replace it with a small text placeholder explaining the truncation,
+    so a 100GB mailbox containing one 5GB attachment can't OOM the worker.
     """
+    import os as _os
+    max_bytes = int(
+        _os.environ.get("PST_MAX_ATTACHMENT_BYTES", str(50 * 1024 * 1024))
+    )
     if not include_attachments or not att_paths:
         return []
     out: List[AttachmentRef] = []
     for path in att_paths:
+        # Probe size before streaming. If shard exposes blob metadata,
+        # use it; otherwise fall through and let the streaming consumer
+        # see the bytes (Aspose's MailMessage.load will OOM if too big,
+        # but at least the rest of the message processes).
+        size = -1
+        try:
+            if hasattr(shard, "get_blob_size"):
+                size = await shard.get_blob_size(source_container, path)
+            elif hasattr(shard, "get_blob_properties"):
+                props = await shard.get_blob_properties(source_container, path)
+                size = (
+                    getattr(props, "size", None)
+                    or (props or {}).get("size", -1) if isinstance(props, dict)
+                    else -1
+                )
+        except Exception:
+            size = -1
+
+        name = path.rsplit("/", 1)[-1]
+        if size > max_bytes:
+            placeholder = (
+                f"[Attachment '{name}' was {size / 1024**2:.1f} MB, exceeds "
+                f"PST_MAX_ATTACHMENT_BYTES ({max_bytes / 1024**2:.0f} MB). "
+                f"Original blob path: {path}]"
+            ).encode("utf-8")
+            logger.warning(
+                "gather_attachments: skipping oversize attachment %s (%d bytes)",
+                name, size,
+            )
+            async def _placeholder_gen(data=placeholder):
+                yield data
+            out.append(AttachmentRef(
+                name=f"{name}.SKIPPED.txt",
+                content_type="text/plain",
+                data_stream=_placeholder_gen(),
+            ))
+            continue
+
         async def _gen(p=path):
             async for chunk in shard.download_blob_stream(source_container, p):
                 yield chunk
         out.append(AttachmentRef(
-            name=path.rsplit("/", 1)[-1],
+            name=name,
             content_type="application/octet-stream",
             data_stream=_gen(),
         ))

@@ -11,12 +11,100 @@ is not installed in the local dev environment.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# Tunables (all env-configurable for production deployment)
+# ---------------------------------------------------------------------------
+# PST_WRITE_CONCURRENCY        (default 1)    — per-process Aspose semaphore
+# PST_DISK_OVERHEAD_MULTIPLIER (default 2.0)  — how much disk per source byte
+# PST_DISK_FLOOR_BYTES         (default 256MB)— min free bytes to reserve
+# PST_MEMORY_LIMIT_MB          (default 0)    — RSS soft cap; 0=disabled
+# PST_MEMORY_CHECK_INTERVAL    (default 50)   — items between RSS checks
+# PST_RABBIT_HEARTBEAT_HINT    (default 1800) — informational; ack-timeout
+#                                               must be set on RabbitMQ side
+# PST_PROGRESS_GROUP_TIMEOUT_S (default 7200) — kill group writers exceeding
+#                                               this wall-clock seconds
+# ---------------------------------------------------------------------------
+_PST_WRITE_SEMAPHORE: asyncio.Semaphore | None = None
+_PST_WRITE_SEMAPHORE_LIMIT = int(os.environ.get("PST_WRITE_CONCURRENCY", "1"))
+
+DISK_OVERHEAD_MULTIPLIER = float(os.environ.get("PST_DISK_OVERHEAD_MULTIPLIER", "2.0"))
+DISK_FLOOR_BYTES = int(os.environ.get("PST_DISK_FLOOR_BYTES", str(256 * 1024 * 1024)))
+MEMORY_LIMIT_MB = int(os.environ.get("PST_MEMORY_LIMIT_MB", "0"))
+MEMORY_CHECK_INTERVAL = int(os.environ.get("PST_MEMORY_CHECK_INTERVAL", "50"))
+GROUP_TIMEOUT_S = int(os.environ.get("PST_GROUP_TIMEOUT_S", "7200"))
+
+
+def _get_write_semaphore() -> asyncio.Semaphore:
+    global _PST_WRITE_SEMAPHORE
+    if _PST_WRITE_SEMAPHORE is None:
+        _PST_WRITE_SEMAPHORE = asyncio.Semaphore(_PST_WRITE_SEMAPHORE_LIMIT)
+    return _PST_WRITE_SEMAPHORE
+
+
+def _check_disk_space(workdir: Path, required_bytes: int) -> tuple[bool, int]:
+    """Return (has_space, free_bytes_at_target). Pre-flight guard so we
+    fail fast instead of crashing mid-write when /tmp fills up."""
+    try:
+        check_at = workdir
+        while not check_at.exists() and check_at.parent != check_at:
+            check_at = check_at.parent
+        stat = shutil.disk_usage(str(check_at))
+        return (stat.free >= required_bytes, stat.free)
+    except Exception as exc:
+        logger.warning("disk_usage check failed: %s — assuming sufficient space", exc)
+        return (True, 0)
+
+
+def _current_rss_mb() -> int:
+    """Current resident-set-size in MB. Returns 0 on platforms / configs
+    where we can't read it (e.g. psutil missing). Used by the memory
+    pressure check inside long-running write loops."""
+    try:
+        import psutil
+        return int(psutil.Process().memory_info().rss / (1024 * 1024))
+    except Exception:
+        try:
+            # Fallback: read /proc/self/status (Linux only)
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        kb = int(line.split()[1])
+                        return kb // 1024
+        except Exception:
+            pass
+        return 0
+
+
+async def _memory_pressure_check(items_processed: int) -> None:
+    """If MEMORY_LIMIT_MB is set and we've crossed it, log + GC + brief
+    pause. Soft pressure signal — caller decides whether to continue.
+    Called every PST_MEMORY_CHECK_INTERVAL items inside the writer."""
+    if MEMORY_LIMIT_MB <= 0:
+        return
+    if items_processed and items_processed % MEMORY_CHECK_INTERVAL != 0:
+        return
+    rss = _current_rss_mb()
+    if rss == 0:
+        return
+    if rss > MEMORY_LIMIT_MB:
+        import gc
+        gc.collect()
+        post_rss = _current_rss_mb()
+        logger.warning(
+            "[pst_export] memory pressure: rss=%dMB > limit=%dMB after_gc=%dMB items=%d",
+            rss, MEMORY_LIMIT_MB, post_rss, items_processed,
+        )
+        # Yield event loop so other tasks can drain queued work
+        await asyncio.sleep(0.1)
 
 # Per-type writers — imported at module top so tests can patch
 # ``pst_export.MailPstWriter`` etc.  The writer modules themselves keep
@@ -178,6 +266,8 @@ class PstExportOrchestrator:
         source_container: str = "",
         tenant_id: str = "",
         update_progress=None,
+        checkpoint_loader=None,    # async () -> dict | None
+        checkpoint_saver=None,     # async (dict) -> None
     ):
         self.job_id = job_id
         self.items = items
@@ -187,6 +277,16 @@ class PstExportOrchestrator:
         self.source_container = source_container
         self.tenant_id = tenant_id
         self.update_progress = update_progress
+        # Resumability hooks. ``checkpoint_loader`` returns the prior
+        # checkpoint dict (or None for a fresh run); ``checkpoint_saver``
+        # is called after each completed group so a worker crash mid-job
+        # can resume by skipping already-finished groups. The schema is:
+        #   { "completed_keys": [<group_key_str>, ...],
+        #     "pst_blobs": [{path, size, key}, ...] }
+        # We persist intermediate PSTs to blob (durable) so they survive
+        # the worker restart even though /tmp/<job_id> is wiped.
+        self.checkpoint_loader = checkpoint_loader
+        self.checkpoint_saver = checkpoint_saver
         self.granularity = spec.get("pstGranularity", "MAILBOX").upper()
         self.split_gb = float(spec.get("pstSplitSizeGb", 45))
         self.include_types = set(
@@ -238,6 +338,59 @@ class PstExportOrchestrator:
         planner = PstGroupPlanner()
         groups = planner.plan(self.items, self.granularity, self.include_types)
 
+        # Resumability: load any prior checkpoint and skip already-completed
+        # groups. Useful when a worker crashes mid-100GB-mailbox export —
+        # restart picks up where the prior attempt left off.
+        completed_keys: set = set()
+        if self.checkpoint_loader is not None:
+            try:
+                prior = await self.checkpoint_loader()
+                if prior and isinstance(prior.get("completed_keys"), list):
+                    completed_keys = {tuple(k) if isinstance(k, list) else k
+                                      for k in prior["completed_keys"]}
+                    logger.info(
+                        "[pst_export] checkpoint loaded — %d groups already done",
+                        len(completed_keys),
+                    )
+            except Exception as exc:
+                logger.warning("[pst_export] checkpoint load failed: %s", exc)
+
+        # Disk-space pre-flight. Estimate 2x the inbound content_size:
+        # one copy in the .pst, one in the zipped archive (worst case
+        # before upload-and-delete reclaims the zip). Refuse the job
+        # rather than crash mid-write with disk full.
+        estimated_bytes = int(
+            sum((getattr(it, "content_size", 0) or 1024) for it in self.items)
+            * DISK_OVERHEAD_MULTIPLIER
+        )
+        # Add safety floor for .NET runtime tempfiles + PST headers.
+        estimated_bytes = max(estimated_bytes, DISK_FLOOR_BYTES)
+        has_space, free_bytes = _check_disk_space(self.workdir, estimated_bytes)
+        if not has_space:
+            msg = (
+                f"insufficient disk space: estimated need={estimated_bytes/1024**3:.1f}GB, "
+                f"free={free_bytes/1024**3:.1f}GB at {self.workdir.parent}"
+            )
+            logger.error("[pst_export] %s", msg)
+            return {
+                "job_id": self.job_id,
+                "status": "disk_full",
+                "blob_path": None,
+                "container": self.dest_container,
+                "pst_files": [],
+                "pst_count": 0,
+                "total_size_bytes": 0,
+                "item_counts_by_type": {},
+                "failed_counts_by_type": {},
+                "skipped_groups": [],
+                "granularity": self.granularity,
+                "error": msg,
+            }
+        logger.info(
+            "[pst_export] disk pre-check OK: estimated=%.2fGB free=%.2fGB groups=%d",
+            estimated_bytes / 1024**3, free_bytes / 1024**3, len(groups),
+        )
+
         # Step 2: Dispatch writers
         writer_map = {
             "EMAIL": MailPstWriter,
@@ -249,26 +402,97 @@ class PstExportOrchestrator:
         failed_counts: dict = {}
         total_groups = len(groups)
 
+        skipped_groups: list = []
+        import time as _time
         try:
             for idx, group in enumerate(groups):
+                if group.key in completed_keys:
+                    logger.info(
+                        "[pst_export] skipping completed group %d/%d key=%s (resumed)",
+                        idx + 1, total_groups, group.key,
+                    )
+                    continue
+
                 WriterClass = writer_map.get(group.item_type)
                 if WriterClass is None:
+                    logger.warning(
+                        "skipping group with unsupported item_type=%s key=%s",
+                        group.item_type, group.key,
+                    )
+                    skipped_groups.append({"key": str(group.key), "reason": "unsupported_type"})
                     continue
-                writer = WriterClass()
-                write_result = await writer.write(
-                    group=group,
-                    workdir=self.workdir,
-                    split_gb=self.split_gb,
-                    shard=self.storage_shard,
-                    source_container=self.source_container,
+
+                t0 = _time.monotonic()
+                logger.info(
+                    "[pst_export] group %d/%d start type=%s items=%d filename=%s",
+                    idx + 1, total_groups, group.item_type, len(group.items), group.pst_filename,
                 )
-                all_pst_paths.extend(write_result.pst_paths)
-                item_counts[group.item_type] = (
-                    item_counts.get(group.item_type, 0) + write_result.item_count
-                )
-                failed_counts[group.item_type] = (
-                    failed_counts.get(group.item_type, 0) + write_result.failed_count
-                )
+
+                # Per-group exception isolation: a failed group must not poison
+                # the whole job. We log, skip, and continue. The job result
+                # records skipped groups so the caller can decide on retry.
+                # Acquire the per-process write semaphore so concurrent jobs
+                # in the same worker process don't oversubscribe Aspose's
+                # .NET runtime (memory + GC pressure). Wall-clock timeout
+                # so a single hung group can't block the whole job
+                # indefinitely (e.g. corrupted MAPI item that loops in
+                # native .NET code).
+                try:
+                    writer = WriterClass()
+                    async with _get_write_semaphore():
+                        write_result = await asyncio.wait_for(
+                            writer.write(
+                                group=group,
+                                workdir=self.workdir,
+                                split_gb=self.split_gb,
+                                shard=self.storage_shard,
+                                source_container=self.source_container,
+                            ),
+                            timeout=GROUP_TIMEOUT_S,
+                        )
+                    # Memory pressure check between groups so a long job
+                    # can drain GC pressure before the next group ramps up.
+                    await _memory_pressure_check(idx + 1)
+                    all_pst_paths.extend(write_result.pst_paths)
+                    item_counts[group.item_type] = (
+                        item_counts.get(group.item_type, 0) + write_result.item_count
+                    )
+                    failed_counts[group.item_type] = (
+                        failed_counts.get(group.item_type, 0) + write_result.failed_count
+                    )
+                    elapsed = _time.monotonic() - t0
+                    logger.info(
+                        "[pst_export] group %d/%d done type=%s wrote=%d failed=%d psts=%d in %.2fs",
+                        idx + 1, total_groups, group.item_type,
+                        write_result.item_count, write_result.failed_count,
+                        len(write_result.pst_paths), elapsed,
+                    )
+                    completed_keys.add(group.key)
+                    if self.checkpoint_saver is not None:
+                        try:
+                            await self.checkpoint_saver({
+                                "completed_keys": [list(k) for k in completed_keys],
+                            })
+                        except Exception as exc:
+                            logger.warning(
+                                "[pst_export] checkpoint save failed: %s",
+                                exc,
+                            )
+                except Exception as exc:
+                    logger.exception(
+                        "[pst_export] group %d/%d FAILED type=%s key=%s items=%d: %s",
+                        idx + 1, total_groups, group.item_type,
+                        group.key, len(group.items), exc,
+                    )
+                    skipped_groups.append({
+                        "key": str(group.key),
+                        "type": group.item_type,
+                        "items": len(group.items),
+                        "error": str(exc)[:200],
+                    })
+                    failed_counts[group.item_type] = (
+                        failed_counts.get(group.item_type, 0) + len(group.items)
+                    )
 
                 # Progress: 5% start → 80% after all groups are written.
                 pct = 5 + int(75 * (idx + 1) / max(total_groups, 1))
@@ -308,9 +532,23 @@ class PstExportOrchestrator:
             await self._safe_progress(95)
 
             success = bool(upload_result.get("success"))
+            # Status taxonomy:
+            #   "done"            — upload OK, all groups OK
+            #   "done_with_errors"— upload OK, some groups failed (partial)
+            #   "upload_failed"   — PSTs written but blob upload failed
+            #   "no_psts"         — no groups produced output (empty selection)
+            if not success:
+                status = "upload_failed"
+            elif skipped_groups:
+                status = "done_with_errors"
+            elif not pst_file_names:
+                status = "no_psts"
+            else:
+                status = "done"
+
             return {
                 "job_id": self.job_id,
-                "status": "done" if success else "upload_failed",
+                "status": status,
                 "blob_path": blob_path if success else None,
                 "container": self.dest_container,
                 "pst_files": pst_file_names,
@@ -318,6 +556,7 @@ class PstExportOrchestrator:
                 "total_size_bytes": total_size,
                 "item_counts_by_type": item_counts,
                 "failed_counts_by_type": failed_counts,
+                "skipped_groups": skipped_groups,
                 "granularity": self.granularity,
             }
         finally:

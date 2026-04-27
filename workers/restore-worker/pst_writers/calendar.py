@@ -32,6 +32,39 @@ from .base import PstWriterBase  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+async def _attach_to_mapi(mapi_mod, mapi_item, attachments) -> None:
+    """Attach ``AttachmentRef`` items to a MAPI item (calendar or message).
+
+    Each ``AttachmentRef`` exposes ``name`` and an async ``data_stream``.
+    We stream the bytes, then call ``MapiAttachmentCollection.add()`` with
+    the file name + bytes — the Aspose API used identically by mail and
+    calendar items.
+    """
+    coll = getattr(mapi_item, "attachments", None)
+    if coll is None:
+        logger.debug("attachments collection not exposed on this MAPI type — skipping")
+        return
+    for ref in attachments:
+        try:
+            chunks = []
+            async for chunk in ref.data_stream:
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            if not data:
+                continue
+            # MapiAttachmentCollection.add(name, data) — Aspose 26.x signature
+            try:
+                coll.add(ref.name, data)
+            except Exception:
+                # Some Aspose builds expose `append` instead — try that path.
+                if hasattr(coll, "append"):
+                    coll.append(ref.name, data)
+                else:
+                    raise
+        except Exception as exc:
+            logger.warning("attach failed for %s: %s", getattr(ref, "name", "?"), exc)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -348,6 +381,33 @@ class CalendarPstWriter(PstWriterBase):
                 rec_obj = _build_recurrence(mapi_mod, recurrence, start_dt)
                 if rec_obj is not None:
                     _set_if(cal, "recurrence", rec_obj)
+
+            # --- Attachments -------------------------------------------
+            # Graph events can have file attachments backed up to blob storage.
+            # Same pattern as MailPstWriter: pull blob_paths from the item,
+            # download bytes, attach to the MapiCalendar.attachments collection.
+            try:
+                att_paths = getattr(item, "attachment_blob_paths", None) or []
+                # Some backup pipelines stash attachment paths under
+                # extra_data (calendar events historically used this) — fall
+                # back to that location for backward compat.
+                if not att_paths:
+                    att_paths = (
+                        (extra.get("attachment_blob_paths") or [])
+                        if isinstance(extra, dict) else []
+                    )
+                if att_paths and shard:
+                    from mail_fetch import gather_attachments
+                    attachments = await gather_attachments(
+                        att_paths, shard, source_container, True
+                    )
+                    if attachments:
+                        await _attach_to_mapi(mapi_mod, cal, attachments)
+            except Exception as att_exc:
+                logger.warning(
+                    "calendar: attachment processing failed for %s (continuing without): %s",
+                    raw_event.get("id"), att_exc,
+                )
 
             return cal
 

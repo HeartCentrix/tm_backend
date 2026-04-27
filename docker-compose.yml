@@ -530,6 +530,7 @@ services:
       - tm-network
 
   restore-worker:
+    platform: linux/amd64
     build:
       context: .
       dockerfile: workers/restore-worker/Dockerfile
@@ -561,6 +562,16 @@ services:
       ASPOSE_LICENSE_KV_SECRET_NAME: ${ASPOSE_LICENSE_KV_SECRET_NAME:-}
       ASPOSE_LICENSE_KV_URL: ${ASPOSE_LICENSE_KV_URL:-}
       ASPOSE_EMAIL_LIC_B64: ${ASPOSE_EMAIL_LIC_B64:-}
+      # PST export — production tunables (override per workload)
+      PST_WRITE_CONCURRENCY: ${PST_WRITE_CONCURRENCY:-1}
+      PST_DISK_OVERHEAD_MULTIPLIER: ${PST_DISK_OVERHEAD_MULTIPLIER:-2.0}
+      PST_DISK_FLOOR_BYTES: ${PST_DISK_FLOOR_BYTES:-268435456}
+      PST_MEMORY_LIMIT_MB: ${PST_MEMORY_LIMIT_MB:-0}
+      PST_MEMORY_CHECK_INTERVAL: ${PST_MEMORY_CHECK_INTERVAL:-50}
+      PST_GROUP_TIMEOUT_S: ${PST_GROUP_TIMEOUT_S:-7200}
+      PST_ITEM_RETRY_MAX: ${PST_ITEM_RETRY_MAX:-3}
+      PST_ITEM_RETRY_BACKOFF_BASE: ${PST_ITEM_RETRY_BACKOFF_BASE:-0.5}
+      PST_MAX_ATTACHMENT_BYTES: ${PST_MAX_ATTACHMENT_BYTES:-52428800}
     depends_on:
       postgres:
         condition: service_healthy
@@ -579,6 +590,7 @@ services:
           memory: 1G
 
   restore-worker-heavy:
+    platform: linux/amd64
     build:
       context: .
       dockerfile: workers/restore-worker/Dockerfile
@@ -613,6 +625,16 @@ services:
       ASPOSE_LICENSE_KV_SECRET_NAME: ${ASPOSE_LICENSE_KV_SECRET_NAME:-}
       ASPOSE_LICENSE_KV_URL: ${ASPOSE_LICENSE_KV_URL:-}
       ASPOSE_EMAIL_LIC_B64: ${ASPOSE_EMAIL_LIC_B64:-}
+      # PST export — production tunables (override per workload)
+      PST_WRITE_CONCURRENCY: ${PST_WRITE_CONCURRENCY:-1}
+      PST_DISK_OVERHEAD_MULTIPLIER: ${PST_DISK_OVERHEAD_MULTIPLIER:-2.0}
+      PST_DISK_FLOOR_BYTES: ${PST_DISK_FLOOR_BYTES:-268435456}
+      PST_MEMORY_LIMIT_MB: ${PST_MEMORY_LIMIT_MB:-0}
+      PST_MEMORY_CHECK_INTERVAL: ${PST_MEMORY_CHECK_INTERVAL:-50}
+      PST_GROUP_TIMEOUT_S: ${PST_GROUP_TIMEOUT_S:-7200}
+      PST_ITEM_RETRY_MAX: ${PST_ITEM_RETRY_MAX:-3}
+      PST_ITEM_RETRY_BACKOFF_BASE: ${PST_ITEM_RETRY_BACKOFF_BASE:-0.5}
+      PST_MAX_ATTACHMENT_BYTES: ${PST_MAX_ATTACHMENT_BYTES:-52428800}
     depends_on:
       rabbitmq:
         condition: service_healthy

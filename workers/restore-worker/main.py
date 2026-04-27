@@ -761,19 +761,9 @@ class RestoreWorker:
         folder_paths = folder_paths or []
         excluded_item_ids = excluded_item_ids or []
 
-        if folder_paths or excluded_item_ids:
-            from shared.folder_resolver import resolve_selection
-            if not snapshot_ids:
-                return []
-            return await resolve_selection(
-                session,
-                snapshot_id=snapshot_ids[0],
-                item_ids=item_ids,
-                folder_paths=folder_paths,
-                excluded_item_ids=excluded_item_ids,
-            )
-
-        if item_ids:
+        # Direct item_ids lookup bypasses snapshot resolution — used for
+        # legacy single-item exports that pass exact ids.
+        if item_ids and not folder_paths and not excluded_item_ids:
             stmt = select(SnapshotItem).where(
                 SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids])
             )
@@ -788,42 +778,69 @@ class RestoreWorker:
                 select(Snapshot).where(Snapshot.id.in_(picked_uuids))
             )
         ).scalars().all()
-        if not picked_rows:
-            # Unknown ids — fall back to strict behaviour so we don't
-            # silently turn a bad id into an empty restore.
-            stmt = select(SnapshotItem).where(
-                SnapshotItem.snapshot_id.in_(picked_uuids)
-            )
-            return (await session.execute(stmt)).scalars().all()
 
+        # ── Sibling-snapshot union ──────────────────────────────────────
+        # Delta-based backups: a single INCREMENTAL snapshot only contains
+        # rows that changed in that interval. The user-picked snapshot may
+        # be empty/sparse while older sibling snapshots hold the bulk of
+        # the content. Union ALL siblings of the same resource with
+        # created_at <= picked.created_at, then DISTINCT ON (external_id)
+        # with newest-wins. This applies uniformly to:
+        #   - snapshot-only exports
+        #   - folder_paths-filtered exports (the user-reported bug)
+        #   - item_ids-filtered exports when combined with folder_paths
         sibling_ids: set = set()
-        for picked in picked_rows:
-            rows = (
-                await session.execute(
-                    select(Snapshot.id).where(
-                        Snapshot.resource_id == picked.resource_id,
-                        Snapshot.created_at <= picked.created_at,
+        if picked_rows:
+            for picked in picked_rows:
+                rows = (
+                    await session.execute(
+                        select(Snapshot.id).where(
+                            Snapshot.resource_id == picked.resource_id,
+                            Snapshot.created_at <= picked.created_at,
+                        )
                     )
-                )
-            ).all()
-            sibling_ids.update(r[0] for r in rows)
-
+                ).all()
+                sibling_ids.update(r[0] for r in rows)
         if not sibling_ids:
             sibling_ids = set(picked_uuids)
 
-        # DISTINCT ON (external_id) + ORDER BY external_id, Snapshot
-        # created_at DESC → one row per logical item, newest captured
-        # version wins. Join Snapshot to rank by the snapshot's own
-        # timestamp — SnapshotItem.created_at can drift within a
-        # snapshot and isn't the right clock to order on.
-        stmt = (
+        # Build the newest-wins base query over all siblings.
+        base_stmt = (
             select(SnapshotItem)
             .join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id)
             .where(SnapshotItem.snapshot_id.in_(sibling_ids))
             .order_by(SnapshotItem.external_id, Snapshot.created_at.desc())
             .distinct(SnapshotItem.external_id)
         )
-        return (await session.execute(stmt)).scalars().all()
+
+        # Apply folder/item filters on top of the sibling-unioned base.
+        if folder_paths or item_ids:
+            from shared.folder_resolver import _prefix_and_exact_for
+            from sqlalchemy import or_
+
+            clauses = []
+            if item_ids:
+                clauses.append(
+                    SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids])
+                )
+            prefixes, exacts = _prefix_and_exact_for(folder_paths)
+            for prefix in prefixes:
+                clauses.append(SnapshotItem.folder_path.like(prefix))
+            if exacts:
+                clauses.append(SnapshotItem.folder_path.in_(exacts))
+
+            if clauses:
+                base_stmt = base_stmt.where(or_(*clauses))
+
+        rows = (await session.execute(base_stmt)).scalars().all()
+
+        # Excluded-id filtering happens client-side after newest-wins —
+        # excluded ids reference a specific row, not a logical item.
+        if excluded_item_ids:
+            excluded_uuids = {uuid.UUID(iid) for iid in excluded_item_ids}
+            rows = [r for r in rows if r.id not in excluded_uuids]
+
+        return rows
 
     # ==================== Restore Handlers ====================
 
@@ -1467,14 +1484,45 @@ class RestoreWorker:
             print(f"[{self.worker_id}] export_as_pst: ensure_container({dest_container}) failed (non-fatal): {_e}", flush=True)
 
         async def _update_progress(pct: int) -> None:
+            # Fire-and-forget the DB write so it doesn't block the orchestrator
+            # on connection pool contention with the outer process_restore_message
+            # session. Progress is best-effort; failures are logged not raised.
+            async def _do_write():
+                try:
+                    async with async_session_factory() as s:
+                        j = await s.get(_Job, _uuid.UUID(job_id))
+                        if j:
+                            j.progress_pct = pct
+                            await s.commit()
+                except Exception as exc:
+                    print(f"[{self.worker_id}] progress update {pct}% failed: {exc}", flush=True)
+            import asyncio as _aio
+            _aio.create_task(_do_write())
+
+        # Resumability: read/write checkpoint to Job.result["pst_checkpoint"].
+        # Survives worker crash — on redelivery the orchestrator skips
+        # already-completed groups instead of reprocessing the entire mailbox.
+        async def _checkpoint_load():
+            try:
+                async with async_session_factory() as s:
+                    j = await s.get(_Job, _uuid.UUID(job_id))
+                    if j and isinstance(j.result, dict):
+                        return j.result.get("pst_checkpoint")
+            except Exception as exc:
+                print(f"[{self.worker_id}] checkpoint load failed: {exc}", flush=True)
+            return None
+
+        async def _checkpoint_save(state: Dict) -> None:
             try:
                 async with async_session_factory() as s:
                     j = await s.get(_Job, _uuid.UUID(job_id))
                     if j:
-                        j.progress_pct = pct
+                        result = dict(j.result or {})
+                        result["pst_checkpoint"] = state
+                        j.result = result
                         await s.commit()
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[{self.worker_id}] checkpoint save failed: {exc}", flush=True)
 
         print(f"[{self.worker_id}] export_as_pst ENTER job={job_id} items={len(items)} granularity={_spec.get('pstGranularity','MAILBOX')}", flush=True)
 
@@ -1487,6 +1535,8 @@ class RestoreWorker:
             source_container=source_container,
             tenant_id=tenant_id,
             update_progress=_update_progress,
+            checkpoint_loader=_checkpoint_load,
+            checkpoint_saver=_checkpoint_save,
         )
 
         result = await orch.run()
@@ -1506,6 +1556,9 @@ class RestoreWorker:
             "total_size_bytes": result.get("total_size_bytes", 0),
             "granularity": result.get("granularity"),
             "status": result.get("status"),
+            "item_counts_by_type": result.get("item_counts_by_type", {}),
+            "failed_counts_by_type": result.get("failed_counts_by_type", {}),
+            "skipped_groups": result.get("skipped_groups", []),
         }
 
     # Pure tree-navigation rows — folder / list / channel definitions

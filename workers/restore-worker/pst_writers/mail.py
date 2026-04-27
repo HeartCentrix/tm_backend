@@ -67,5 +67,9 @@ class MailPstWriter(PstWriterBase):
             logger.error("EML build failed for item %s: %s", getattr(item, "external_id", "?"), exc)
             return None
 
-        MapiMessage = importlib.import_module("aspose.email.mapi").MapiMessage
-        return MapiMessage.from_mime_message_bytes(eml_bytes)
+        import io
+        aspose_email = importlib.import_module("aspose.email")
+        aspose_mapi = importlib.import_module("aspose.email.mapi")
+        # Aspose 26.x: load EML as MailMessage first, then convert to MapiMessage
+        mail = aspose_email.MailMessage.load(io.BytesIO(eml_bytes))
+        return aspose_mapi.MapiMessage.from_mail_message(mail)
