@@ -57,3 +57,5 @@ graphify-out/
 .agents/
 .qwen/
 skills-lock.json
+# Git worktrees
+.worktrees/
