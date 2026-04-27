@@ -383,6 +383,11 @@ class PstExportOrchestrator:
         # job has been cancelled (Job.status='CANCELLED' in DB). Polled
         # every PST_CANCEL_CHECK_INTERVAL items.
         self.cancel_check = None
+        # Raw-file item types (OneDrive files, SharePoint files, etc.).
+        # Items matching these flow into the final ZIP as plain blob
+        # members alongside the PSTs — so a "Download all" with PST
+        # format AND OneDrive checked produces ONE zip containing both.
+        self.raw_file_types: set = set()
         self.granularity = spec.get("pstGranularity", "MAILBOX").upper()
         self.split_gb = float(spec.get("pstSplitSizeGb", 45))
         self.include_types = set(
@@ -693,8 +698,59 @@ class PstExportOrchestrator:
         # Stream items, accumulate per group, flush at threshold.
         items_seen = 0
         cancelled = False
+        # Raw-file members for the final zip — populated when raw_file_types
+        # is non-empty (e.g. OneDrive files alongside PSTs in a "Download
+        # all" export). Each entry is (arcname, container, blob_path).
+        raw_members: list = []
+        raw_count = 0
+        # Tenant-scoped container resolver (lazy: built on first use).
+        _container_cache: dict = {}
+
+        def _resolve_raw_container(item) -> str:
+            """Pick the source container for a raw item based on its type."""
+            it = item.item_type
+            workload = "files"
+            if it.startswith("SHAREPOINT"):
+                workload = "sharepoint"
+            elif it in {"FILE", "ONEDRIVE_FILE", "FILE_VERSION"}:
+                workload = "files"
+            cached = _container_cache.get(workload)
+            if cached is not None:
+                return cached
+            try:
+                from shared.azure_storage import azure_storage_manager
+                tid = getattr(self, "tenant_id", "") or ""
+                if tid:
+                    cached = azure_storage_manager.get_container_name(tid, workload)
+                else:
+                    cached = workload
+            except Exception:
+                cached = workload
+            _container_cache[workload] = cached
+            return cached
+
         async for batch in self.item_stream_factory():
             for item in batch:
+                # Raw-file path: don't go through the PST writer; collect
+                # blob coordinates for the final zip stream.
+                if item.item_type in self.raw_file_types:
+                    blob_path = getattr(item, "blob_path", None)
+                    if not blob_path:
+                        continue
+                    container = _resolve_raw_container(item)
+                    name = item.name or item.external_id
+                    folder = item.folder_path or "root"
+                    workload_dir = (
+                        "onedrive" if item.item_type in {"ONEDRIVE_FILE", "FILE", "FILE_VERSION"}
+                        else "sharepoint" if item.item_type.startswith("SHAREPOINT")
+                        else "files"
+                    )
+                    arcname = f"{workload_dir}/{folder.lstrip('/')}/{name}".replace("//", "/")
+                    raw_members.append((arcname, container, blob_path))
+                    raw_count += 1
+                    items_seen += 1
+                    continue
+
                 if item.item_type not in self.include_types:
                     continue
                 group_key = _compute_group_key(item)
@@ -762,6 +818,11 @@ class PstExportOrchestrator:
             members.append((entry["filename"], self.dest_container, entry["blob_path"]))
             pst_filenames.append(entry["filename"])
             total_size += int(entry.get("size") or 0)
+        # Raw-file members go in the same zip — OneDrive/SharePoint files
+        # land under their workload subfolder so end-users see a clear
+        # tree: `mail.pst`, `calendar.pst`, `onedrive/path/to/file.docx`.
+        for raw in raw_members:
+            members.append(raw)
 
         manifest = {
             "job_id": self.job_id,
@@ -771,6 +832,8 @@ class PstExportOrchestrator:
                 {"filename": e["filename"], "size": e.get("size"), "type": e.get("item_type")}
                 for e in pst_blob_paths
             ],
+            "raw_file_count": raw_count,
+            "raw_workloads_included": sorted(self.raw_file_types) if self.raw_file_types else [],
             "item_counts_by_type": dict(item_counts),
             "failed_counts_by_type": dict(failed_counts),
             "skipped_groups": skipped_groups,

@@ -1746,7 +1746,10 @@ class RestoreWorker:
         item_ids_stream = (message or {}).get("itemIds") or _spec.get("item_ids") or []
         folder_paths_stream = _spec.get("folderPaths") or []
         excluded_stream = _spec.get("excludedItemIds") or []
-        # Apply workload filter to item types (Mail/Contacts/Calendar checkboxes).
+        # Apply workload filter to item types (Mail/Contacts/Calendar/OneDrive
+        # checkboxes). The fetcher pulls everything matching this set; the
+        # orchestrator then splits PST-bound items from raw-file items
+        # (OneDrive files travel into the final zip as plain blob members).
         wl = _spec.get("workloads")
         if wl:
             allowed: set = set()
@@ -1760,20 +1763,31 @@ class RestoreWorker:
         _batch_size = int(_os.environ.get("PST_FETCH_BATCH_SIZE", "1000"))
 
         # ── Cross-resource expansion for "Download all" ──────────────────
-        # Each user's Mail / Calendar / Contacts live in SEPARATE resources
-        # (USER_MAIL, USER_CALENDAR, USER_CONTACTS) under one ENTRA_USER
-        # parent. The UI sends ONE snapshot id (the currently-viewed tab),
-        # but pstIncludeTypes may span multiple workloads. Find sibling
-        # resources of the same parent and add their latest snapshots so
-        # a "Download all" with Mail+Calendar+Contacts actually covers
-        # all three.
+        # Each user's Mail / Calendar / Contacts / OneDrive live in
+        # SEPARATE resources under one ENTRA_USER parent. The UI sends ONE
+        # snapshot id (the currently-viewed tab), but workloads may span
+        # multiple. Find sibling resources of the same parent and add
+        # their latest snapshots so a "Download all" with multi-workload
+        # actually covers everything.
         ITEM_TYPE_TO_RESOURCE_TYPES = {
             "EMAIL": {"USER_MAIL", "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX", "M365_GROUP"},
             "CALENDAR_EVENT": {"USER_CALENDAR", "M365_GROUP"},
             "USER_CONTACT": {"USER_CONTACTS"},
+            # Non-PST workloads — files come through verbatim into the zip.
+            "ONEDRIVE_FILE": {"USER_ONEDRIVE", "ONEDRIVE"},
+            "FILE": {"USER_ONEDRIVE", "ONEDRIVE", "SHAREPOINT_SITE"},
         }
         pst_include_types = set(_spec.get("pstIncludeTypes") or [])
-        if snapshot_ids_stream and pst_include_types:
+        # Non-PST item types from selected workloads (OneDrive files etc).
+        # These travel into the final zip as raw blob members.
+        raw_file_types: set = set()
+        if wl:
+            non_pst_workloads = [w for w in wl if w not in ("Mail", "Contacts", "Calendar")]
+            for w in non_pst_workloads:
+                raw_file_types |= self.WORKLOAD_ITEM_TYPES.get(w, set())
+        # Run sibling expansion if any cross-workload type (PST or raw) is requested.
+        all_needed_types = pst_include_types | raw_file_types
+        if snapshot_ids_stream and all_needed_types:
             try:
                 from sqlalchemy import or_ as _or
                 # Resolve the picked snapshot's resource → parent
@@ -1798,9 +1812,9 @@ class RestoreWorker:
                         )).scalars().all()
 
                         # Determine which resource types are needed for
-                        # the requested item types.
+                        # the requested item types (PST and raw both).
                         needed_resource_types: set = set()
-                        for it in pst_include_types:
+                        for it in all_needed_types:
                             needed_resource_types |= ITEM_TYPE_TO_RESOURCE_TYPES.get(it, set())
 
                         # For each needed resource (other than picked),
@@ -1903,6 +1917,12 @@ class RestoreWorker:
         # Uses the snapshot's resource_id, which corresponds 1:1 with the
         # M365 user/mailbox in the source backup.
         orch.rate_limit_user_key = primary_resource_id
+        # Raw-file item types travel into the final zip as plain blob
+        # members alongside the PSTs (OneDrive files, SharePoint files).
+        orch.raw_file_types = raw_file_types
+        # Tenant id needed to resolve per-workload source containers
+        # (mail vs files vs sharepoint) at member-build time.
+        orch.tenant_id = tenant_id
 
         result = await orch.run()
 
