@@ -8661,14 +8661,42 @@ class BackupWorker:
         to avoid overwriting extra_data (delta_token) set by complete_snapshot."""
         from sqlalchemy import update as sa_update
         
-        # Calculate new storage_bytes from backup result
-        storage_bytes = resource.storage_bytes or 0
+        # storage_bytes = "current size of all backed-up data on this
+        # resource". Two failure modes the prior accumulator hit:
+        #   1. bytes_added == bytes_total in most paths (the snapshot
+        #      reports its full size as 'added'), so re-running a backup
+        #      added the WHOLE content again. After 4 runs of a 1.5 GB
+        #      OneDrive, storage_bytes wedged at 6 GB.
+        #   2. Failed snapshots that didn't roll back the previous
+        #      addition left the counter inflated.
+        #
+        # Fix: re-derive from the latest COMPLETED snapshot for this
+        # resource. Each snapshot's bytes_total reflects the full content
+        # captured (newest-wins sibling-union semantics) so the latest
+        # snapshot's bytes_total IS the current backed-up size — exactly
+        # what the UI labels as "Backup size". One SQL hop, no drift.
+        from sqlalchemy import desc as _desc, select as sa_select
+        latest_completed = (await session.execute(
+            sa_select(Snapshot.bytes_total)
+            .where(
+                Snapshot.resource_id == resource.id,
+                Snapshot.status == SnapshotStatus.COMPLETED,
+                Snapshot.bytes_total > 0,
+            )
+            .order_by(_desc(Snapshot.created_at))
+            .limit(1)
+        )).scalar_one_or_none()
+        prev = resource.storage_bytes or 0
+        if latest_completed is not None:
+            storage_bytes = int(latest_completed)
+        else:
+            # No completed content-bearing snapshot yet — keep prior value.
+            storage_bytes = prev
         if result:
-            bytes_added = result.get("bytes_added", 0)
-            bytes_removed = result.get("bytes_removed", 0) or 0
-            net_change = bytes_added - bytes_removed
-            storage_bytes = max(0, storage_bytes + net_change)
-            print(f"[{self.worker_id}] Updated storage_bytes for {resource.id}: {resource.storage_bytes} -> {storage_bytes} bytes (added {bytes_added}, removed {bytes_removed})")
+            print(
+                f"[{self.worker_id}] storage_bytes for {resource.id}: "
+                f"{prev} -> {storage_bytes} (latest snapshot bytes_total)"
+            )
         
         new_status = ResourceStatus.ACTIVE if resource.status == ResourceStatus.DISCOVERED else resource.status
         await session.execute(
