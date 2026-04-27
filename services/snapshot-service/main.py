@@ -209,6 +209,102 @@ async def list_snapshots(
     )
 
 
+@app.get("/api/v1/resources/{resource_id}/storage-summary")
+async def storage_summary(
+    resource_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Authoritative "actually-used storage" rollup for the protection tab.
+
+    Why this exists: the frontend was computing the headline "Backup size"
+    + 1w/1m/1y deltas + per-day sparkline by summing snapshot.bytes_total
+    on the client. That number is wrong twice over:
+      1. bytes_total is *cumulative content size* of a snapshot's view —
+         re-summing it across snapshots double-counts unchanged items
+         that the next incremental snapshot still references.
+      2. ENTRA_USER backups fan out into sibling per-content-type
+         snapshots (USER_MAIL/CALENDAR/CONTACTS/ONEDRIVE/CHATS) that
+         all live under the same parent. Without subtree awareness the
+         parent looks empty (~8 KB metadata) while the actual user data
+         lives on the children.
+
+    Correct metric = sum of bytes_added across non-failed snapshots in
+    the parent + child subtree. bytes_added is the bytes the worker
+    actually wrote to object storage on that backup run, so summing
+    across all retained snapshots gives the true on-disk footprint.
+
+    Returns headline `totalBytes` + 1w/1m/1y window deltas + a 7-day
+    daily series (today-3 .. today+3). Single round-trip, all sums
+    derived from one query.
+    """
+    from datetime import timedelta
+
+    rid = UUID(resource_id)
+
+    # Resource subtree = self + direct children (Tier-2 USER_* fan-out
+    # under ENTRA_USER, content-type leaves under SHAREPOINT_SITE, etc.)
+    child_rows = (await db.execute(
+        select(Resource.id).where(Resource.parent_resource_id == rid)
+    )).all()
+    target_ids = [rid] + [r[0] for r in child_rows]
+
+    # Pull (started_at, bytes_added) for every snapshot whose data is
+    # still on disk. IN_PROGRESS rows might still be writing — exclude
+    # so a half-done backup doesn't inflate the total. FAILED rows had
+    # their bytes cleaned up by backup_cleanup. PENDING_DELETION is
+    # awaiting GC — its bytes still exist on disk so we count them.
+    rows = (await db.execute(
+        select(Snapshot.started_at, Snapshot.bytes_added).where(
+            Snapshot.resource_id.in_(target_ids),
+            Snapshot.status.in_([
+                SnapshotStatus.COMPLETED,
+                SnapshotStatus.PARTIAL,
+                SnapshotStatus.PENDING_DELETION,
+            ]),
+        )
+    )).all()
+
+    pairs = [(r[0], int(r[1] or 0)) for r in rows if r[0] is not None]
+
+    total_bytes = sum(b for _, b in pairs)
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    week_cut = now - timedelta(days=7)
+    month_cut = now - timedelta(days=30)
+    year_cut = now - timedelta(days=365)
+
+    deltas = {
+        "week": sum(b for ts, b in pairs if ts >= week_cut),
+        "month": sum(b for ts, b in pairs if ts >= month_cut),
+        "year": sum(b for ts, b in pairs if ts >= year_cut),
+    }
+
+    # 7-day daily series anchored on today (today-3 .. today+3) so the
+    # sparkline lines up with the calendar in the user's timezone-naive
+    # representation. Future days render as null on the FE so we emit
+    # null, not 0, for them.
+    today_midnight = datetime(now.year, now.month, now.day)
+    daily_series = []
+    for offset in range(-3, 4):
+        day_start = today_midnight + timedelta(days=offset)
+        day_end = day_start + timedelta(days=1)
+        added = sum(b for ts, b in pairs if day_start <= ts < day_end)
+        is_future = day_start > today_midnight
+        daily_series.append({
+            "date": day_start.date().isoformat(),
+            "bytesAdded": added if (added or not is_future) else None,
+            "isFuture": is_future,
+        })
+
+    return {
+        "resourceId": str(rid),
+        "subtreeSize": len(target_ids),
+        "totalBytes": total_bytes,
+        "deltas": deltas,
+        "dailySeries": daily_series,
+    }
+
+
 @app.get("/api/v1/resources/snapshots/folders")
 async def get_snapshot_folders(
     snapshot_id: str = Query(...),
