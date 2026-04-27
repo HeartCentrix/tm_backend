@@ -23,6 +23,7 @@ sys.modules.setdefault("aspose", _aspose_mock)
 sys.modules.setdefault("aspose.email", _aspose_email_mock)
 
 # Now safe to import — lazy import inside apply_license will hit our stubs.
+import shared.aspose_license as aspose_license_mod
 from shared.aspose_license import apply_license, reset_for_testing  # noqa: E402
 
 
@@ -219,14 +220,25 @@ class TestIdempotency:
     """License is applied at most once per process."""
 
     def test_apply_twice_calls_set_license_once(self, tmp_path, mock_license_cls, monkeypatch):
-        """Calling apply_license() twice only applies the license once."""
+        """Calling apply_license() twice only applies the license once.
+
+        _resolve_license_path must also be called exactly once — confirming the
+        early-return guard fires before any path resolution on the second call.
+        """
         license_cls, license_instance = mock_license_cls
         lic_file = tmp_path / "aspose.lic"
         lic_file.write_bytes(b"<License>x</License>")
         monkeypatch.setenv("ASPOSE_LICENSE_PATH", str(lic_file))
 
-        apply_license()
-        apply_license()
+        with patch.object(aspose_license_mod, "_resolve_license_path",
+                          wraps=aspose_license_mod._resolve_license_path) as spy:
+            apply_license()
+            apply_license()
+
+            assert spy.call_count == 1, (
+                "_resolve_license_path should only be called once; "
+                f"was called {spy.call_count} times"
+            )
 
         assert license_instance.set_license.call_count == 1
 

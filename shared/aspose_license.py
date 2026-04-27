@@ -32,6 +32,7 @@ _applied: bool = False
 
 def _write_temp(data: bytes) -> str:
     """Write *data* to a NamedTemporaryFile with suffix `.lic` and return the path."""
+    # delete=False: tempfile persists until OS cleanup — intentional, .lic files are tiny
     with tempfile.NamedTemporaryFile(suffix=".lic", delete=False) as fh:
         fh.write(data)
         return fh.name
