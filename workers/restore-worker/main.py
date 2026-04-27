@@ -4371,4 +4371,13 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Demote aio-pika's "Future exception was never retrieved" /
+    # ECONNRESET noise to debug — robust-connection layer recovers
+    # silently; the warning is cosmetic.
+    from shared.asyncio_handlers import install_robust_loop_handler
+
+    async def _main_with_handler():
+        install_robust_loop_handler()
+        await main()
+
+    asyncio.run(_main_with_handler())
