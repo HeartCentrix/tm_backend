@@ -657,6 +657,15 @@ class RestoreWorker:
                     job = await session.get(Job, job_id)
                     if job:
                         job.progress_pct = 5
+                    # COMMIT IMMEDIATELY: long-running handlers (PST export,
+                    # whale restores) fire async progress-update tasks via
+                    # fire-and-forget asyncio.create_task. Without this commit,
+                    # the row lock on `jobs[job_id]` from the RUNNING update
+                    # blocks every subsequent progress write — workers stall
+                    # silently with all DB connections waiting on the lock the
+                    # outer session itself is holding. Commit here so other
+                    # sessions see the RUNNING state and can update progress.
+                    await session.commit()
                     print(f"[{self.worker_id}] job status RUNNING job={job_id}", flush=True)
                     await self.log_audit_event(
                         job_id, message, {}, action="RESTORE_RUNNING", outcome="IN_PROGRESS",
