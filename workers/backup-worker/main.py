@@ -649,6 +649,42 @@ class BackupWorker:
             job_status_name = job.status.name if hasattr(job.status, "name") else str(job.status)
             if job_status_name == "CANCELLED":
                 print(f"[{self.worker_id}] Skipping CANCELLED job {job_id} for resource {resource_id}")
+                # Trigger cleanup of any partial blobs the worker had
+                # already flushed before the cancel signal landed.
+                # Fire-and-forget so message ack isn't blocked on the
+                # storage walk; the cleanup helper is idempotent.
+                try:
+                    from shared.backup_cleanup import (
+                        cleanup_cancelled_snapshots,
+                        default_container_resolver,
+                    )
+
+                    async def _cleanup():
+                        try:
+                            stats = await cleanup_cancelled_snapshots(
+                                job_id=uuid.UUID(job_id),
+                                session_factory=async_session_factory,
+                                shard=self.azure_storage.get_default_shard()
+                                if hasattr(self, "azure_storage") and self.azure_storage
+                                else azure_storage_manager.get_default_shard(),
+                                container_resolver=default_container_resolver,
+                            )
+                            print(
+                                f"[{self.worker_id}] cancel-cleanup job={job_id}: {stats}",
+                                flush=True,
+                            )
+                        except Exception as exc:
+                            print(
+                                f"[{self.worker_id}] cancel-cleanup job={job_id} failed: {exc}",
+                                flush=True,
+                            )
+
+                    asyncio.create_task(_cleanup())
+                except Exception as schedule_exc:
+                    print(
+                        f"[{self.worker_id}] cancel-cleanup schedule failed: {schedule_exc}",
+                        flush=True,
+                    )
                 return
             resource = await session.get(Resource, uuid.UUID(resource_id))
             if not resource:

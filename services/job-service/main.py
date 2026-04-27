@@ -446,6 +446,37 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
     except Exception:
         pass
 
+    # Blob cleanup — for BACKUP jobs only (RESTORE jobs export ZIPs,
+    # not snapshots). Fire-and-forget so the cancel endpoint returns
+    # 204 immediately while bytes are reclaimed in the background. The
+    # cleanup helper is idempotent: if a backup-worker beats us to it
+    # (worker also runs cleanup when it sees CANCELLED status on its
+    # next message pull), the second run is a no-op.
+    if job.type == JobType.BACKUP:
+        async def _cleanup_blobs(jid: UUID):
+            try:
+                from shared.backup_cleanup import (
+                    cleanup_cancelled_snapshots,
+                    default_container_resolver,
+                )
+                from shared.azure_storage import azure_storage_manager
+                from shared.database import async_session_factory
+                stats = await cleanup_cancelled_snapshots(
+                    job_id=jid,
+                    session_factory=async_session_factory,
+                    shard=azure_storage_manager.get_default_shard(),
+                    container_resolver=default_container_resolver,
+                )
+                print(f"[JOB_SERVICE] cancel-cleanup job={jid}: {stats}")
+            except Exception as exc:
+                print(f"[JOB_SERVICE] cancel-cleanup job={jid} failed: {exc}")
+
+        try:
+            import asyncio as _aio
+            _aio.create_task(_cleanup_blobs(job.id))
+        except Exception:
+            pass
+
 
 @app.post("/api/v1/jobs/{job_id}/retry", response_model=JobResponse)
 async def retry_job(job_id: str, db: AsyncSession = Depends(get_db)):
