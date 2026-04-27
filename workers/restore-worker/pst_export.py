@@ -194,6 +194,14 @@ class PstExportOrchestrator:
         )
         self.workdir = Path(f"/tmp/pst-export/{job_id}")
 
+    async def _safe_progress(self, pct: int) -> None:
+        """Invoke ``update_progress`` swallowing any exception it raises."""
+        if self.update_progress:
+            try:
+                await self.update_progress(pct)
+            except Exception as exc:
+                logger.warning("progress update failed at %d%%: %s", pct, exc)
+
     async def run(self) -> dict:
         """Plan groups, dispatch writers, ZIP output, upload, return result.
 
@@ -226,8 +234,7 @@ class PstExportOrchestrator:
             await self.storage_shard.ensure_container(self.dest_container)
 
         # Step 1: Plan
-        if self.update_progress:
-            await self.update_progress(5)
+        await self._safe_progress(5)
         planner = PstGroupPlanner()
         groups = planner.plan(self.items, self.granularity, self.include_types)
 
@@ -242,75 +249,78 @@ class PstExportOrchestrator:
         failed_counts: dict = {}
         total_groups = len(groups)
 
-        for idx, group in enumerate(groups):
-            WriterClass = writer_map.get(group.item_type)
-            if WriterClass is None:
-                continue
-            writer = WriterClass()
-            write_result = await writer.write(
-                group=group,
-                workdir=self.workdir,
-                split_gb=self.split_gb,
-                shard=self.storage_shard,
-                source_container=self.source_container,
-            )
-            all_pst_paths.extend(write_result.pst_paths)
-            item_counts[group.item_type] = (
-                item_counts.get(group.item_type, 0) + write_result.item_count
-            )
-            failed_counts[group.item_type] = (
-                failed_counts.get(group.item_type, 0) + write_result.failed_count
-            )
+        try:
+            for idx, group in enumerate(groups):
+                WriterClass = writer_map.get(group.item_type)
+                if WriterClass is None:
+                    continue
+                writer = WriterClass()
+                write_result = await writer.write(
+                    group=group,
+                    workdir=self.workdir,
+                    split_gb=self.split_gb,
+                    shard=self.storage_shard,
+                    source_container=self.source_container,
+                )
+                all_pst_paths.extend(write_result.pst_paths)
+                item_counts[group.item_type] = (
+                    item_counts.get(group.item_type, 0) + write_result.item_count
+                )
+                failed_counts[group.item_type] = (
+                    failed_counts.get(group.item_type, 0) + write_result.failed_count
+                )
 
-            # Progress: 5% start → 80% after all groups are written.
-            if self.update_progress:
+                # Progress: 5% start → 80% after all groups are written.
                 pct = 5 + int(75 * (idx + 1) / max(total_groups, 1))
-                await self.update_progress(pct)
+                await self._safe_progress(pct)
 
-        # Step 3: ZIP all .pst files into a single archive.
-        zip_path = self.workdir.parent / f"{self.job_id}.zip"
-        total_size = 0
-        pst_file_names: list = []
-        with _zipfile.ZipFile(str(zip_path), "w", _zipfile.ZIP_STORED) as zf:
-            for pst_path in all_pst_paths:
-                if pst_path.exists():
-                    zf.write(str(pst_path), arcname=pst_path.name)
-                    total_size += pst_path.stat().st_size
-                    pst_file_names.append(pst_path.name)
+            # Step 3: ZIP all .pst files into a single archive.
+            zip_path = self.workdir.parent / f"{self.job_id}.zip"
+            total_size = 0
+            pst_file_names: list = []
+            with _zipfile.ZipFile(str(zip_path), "w", _zipfile.ZIP_STORED) as zf:
+                for pst_path in all_pst_paths:
+                    if pst_path.exists():
+                        zf.write(str(pst_path), arcname=pst_path.name)
+                        total_size += pst_path.stat().st_size
+                        pst_file_names.append(pst_path.name)
 
-        # Step 4: Upload zip.  upload_blob_with_retry_from_file deletes
-        # the local zip on success.
-        blob_path = f"pst-exports/{self.job_id}/{self.job_id}.zip"
-        zip_size = zip_path.stat().st_size if zip_path.exists() else 0
-        upload_result = await upload_blob_with_retry_from_file(
-            container_name=self.dest_container,
-            blob_path=blob_path,
-            file_path=str(zip_path),
-            shard=self.storage_shard,
-            file_size=zip_size,
-            metadata={"job_id": self.job_id, "granularity": self.granularity},
-        )
+            # Step 4: Upload zip.  upload_blob_with_retry_from_file deletes
+            # the local zip on success.
+            blob_path = f"pst-exports/{self.job_id}/{self.job_id}.zip"
+            zip_size = zip_path.stat().st_size if zip_path.exists() else 0
+            upload_result = await upload_blob_with_retry_from_file(
+                container_name=self.dest_container,
+                blob_path=blob_path,
+                file_path=str(zip_path),
+                shard=self.storage_shard,
+                file_size=zip_size,
+                metadata={"job_id": self.job_id, "granularity": self.granularity},
+            )
 
-        if self.update_progress:
-            await self.update_progress(95)
+            if not upload_result.get("success"):
+                # upload_blob_with_retry_from_file only auto-deletes on success
+                try:
+                    zip_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-        # Step 5: Cleanup local workdir (PSTs etc.).  The zip itself
-        # was already deleted by upload_blob_with_retry_from_file.
-        _cleanup_dir(self.workdir)
+            await self._safe_progress(95)
 
-        if self.update_progress:
-            await self.update_progress(100)
-
-        success = bool(upload_result.get("success"))
-        return {
-            "job_id": self.job_id,
-            "status": "done" if success else "upload_failed",
-            "blob_path": blob_path if success else None,
-            "container": self.dest_container,
-            "pst_files": pst_file_names,
-            "pst_count": len(pst_file_names),
-            "total_size_bytes": total_size,
-            "item_counts_by_type": item_counts,
-            "failed_counts_by_type": failed_counts,
-            "granularity": self.granularity,
-        }
+            success = bool(upload_result.get("success"))
+            return {
+                "job_id": self.job_id,
+                "status": "done" if success else "upload_failed",
+                "blob_path": blob_path if success else None,
+                "container": self.dest_container,
+                "pst_files": pst_file_names,
+                "pst_count": len(pst_file_names),
+                "total_size_bytes": total_size,
+                "item_counts_by_type": item_counts,
+                "failed_counts_by_type": failed_counts,
+                "granularity": self.granularity,
+            }
+        finally:
+            # Step 5: Always clean up local workdir (PSTs etc.).
+            _cleanup_dir(self.workdir)
+            await self._safe_progress(100)
