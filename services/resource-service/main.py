@@ -324,23 +324,62 @@ async def list_resources(
         counts_result = await db.execute(counts_query, {"resource_ids": resource_ids})
         backup_counts = {str(row[0]): row[1] for row in counts_result.fetchall()}
 
-    # Roll up Tier 2 child sizes into the parent. After the Tier 2 refactor,
-    # ENTRA_USER rows only carry tiny metadata in their own storage_bytes;
-    # the real content bytes live on the 5 USER_* children linked via
-    # parent_resource_id. For the Protection table we want "whole backup"
-    # so sum the children here and add them to the parent's size. Resources
-    # without children (Tier 1 MAILBOX, SharePoint sites, etc.) just get 0
-    # from this map and fall back to their own storage_bytes.
-    child_size_map: dict = {}
+    # Per-resource backup size + windowed deltas, computed from
+    # snapshots.bytes_added across the resource subtree (self + Tier-2
+    # children linked via parent_resource_id). This mirrors the
+    # /storage-summary endpoint so the Protection table and the
+    # Recovery panel can never disagree.
+    #
+    # Why bytes_added (not storage_bytes): resources.storage_bytes is a
+    # cached counter the backup worker bumps per run; the bug history
+    # is full of cases where it drifted (double-counting after retries,
+    # not decremented after retention purge, not zeroed after schema
+    # reset). Snapshots are the source of truth — bytes_added is the
+    # bytes the worker actually wrote on that run, so summing them
+    # across all retained snapshots gives the true on-disk footprint.
+    #
+    # Also computes the real 1w / 1m / 1y deltas (previously hardcoded
+    # to zero in the response).
+    subtree_size_map: dict = {}
     if resource_ids:
-        child_size_query = text("""
-            SELECT parent_resource_id, COALESCE(SUM(storage_bytes), 0) AS children_total
-            FROM resources
-            WHERE parent_resource_id = ANY(:resource_ids)
-            GROUP BY parent_resource_id
+        subtree_size_query = text("""
+            WITH targets AS (
+                SELECT id AS root_id, id AS leaf_id
+                FROM resources
+                WHERE id = ANY(:resource_ids)
+                UNION ALL
+                SELECT parent_resource_id AS root_id, id AS leaf_id
+                FROM resources
+                WHERE parent_resource_id = ANY(:resource_ids)
+            )
+            SELECT
+                t.root_id,
+                COALESCE(SUM(s.bytes_added), 0) AS total,
+                COALESCE(SUM(s.bytes_added) FILTER (
+                    WHERE s.started_at >= now() - interval '7 days'
+                ), 0) AS d7,
+                COALESCE(SUM(s.bytes_added) FILTER (
+                    WHERE s.started_at >= now() - interval '30 days'
+                ), 0) AS d30,
+                COALESCE(SUM(s.bytes_added) FILTER (
+                    WHERE s.started_at >= now() - interval '365 days'
+                ), 0) AS d365
+            FROM targets t
+            LEFT JOIN snapshots s
+                ON s.resource_id = t.leaf_id
+                AND s.status IN ('COMPLETED', 'PARTIAL', 'PENDING_DELETION')
+            GROUP BY t.root_id
         """)
-        child_size_result = await db.execute(child_size_query, {"resource_ids": resource_ids})
-        child_size_map = {str(row[0]): int(row[1] or 0) for row in child_size_result.fetchall()}
+        subtree_size_result = await db.execute(
+            subtree_size_query, {"resource_ids": resource_ids}
+        )
+        for row in subtree_size_result.fetchall():
+            subtree_size_map[str(row[0])] = {
+                "size": int(row[1] or 0),
+                "size_delta_week": int(row[2] or 0),
+                "size_delta_month": int(row[3] or 0),
+                "size_delta_year": int(row[4] or 0),
+            }
 
     # Likewise, treat a completed snapshot on ANY child as "the parent was
     # backed up" so the UI chip flips to "protected" for parents whose only
@@ -396,12 +435,14 @@ async def list_resources(
 
     items = []
     for r in rows:
-        # "Whole backup" = parent's own bytes + every Tier 2 child's bytes.
-        # For non-parents the map lookup returns 0 and this matches the old
-        # storage_bytes value exactly.
-        storage_bytes = (r[9] or 0) + child_size_map.get(str(r[0]), 0)
+        rid = str(r[0])
+        sub = subtree_size_map.get(rid, {})
+        storage_bytes = sub.get("size", 0)
+        size_delta_week = sub.get("size_delta_week", 0)
+        size_delta_month = sub.get("size_delta_month", 0)
+        size_delta_year = sub.get("size_delta_year", 0)
         has_backup = r[10] is not None  # last_backup_at is not None
-        backup_count = backup_counts.get(str(r[0]), 0)
+        backup_count = backup_counts.get(rid, 0)
         items.append({
             "id": str(r[0]), "tenant_id": str(r[1]), "owner": None,
             "kind": map_kind(r[2]),
@@ -419,8 +460,11 @@ async def list_resources(
             },
             "archived": r[8] == "ARCHIVED", "deleted": r[8] == "PENDING_DELETION",
             "protections": [{"policy_id": str(r[7])}] if r[7] else None,
-            "usage": {"resource_id": str(r[0]), "tenant_id": str(r[1]), "backups": backup_count,
-                      "size": storage_bytes, "size_delta_year": 0, "size_delta_month": 0, "size_delta_week": 0},
+            "usage": {"resource_id": rid, "tenant_id": str(r[1]), "backups": backup_count,
+                      "size": storage_bytes,
+                      "size_delta_year": size_delta_year,
+                      "size_delta_month": size_delta_month,
+                      "size_delta_week": size_delta_week},
             "backupSize": format_backup_size(storage_bytes) if has_backup else None,
             "status": map_status(r[8]),
             "sla": policies.get(str(r[7])) if r[7] else None,
@@ -613,22 +657,51 @@ async def get_resources_by_type(
         counts_result = await db.execute(counts_query, {"resource_ids": resource_ids})
         backup_counts = {str(r[0]): r[1] for r in counts_result.fetchall()}
 
-    # Tier 2 roll-up: sum storage_bytes of every child resource into its
-    # parent's total and count child-level snapshots as parent backups.
-    # Without this the Protection page shows an ENTRA_USER as "10 KB / No
-    # backups" even when its USER_MAIL / USER_ONEDRIVE / USER_CHATS
-    # children hold gigabytes of content. Mirrors the logic in /resources.
-    child_size_map: dict = {}
+    # Subtree-aware size + window deltas (mirrors /resources path and the
+    # /storage-summary endpoint — single source of truth so the Protection
+    # table, the Recovery panel, and any future surfaces all agree).
+    subtree_size_map: dict = {}
     if resource_ids:
-        child_size_query = text("""
-            SELECT parent_resource_id, COALESCE(SUM(storage_bytes), 0) AS children_total
-            FROM resources
-            WHERE parent_resource_id = ANY(:resource_ids)
-            GROUP BY parent_resource_id
+        subtree_size_query = text("""
+            WITH targets AS (
+                SELECT id AS root_id, id AS leaf_id
+                FROM resources
+                WHERE id = ANY(:resource_ids)
+                UNION ALL
+                SELECT parent_resource_id AS root_id, id AS leaf_id
+                FROM resources
+                WHERE parent_resource_id = ANY(:resource_ids)
+            )
+            SELECT
+                t.root_id,
+                COALESCE(SUM(s.bytes_added), 0) AS total,
+                COALESCE(SUM(s.bytes_added) FILTER (
+                    WHERE s.started_at >= now() - interval '7 days'
+                ), 0) AS d7,
+                COALESCE(SUM(s.bytes_added) FILTER (
+                    WHERE s.started_at >= now() - interval '30 days'
+                ), 0) AS d30,
+                COALESCE(SUM(s.bytes_added) FILTER (
+                    WHERE s.started_at >= now() - interval '365 days'
+                ), 0) AS d365
+            FROM targets t
+            LEFT JOIN snapshots s
+                ON s.resource_id = t.leaf_id
+                AND s.status IN ('COMPLETED', 'PARTIAL', 'PENDING_DELETION')
+            GROUP BY t.root_id
         """)
-        child_size_result = await db.execute(child_size_query, {"resource_ids": resource_ids})
-        child_size_map = {str(r[0]): int(r[1] or 0) for r in child_size_result.fetchall()}
+        subtree_size_result = await db.execute(
+            subtree_size_query, {"resource_ids": resource_ids}
+        )
+        for row in subtree_size_result.fetchall():
+            subtree_size_map[str(row[0])] = {
+                "size": int(row[1] or 0),
+                "size_delta_week": int(row[2] or 0),
+                "size_delta_month": int(row[3] or 0),
+                "size_delta_year": int(row[4] or 0),
+            }
 
+    if resource_ids:
         child_backup_query = text("""
             SELECT r.parent_resource_id, COUNT(*) AS child_backups
             FROM snapshots s
@@ -660,21 +733,29 @@ async def get_resources_by_type(
 
     items = []
     for row in rows:
-        storage_bytes = (row[9] or 0) + child_size_map.get(str(row[0]), 0)
+        rid = str(row[0])
+        sub = subtree_size_map.get(rid, {})
+        storage_bytes = sub.get("size", 0)
+        size_delta_week = sub.get("size_delta_week", 0)
+        size_delta_month = sub.get("size_delta_month", 0)
+        size_delta_year = sub.get("size_delta_year", 0)
         # has_backup = parent has own last_backup_at OR any child does
-        last_backup_dt = row[10] or child_last_backup_map.get(str(row[0]))
+        last_backup_dt = row[10] or child_last_backup_map.get(rid)
         has_backup = last_backup_dt is not None
-        backup_count = backup_counts.get(str(row[0]), 0)
+        backup_count = backup_counts.get(rid, 0)
         items.append({
-            "id": str(row[0]), "tenant_id": str(row[1]), "owner": None,
+            "id": rid, "tenant_id": str(row[1]), "owner": None,
             "kind": map_kind(row[2]),
             "provider": "azure" if "AZURE" in (row[2] or "") else "o365",
             "external_id": row[3], "name": row[4], "email": row[5],
             "data": row[6] or {},
             "archived": row[8] == "ARCHIVED", "deleted": row[8] == "PENDING_DELETION",
             "protections": [{"policy_id": str(row[7])}] if row[7] else None,
-            "usage": {"resource_id": str(row[0]), "tenant_id": str(row[1]), "backups": backup_count,
-                      "size": storage_bytes, "size_delta_year": 0, "size_delta_month": 0, "size_delta_week": 0},
+            "usage": {"resource_id": rid, "tenant_id": str(row[1]), "backups": backup_count,
+                      "size": storage_bytes,
+                      "size_delta_year": size_delta_year,
+                      "size_delta_month": size_delta_month,
+                      "size_delta_week": size_delta_week},
             "backupSize": format_backup_size(storage_bytes) if has_backup else None,
             "status": map_status(row[8]),
             "sla": policies.get(str(row[7])) if row[7] else None,
