@@ -1284,18 +1284,26 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                restoreType:
-                  type: string
-                  enum: [MAILBOX, ONEDRIVE, SHAREPOINT, ENTRA_OBJECT]
-                snapshotIds:
-                  type: array
-                  items:
-                    type: string
-                    format: uuid
-                targetLocation:
-                  type: string
+              oneOf:
+                - $ref: '#/components/schemas/MailExportRequest'
+                - type: object
+                  properties:
+                    restoreType:
+                      type: string
+                      enum: [MAILBOX, ONEDRIVE, SHAREPOINT, ENTRA_OBJECT, EXPORT_PST, EXPORT_ZIP]
+                    snapshotIds:
+                      type: array
+                      items: {type: string, format: uuid}
+                    itemIds:
+                      type: array
+                      items: {type: string, format: uuid}
+                    targetLocation:
+                      type: string
+                    exportFormat:
+                      type: string
+                      enum: [MBOX, EML, PST]
+              discriminator:
+                propertyName: exportFormat
       responses:
         '200':
           description: Restore job created
@@ -3730,6 +3738,51 @@ components:
             format: {type: string}
             layoutMode: {type: string}
         error: {type: object, nullable: true}
+
+    # Mail / PST Export Schemas
+    MailExportRequest:
+      type: object
+      required: [snapshotIds, exportFormat]
+      properties:
+        snapshotIds:
+          type: array
+          items: {type: string, format: uuid}
+        itemIds:
+          type: array
+          items: {type: string, format: uuid}
+          nullable: true
+        exportFormat:
+          type: string
+          enum: [MBOX, EML, PST]
+          description: Output format — MBOX/EML produce a ZIP archive; PST produces per-type Outlook PST files
+        includeAttachments:
+          type: boolean
+          default: true
+        pstGranularity:
+          type: string
+          enum: [MAILBOX, FOLDER, ITEM]
+          default: MAILBOX
+          description: "PST only: grouping unit for output files (AFI parity)"
+        pstSplitSizeGb:
+          type: integer
+          default: 45
+          minimum: 5
+          maximum: 49
+          description: "PST only: auto-rotate threshold below the 50 GB Unicode PST cap"
+        pstIncludeTypes:
+          type: array
+          items:
+            type: string
+            enum: [EMAIL, CALENDAR_EVENT, USER_CONTACT]
+          description: "PST only: item types to include (default: all three)"
+    MailExportResponse:
+      type: object
+      properties:
+        jobId: {type: string, format: uuid}
+        status: {type: string}
+        exportFormat: {type: string}
+        pstCount: {type: integer}
+        blobPath: {type: string, nullable: true}
 
     # Policy Schemas
     SlaPolicyResponse:
