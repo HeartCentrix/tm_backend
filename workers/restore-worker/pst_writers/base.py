@@ -59,37 +59,39 @@ class PstWriterBase:
         size_estimate = 0
         split_bytes = split_gb * 0.95 * 1024 ** 3
 
-        for item in group.items:
-            try:
-                mapi_item = await self._build_mapi_item(item, shard, source_container)
-                if mapi_item is None:
+        try:
+            for item in group.items:
+                try:
+                    mapi_item = await self._build_mapi_item(item, shard, source_container)
+                    if mapi_item is None:
+                        result.failed_count += 1
+                        continue
+                    folder.add_mapi_message_item(mapi_item)
+                    size_estimate += getattr(item, "content_size", 0) or 1024
+                    result.item_count += 1
+
+                    # Rotate when nearing split threshold
+                    if size_estimate >= split_bytes:
+                        pst.dispose()
+                        result.pst_paths.append(pst_path)
+                        part += 1
+                        stem = group.pst_filename[:-4]   # strip ".pst"
+                        base = f"{stem}-{part:03d}.pst"
+                        pst_path = workdir / base
+                        pst = PersonalStorage.create(str(pst_path), FileFormatVersion.UNICODE)
+                        folder = self._get_or_create_folder(pst, self.standard_folder_type)
+                        size_estimate = 0
+
+                except Exception as exc:
+                    logger.error(
+                        "PST write failed for item %s: %s",
+                        getattr(item, "external_id", "?"),
+                        exc,
+                    )
                     result.failed_count += 1
-                    continue
-                folder.add_mapi_message_item(mapi_item)
-                size_estimate += getattr(item, "content_size", 0) or 1024
-                result.item_count += 1
-
-                # Rotate when nearing split threshold
-                if size_estimate >= split_bytes:
-                    pst.dispose()
-                    result.pst_paths.append(pst_path)
-                    part += 1
-                    base = group.pst_filename.replace(".pst", f"-{part:03d}.pst")
-                    pst_path = workdir / base
-                    pst = PersonalStorage.create(str(pst_path), FileFormatVersion.UNICODE)
-                    folder = self._get_or_create_folder(pst, self.standard_folder_type)
-                    size_estimate = 0
-
-            except Exception as exc:
-                logger.error(
-                    "PST write failed for item %s: %s",
-                    getattr(item, "external_id", "?"),
-                    exc,
-                )
-                result.failed_count += 1
-
-        pst.dispose()
-        result.pst_paths.append(pst_path)
+        finally:
+            pst.dispose()
+            result.pst_paths.append(pst_path)
         return result
 
     def _get_or_create_folder(self, pst, folder_name: str):

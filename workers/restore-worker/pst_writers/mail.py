@@ -55,13 +55,17 @@ class MailPstWriter(PstWriterBase):
             att_paths, shard, source_container, include_attachments
         )
 
-        if attachments:
-            pieces = []
-            async for chunk in build_eml_streaming(msg_json, attachments):
-                pieces.append(chunk)
-            eml_bytes = b"".join(pieces)
-        else:
-            eml_bytes = build_eml(msg_json, attachments=[])
+        try:
+            if attachments:
+                pieces = []
+                async for chunk in build_eml_streaming(msg_json, attachments):
+                    pieces.append(chunk)
+                eml_bytes = b"".join(pieces)
+            else:
+                eml_bytes = build_eml(msg_json, attachments=[])
+        except Exception as exc:
+            logger.error("EML build failed for item %s: %s", getattr(item, "external_id", "?"), exc)
+            return None
 
         MapiMessage = importlib.import_module("aspose.email.mapi").MapiMessage
         return MapiMessage.from_mime_message_bytes(eml_bytes)
