@@ -1818,7 +1818,10 @@ class RestoreWorker:
                             needed_resource_types |= ITEM_TYPE_TO_RESOURCE_TYPES.get(it, set())
 
                         # For each needed resource (other than picked),
-                        # add its latest snapshot to the stream sources.
+                        # add ALL its sibling snapshots so the streaming
+                        # fetch's newest-wins dedup runs across history.
+                        # If we only added the latest, items only modified
+                        # in earlier snapshots would be missed.
                         existing_ids = {str(s) for s in snapshot_ids_stream}
                         added_ids: list = []
                         for sib in sibling_rows:
@@ -1826,20 +1829,22 @@ class RestoreWorker:
                             if sib_type not in needed_resource_types:
                                 continue
                             if str(sib.id) == str(picked_resource.id):
-                                continue   # already covered by snapshot_ids_stream
-                            latest = (await session.execute(
+                                continue   # already covered
+                            sib_snaps = (await session.execute(
                                 select(Snapshot.id)
                                 .where(Snapshot.resource_id == sib.id)
                                 .order_by(Snapshot.created_at.desc())
-                                .limit(1)
-                            )).scalar_one_or_none()
-                            if latest and str(latest) not in existing_ids:
-                                snapshot_ids_stream = list(snapshot_ids_stream) + [str(latest)]
-                                existing_ids.add(str(latest))
-                                added_ids.append((sib_type, str(latest)))
+                            )).scalars().all()
+                            for sn_id in sib_snaps:
+                                sn_str = str(sn_id)
+                                if sn_str in existing_ids:
+                                    continue
+                                snapshot_ids_stream = list(snapshot_ids_stream) + [sn_str]
+                                existing_ids.add(sn_str)
+                                added_ids.append((sib_type, sn_str))
                         if added_ids:
                             print(
-                                f"[{self.worker_id}] expanded snapshots for cross-workload export: {added_ids}",
+                                f"[{self.worker_id}] expanded snapshots for cross-workload export: {len(added_ids)} added",
                                 flush=True,
                             )
             except Exception as _exp_exc:
@@ -1848,12 +1853,16 @@ class RestoreWorker:
                     flush=True,
                 )
 
-        # Resolve human-readable resource label per snapshot so PST
-        # filenames look like ``AmitMishra-Inbox-mail.pst`` instead of
-        # the cryptic ``5010945e-Inbox-mail.pst``. Falls back to the
-        # display_name's local-part if the email is set, else the full
-        # display_name with whitespace stripped.
+        # Resolve human-readable resource label PER RESOURCE (not per
+        # snapshot) so all sibling snapshots of the same user collapse
+        # to one label — and one PST filename — across the export. We
+        # also build the snapshot→resource map the orchestrator needs
+        # to group by resource (not snapshot) for MAILBOX/FOLDER
+        # granularity. Without this, sibling snapshots produced one
+        # PST each instead of one PST per (resource, type).
         resource_label_by_snapshot: Dict[str, str] = {}
+        snapshot_to_resource: Dict[str, str] = {}
+        resource_label_by_resource: Dict[str, str] = {}
         primary_resource_id: str = ""
         if snapshot_ids_stream:
             try:
@@ -1871,6 +1880,8 @@ class RestoreWorker:
                     )
                     label = "".join(ch for ch in (raw or "") if ch.isalnum() or ch in "-_") or str(sid)[:8]
                     resource_label_by_snapshot[str(sid)] = label
+                    snapshot_to_resource[str(sid)] = str(rid)
+                    resource_label_by_resource[str(rid)] = label
                     if not primary_resource_id and rid:
                         primary_resource_id = str(rid)
             except Exception as _label_exc:
@@ -1912,6 +1923,8 @@ class RestoreWorker:
             item_stream_factory=_make_stream,
         )
         orch.resource_label_by_snapshot = resource_label_by_snapshot
+        orch.snapshot_to_resource = snapshot_to_resource
+        orch.resource_label_by_resource = resource_label_by_resource
         orch.cancel_check = _cancel_check
         # Per-user rate limit key (PST_RATE_LIMIT_SCOPE=user, the default).
         # Uses the snapshot's resource_id, which corresponds 1:1 with the

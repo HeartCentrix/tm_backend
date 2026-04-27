@@ -400,11 +400,16 @@ class PstExportOrchestrator:
         self.auto_folder_threshold = int(
             os.environ.get("PST_AUTO_FOLDER_THRESHOLD", "5000")
         )
-        # Optional override from caller — used for human-readable PST
-        
+        # Optional overrides from caller — used for human-readable PST
+        # filenames like ``AmitMishra-mail.pst`` instead of the
         # snapshot-id-prefix default. Caller (export_as_pst) populates
-        # this from the resource's display_name + email.
+        # these from the resource's display_name + email.
         self.resource_label_by_snapshot: dict[str, str] = {}
+        # snapshot_id → resource_id. With sibling-snapshot unioning,
+        # MAILBOX/FOLDER group_key uses resource_id so all an item's
+        # revisions across snapshots collapse into ONE PST.
+        self.snapshot_to_resource: dict[str, str] = {}
+        self.resource_label_by_resource: dict[str, str] = {}
 
     async def _safe_progress(self, pct: int) -> None:
         """Invoke ``update_progress`` swallowing any exception it raises."""
@@ -646,26 +651,37 @@ class PstExportOrchestrator:
                 })
                 failed_counts[item_type] += len(items_to_write)
 
-        def _compute_group_key(item) -> tuple:
+        def _resource_key_for(item) -> str:
+            """Map item → resource_id. With sibling-snapshot unioning,
+            the same logical item may surface under different
+            snapshot_ids; grouping by snapshot would scatter one user's
+            mailbox across multiple PSTs."""
             sid = str(item.snapshot_id)
+            return self.snapshot_to_resource.get(sid, sid)
+
+        def _compute_group_key(item) -> tuple:
             it = item.item_type
+            rkey = _resource_key_for(item)
             if self.granularity == "MAILBOX":
-                return (sid, it)
+                return (rkey, it)
             if self.granularity == "FOLDER":
-                return (sid, it, item.folder_path or "root")
-            # ITEM
-            return (sid, it, item.external_id)
+                return (rkey, it, item.folder_path or "root")
+            # ITEM granularity stays at external_id — one PST per item
+            # is the user's explicit choice.
+            return (rkey, it, item.external_id)
 
         def _register_metadata(group_key: tuple, item) -> None:
             if group_key in group_metadata:
                 return
             sid = str(item.snapshot_id)
             sid_short = sid[:8]
-            
-            # caller pre-populated resource_label_by_snapshot. Fall back
-            # to the 8-char snapshot id prefix.
+            rkey = _resource_key_for(item)
+            # Prefer the human-readable label keyed by resource_id —
+            # consistent across all sibling snapshots so every PST for
+            # the same mailbox/calendar/contacts gets the same prefix.
             label = (
-                self.resource_label_by_snapshot.get(sid)
+                self.resource_label_by_resource.get(rkey)
+                or self.resource_label_by_snapshot.get(sid)
                 or self.resource_label_by_snapshot.get(sid_short)
                 or sid_short
             )
