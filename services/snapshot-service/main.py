@@ -159,6 +159,8 @@ async def list_snapshots(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1),
     include_children: bool = Query(False, description="Also include snapshots of child resources (Tier 2 USER_MAIL/ONEDRIVE/etc. under an ENTRA_USER parent). Needed so the Recovery sparkline can plot the actual content bytes instead of the parent's tiny metadata row."),
+    include_failed: bool = Query(False, description="Include FAILED / RUNNING snapshots. Default off — the version dropdown only wants successful, recoverable points in time."),
+    include_empty: bool = Query(False, description="Include INCREMENTAL snapshots that captured 0 items (no delta since the prior snapshot). Default off — they would otherwise pollute the version dropdown with duplicates that present the same data as the previous entry."),
     db: AsyncSession = Depends(get_db),
 ):
     # Build the set of resource IDs whose snapshots we want. By default
@@ -173,6 +175,16 @@ async def list_snapshots(
         target_ids.extend(r[0] for r in child_rows)
 
     filters = [Snapshot.resource_id.in_(target_ids)]
+    # By default the version dropdown should show only RECOVERABLE
+    # points in time. Hide failed + empty-delta snapshots which both
+    # surface as confusing "duplicate" versions in the UI dropdown
+    # (failed = nothing to restore, empty incremental = same data as
+    # the prior entry). Admin / debug callers can opt-in via query.
+    if not include_failed:
+        filters.append(Snapshot.status == SnapshotStatus.COMPLETED)
+    if not include_empty:
+        filters.append(Snapshot.item_count > 0)
+
     total = (await db.execute(select(func.count(Snapshot.id)).where(*filters))).scalar() or 0
     stmt = select(Snapshot).where(*filters).order_by(Snapshot.created_at.desc()).offset((page-1)*size).limit(size)
     result = await db.execute(stmt)
