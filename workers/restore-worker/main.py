@@ -1742,6 +1742,34 @@ class RestoreWorker:
         import os as _os
         _batch_size = int(_os.environ.get("PST_FETCH_BATCH_SIZE", "1000"))
 
+        # Resolve human-readable resource label per snapshot so PST
+        
+        # the cryptic ``5010945e-Inbox-mail.pst``. Falls back to the
+        # display_name's local-part if the email is set, else the full
+        # display_name with whitespace stripped.
+        resource_label_by_snapshot: Dict[str, str] = {}
+        if snapshot_ids_stream:
+            try:
+                snap_uuids = [_uuid.UUID(str(s)) for s in snapshot_ids_stream]
+                rows = (await session.execute(
+                    select(Snapshot.id, Resource.display_name, Resource.email)
+                    .join(Resource, Resource.id == Snapshot.resource_id)
+                    .where(Snapshot.id.in_(snap_uuids))
+                )).all()
+                for sid, dn, email in rows:
+                    raw = (
+                        (email.split("@")[0] if email else None)
+                        or (dn.split("—")[-1].strip() if dn and "—" in dn else dn)
+                        or ""
+                    )
+                    label = "".join(ch for ch in (raw or "") if ch.isalnum() or ch in "-_") or str(sid)[:8]
+                    resource_label_by_snapshot[str(sid)] = label
+            except Exception as _label_exc:
+                print(
+                    f"[{self.worker_id}] resource label lookup failed (non-fatal): {_label_exc}",
+                    flush=True,
+                )
+
         def _make_stream():
             return self.stream_snapshot_items_by_group(
                 async_session_factory,
@@ -1752,6 +1780,14 @@ class RestoreWorker:
                 item_types=item_types_filter,
                 batch_size=_batch_size,
             )
+
+        async def _cancel_check() -> bool:
+            try:
+                async with async_session_factory() as s:
+                    j = await s.get(_Job, _uuid.UUID(job_id))
+                    return bool(j and getattr(j, "status", None) == JobStatus.CANCELLED)
+            except Exception:
+                return False
 
         orch = PstExportOrchestrator(
             job_id=job_id,
@@ -1766,6 +1802,8 @@ class RestoreWorker:
             checkpoint_saver=_checkpoint_save,
             item_stream_factory=_make_stream,
         )
+        orch.resource_label_by_snapshot = resource_label_by_snapshot
+        orch.cancel_check = _cancel_check
 
         result = await orch.run()
 

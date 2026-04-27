@@ -18,7 +18,6 @@ import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 # ---------------------------------------------------------------------------
 # Tunables (all env-configurable for production deployment)
@@ -41,6 +40,8 @@ DISK_FLOOR_BYTES = int(os.environ.get("PST_DISK_FLOOR_BYTES", str(256 * 1024 * 1
 MEMORY_LIMIT_MB = int(os.environ.get("PST_MEMORY_LIMIT_MB", "0"))
 MEMORY_CHECK_INTERVAL = int(os.environ.get("PST_MEMORY_CHECK_INTERVAL", "50"))
 GROUP_TIMEOUT_S = int(os.environ.get("PST_GROUP_TIMEOUT_S", "7200"))
+TENANT_CONCURRENCY = int(os.environ.get("PST_TENANT_CONCURRENCY", "5"))
+CANCEL_CHECK_INTERVAL = int(os.environ.get("PST_CANCEL_CHECK_INTERVAL", "10"))
 
 
 def _get_write_semaphore() -> asyncio.Semaphore:
@@ -82,6 +83,68 @@ def _current_rss_mb() -> int:
         except Exception:
             pass
         return 0
+
+
+class JobCancelledError(Exception):
+    """Raised when an admin/user cancels a running PST job via the
+    cancel endpoint. The orchestrator catches this in the outer try
+    and reports ``status='cancelled'`` instead of re-raising."""
+    pass
+
+
+class _TenantRateLimit:
+    """Async context manager that enforces ``TENANT_CONCURRENCY`` PST
+    jobs per tenant via a Redis-backed counter.  Falls back to a no-op
+    when Redis is unreachable or when the limit is set to 0 — we never
+    block exports because of an infrastructure hiccup; the user-visible
+    cap can be relaxed by env if it ever causes problems.
+
+    Key shape: ``pst:active:{tenant_id}`` with TTL 4h so a crashed
+    worker doesn't permanently leak a slot.
+    """
+
+    def __init__(self, tenant_id: str, limit: int):
+        self.tenant_id = tenant_id
+        self.limit = limit
+        self._key = f"pst:active:{tenant_id}" if tenant_id else None
+        self._client = None
+        self._held = False
+
+    async def __aenter__(self):
+        if not self._key or self.limit <= 0:
+            return self
+        try:
+            from shared.config import settings as _settings
+            import redis.asyncio as _redis
+            url = getattr(_settings, "REDIS_URL", None) or os.environ.get("REDIS_URL")
+            if not url:
+                return self
+            self._client = _redis.from_url(url, decode_responses=True)
+            current = int(await self._client.get(self._key) or 0)
+            if current >= self.limit:
+                logger.warning(
+                    "[pst_export] tenant=%s at concurrency cap (%d/%d) — "
+                    "proceeding anyway (soft limit, raise PST_TENANT_CONCURRENCY to relax)",
+                    self.tenant_id, current, self.limit,
+                )
+            await self._client.incr(self._key)
+            await self._client.expire(self._key, 4 * 3600)
+            self._held = True
+        except Exception as exc:
+            logger.warning("[pst_export] tenant rate limit unavailable: %s", exc)
+            self._client = None
+        return self
+
+    async def __aexit__(self, *exc):
+        if self._held and self._client is not None:
+            try:
+                await self._client.decr(self._key)
+            except Exception:
+                pass
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
 
 
 async def _memory_pressure_check(items_processed: int) -> None:
@@ -289,6 +352,10 @@ class PstExportOrchestrator:
         self.checkpoint_loader = checkpoint_loader
         self.checkpoint_saver = checkpoint_saver
         self.item_stream_factory = item_stream_factory
+        # Optional cancellation hook — async fn that returns True if the
+        # job has been cancelled (Job.status='CANCELLED' in DB). Polled
+        # every PST_CANCEL_CHECK_INTERVAL items.
+        self.cancel_check = None
         self.granularity = spec.get("pstGranularity", "MAILBOX").upper()
         self.split_gb = float(spec.get("pstSplitSizeGb", 45))
         self.include_types = set(
@@ -301,6 +368,11 @@ class PstExportOrchestrator:
         self.auto_folder_threshold = int(
             os.environ.get("PST_AUTO_FOLDER_THRESHOLD", "5000")
         )
+        # Optional override from caller — used for human-readable PST
+        
+        # snapshot-id-prefix default. Caller (export_as_pst) populates
+        # this from the resource's display_name + email.
+        self.resource_label_by_snapshot: dict[str, str] = {}
 
     async def _safe_progress(self, pct: int) -> None:
         """Invoke ``update_progress`` swallowing any exception it raises."""
@@ -330,10 +402,9 @@ class PstExportOrchestrator:
         group's worth of bytes. Final step zips the per-group PSTs into
         a single archive (the existing single-zip download contract).
         """
-        import zipfile as _zipfile
         from collections import defaultdict
         from shared.aspose_license import apply_license
-        from shared.azure_storage import upload_blob_with_retry_from_file
+        from shared.azure_storage import upload_blob_with_retry_from_file  # noqa: F401  (used by _flush_group)
 
         apply_license()
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -349,6 +420,11 @@ class PstExportOrchestrator:
             await self.storage_shard.ensure_container(self.dest_container)
 
         await self._safe_progress(5)
+
+        # Tenant-level rate limit — soft cap. If unreachable, we let
+        # the job proceed rather than blocking on infra issues.
+        rate_limit = _TenantRateLimit(self.tenant_id, TENANT_CONCURRENCY)
+        await rate_limit.__aenter__()
 
         # Resumability — load prior progress and skip done groups.
         completed_keys: set = set()
@@ -519,16 +595,37 @@ class PstExportOrchestrator:
         def _register_metadata(group_key: tuple, item) -> None:
             if group_key in group_metadata:
                 return
-            sid_short = str(item.snapshot_id)[:8]
+            sid = str(item.snapshot_id)
+            sid_short = sid[:8]
+            
+            # caller pre-populated resource_label_by_snapshot. Fall back
+            # to the 8-char snapshot id prefix.
+            label = (
+                self.resource_label_by_snapshot.get(sid)
+                or self.resource_label_by_snapshot.get(sid_short)
+                or sid_short
+            )
+            label = _safe_name(label)
             it = item.item_type
             suffix = PstGroupPlanner.TYPE_SUFFIX.get(it, "items")
             if self.granularity == "MAILBOX":
-                fn = f"{sid_short}-{suffix}.pst"
+                fn = f"{label}-{suffix}.pst"
             elif self.granularity == "FOLDER":
                 folder = item.folder_path or "root"
-                fn = f"{sid_short}-{_safe_name(folder)}-{suffix}.pst"
+                # Strip leading "Calendar/" or "Contacts/" prefix that
+                # backups always include; the suffix already conveys type.
+                pretty_folder = folder.lstrip("/").replace("/", "-")
+                if pretty_folder.lower().startswith(("calendar-", "contacts-")):
+                    pretty_folder = pretty_folder.split("-", 1)[1] or pretty_folder
+                fn = f"{label}-{_safe_name(pretty_folder)}-{suffix}.pst"
             else:
-                fn = f"{sid_short}-{item.external_id[:16]}-{suffix}.pst"
+                # ITEM granularity — use the item's own name when present,
+                # else first 12 chars of external_id.
+                base = (
+                    _safe_name((item.name or "")[:32])
+                    or _safe_name(item.external_id[:12])
+                )
+                fn = f"{label}-{base}-{suffix}.pst"
             group_metadata[group_key] = {
                 "item_type": it,
                 "pst_filename": fn,
@@ -536,6 +633,7 @@ class PstExportOrchestrator:
 
         # Stream items, accumulate per group, flush at threshold.
         items_seen = 0
+        cancelled = False
         async for batch in self.item_stream_factory():
             for item in batch:
                 if item.item_type not in self.include_types:
@@ -551,6 +649,23 @@ class PstExportOrchestrator:
                 if len(accumulated[group_key]) >= flush_threshold:
                     await _flush_group(group_key)
                     await _memory_pressure_check(items_seen)
+
+                # Cancellation poll: cheap DB check every N items, lets
+                # an admin stop a runaway whale-mailbox job mid-flight.
+                if (self.cancel_check is not None
+                        and items_seen % CANCEL_CHECK_INTERVAL == 0):
+                    try:
+                        if await self.cancel_check():
+                            logger.warning(
+                                "[pst_export] job=%s cancelled at item=%d",
+                                self.job_id, items_seen,
+                            )
+                            cancelled = True
+                            break
+                    except Exception as exc:
+                        logger.debug("cancel check failed: %s", exc)
+            if cancelled:
+                break
 
             # Total-memory cap: if many small folders accumulate, flush
             # the largest group to bound RAM.
@@ -574,67 +689,65 @@ class PstExportOrchestrator:
 
         await self._safe_progress(85)
 
-        # Final ZIP step: download per-group PSTs from blob, write to a
-        # local ZIP, upload to the well-known job blob path. This second
-        # pass uses /tmp briefly per PST (max one PST at a time).
-        zip_path = self.workdir.parent / f"{self.job_id}.zip"
+        # Final ZIP step: stream per-group PSTs from blob → zipstream-ng
+        # → dest blob, never touching /tmp for the archive bytes. Memory
+        # ceiling = block_size (~4MB) on Azure or zip-size on Seaweed.
+        # Reuses the production-tested helper from mail_export so both
+        # backends behave identically here.
+        from mail_export import stream_zip_to_block_blob
         zip_blob_path = f"pst-exports/{self.job_id}/{self.job_id}.zip"
         total_size = 0
         pst_filenames: list = []
-        try:
-            with _zipfile.ZipFile(str(zip_path), "w", _zipfile.ZIP_STORED) as zf:
-                for entry in pst_blob_paths:
-                    blob_key = entry["blob_path"]
-                    fname = entry["filename"]
-                    local_temp = self.workdir / fname
-                    try:
-                        # Stream-download the PST from blob to /tmp.
-                        chunks = []
-                        if hasattr(self.storage_shard, "download_blob_stream"):
-                            async for chunk in self.storage_shard.download_blob_stream(
-                                self.dest_container, blob_key
-                            ):
-                                chunks.append(chunk)
-                        else:
-                            data = await self.storage_shard.download_blob(
-                                self.dest_container, blob_key
-                            )
-                            if data:
-                                chunks.append(data)
-                        if not chunks:
-                            logger.warning("download empty for %s", blob_key)
-                            continue
-                        with open(local_temp, "wb") as fh:
-                            for c in chunks:
-                                fh.write(c)
-                        zf.write(str(local_temp), arcname=fname)
-                        total_size += local_temp.stat().st_size
-                        pst_filenames.append(fname)
-                    finally:
-                        try:
-                            local_temp.unlink(missing_ok=True)
-                        except Exception:
-                            pass
+        members: list = []
+        for entry in pst_blob_paths:
+            members.append((entry["filename"], self.dest_container, entry["blob_path"]))
+            pst_filenames.append(entry["filename"])
+            total_size += int(entry.get("size") or 0)
 
-            zip_size = zip_path.stat().st_size if zip_path.exists() else 0
-            upload_result = await upload_blob_with_retry_from_file(
-                container_name=self.dest_container,
-                blob_path=zip_blob_path,
-                file_path=str(zip_path),
-                shard=self.storage_shard,
-                file_size=zip_size,
-                metadata={"job_id": self.job_id, "granularity": self.granularity},
-            )
-            success = bool(upload_result.get("success"))
-            if not success:
+        manifest = {
+            "job_id": self.job_id,
+            "granularity": self.granularity,
+            "pst_count": len(pst_filenames),
+            "pst_files": [
+                {"filename": e["filename"], "size": e.get("size"), "type": e.get("item_type")}
+                for e in pst_blob_paths
+            ],
+            "item_counts_by_type": dict(item_counts),
+            "failed_counts_by_type": dict(failed_counts),
+            "skipped_groups": skipped_groups,
+            "total_size_bytes": total_size,
+        }
+        import json as _json
+        manifest_bytes = _json.dumps(manifest, indent=2).encode("utf-8")
+
+        block_size = int(os.environ.get("PST_ZIP_BLOCK_SIZE", str(4 * 1024 * 1024)))
+
+        try:
+            if not members:
+                # Empty selection — nothing to zip, just record the result.
+                logger.info("[pst_export] no PSTs produced, skipping final ZIP")
+                upload_success = True
+            else:
                 try:
-                    zip_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                    await stream_zip_to_block_blob(
+                        dest_shard=self.storage_shard,
+                        dest_container=self.dest_container,
+                        dest_blob_path=zip_blob_path,
+                        members=members,
+                        member_source_shard=self.storage_shard,
+                        manifest_bytes=manifest_bytes,
+                        block_size=block_size,
+                    )
+                    upload_success = True
+                except Exception as zip_exc:
+                    logger.exception("[pst_export] streaming ZIP failed: %s", zip_exc)
+                    upload_success = False
 
             await self._safe_progress(95)
 
-            if not success:
+            if cancelled:
+                status = "cancelled"
+            elif not upload_success:
                 status = "upload_failed"
             elif skipped_groups:
                 status = "done_with_errors"
@@ -646,7 +759,7 @@ class PstExportOrchestrator:
             return {
                 "job_id": self.job_id,
                 "status": status,
-                "blob_path": zip_blob_path if success else None,
+                "blob_path": zip_blob_path if upload_success and pst_filenames else None,
                 "container": self.dest_container,
                 "pst_files": pst_filenames,
                 "pst_count": len(pst_filenames),
@@ -658,6 +771,7 @@ class PstExportOrchestrator:
                 "items_processed": items_seen,
             }
         finally:
+            await rate_limit.__aexit__(None, None, None)
             _cleanup_dir(self.workdir)
             await self._safe_progress(100)
 
