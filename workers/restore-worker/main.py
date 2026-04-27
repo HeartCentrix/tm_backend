@@ -1440,13 +1440,73 @@ class RestoreWorker:
         session: AsyncSession,
         items: List[SnapshotItem],
         message: Dict,
-        spec: Dict
+        spec: Dict,
     ) -> Dict:
-        """Export items as PST file (for email backups)"""
-        # Note: Actual PST generation requires Exchange Web Services or third-party library
-        # For now, export as ZIP with MSG/EML files
-        print(f"[{self.worker_id}] PST export requested - exporting as ZIP instead")
-        return await self.export_as_zip(session, items, message, spec)
+        """Export items as PST archive(s) using Aspose.Email."""
+        import uuid as _uuid
+        from shared.azure_storage import azure_storage_manager
+        from shared.models import Job as _Job
+        from pst_export import PstExportOrchestrator
+
+        _spec = spec or {}
+        job_id = str((message or {}).get("jobId") or (message or {}).get("job_id") or "unknown")
+        tenant_id = str(getattr(items[0], "tenant_id", "") or "") if items else ""
+
+        source_container = (
+            azure_storage_manager.get_container_name(tenant_id, "email")
+            if tenant_id else "mailbox"
+        )
+        dest_container = (
+            azure_storage_manager.get_container_name(tenant_id, "exports")
+            if tenant_id else "exports"
+        )
+        default_shard = azure_storage_manager.get_default_shard()
+        try:
+            await default_shard.ensure_container(dest_container)
+        except Exception as _e:
+            print(f"[{self.worker_id}] export_as_pst: ensure_container({dest_container}) failed (non-fatal): {_e}", flush=True)
+
+        async def _update_progress(pct: int) -> None:
+            try:
+                async with async_session_factory() as s:
+                    j = await s.get(_Job, _uuid.UUID(job_id))
+                    if j:
+                        j.progress_pct = pct
+                        await s.commit()
+            except Exception:
+                pass
+
+        print(f"[{self.worker_id}] export_as_pst ENTER job={job_id} items={len(items)} granularity={_spec.get('pstGranularity','MAILBOX')}", flush=True)
+
+        orch = PstExportOrchestrator(
+            job_id=job_id,
+            items=items,
+            spec=_spec,
+            storage_shard=default_shard,
+            dest_container=dest_container,
+            source_container=source_container,
+            tenant_id=tenant_id,
+            update_progress=_update_progress,
+        )
+
+        result = await orch.run()
+
+        print(f"[{self.worker_id}] export_as_pst DONE job={job_id} pst_count={result.get('pst_count')} status={result.get('status')}", flush=True)
+
+        return {
+            "exported_count": result.get("item_counts_by_type", {}).get("EMAIL", 0)
+                             + result.get("item_counts_by_type", {}).get("CALENDAR_EVENT", 0)
+                             + result.get("item_counts_by_type", {}).get("USER_CONTACT", 0),
+            "failed_count": sum(result.get("failed_counts_by_type", {}).values()),
+            "export_type": "PST",
+            "blob_path": result.get("blob_path"),
+            "container": result.get("container"),
+            "pst_files": result.get("pst_files", []),
+            "pst_count": result.get("pst_count", 0),
+            "total_size_bytes": result.get("total_size_bytes", 0),
+            "granularity": result.get("granularity"),
+            "status": result.get("status"),
+        }
 
     # Pure tree-navigation rows — folder / list / channel definitions
     # with no content (no blob_path AND no payload in metadata.raw).
