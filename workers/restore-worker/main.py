@@ -1759,8 +1759,83 @@ class RestoreWorker:
         import os as _os
         _batch_size = int(_os.environ.get("PST_FETCH_BATCH_SIZE", "1000"))
 
+        # ── Cross-resource expansion for "Download all" ──────────────────
+        # Each user's Mail / Calendar / Contacts live in SEPARATE resources
+        # (USER_MAIL, USER_CALENDAR, USER_CONTACTS) under one ENTRA_USER
+        # parent. The UI sends ONE snapshot id (the currently-viewed tab),
+        # but pstIncludeTypes may span multiple workloads. Find sibling
+        # resources of the same parent and add their latest snapshots so
+        # a "Download all" with Mail+Calendar+Contacts actually covers
+        # all three.
+        ITEM_TYPE_TO_RESOURCE_TYPES = {
+            "EMAIL": {"USER_MAIL", "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX", "M365_GROUP"},
+            "CALENDAR_EVENT": {"USER_CALENDAR", "M365_GROUP"},
+            "USER_CONTACT": {"USER_CONTACTS"},
+        }
+        pst_include_types = set(_spec.get("pstIncludeTypes") or [])
+        if snapshot_ids_stream and pst_include_types:
+            try:
+                from sqlalchemy import or_ as _or
+                # Resolve the picked snapshot's resource → parent
+                first_snap_uuid = _uuid.UUID(str(snapshot_ids_stream[0]))
+                first_snap = await session.get(Snapshot, first_snap_uuid)
+                if first_snap:
+                    picked_resource = await session.get(Resource, first_snap.resource_id)
+                    if picked_resource:
+                        parent_id = (
+                            getattr(picked_resource, "parent_resource_id", None)
+                            or picked_resource.id
+                        )
+                        # Find every sibling resource (incl. picked) under
+                        # the same parent.
+                        sibling_rows = (await session.execute(
+                            select(Resource).where(
+                                _or(
+                                    Resource.parent_resource_id == parent_id,
+                                    Resource.id == parent_id,
+                                )
+                            )
+                        )).scalars().all()
+
+                        # Determine which resource types are needed for
+                        # the requested item types.
+                        needed_resource_types: set = set()
+                        for it in pst_include_types:
+                            needed_resource_types |= ITEM_TYPE_TO_RESOURCE_TYPES.get(it, set())
+
+                        # For each needed resource (other than picked),
+                        # add its latest snapshot to the stream sources.
+                        existing_ids = {str(s) for s in snapshot_ids_stream}
+                        added_ids: list = []
+                        for sib in sibling_rows:
+                            sib_type = sib.type.value if hasattr(sib.type, "value") else str(sib.type)
+                            if sib_type not in needed_resource_types:
+                                continue
+                            if str(sib.id) == str(picked_resource.id):
+                                continue   # already covered by snapshot_ids_stream
+                            latest = (await session.execute(
+                                select(Snapshot.id)
+                                .where(Snapshot.resource_id == sib.id)
+                                .order_by(Snapshot.created_at.desc())
+                                .limit(1)
+                            )).scalar_one_or_none()
+                            if latest and str(latest) not in existing_ids:
+                                snapshot_ids_stream = list(snapshot_ids_stream) + [str(latest)]
+                                existing_ids.add(str(latest))
+                                added_ids.append((sib_type, str(latest)))
+                        if added_ids:
+                            print(
+                                f"[{self.worker_id}] expanded snapshots for cross-workload export: {added_ids}",
+                                flush=True,
+                            )
+            except Exception as _exp_exc:
+                print(
+                    f"[{self.worker_id}] sibling-resource expansion failed (non-fatal): {_exp_exc}",
+                    flush=True,
+                )
+
         # Resolve human-readable resource label per snapshot so PST
-        
+        # filenames look like ``AmitMishra-Inbox-mail.pst`` instead of
         # the cryptic ``5010945e-Inbox-mail.pst``. Falls back to the
         # display_name's local-part if the email is set, else the full
         # display_name with whitespace stripped.
