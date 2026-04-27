@@ -556,6 +556,11 @@ services:
       APP_3_TENANT_ID: ${APP_3_TENANT_ID:-}
       AZURE_AD_CLIENT_ID: ${AZURE_AD_CLIENT_ID}
       AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
+      # PST export — Aspose.Email license delivery
+      ASPOSE_LICENSE_PATH: ${ASPOSE_LICENSE_PATH:-}
+      ASPOSE_LICENSE_KV_SECRET_NAME: ${ASPOSE_LICENSE_KV_SECRET_NAME:-}
+      ASPOSE_LICENSE_KV_URL: ${ASPOSE_LICENSE_KV_URL:-}
+      ASPOSE_EMAIL_LIC_B64: ${ASPOSE_EMAIL_LIC_B64:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -602,6 +607,11 @@ services:
       AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
       RESTORE_WORKER_QUEUE: restore.heavy
       MAX_CONCURRENT_EXPORTS_PER_WORKER: 1
+      # PST export — Aspose.Email license delivery
+      ASPOSE_LICENSE_PATH: ${ASPOSE_LICENSE_PATH:-}
+      ASPOSE_LICENSE_KV_SECRET_NAME: ${ASPOSE_LICENSE_KV_SECRET_NAME:-}
+      ASPOSE_LICENSE_KV_URL: ${ASPOSE_LICENSE_KV_URL:-}
+      ASPOSE_EMAIL_LIC_B64: ${ASPOSE_EMAIL_LIC_B64:-}
     depends_on:
       rabbitmq:
         condition: service_healthy

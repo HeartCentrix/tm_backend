@@ -16,3 +16,8 @@ aiohttp>=3.9.0
 aioboto3>=15.5.0,<16
 aiobotocore>=2.25.0,<3
 boto3>=1.40.0,<2
+
+# PST export via Aspose.Email for Python via .NET
+aspose-email>=24.1
+azure-keyvault-secrets>=4.7
+azure-identity>=1.15
