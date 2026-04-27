@@ -572,6 +572,11 @@ services:
       PST_ITEM_RETRY_MAX: ${PST_ITEM_RETRY_MAX:-3}
       PST_ITEM_RETRY_BACKOFF_BASE: ${PST_ITEM_RETRY_BACKOFF_BASE:-0.5}
       PST_MAX_ATTACHMENT_BYTES: ${PST_MAX_ATTACHMENT_BYTES:-52428800}
+      # PST streaming mode tunables — bound memory regardless of mailbox size
+      PST_FETCH_BATCH_SIZE: ${PST_FETCH_BATCH_SIZE:-1000}
+      PST_GROUP_FLUSH_AT: ${PST_GROUP_FLUSH_AT:-1000}
+      PST_TOTAL_ACCUMULATED_CAP: ${PST_TOTAL_ACCUMULATED_CAP:-5000}
+      PST_AUTO_FOLDER_THRESHOLD: ${PST_AUTO_FOLDER_THRESHOLD:-5000}
     depends_on:
       postgres:
         condition: service_healthy
@@ -635,6 +640,11 @@ services:
       PST_ITEM_RETRY_MAX: ${PST_ITEM_RETRY_MAX:-3}
       PST_ITEM_RETRY_BACKOFF_BASE: ${PST_ITEM_RETRY_BACKOFF_BASE:-0.5}
       PST_MAX_ATTACHMENT_BYTES: ${PST_MAX_ATTACHMENT_BYTES:-52428800}
+      # PST streaming mode tunables — bound memory regardless of mailbox size
+      PST_FETCH_BATCH_SIZE: ${PST_FETCH_BATCH_SIZE:-1000}
+      PST_GROUP_FLUSH_AT: ${PST_GROUP_FLUSH_AT:-1000}
+      PST_TOTAL_ACCUMULATED_CAP: ${PST_TOTAL_ACCUMULATED_CAP:-5000}
+      PST_AUTO_FOLDER_THRESHOLD: ${PST_AUTO_FOLDER_THRESHOLD:-5000}
     depends_on:
       rabbitmq:
         condition: service_healthy

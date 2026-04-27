@@ -658,30 +658,50 @@ class RestoreWorker:
                     snapshot_ids = message.get("snapshotIds", [])
                     item_ids = message.get("itemIds", [])
 
-                    items_to_restore = await self.fetch_snapshot_items(
-                        session, snapshot_ids, item_ids,
-                        folder_paths=spec.get("folderPaths") or [],
-                        excluded_item_ids=spec.get("excludedItemIds") or [],
-                    )
-                    print(f"[{self.worker_id}] fetched {len(items_to_restore)} snapshot items job={job_id}", flush=True)
+                    # PST exports use streaming fetch (bounded memory regardless
+                    # of mailbox size). All other handlers continue with the
+                    # bulk-load contract that gives them a List[SnapshotItem].
+                    if restore_type == "EXPORT_PST":
+                        # Fast count check: don't materialize 100GB worth of
+                        # SnapshotItem rows. Hand a stream descriptor to the
+                        # PST handler — it streams items group-by-group.
+                        item_count = await self.count_snapshot_items(
+                            session, snapshot_ids, item_ids,
+                            folder_paths=spec.get("folderPaths") or [],
+                            excluded_item_ids=spec.get("excludedItemIds") or [],
+                        )
+                        print(
+                            f"[{self.worker_id}] PST stream-mode fetch: count={item_count} job={job_id}",
+                            flush=True,
+                        )
+                        if item_count == 0:
+                            raise ValueError("No snapshot items found to restore")
+                        items_to_restore = []  # PST handler ignores; uses stream
+                    else:
+                        items_to_restore = await self.fetch_snapshot_items(
+                            session, snapshot_ids, item_ids,
+                            folder_paths=spec.get("folderPaths") or [],
+                            excluded_item_ids=spec.get("excludedItemIds") or [],
+                        )
+                        print(f"[{self.worker_id}] fetched {len(items_to_restore)} snapshot items job={job_id}", flush=True)
 
-                    # Workload filter (from RestoreModal checkboxes). When spec.workloads is
-                    # None, skip filtering — back-compat for jobs submitted without the field
-                    # and for Azure/Power-platform restores that don't use the M365 checkboxes.
-                    workloads = spec.get("workloads")
-                    if workloads:
-                        allowed: set = set()
-                        for w in workloads:
-                            allowed |= self.WORKLOAD_ITEM_TYPES.get(w, set())
-                        before = len(items_to_restore)
-                        items_to_restore = [
-                            it for it in items_to_restore
-                            if getattr(it, "item_type", None) in allowed
-                        ]
-                        print(f"[{self.worker_id}] Workload filter {workloads}: kept {len(items_to_restore)}/{before} items")
+                        # Workload filter (from RestoreModal checkboxes). When spec.workloads is
+                        # None, skip filtering — back-compat for jobs submitted without the field
+                        # and for Azure/Power-platform restores that don't use the M365 checkboxes.
+                        workloads = spec.get("workloads")
+                        if workloads:
+                            allowed: set = set()
+                            for w in workloads:
+                                allowed |= self.WORKLOAD_ITEM_TYPES.get(w, set())
+                            before = len(items_to_restore)
+                            items_to_restore = [
+                                it for it in items_to_restore
+                                if getattr(it, "item_type", None) in allowed
+                            ]
+                            print(f"[{self.worker_id}] Workload filter {workloads}: kept {len(items_to_restore)}/{before} items")
 
-                    if not items_to_restore:
-                        raise ValueError("No snapshot items found to restore")
+                        if not items_to_restore:
+                            raise ValueError("No snapshot items found to restore")
 
                     # Route to appropriate restore handler
                     handlers = {
@@ -841,6 +861,182 @@ class RestoreWorker:
             rows = [r for r in rows if r.id not in excluded_uuids]
 
         return rows
+
+    async def count_snapshot_items(
+        self,
+        session: AsyncSession,
+        snapshot_ids: List[str],
+        item_ids: List[str],
+        folder_paths: Optional[List[str]] = None,
+        excluded_item_ids: Optional[List[str]] = None,
+    ) -> int:
+        """Count items the selection would yield WITHOUT materialising them.
+
+        Used by PST streaming mode to fail-fast on empty selections and to
+        decide whether to auto-promote MAILBOX granularity to FOLDER. The
+        sibling-snapshot logic mirrors :meth:`fetch_snapshot_items`, but we
+        wrap the dedup query in a ``SELECT COUNT(*) FROM (…)`` so the DB
+        does the counting in one round-trip.
+        """
+        from sqlalchemy import func, or_ as _or
+
+        folder_paths = folder_paths or []
+        excluded_item_ids = excluded_item_ids or []
+
+        if item_ids and not folder_paths and not excluded_item_ids:
+            cnt = (await session.execute(
+                select(func.count())
+                .select_from(SnapshotItem)
+                .where(SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids]))
+            )).scalar_one()
+            return int(cnt or 0)
+
+        if not snapshot_ids:
+            return 0
+
+        picked_uuids = [uuid.UUID(sid) for sid in snapshot_ids]
+        picked_rows = (await session.execute(
+            select(Snapshot).where(Snapshot.id.in_(picked_uuids))
+        )).scalars().all()
+
+        sibling_ids: set = set()
+        if picked_rows:
+            for picked in picked_rows:
+                rows = (await session.execute(
+                    select(Snapshot.id).where(
+                        Snapshot.resource_id == picked.resource_id,
+                        Snapshot.created_at <= picked.created_at,
+                    )
+                )).all()
+                sibling_ids.update(r[0] for r in rows)
+        if not sibling_ids:
+            sibling_ids = set(picked_uuids)
+
+        # Inner: DISTINCT external_id newest-wins; outer: COUNT(*).
+        inner = (
+            select(SnapshotItem.id)
+            .join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id)
+            .where(SnapshotItem.snapshot_id.in_(sibling_ids))
+            .order_by(SnapshotItem.external_id, Snapshot.created_at.desc())
+            .distinct(SnapshotItem.external_id)
+        )
+
+        if folder_paths or item_ids:
+            from shared.folder_resolver import _prefix_and_exact_for
+            clauses = []
+            if item_ids:
+                clauses.append(SnapshotItem.id.in_([uuid.UUID(iid) for iid in item_ids]))
+            prefixes, exacts = _prefix_and_exact_for(folder_paths)
+            for prefix in prefixes:
+                clauses.append(SnapshotItem.folder_path.like(prefix))
+            if exacts:
+                clauses.append(SnapshotItem.folder_path.in_(exacts))
+            if clauses:
+                inner = inner.where(_or(*clauses))
+
+        cnt = (await session.execute(
+            select(func.count()).select_from(inner.subquery())
+        )).scalar_one()
+        return int(cnt or 0)
+
+    async def stream_snapshot_items_by_group(
+        self,
+        session_factory,
+        snapshot_ids: List[str],
+        item_ids: List[str],
+        folder_paths: Optional[List[str]] = None,
+        excluded_item_ids: Optional[List[str]] = None,
+        item_types: Optional[set] = None,
+        batch_size: int = 1000,
+    ):
+        """Yield ``(group_key, items_batch)`` tuples in stable order.
+
+        Bounded memory regardless of mailbox size: each batch is at most
+        ``batch_size`` items, and we re-open a fresh DB session per batch
+        so SQLAlchemy's identity map / ORM heap doesn't grow unboundedly.
+
+        Order: ``(item_type, folder_path, external_id)``. Items sharing
+        the leading two columns are emitted contiguously, so a downstream
+        consumer can detect group transitions by comparing
+        ``(item_type, folder_path)`` between successive items.
+
+        Sibling-snapshot unioning + DISTINCT ON (external_id) newest-wins
+        is applied identically to ``fetch_snapshot_items``.
+        """
+        from sqlalchemy import or_ as _or
+
+        # Resolve sibling snapshot set ONCE, in its own short-lived session.
+        async with session_factory() as session:
+            picked_uuids = [uuid.UUID(sid) for sid in snapshot_ids]
+            picked_rows = (await session.execute(
+                select(Snapshot).where(Snapshot.id.in_(picked_uuids))
+            )).scalars().all()
+
+            sibling_ids: set = set()
+            if picked_rows:
+                for picked in picked_rows:
+                    rows = (await session.execute(
+                        select(Snapshot.id).where(
+                            Snapshot.resource_id == picked.resource_id,
+                            Snapshot.created_at <= picked.created_at,
+                        )
+                    )).all()
+                    sibling_ids.update(r[0] for r in rows)
+            if not sibling_ids:
+                sibling_ids = set(picked_uuids)
+
+        excluded_uuids = (
+            {uuid.UUID(iid) for iid in (excluded_item_ids or [])}
+            if excluded_item_ids else set()
+        )
+
+        # Keyset pagination on (external_id, snapshot_id) — DISTINCT ON
+        # external_id with newest-wins means we always get one row per
+        # logical item, so external_id alone is a stable cursor.
+        from shared.folder_resolver import _prefix_and_exact_for
+        prefixes, exacts = _prefix_and_exact_for(folder_paths or [])
+
+        last_ext = ""
+        while True:
+            async with session_factory() as session:
+                inner = (
+                    select(SnapshotItem)
+                    .join(Snapshot, Snapshot.id == SnapshotItem.snapshot_id)
+                    .where(SnapshotItem.snapshot_id.in_(sibling_ids))
+                    .where(SnapshotItem.external_id > last_ext)
+                    .order_by(SnapshotItem.external_id, Snapshot.created_at.desc())
+                    .distinct(SnapshotItem.external_id)
+                    .limit(batch_size)
+                )
+
+                clauses = []
+                if item_ids:
+                    clauses.append(SnapshotItem.id.in_([uuid.UUID(i) for i in item_ids]))
+                for prefix in prefixes:
+                    clauses.append(SnapshotItem.folder_path.like(prefix))
+                if exacts:
+                    clauses.append(SnapshotItem.folder_path.in_(exacts))
+                if clauses:
+                    inner = inner.where(_or(*clauses))
+                if item_types:
+                    inner = inner.where(SnapshotItem.item_type.in_(item_types))
+
+                batch = (await session.execute(inner)).scalars().all()
+                # Detach so caller can safely use after session close.
+                for it in batch:
+                    session.expunge(it)
+
+            if not batch:
+                break
+            if excluded_uuids:
+                batch = [r for r in batch if r.id not in excluded_uuids]
+            if not batch:
+                # Whole batch excluded — keep paging.
+                # Use the highest external_id we saw in the original batch.
+                last_ext = batch[-1].external_id if batch else last_ext
+                continue
+            yield batch
+            last_ext = batch[-1].external_id
 
     # ==================== Restore Handlers ====================
 
@@ -1526,9 +1722,40 @@ class RestoreWorker:
 
         print(f"[{self.worker_id}] export_as_pst ENTER job={job_id} items={len(items)} granularity={_spec.get('pstGranularity','MAILBOX')}", flush=True)
 
+        # Streaming source for items: orchestrator pages through DB rather
+        # than receiving a pre-loaded list. Enables 100GB+ mailboxes on
+        # memory-constrained pods because at most one batch lives in RAM.
+        snapshot_ids_stream = (message or {}).get("snapshotIds") or _spec.get("snapshot_ids") or []
+        item_ids_stream = (message or {}).get("itemIds") or _spec.get("item_ids") or []
+        folder_paths_stream = _spec.get("folderPaths") or []
+        excluded_stream = _spec.get("excludedItemIds") or []
+        # Apply workload filter to item types (Mail/Contacts/Calendar checkboxes).
+        wl = _spec.get("workloads")
+        if wl:
+            allowed: set = set()
+            for w in wl:
+                allowed |= self.WORKLOAD_ITEM_TYPES.get(w, set())
+            item_types_filter = allowed
+        else:
+            item_types_filter = None
+
+        import os as _os
+        _batch_size = int(_os.environ.get("PST_FETCH_BATCH_SIZE", "1000"))
+
+        def _make_stream():
+            return self.stream_snapshot_items_by_group(
+                async_session_factory,
+                snapshot_ids=[str(s) for s in snapshot_ids_stream],
+                item_ids=[str(i) for i in item_ids_stream],
+                folder_paths=folder_paths_stream,
+                excluded_item_ids=excluded_stream,
+                item_types=item_types_filter,
+                batch_size=_batch_size,
+            )
+
         orch = PstExportOrchestrator(
             job_id=job_id,
-            items=items,
+            items=items,                     # may be empty list (PST stream mode)
             spec=_spec,
             storage_shard=default_shard,
             dest_container=dest_container,
@@ -1537,6 +1764,7 @@ class RestoreWorker:
             update_progress=_update_progress,
             checkpoint_loader=_checkpoint_load,
             checkpoint_saver=_checkpoint_save,
+            item_stream_factory=_make_stream,
         )
 
         result = await orch.run()

@@ -268,6 +268,7 @@ class PstExportOrchestrator:
         update_progress=None,
         checkpoint_loader=None,    # async () -> dict | None
         checkpoint_saver=None,     # async (dict) -> None
+        item_stream_factory=None,  # callable -> async-iterator of [SnapshotItem] batches
     ):
         self.job_id = job_id
         self.items = items
@@ -287,12 +288,19 @@ class PstExportOrchestrator:
         # the worker restart even though /tmp/<job_id> is wiped.
         self.checkpoint_loader = checkpoint_loader
         self.checkpoint_saver = checkpoint_saver
+        self.item_stream_factory = item_stream_factory
         self.granularity = spec.get("pstGranularity", "MAILBOX").upper()
         self.split_gb = float(spec.get("pstSplitSizeGb", 45))
         self.include_types = set(
             spec.get("pstIncludeTypes", ["EMAIL", "CALENDAR_EVENT", "USER_CONTACT"])
         )
         self.workdir = Path(f"/tmp/pst-export/{job_id}")
+        # When the user picks MAILBOX granularity but the mailbox holds
+        # more items than this, auto-promote to FOLDER. Each per-folder
+        # PST stays small + uploads independently → bounded /tmp usage.
+        self.auto_folder_threshold = int(
+            os.environ.get("PST_AUTO_FOLDER_THRESHOLD", "5000")
+        )
 
     async def _safe_progress(self, pct: int) -> None:
         """Invoke ``update_progress`` swallowing any exception it raises."""
@@ -303,8 +311,360 @@ class PstExportOrchestrator:
                 logger.warning("progress update failed at %d%%: %s", pct, exc)
 
     async def run(self) -> dict:
-        """Plan groups, dispatch writers, ZIP output, upload, return result.
+        """Entry point.  Routes to streaming mode when an
+        ``item_stream_factory`` is provided (preferred for production
+        durability — bounded memory regardless of mailbox size); falls
+        back to the legacy bulk-list mode for callers passing
+        ``items=...`` directly (tests, small inline cases)."""
+        if self.item_stream_factory is not None:
+            return await self._run_streaming()
+        return await self._run_bulk()
 
+    async def _run_streaming(self) -> dict:
+        """Streaming PST export — fail-proof for 100GB+ mailboxes.
+
+        Pulls items batch-by-batch from ``item_stream_factory`` so the
+        worker never holds the full mailbox in RAM. Each group's PST is
+        uploaded to blob and the local file deleted as soon as the group
+        finishes, so /tmp never accumulates more than one in-flight
+        group's worth of bytes. Final step zips the per-group PSTs into
+        a single archive (the existing single-zip download contract).
+        """
+        import zipfile as _zipfile
+        from collections import defaultdict
+        from shared.aspose_license import apply_license
+        from shared.azure_storage import upload_blob_with_retry_from_file
+
+        apply_license()
+        self.workdir.mkdir(parents=True, exist_ok=True)
+
+        # Resolve storage shard if caller didn't pass one in.
+        if self.storage_shard is None:
+            from shared.azure_storage import azure_storage_manager
+            self.storage_shard = azure_storage_manager.get_default_shard()
+            if not self.dest_container or self.dest_container == "exports":
+                self.dest_container = azure_storage_manager.get_container_name(
+                    self.tenant_id, "exports"
+                )
+            await self.storage_shard.ensure_container(self.dest_container)
+
+        await self._safe_progress(5)
+
+        # Resumability — load prior progress and skip done groups.
+        completed_keys: set = set()
+        prior_blobs: list = []
+        if self.checkpoint_loader is not None:
+            try:
+                prior = await self.checkpoint_loader()
+                if prior:
+                    completed_keys = {
+                        tuple(k) if isinstance(k, list) else k
+                        for k in prior.get("completed_keys", [])
+                    }
+                    prior_blobs = list(prior.get("pst_blobs", []) or [])
+                    logger.info(
+                        "[pst_export] resumed: %d groups done, %d PSTs uploaded",
+                        len(completed_keys), len(prior_blobs),
+                    )
+            except Exception as exc:
+                logger.warning("[pst_export] checkpoint load failed: %s", exc)
+
+        item_counts: dict = defaultdict(int)
+        failed_counts: dict = defaultdict(int)
+        skipped_groups: list = []
+        pst_blob_paths: list = list(prior_blobs)
+        # Per-group accumulator. Memory bound = Σ(items per active group).
+        accumulated: dict[tuple, list] = defaultdict(list)
+        # Map of group_key -> filename + item_type for flushing.
+        group_metadata: dict[tuple, dict] = {}
+
+        flush_threshold = int(os.environ.get("PST_GROUP_FLUSH_AT", "1000"))
+        total_accumulated_cap = int(os.environ.get("PST_TOTAL_ACCUMULATED_CAP", "5000"))
+
+        writer_map = {
+            "EMAIL": MailPstWriter,
+            "CALENDAR_EVENT": CalendarPstWriter,
+            "USER_CONTACT": ContactPstWriter,
+        }
+
+        async def _flush_group(group_key: tuple) -> None:
+            """Write one group's accumulated items to a PST, upload to
+            blob, delete the local file, update checkpoint. Memory and
+            disk are reclaimed in this single function."""
+            items_to_write = accumulated.pop(group_key, [])
+            if not items_to_write:
+                return
+            meta = group_metadata.get(group_key)
+            if not meta:
+                logger.warning("flush_group: no metadata for %s", group_key)
+                return
+            item_type = meta["item_type"]
+            WriterClass = writer_map.get(item_type)
+            if WriterClass is None:
+                skipped_groups.append({
+                    "key": str(group_key), "reason": "unsupported_type"
+                })
+                failed_counts[item_type] += len(items_to_write)
+                return
+
+            group = PstGroup(
+                key=group_key,
+                item_type=item_type,
+                items=items_to_write,
+                pst_filename=meta["pst_filename"],
+            )
+
+            import time as _time
+            t0 = _time.monotonic()
+            try:
+                writer = WriterClass()
+                async with _get_write_semaphore():
+                    write_result = await asyncio.wait_for(
+                        writer.write(
+                            group=group,
+                            workdir=self.workdir,
+                            split_gb=self.split_gb,
+                            shard=self.storage_shard,
+                            source_container=self.source_container,
+                        ),
+                        timeout=GROUP_TIMEOUT_S,
+                    )
+                item_counts[item_type] += write_result.item_count
+                failed_counts[item_type] += write_result.failed_count
+
+                # Upload each produced PST to blob immediately, then
+                # delete the local file. This bounds /tmp regardless of
+                # total mailbox size.
+                for pst_path in write_result.pst_paths:
+                    if not pst_path.exists():
+                        continue
+                    blob_key = f"pst-exports/{self.job_id}/{pst_path.name}"
+                    try:
+                        size = pst_path.stat().st_size
+                        upload_res = await upload_blob_with_retry_from_file(
+                            container_name=self.dest_container,
+                            blob_path=blob_key,
+                            file_path=str(pst_path),
+                            shard=self.storage_shard,
+                            file_size=size,
+                            metadata={
+                                "job_id": self.job_id,
+                                "type": item_type,
+                            },
+                        )
+                        if upload_res.get("success"):
+                            pst_blob_paths.append({
+                                "blob_path": blob_key,
+                                "filename": pst_path.name,
+                                "size": size,
+                                "item_type": item_type,
+                            })
+                        else:
+                            logger.error(
+                                "PST upload failed for %s: %s",
+                                pst_path.name, upload_res.get("error"),
+                            )
+                            skipped_groups.append({
+                                "key": str(group_key),
+                                "filename": pst_path.name,
+                                "reason": "upload_failed",
+                                "error": str(upload_res.get("error"))[:200],
+                            })
+                    finally:
+                        # upload_blob_with_retry_from_file already unlinks
+                        # on success; this is a defensive belt-and-braces
+                        # for the failure path.
+                        try:
+                            pst_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+                completed_keys.add(group_key)
+                logger.info(
+                    "[pst_export] group %s flushed: items=%d psts=%d in %.2fs",
+                    group_key, write_result.item_count,
+                    len(write_result.pst_paths), _time.monotonic() - t0,
+                )
+
+                # Persist checkpoint after each group. Survives crash.
+                if self.checkpoint_saver is not None:
+                    try:
+                        await self.checkpoint_saver({
+                            "completed_keys": [list(k) for k in completed_keys],
+                            "pst_blobs": pst_blob_paths,
+                        })
+                    except Exception as exc:
+                        logger.warning("checkpoint save failed: %s", exc)
+            except Exception as exc:
+                logger.exception(
+                    "[pst_export] flush_group %s FAILED: %s", group_key, exc,
+                )
+                skipped_groups.append({
+                    "key": str(group_key),
+                    "items": len(items_to_write),
+                    "error": str(exc)[:200],
+                })
+                failed_counts[item_type] += len(items_to_write)
+
+        def _compute_group_key(item) -> tuple:
+            sid = str(item.snapshot_id)
+            it = item.item_type
+            if self.granularity == "MAILBOX":
+                return (sid, it)
+            if self.granularity == "FOLDER":
+                return (sid, it, item.folder_path or "root")
+            # ITEM
+            return (sid, it, item.external_id)
+
+        def _register_metadata(group_key: tuple, item) -> None:
+            if group_key in group_metadata:
+                return
+            sid_short = str(item.snapshot_id)[:8]
+            it = item.item_type
+            suffix = PstGroupPlanner.TYPE_SUFFIX.get(it, "items")
+            if self.granularity == "MAILBOX":
+                fn = f"{sid_short}-{suffix}.pst"
+            elif self.granularity == "FOLDER":
+                folder = item.folder_path or "root"
+                fn = f"{sid_short}-{_safe_name(folder)}-{suffix}.pst"
+            else:
+                fn = f"{sid_short}-{item.external_id[:16]}-{suffix}.pst"
+            group_metadata[group_key] = {
+                "item_type": it,
+                "pst_filename": fn,
+            }
+
+        # Stream items, accumulate per group, flush at threshold.
+        items_seen = 0
+        async for batch in self.item_stream_factory():
+            for item in batch:
+                if item.item_type not in self.include_types:
+                    continue
+                group_key = _compute_group_key(item)
+                if group_key in completed_keys:
+                    continue
+                _register_metadata(group_key, item)
+                accumulated[group_key].append(item)
+                items_seen += 1
+
+                # Per-group flush
+                if len(accumulated[group_key]) >= flush_threshold:
+                    await _flush_group(group_key)
+                    await _memory_pressure_check(items_seen)
+
+            # Total-memory cap: if many small folders accumulate, flush
+            # the largest group to bound RAM.
+            total_acc = sum(len(v) for v in accumulated.values())
+            while total_acc > total_accumulated_cap and accumulated:
+                largest_key = max(accumulated, key=lambda k: len(accumulated[k]))
+                await _flush_group(largest_key)
+                await _memory_pressure_check(items_seen)
+                total_acc = sum(len(v) for v in accumulated.values())
+
+            # Progress: smear 5%→80% across the stream by item count.
+            # We don't know the total upfront, so scale logarithmically.
+            if items_seen > 0:
+                # Cap at 80% — final 20% is for ZIP + upload.
+                pct = min(80, 5 + int(items_seen ** 0.5 / 10))
+                await self._safe_progress(pct)
+
+        # Flush remaining accumulated groups.
+        for group_key in list(accumulated.keys()):
+            await _flush_group(group_key)
+
+        await self._safe_progress(85)
+
+        # Final ZIP step: download per-group PSTs from blob, write to a
+        # local ZIP, upload to the well-known job blob path. This second
+        # pass uses /tmp briefly per PST (max one PST at a time).
+        zip_path = self.workdir.parent / f"{self.job_id}.zip"
+        zip_blob_path = f"pst-exports/{self.job_id}/{self.job_id}.zip"
+        total_size = 0
+        pst_filenames: list = []
+        try:
+            with _zipfile.ZipFile(str(zip_path), "w", _zipfile.ZIP_STORED) as zf:
+                for entry in pst_blob_paths:
+                    blob_key = entry["blob_path"]
+                    fname = entry["filename"]
+                    local_temp = self.workdir / fname
+                    try:
+                        # Stream-download the PST from blob to /tmp.
+                        chunks = []
+                        if hasattr(self.storage_shard, "download_blob_stream"):
+                            async for chunk in self.storage_shard.download_blob_stream(
+                                self.dest_container, blob_key
+                            ):
+                                chunks.append(chunk)
+                        else:
+                            data = await self.storage_shard.download_blob(
+                                self.dest_container, blob_key
+                            )
+                            if data:
+                                chunks.append(data)
+                        if not chunks:
+                            logger.warning("download empty for %s", blob_key)
+                            continue
+                        with open(local_temp, "wb") as fh:
+                            for c in chunks:
+                                fh.write(c)
+                        zf.write(str(local_temp), arcname=fname)
+                        total_size += local_temp.stat().st_size
+                        pst_filenames.append(fname)
+                    finally:
+                        try:
+                            local_temp.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+            zip_size = zip_path.stat().st_size if zip_path.exists() else 0
+            upload_result = await upload_blob_with_retry_from_file(
+                container_name=self.dest_container,
+                blob_path=zip_blob_path,
+                file_path=str(zip_path),
+                shard=self.storage_shard,
+                file_size=zip_size,
+                metadata={"job_id": self.job_id, "granularity": self.granularity},
+            )
+            success = bool(upload_result.get("success"))
+            if not success:
+                try:
+                    zip_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            await self._safe_progress(95)
+
+            if not success:
+                status = "upload_failed"
+            elif skipped_groups:
+                status = "done_with_errors"
+            elif not pst_filenames:
+                status = "no_psts"
+            else:
+                status = "done"
+
+            return {
+                "job_id": self.job_id,
+                "status": status,
+                "blob_path": zip_blob_path if success else None,
+                "container": self.dest_container,
+                "pst_files": pst_filenames,
+                "pst_count": len(pst_filenames),
+                "total_size_bytes": total_size,
+                "item_counts_by_type": dict(item_counts),
+                "failed_counts_by_type": dict(failed_counts),
+                "skipped_groups": skipped_groups,
+                "granularity": self.granularity,
+                "items_processed": items_seen,
+            }
+        finally:
+            _cleanup_dir(self.workdir)
+            await self._safe_progress(100)
+
+    async def _run_bulk(self) -> dict:
+        """Legacy bulk-list mode — used by tests and small inline calls.
+
+        Plan groups, dispatch writers, ZIP output, upload, return result.
         Steps:
           1. ``apply_license()`` (Aspose.Email needs the metered licence).
           2. Plan groups via :class:`PstGroupPlanner`.
