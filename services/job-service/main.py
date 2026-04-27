@@ -31,22 +31,41 @@ AZURE_WORKLOAD_QUEUES = {
 }
 
 M365_RESOURCE_TYPES = [
+    # Tier-1 mailbox / drive resources (legacy, still in use for some
+    # tenants).
     ResourceType.MAILBOX,
     ResourceType.SHARED_MAILBOX,
     ResourceType.ROOM_MAILBOX,
     ResourceType.ONEDRIVE,
+    # Tier-2 per-workload children. Each ENTRA_USER discovered today
+    # gets one of each — USER_MAIL/USER_CALENDAR/USER_CONTACTS/
+    # USER_ONEDRIVE/USER_CHATS — and the actual backup data lives in
+    # these rows, not on the parent ENTRA_USER. Earlier versions of this
+    # list omitted them, which made "Backup all M365 now" silently skip
+    # ~60% of eligible content.
+    ResourceType.USER_MAIL,
+    ResourceType.USER_CALENDAR,
+    ResourceType.USER_CONTACTS,
+    ResourceType.USER_ONEDRIVE,
+    ResourceType.USER_CHATS,
+    # Group + SharePoint resources.
+    ResourceType.M365_GROUP,
     ResourceType.SHAREPOINT_SITE,
     ResourceType.TEAMS_CHANNEL,
     ResourceType.TEAMS_CHAT,
+    # Identity surface — Entra metadata is its own backup pipeline
+    # (entra-export worker), still triggered by the same datasource hit.
     ResourceType.ENTRA_USER,
     ResourceType.ENTRA_GROUP,
     ResourceType.ENTRA_APP,
     ResourceType.ENTRA_DEVICE,
     ResourceType.ENTRA_SERVICE_PRINCIPAL,
+    # Power Platform.
     ResourceType.POWER_BI,
     ResourceType.POWER_APPS,
     ResourceType.POWER_AUTOMATE,
     ResourceType.POWER_DLP,
+    # Misc M365 surfaces backed by their own workers.
     ResourceType.COPILOT,
     ResourceType.PLANNER,
     ResourceType.TODO,
