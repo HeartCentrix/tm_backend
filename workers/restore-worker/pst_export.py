@@ -448,6 +448,12 @@ class PstExportOrchestrator:
         from collections import defaultdict
         from shared.aspose_license import apply_license
         from shared.azure_storage import upload_blob_with_retry_from_file  # noqa: F401  (used by _flush_group)
+        # Lazy import metrics module — module-level safe_* helpers no-op
+        # when the prometheus_client dep is missing or the HTTP server
+        # never came up (init() is called once at worker boot).
+        from shared import pst_metrics as _m
+        import time as _time
+        _job_started_at = _time.monotonic()
 
         apply_license()
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -601,11 +607,19 @@ class PstExportOrchestrator:
                             pass
 
                 completed_keys.add(group_key)
+                _elapsed = _time.monotonic() - t0
                 logger.info(
                     "[pst_export] group %s flushed: items=%d psts=%d in %.2fs",
                     group_key, write_result.item_count,
-                    len(write_result.pst_paths), _time.monotonic() - t0,
+                    len(write_result.pst_paths), _elapsed,
                 )
+                _m.safe_observe(_m.group_duration_seconds, _elapsed, item_type)
+                _m.safe_inc(_m.items_total, item_type, amount=write_result.item_count)
+                if write_result.failed_count:
+                    _m.safe_inc(
+                        _m.items_failed_total, item_type, "build_or_insert",
+                        amount=write_result.failed_count,
+                    )
 
                 # Persist checkpoint after each group. Survives crash.
                 if self.checkpoint_saver is not None:
@@ -800,6 +814,13 @@ class PstExportOrchestrator:
                 status = "no_psts"
             else:
                 status = "done"
+
+            # Final job metrics — bucketed by granularity + status so the
+            # Grafana dashboard can spot slow whales vs quick small jobs.
+            _job_elapsed = _time.monotonic() - _job_started_at
+            _m.safe_observe(_m.job_duration_seconds, _job_elapsed,
+                            self.granularity, status)
+            _m.safe_inc(_m.job_total, status, self.granularity)
 
             return {
                 "job_id": self.job_id,

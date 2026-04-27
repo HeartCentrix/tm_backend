@@ -822,6 +822,31 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
             tenant_id = str(resource.tenant_id)
             resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
 
+    # Estimate total selection size so the message_bus router can send
+    # whale jobs (>HEAVY_EXPORT_THRESHOLD_BYTES, default 20 GB) to
+    # restore.heavy automatically. Falls back to 0 (= normal queue) if
+    # the snapshot has no item rows yet (rare race) or the query errors.
+    total_bytes = 0
+    try:
+        from sqlalchemy import func as _func
+        if item_ids:
+            stmt = sa_select(_func.coalesce(_func.sum(SnapshotItem.content_size), 0)).where(
+                SnapshotItem.id.in_([UUID(i) for i in item_ids])
+            )
+        elif snapshot_ids:
+            stmt = sa_select(_func.coalesce(_func.sum(SnapshotItem.content_size), 0)).where(
+                SnapshotItem.snapshot_id.in_([UUID(s) for s in snapshot_ids])
+            )
+        else:
+            stmt = None
+        if stmt is not None:
+            total_bytes = int((await db.execute(stmt)).scalar_one() or 0)
+        spec["totalBytes"] = total_bytes
+    except Exception as size_exc:
+        # Router will fall back to restore.normal — non-fatal.
+        spec["totalBytes"] = 0
+        print(f"[JOB_SERVICE] totalBytes estimate failed (non-fatal): {size_exc}")
+
     job = Job(
         id=uuid4(),
         type=JobType.RESTORE,

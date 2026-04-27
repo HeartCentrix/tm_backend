@@ -598,6 +598,7 @@ services:
       PST_RATE_LIMIT_PER_KEY: ${PST_RATE_LIMIT_PER_KEY:-3}
       PST_CANCEL_CHECK_INTERVAL: ${PST_CANCEL_CHECK_INTERVAL:-10}
       PST_ZIP_BLOCK_SIZE: ${PST_ZIP_BLOCK_SIZE:-4194304}
+      PST_METRICS_PORT: ${PST_METRICS_PORT:-9100}
     depends_on:
       postgres:
         condition: service_healthy
@@ -679,6 +680,7 @@ services:
       PST_RATE_LIMIT_PER_KEY: ${PST_RATE_LIMIT_PER_KEY:-3}
       PST_CANCEL_CHECK_INTERVAL: ${PST_CANCEL_CHECK_INTERVAL:-10}
       PST_ZIP_BLOCK_SIZE: ${PST_ZIP_BLOCK_SIZE:-4194304}
+      PST_METRICS_PORT: ${PST_METRICS_PORT:-9100}
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -769,10 +771,109 @@ services:
     deploy:
       replicas: ${DR_WORKER_REPLICAS:-1}
 
+  # ---------------------------------------------------------------------------
+  # Observability — Prometheus + Grafana (gated by 'observability' profile)
+  # Bring up with: docker compose --profile observability up -d
+  # Scrapes metrics on the worker pods at :9100/metrics. Grafana on :3001.
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: tm_vault_prometheus
+    profiles: ["observability"]
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--storage.tsdb.path=/prometheus"
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: tm_vault_grafana
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./ops/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  # ---------------------------------------------------------------------------
+  # Postgres read-replica (gated by 'ha' profile). For true production HA
+  # use a managed service (Azure Database for PostgreSQL Flexible Server,
+  # AWS RDS, Cloud SQL) — this compose service is for dev-validating the
+  # app-side failover behaviour, not for production-grade replication.
+  # ---------------------------------------------------------------------------
+  postgres-replica:
+    image: postgres:16
+    container_name: tm_vault_db_replica
+    profiles: ["ha"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGUSER: replicator
+    command: >
+      bash -c "
+        until pg_basebackup --pgdata=/var/lib/postgresql/data -R --slot=replica_slot --host=postgres --port=5432; do
+          echo 'Waiting for primary to be ready...'; sleep 5;
+        done
+        echo 'standby_mode = on' >> /var/lib/postgresql/data/postgresql.conf
+        chown -R postgres:postgres /var/lib/postgresql/data
+        exec postgres
+      "
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  # ---------------------------------------------------------------------------
+  # Redis Sentinel (gated by 'ha' profile). For production: managed Redis
+  # (Azure Cache for Redis Premium, ElastiCache) or a self-hosted Sentinel
+  # cluster. This single-Sentinel setup validates app-side failover.
+  # ---------------------------------------------------------------------------
+  redis-sentinel:
+    image: bitnami/redis-sentinel:latest
+    container_name: tm_vault_redis_sentinel
+    profiles: ["ha"]
+    environment:
+      REDIS_MASTER_HOST: redis
+      REDIS_MASTER_SET: tmvault-master
+      REDIS_SENTINEL_QUORUM: "1"
+      REDIS_SENTINEL_DOWN_AFTER_MILLISECONDS: "10000"
+      REDIS_SENTINEL_FAILOVER_TIMEOUT: "30000"
+    ports:
+      - "26379:26379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
 volumes:
   postgres_data:
+  postgres_replica_data:
   redis_data:
   azurite_data:
+  prometheus_data:
+  grafana_data:
 
 networks:
   tm-network:

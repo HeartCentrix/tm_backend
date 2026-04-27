@@ -545,6 +545,14 @@ class RestoreWorker:
 
         print(f"[{self.worker_id}] Restore worker initialized")
 
+        # Bring up Prometheus metrics endpoint (no-op if prometheus_client
+        # missing or PST_METRICS_PORT already bound by another process).
+        try:
+            from shared.pst_metrics import init as _metrics_init
+            _metrics_init()
+        except Exception as _m_exc:
+            print(f"[{self.worker_id}] metrics init skipped: {_m_exc}")
+
     async def start(self):
         """Start consuming from restore queues"""
         # Wait for RabbitMQ to be ready (retry loop)
