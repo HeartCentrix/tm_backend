@@ -1,8 +1,10 @@
-"""PST export — planner + orchestrator shell.
+"""PST export — planner + orchestrator.
 
 PstGroupPlanner groups SnapshotItems into PstGroups by mailbox, folder, or
-individual item.  PstExportOrchestrator (shell only for Task 3) plans the
-groups and returns the plan; writers are implemented in subsequent tasks.
+individual item.  PstExportOrchestrator plans the groups, dispatches the
+correct per-type writer, ZIPs the resulting ``.pst`` files, uploads the
+archive to blob storage, and reports progress via an optional async
+callback.
 
 All Aspose imports are lazy (never at module top level) because aspose-email
 is not installed in the local dev environment.
@@ -11,9 +13,18 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# Per-type writers — imported at module top so tests can patch
+# ``pst_export.MailPstWriter`` etc.  The writer modules themselves keep
+# all ``aspose.*`` imports lazy, so importing them here is safe in the
+# dev/test environment.
+from pst_writers.mail import MailPstWriter
+from pst_writers.calendar import CalendarPstWriter
+from pst_writers.contact import ContactPstWriter
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +34,16 @@ def _safe_name(s: str) -> str:
     truncate to 64 characters."""
     sanitized = re.sub(r"[^A-Za-z0-9\-_]", "_", s)
     return sanitized[:64]
+
+
+def _cleanup_dir(path: Path) -> None:
+    """Best-effort recursive delete of ``path``.  Swallows errors; the
+    PST workdir lives under ``/tmp`` and we don't want a stray cleanup
+    failure to mask an otherwise successful export."""
+    try:
+        shutil.rmtree(str(path), ignore_errors=True)
+    except Exception:  # pragma: no cover - defensive
+        pass
 
 
 @dataclass
@@ -140,8 +161,11 @@ class PstGroupPlanner:
 
 
 class PstExportOrchestrator:
-    """Entry point for PST export.  Writers are not yet implemented (Task 4+).
-    This shell plans the groups and returns a planning result dict.
+    """Entry point for PST export.
+
+    Plans groups, dispatches per-type writers, ZIPs the resulting PST
+    files, uploads the archive to blob storage, cleans up the local
+    workdir, and reports progress via an optional async callback.
     """
 
     def __init__(
@@ -150,11 +174,19 @@ class PstExportOrchestrator:
         items: list,
         spec: dict,
         storage_shard=None,
+        dest_container: str = "exports",
+        source_container: str = "",
+        tenant_id: str = "",
+        update_progress=None,
     ):
         self.job_id = job_id
         self.items = items
         self.spec = spec
         self.storage_shard = storage_shard
+        self.dest_container = dest_container or "exports"
+        self.source_container = source_container
+        self.tenant_id = tenant_id
+        self.update_progress = update_progress
         self.granularity = spec.get("pstGranularity", "MAILBOX").upper()
         self.split_gb = float(spec.get("pstSplitSizeGb", 45))
         self.include_types = set(
@@ -163,30 +195,122 @@ class PstExportOrchestrator:
         self.workdir = Path(f"/tmp/pst-export/{job_id}")
 
     async def run(self) -> dict:
-        """Plan groups, dispatch writers (stub), zip output, return result dict.
+        """Plan groups, dispatch writers, ZIP output, upload, return result.
 
-        Writers are not yet implemented — this shell just plans and returns.
+        Steps:
+          1. ``apply_license()`` (Aspose.Email needs the metered licence).
+          2. Plan groups via :class:`PstGroupPlanner`.
+          3. For each group, dispatch the matching writer; collect PSTs.
+          4. ZIP all ``.pst`` files into ``{job_id}.zip`` (STORED — the
+             PSTs are already large/dense; deflate adds overhead).
+          5. Upload the archive (built-in cleanup deletes the local zip).
+          6. Cleanup local workdir.
+          7. Return result dict.
         """
+        import zipfile as _zipfile
         from shared.aspose_license import apply_license  # lazy import
+        from shared.azure_storage import upload_blob_with_retry_from_file
+
         apply_license()
 
         self.workdir.mkdir(parents=True, exist_ok=True)
+
+        # Resolve storage shard if caller didn't pass one in.
+        if self.storage_shard is None:
+            from shared.azure_storage import azure_storage_manager
+            self.storage_shard = azure_storage_manager.get_default_shard()
+            if not self.dest_container or self.dest_container == "exports":
+                self.dest_container = azure_storage_manager.get_container_name(
+                    self.tenant_id, "exports"
+                )
+            await self.storage_shard.ensure_container(self.dest_container)
+
+        # Step 1: Plan
+        if self.update_progress:
+            await self.update_progress(5)
         planner = PstGroupPlanner()
         groups = planner.plan(self.items, self.granularity, self.include_types)
 
-        # Writers not yet implemented — return planning result for now
+        # Step 2: Dispatch writers
+        writer_map = {
+            "EMAIL": MailPstWriter,
+            "CALENDAR_EVENT": CalendarPstWriter,
+            "USER_CONTACT": ContactPstWriter,
+        }
+        all_pst_paths: list = []
+        item_counts: dict = {}
+        failed_counts: dict = {}
+        total_groups = len(groups)
+
+        for idx, group in enumerate(groups):
+            WriterClass = writer_map.get(group.item_type)
+            if WriterClass is None:
+                continue
+            writer = WriterClass()
+            write_result = await writer.write(
+                group=group,
+                workdir=self.workdir,
+                split_gb=self.split_gb,
+                shard=self.storage_shard,
+                source_container=self.source_container,
+            )
+            all_pst_paths.extend(write_result.pst_paths)
+            item_counts[group.item_type] = (
+                item_counts.get(group.item_type, 0) + write_result.item_count
+            )
+            failed_counts[group.item_type] = (
+                failed_counts.get(group.item_type, 0) + write_result.failed_count
+            )
+
+            # Progress: 5% start → 80% after all groups are written.
+            if self.update_progress:
+                pct = 5 + int(75 * (idx + 1) / max(total_groups, 1))
+                await self.update_progress(pct)
+
+        # Step 3: ZIP all .pst files into a single archive.
+        zip_path = self.workdir.parent / f"{self.job_id}.zip"
+        total_size = 0
+        pst_file_names: list = []
+        with _zipfile.ZipFile(str(zip_path), "w", _zipfile.ZIP_STORED) as zf:
+            for pst_path in all_pst_paths:
+                if pst_path.exists():
+                    zf.write(str(pst_path), arcname=pst_path.name)
+                    total_size += pst_path.stat().st_size
+                    pst_file_names.append(pst_path.name)
+
+        # Step 4: Upload zip.  upload_blob_with_retry_from_file deletes
+        # the local zip on success.
+        blob_path = f"pst-exports/{self.job_id}/{self.job_id}.zip"
+        zip_size = zip_path.stat().st_size if zip_path.exists() else 0
+        upload_result = await upload_blob_with_retry_from_file(
+            container_name=self.dest_container,
+            blob_path=blob_path,
+            file_path=str(zip_path),
+            shard=self.storage_shard,
+            file_size=zip_size,
+            metadata={"job_id": self.job_id, "granularity": self.granularity},
+        )
+
+        if self.update_progress:
+            await self.update_progress(95)
+
+        # Step 5: Cleanup local workdir (PSTs etc.).  The zip itself
+        # was already deleted by upload_blob_with_retry_from_file.
+        _cleanup_dir(self.workdir)
+
+        if self.update_progress:
+            await self.update_progress(100)
+
+        success = bool(upload_result.get("success"))
         return {
             "job_id": self.job_id,
-            "status": "planned",
-            "group_count": len(groups),
-            "groups": [
-                {
-                    "key": g.key,
-                    "item_type": g.item_type,
-                    "item_count": len(g.items),
-                    "pst_filename": g.pst_filename,
-                }
-                for g in groups
-            ],
+            "status": "done" if success else "upload_failed",
+            "blob_path": blob_path if success else None,
+            "container": self.dest_container,
+            "pst_files": pst_file_names,
+            "pst_count": len(pst_file_names),
+            "total_size_bytes": total_size,
+            "item_counts_by_type": item_counts,
+            "failed_counts_by_type": failed_counts,
             "granularity": self.granularity,
         }
