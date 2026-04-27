@@ -1748,15 +1748,16 @@ class RestoreWorker:
         # display_name's local-part if the email is set, else the full
         # display_name with whitespace stripped.
         resource_label_by_snapshot: Dict[str, str] = {}
+        primary_resource_id: str = ""
         if snapshot_ids_stream:
             try:
                 snap_uuids = [_uuid.UUID(str(s)) for s in snapshot_ids_stream]
                 rows = (await session.execute(
-                    select(Snapshot.id, Resource.display_name, Resource.email)
+                    select(Snapshot.id, Snapshot.resource_id, Resource.display_name, Resource.email)
                     .join(Resource, Resource.id == Snapshot.resource_id)
                     .where(Snapshot.id.in_(snap_uuids))
                 )).all()
-                for sid, dn, email in rows:
+                for sid, rid, dn, email in rows:
                     raw = (
                         (email.split("@")[0] if email else None)
                         or (dn.split("—")[-1].strip() if dn and "—" in dn else dn)
@@ -1764,6 +1765,8 @@ class RestoreWorker:
                     )
                     label = "".join(ch for ch in (raw or "") if ch.isalnum() or ch in "-_") or str(sid)[:8]
                     resource_label_by_snapshot[str(sid)] = label
+                    if not primary_resource_id and rid:
+                        primary_resource_id = str(rid)
             except Exception as _label_exc:
                 print(
                     f"[{self.worker_id}] resource label lookup failed (non-fatal): {_label_exc}",
@@ -1804,6 +1807,10 @@ class RestoreWorker:
         )
         orch.resource_label_by_snapshot = resource_label_by_snapshot
         orch.cancel_check = _cancel_check
+        # Per-user rate limit key (PST_RATE_LIMIT_SCOPE=user, the default).
+        # Uses the snapshot's resource_id, which corresponds 1:1 with the
+        # M365 user/mailbox in the source backup.
+        orch.rate_limit_user_key = primary_resource_id
 
         result = await orch.run()
 

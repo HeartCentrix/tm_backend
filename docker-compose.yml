@@ -577,6 +577,14 @@ services:
       PST_GROUP_FLUSH_AT: ${PST_GROUP_FLUSH_AT:-1000}
       PST_TOTAL_ACCUMULATED_CAP: ${PST_TOTAL_ACCUMULATED_CAP:-5000}
       PST_AUTO_FOLDER_THRESHOLD: ${PST_AUTO_FOLDER_THRESHOLD:-5000}
+      # Rate limiting: scope=user (default) caps concurrency per
+      # mailbox/user — right for both single-tenant SaaS with many
+      # users and multi-tenant. scope=tenant caps per organisation.
+      # scope=disabled turns off limiting.
+      PST_RATE_LIMIT_SCOPE: ${PST_RATE_LIMIT_SCOPE:-user}
+      PST_RATE_LIMIT_PER_KEY: ${PST_RATE_LIMIT_PER_KEY:-3}
+      PST_CANCEL_CHECK_INTERVAL: ${PST_CANCEL_CHECK_INTERVAL:-10}
+      PST_ZIP_BLOCK_SIZE: ${PST_ZIP_BLOCK_SIZE:-4194304}
     depends_on:
       postgres:
         condition: service_healthy
@@ -645,6 +653,14 @@ services:
       PST_GROUP_FLUSH_AT: ${PST_GROUP_FLUSH_AT:-1000}
       PST_TOTAL_ACCUMULATED_CAP: ${PST_TOTAL_ACCUMULATED_CAP:-5000}
       PST_AUTO_FOLDER_THRESHOLD: ${PST_AUTO_FOLDER_THRESHOLD:-5000}
+      # Rate limiting: scope=user (default) caps concurrency per
+      # mailbox/user — right for both single-tenant SaaS with many
+      # users and multi-tenant. scope=tenant caps per organisation.
+      # scope=disabled turns off limiting.
+      PST_RATE_LIMIT_SCOPE: ${PST_RATE_LIMIT_SCOPE:-user}
+      PST_RATE_LIMIT_PER_KEY: ${PST_RATE_LIMIT_PER_KEY:-3}
+      PST_CANCEL_CHECK_INTERVAL: ${PST_CANCEL_CHECK_INTERVAL:-10}
+      PST_ZIP_BLOCK_SIZE: ${PST_ZIP_BLOCK_SIZE:-4194304}
     depends_on:
       rabbitmq:
         condition: service_healthy

@@ -40,7 +40,16 @@ DISK_FLOOR_BYTES = int(os.environ.get("PST_DISK_FLOOR_BYTES", str(256 * 1024 * 1
 MEMORY_LIMIT_MB = int(os.environ.get("PST_MEMORY_LIMIT_MB", "0"))
 MEMORY_CHECK_INTERVAL = int(os.environ.get("PST_MEMORY_CHECK_INTERVAL", "50"))
 GROUP_TIMEOUT_S = int(os.environ.get("PST_GROUP_TIMEOUT_S", "7200"))
-TENANT_CONCURRENCY = int(os.environ.get("PST_TENANT_CONCURRENCY", "5"))
+# Concurrency cap per "rate limit scope". Defaults to PER-USER because
+# that's the right shape for both single-tenant (5K users → 5K independent
+# limits) and multi-tenant SaaS deployments. Override scope via
+# ``PST_RATE_LIMIT_SCOPE`` to ``tenant`` for fair-share across customers
+# on a shared pool, or ``disabled`` to turn off entirely.
+RATE_LIMIT_PER_KEY = int(
+    os.environ.get("PST_RATE_LIMIT_PER_KEY",
+                   os.environ.get("PST_TENANT_CONCURRENCY", "3"))
+)
+RATE_LIMIT_SCOPE = os.environ.get("PST_RATE_LIMIT_SCOPE", "user").lower()
 CANCEL_CHECK_INTERVAL = int(os.environ.get("PST_CANCEL_CHECK_INTERVAL", "10"))
 
 
@@ -92,26 +101,39 @@ class JobCancelledError(Exception):
     pass
 
 
-class _TenantRateLimit:
-    """Async context manager that enforces ``TENANT_CONCURRENCY`` PST
-    jobs per tenant via a Redis-backed counter.  Falls back to a no-op
-    when Redis is unreachable or when the limit is set to 0 — we never
-    block exports because of an infrastructure hiccup; the user-visible
-    cap can be relaxed by env if it ever causes problems.
+class _RateLimit:
+    """Async context manager that enforces ``RATE_LIMIT_PER_KEY`` PST
+    jobs per key (where the key is a tenant id, user id, or fixed
+    string depending on ``PST_RATE_LIMIT_SCOPE``) via a Redis-backed
+    counter.
 
-    Key shape: ``pst:active:{tenant_id}`` with TTL 4h so a crashed
+    Falls back to a no-op when Redis is unreachable, when the limit is
+    set to 0, or when scope='disabled'. We never block exports because
+    of an infrastructure hiccup — the cap is a noisy-neighbor guard,
+    not a hard barrier.
+
+    Key shape: ``pst:active:{scope}:{key}`` with TTL 4h so a crashed
     worker doesn't permanently leak a slot.
+
+    Scope guidance:
+        - ``user``   (default) — per-user concurrency. Right for both
+          single-tenant SaaS (5K users → 5K independent limits) and
+          multi-tenant.
+        - ``tenant``  — per-tenant fair share. Useful when one tenant
+          has many users and you want fair pool sharing.
+        - ``disabled`` — no rate limiting.
     """
 
-    def __init__(self, tenant_id: str, limit: int):
-        self.tenant_id = tenant_id
+    def __init__(self, scope_key: str, limit: int, scope: str = "user"):
+        self.scope_key = scope_key
         self.limit = limit
-        self._key = f"pst:active:{tenant_id}" if tenant_id else None
+        self.scope = scope
+        self._key = f"pst:active:{scope}:{scope_key}" if scope_key else None
         self._client = None
         self._held = False
 
     async def __aenter__(self):
-        if not self._key or self.limit <= 0:
+        if self.scope == "disabled" or not self._key or self.limit <= 0:
             return self
         try:
             from shared.config import settings as _settings
@@ -123,19 +145,19 @@ class _TenantRateLimit:
             current = int(await self._client.get(self._key) or 0)
             if current >= self.limit:
                 logger.warning(
-                    "[pst_export] tenant=%s at concurrency cap (%d/%d) — "
-                    "proceeding anyway (soft limit, raise PST_TENANT_CONCURRENCY to relax)",
-                    self.tenant_id, current, self.limit,
+                    "[pst_export] %s=%s at concurrency cap (%d/%d) — "
+                    "proceeding anyway (soft limit, raise PST_RATE_LIMIT_PER_KEY to relax)",
+                    self.scope, self.scope_key, current, self.limit,
                 )
             await self._client.incr(self._key)
             await self._client.expire(self._key, 4 * 3600)
             self._held = True
         except Exception as exc:
-            logger.warning("[pst_export] tenant rate limit unavailable: %s", exc)
+            logger.warning("[pst_export] rate limit unavailable: %s", exc)
             self._client = None
         return self
 
-    async def __aexit__(self, *exc):
+    async def __aexit__(self, *_exc):
         if self._held and self._client is not None:
             try:
                 await self._client.decr(self._key)
@@ -145,6 +167,11 @@ class _TenantRateLimit:
                 await self._client.aclose()
             except Exception:
                 pass
+
+
+# Backwards-compat alias so external callers (tests, docs) referring to
+# ``_TenantRateLimit`` keep working.  Prefer ``_RateLimit`` in new code.
+_TenantRateLimit = _RateLimit
 
 
 async def _memory_pressure_check(items_processed: int) -> None:
@@ -382,6 +409,22 @@ class PstExportOrchestrator:
             except Exception as exc:
                 logger.warning("progress update failed at %d%%: %s", pct, exc)
 
+    def _resolve_rate_limit_scope_key(self) -> str:
+        """Pick the rate-limit key based on PST_RATE_LIMIT_SCOPE.
+
+        ``user``   → resource_id (mailbox/user) when caller populated
+                     ``rate_limit_user_key``; falls back to tenant.
+        ``tenant`` → tenant_id.
+        ``disabled`` → "" (no key, limiter no-ops).
+        Anything else falls through to per-user behaviour.
+        """
+        if RATE_LIMIT_SCOPE == "disabled":
+            return ""
+        if RATE_LIMIT_SCOPE == "tenant":
+            return self.tenant_id or ""
+        # user (default) — caller may have set a more specific key
+        return getattr(self, "rate_limit_user_key", "") or self.tenant_id or ""
+
     async def run(self) -> dict:
         """Entry point.  Routes to streaming mode when an
         ``item_stream_factory`` is provided (preferred for production
@@ -421,9 +464,11 @@ class PstExportOrchestrator:
 
         await self._safe_progress(5)
 
-        # Tenant-level rate limit — soft cap. If unreachable, we let
-        # the job proceed rather than blocking on infra issues.
-        rate_limit = _TenantRateLimit(self.tenant_id, TENANT_CONCURRENCY)
+        # Concurrency cap — scope is per-user by default (right for
+        # single-tenant SaaS with thousands of users). Operators can flip
+        # to per-tenant or disable via PST_RATE_LIMIT_SCOPE.
+        scope_key = self._resolve_rate_limit_scope_key()
+        rate_limit = _RateLimit(scope_key, RATE_LIMIT_PER_KEY, RATE_LIMIT_SCOPE)
         await rate_limit.__aenter__()
 
         # Resumability — load prior progress and skip done groups.
