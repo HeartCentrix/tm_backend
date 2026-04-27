@@ -32,6 +32,7 @@ ENV/
 .env.local
 .env.*.local
 .env.backup
+.env.apps
 
 # Database
 *.db

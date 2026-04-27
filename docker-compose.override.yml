@@ -1,0 +1,10 @@
+services:
+  seaweedfs:
+    volumes:
+      - ./deploy/local/seaweedfs-s3.json:/config/s3.json:ro
+      - seaweedfs_data:/data
+
+volumes:
+  seaweedfs_data:
+    name: tm_backend_seaweedfs_data
+    external: true

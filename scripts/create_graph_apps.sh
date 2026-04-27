@@ -38,8 +38,8 @@
 set -euo pipefail
 
 # ─── Defaults ────────────────────────────────────────────────────────────
-COUNT=16
-PREFIX="TMvault-Graph"
+COUNT=9
+PREFIX="TMvault"
 OUT_FILE="./.env.apps"
 SKIP_CONSENT=false
 SECRET_YEARS=2
