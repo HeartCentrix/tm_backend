@@ -199,6 +199,7 @@ async def list_snapshots(
                 status=s.status.value if hasattr(s.status, 'value') else str(s.status),
                 type=s.type.value if hasattr(s.type, 'value') else str(s.type),
                 itemCount=s.item_count or 0,
+                jobId=str(s.job_id) if s.job_id else None,
             )
             for s in snapshots
         ],
@@ -349,6 +350,7 @@ async def get_snapshot(snapshot_id: str, db: AsyncSession = Depends(get_db)):
         status=snapshot.status.value if hasattr(snapshot.status, 'value') else str(snapshot.status),
         type=snapshot.type.value if hasattr(snapshot.type, 'value') else str(snapshot.type),
         itemCount=snapshot.item_count or 0,
+        jobId=str(snapshot.job_id) if snapshot.job_id else None,
     )
 
 

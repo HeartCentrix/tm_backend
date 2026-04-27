@@ -288,6 +288,7 @@ class SnapshotResponse(BaseModel):
     status: str
     type: str
     itemCount: int
+    jobId: Optional[str] = None
 
 
 class SnapshotItemResponse(BaseModel):
