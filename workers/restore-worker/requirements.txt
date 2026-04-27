@@ -16,3 +16,10 @@ aiohttp>=3.9.0
 aioboto3>=15.5.0,<16
 aiobotocore>=2.25.0,<3
 boto3>=1.40.0,<2
+
+# PST export via Aspose.Email for Python via .NET
+Aspose.Email-for-Python-via-NET
+azure-keyvault-secrets>=4.7
+azure-identity>=1.15
+# Observability — Prometheus metrics scraped on PST_METRICS_PORT (default 9100)
+prometheus-client>=0.20.0

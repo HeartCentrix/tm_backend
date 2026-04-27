@@ -697,6 +697,42 @@ class BackupWorker:
             job_status_name = job.status.name if hasattr(job.status, "name") else str(job.status)
             if job_status_name == "CANCELLED":
                 print(f"[{self.worker_id}] Skipping CANCELLED job {job_id} for resource {resource_id}")
+                # Trigger cleanup of any partial blobs the worker had
+                # already flushed before the cancel signal landed.
+                # Fire-and-forget so message ack isn't blocked on the
+                # storage walk; the cleanup helper is idempotent.
+                try:
+                    from shared.backup_cleanup import (
+                        cleanup_cancelled_snapshots,
+                        default_container_resolver,
+                    )
+
+                    async def _cleanup():
+                        try:
+                            stats = await cleanup_cancelled_snapshots(
+                                job_id=uuid.UUID(job_id),
+                                session_factory=async_session_factory,
+                                shard=self.azure_storage.get_default_shard()
+                                if hasattr(self, "azure_storage") and self.azure_storage
+                                else azure_storage_manager.get_default_shard(),
+                                container_resolver=default_container_resolver,
+                            )
+                            print(
+                                f"[{self.worker_id}] cancel-cleanup job={job_id}: {stats}",
+                                flush=True,
+                            )
+                        except Exception as exc:
+                            print(
+                                f"[{self.worker_id}] cancel-cleanup job={job_id} failed: {exc}",
+                                flush=True,
+                            )
+
+                    asyncio.create_task(_cleanup())
+                except Exception as schedule_exc:
+                    print(
+                        f"[{self.worker_id}] cancel-cleanup schedule failed: {schedule_exc}",
+                        flush=True,
+                    )
                 return
             resource = await session.get(Resource, uuid.UUID(resource_id))
             if not resource:
@@ -8768,14 +8804,42 @@ class BackupWorker:
         to avoid overwriting extra_data (delta_token) set by complete_snapshot."""
         from sqlalchemy import update as sa_update
         
-        # Calculate new storage_bytes from backup result
-        storage_bytes = resource.storage_bytes or 0
+        # storage_bytes = "current size of all backed-up data on this
+        # resource". Two failure modes the prior accumulator hit:
+        #   1. bytes_added == bytes_total in most paths (the snapshot
+        #      reports its full size as 'added'), so re-running a backup
+        #      added the WHOLE content again. After 4 runs of a 1.5 GB
+        #      OneDrive, storage_bytes wedged at 6 GB.
+        #   2. Failed snapshots that didn't roll back the previous
+        #      addition left the counter inflated.
+        #
+        # Fix: re-derive from the latest COMPLETED snapshot for this
+        # resource. Each snapshot's bytes_total reflects the full content
+        # captured (newest-wins sibling-union semantics) so the latest
+        # snapshot's bytes_total IS the current backed-up size — exactly
+        # what the UI labels as "Backup size". One SQL hop, no drift.
+        from sqlalchemy import desc as _desc, select as sa_select
+        latest_completed = (await session.execute(
+            sa_select(Snapshot.bytes_total)
+            .where(
+                Snapshot.resource_id == resource.id,
+                Snapshot.status == SnapshotStatus.COMPLETED,
+                Snapshot.bytes_total > 0,
+            )
+            .order_by(_desc(Snapshot.created_at))
+            .limit(1)
+        )).scalar_one_or_none()
+        prev = resource.storage_bytes or 0
+        if latest_completed is not None:
+            storage_bytes = int(latest_completed)
+        else:
+            # No completed content-bearing snapshot yet — keep prior value.
+            storage_bytes = prev
         if result:
-            bytes_added = result.get("bytes_added", 0)
-            bytes_removed = result.get("bytes_removed", 0) or 0
-            net_change = bytes_added - bytes_removed
-            storage_bytes = max(0, storage_bytes + net_change)
-            print(f"[{self.worker_id}] Updated storage_bytes for {resource.id}: {resource.storage_bytes} -> {storage_bytes} bytes (added {bytes_added}, removed {bytes_removed})")
+            print(
+                f"[{self.worker_id}] storage_bytes for {resource.id}: "
+                f"{prev} -> {storage_bytes} (latest snapshot bytes_total)"
+            )
         
         new_status = ResourceStatus.ACTIVE if resource.status == ResourceStatus.DISCOVERED else resource.status
         await session.execute(
@@ -9591,4 +9655,13 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Demote aio-pika's "Future exception was never retrieved" /
+    # ECONNRESET noise to debug — the robust-connection layer has
+    # already reconnected by the time the warning fires.
+    from shared.asyncio_handlers import install_robust_loop_handler
+
+    async def _main_with_handler():
+        install_robust_loop_handler()
+        await main()
+
+    asyncio.run(_main_with_handler())

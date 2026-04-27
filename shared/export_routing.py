@@ -4,18 +4,26 @@ Lives in `shared/` so every service (job-service, restore-worker, tests) picks
 it up via the standard `from shared.X import ...` package path without needing
 docker-build-context gymnastics.
 """
+import os
 from typing import Optional
 
 from shared.config import settings
 
 
-def pick_export_queue(*, total_bytes: int, include_attachments: bool) -> str:
-    """Return the RabbitMQ queue for an export job. Heavy exports go to a
-    dedicated worker pool with larger memory limits — see Task 23 of the
-    mail-export plan."""
+def pick_export_queue(total_bytes: int = 0, include_attachments: bool = True) -> str:
+    """Return the RabbitMQ queue for an export job.
+
+    Heavy exports go to a dedicated worker pool with larger memory limits.
+    Both keyword and positional arg forms are accepted for back-compat with
+    existing callers.
+
+    The ``include_attachments`` filter used to gate heavy routing — for PST
+    exports we now route by total size regardless, since even no-attachment
+    100GB exports are heavy by item count alone.
+    """
     if not settings.HEAVY_EXPORT_ENABLED:
         return "restore.normal"
-    if include_attachments and total_bytes >= settings.HEAVY_EXPORT_THRESHOLD_BYTES:
+    if total_bytes >= settings.HEAVY_EXPORT_THRESHOLD_BYTES:
         return settings.HEAVY_EXPORT_QUEUE
     return "restore.normal"
 
@@ -45,15 +53,18 @@ def pick_backup_queue(
     return fallback
 
 
-_HEAVY_RESTORE_THRESHOLD = 50 * 1024**3  # 50 GiB
+_HEAVY_RESTORE_THRESHOLD = int(
+    os.getenv("HEAVY_RESTORE_THRESHOLD_BYTES", str(20 * 1024**3))
+)  # default 20 GiB — catches whales sooner on large workloads
 
 
 def pick_restore_queue(total_bytes: int) -> str:
     """Route restore jobs by scope size.
 
-    Large restores (>50 GiB) run on restore.heavy so they don't block
-    small quick restores on the shared restore.normal queue. Mirrors
-    pick_backup_queue / pick_export_queue in the same module.
+    Large restores (>HEAVY_RESTORE_THRESHOLD_BYTES) run on restore.heavy
+    so they don't block small quick restores on the shared restore.normal
+    queue. Threshold is env-tunable for very large M365 deployments where
+    50 GB used to be too high a bar.
     """
     if total_bytes and total_bytes > _HEAVY_RESTORE_THRESHOLD:
         return "restore.heavy"

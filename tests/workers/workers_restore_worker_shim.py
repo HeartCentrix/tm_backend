@@ -5,6 +5,13 @@ import os
 import sys
 
 _here = os.path.dirname(__file__)
+# Make the restore-worker dir importable so sibling modules like `mail_fetch`
+# resolve via lazy `from mail_fetch import ...` calls inside the methods.
+_worker_dir = os.path.abspath(
+    os.path.join(_here, "..", "..", "workers", "restore-worker")
+)
+if _worker_dir not in sys.path:
+    sys.path.insert(0, _worker_dir)
 _target = os.path.abspath(
     os.path.join(_here, "..", "..", "workers", "restore-worker", "mail_export.py")
 )

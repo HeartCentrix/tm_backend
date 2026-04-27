@@ -93,83 +93,12 @@ class FolderExportTask:
         return result
 
     async def _fetch_message(self, item) -> Optional[dict]:
-        # Fast path — Tier 2 USER_MAIL backup stores the Graph message JSON
-        # directly on the SnapshotItem row in extra_data.raw; no Azure blob is
-        # written for the message body (only attachments go to Azure). Use the
-        # inline payload when it's present to skip Azure entirely.
-        meta = getattr(item, "extra_data", None) or getattr(item, "metadata", None) or {}
-        raw_inline = meta.get("raw") if isinstance(meta, dict) else None
-        if raw_inline:
-            print(f"[FolderExportTask/{self.folder_name}] using inline extra_data.raw ext_id={getattr(item, 'external_id', '')[:40]} fields={list(raw_inline.keys())[:8]}", flush=True)
-            return raw_inline
-
-        blob_path = getattr(item, "blob_path", None)
-
-        # Legacy fallback — some SnapshotItem rows were created before blob_path
-        # was persisted. Reconstruct by listing blobs under the snapshot's prefix
-        # and matching on external_id (the last path segment of the canonical
-        # backup path: tenant/resource/snapshot/timestamp/external_id).
-        resolved_container = self.source_container
-        if not blob_path:
-            ext_id = getattr(item, "external_id", "") or ""
-            snap_id = str(getattr(item, "snapshot_id", "") or "")
-            print(f"[FolderExportTask/{self.folder_name}] blob_path=NULL, attempting list-and-match ext_id={ext_id[:40]}...", flush=True)
-
-            candidates = [self.source_container]
-            fb = getattr(item, "_mailbox_fallback_container", None)
-            if fb and fb not in candidates:
-                candidates.append(fb)
-
-            matched = None
-            matched_container = None
-            for cand in candidates:
-                try:
-                    async for name in self.shard.list_blobs(cand):
-                        if snap_id and snap_id not in name:
-                            continue
-                        if name.endswith(f"/{ext_id}"):
-                            matched = name
-                            matched_container = cand
-                            break
-                    if matched:
-                        break
-                    print(f"[FolderExportTask/{self.folder_name}] no match in container={cand}", flush=True)
-                except Exception as exc:
-                    print(f"[FolderExportTask/{self.folder_name}] list container={cand} failed: {type(exc).__name__}: {exc}", flush=True)
-
-            if matched:
-                blob_path = matched
-                resolved_container = matched_container
-                print(f"[FolderExportTask/{self.folder_name}] recovered blob_path={blob_path} container={resolved_container}", flush=True)
-            else:
-                print(f"[FolderExportTask/{self.folder_name}] no blob matched ext_id={ext_id[:40]}... under snapshot={snap_id}", flush=True)
-
-        if not blob_path:
-            print(f"[FolderExportTask/{self.folder_name}] blob_path resolution FAILED ext_id={getattr(item, 'external_id', '')[:40]}", flush=True)
-            return None
-
-        print(f"[FolderExportTask/{self.folder_name}] _fetch_message container={resolved_container} path={blob_path}", flush=True)
-        raw = await self.shard.download_blob(resolved_container, blob_path)
-        if raw is None:
-            print(f"[FolderExportTask/{self.folder_name}] blob MISSING path={blob_path}", flush=True)
-            return None
-        print(f"[FolderExportTask/{self.folder_name}] blob fetched size={len(raw)} path={blob_path}", flush=True)
-        return json.loads(raw.decode("utf-8"))
+        from mail_fetch import fetch_message
+        return await fetch_message(item, self.shard, self.source_container)
 
     async def _gather_attachments(self, att_paths) -> List[AttachmentRef]:
-        if not self.include_attachments or not att_paths:
-            return []
-        out: List[AttachmentRef] = []
-        for path in att_paths:
-            async def _gen(p=path):
-                async for chunk in self.shard.download_blob_stream(self.source_container, p):
-                    yield chunk
-            out.append(AttachmentRef(
-                name=path.rsplit("/", 1)[-1],
-                content_type="application/octet-stream",
-                data_stream=_gen(),
-            ))
-        return out
+        from mail_fetch import gather_attachments
+        return await gather_attachments(att_paths, self.shard, self.source_container, self.include_attachments)
 
     async def _build_eml_for_item(self, item):
         print(f"[FolderExportTask/{self.folder_name}] _build_eml_for_item START ext_id={item.external_id}", flush=True)

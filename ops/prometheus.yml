@@ -1,0 +1,25 @@
+# Prometheus scrape config — TMvault PST export observability
+# Bring up with: docker compose --profile observability up -d
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # PST export workers expose metrics on :9100 via shared/pst_metrics.py.
+  # Compose DNS lets us name each replica; Prometheus's docker_sd_configs
+  # would auto-discover but adds complexity. Static targets are simpler
+  # for the typical 1-5 replica deployment.
+  - job_name: pst_export_workers
+    static_configs:
+      - targets:
+          - restore-worker-1:9100
+          - restore-worker-2:9100
+          - restore-worker-heavy:9100
+        labels:
+          service: restore-worker
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]
+
+# Optional: alerting rules for ops oncall
+rule_files: []

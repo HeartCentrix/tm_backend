@@ -265,6 +265,27 @@ def create_restore_message(
     if not queue:
         queue = queue_map.get(restore_type, "restore.normal")
 
+    # Whale-traffic routing: spec.totalBytes (when populated by job-service
+    # from a snapshot size estimate) lets us route oversized exports /
+    # restores to the dedicated heavy pool so they don't starve the normal
+    # queue. Falls back silently when the field is missing.
+    spec_dict = spec or {}
+    total_bytes = int(spec_dict.get("totalBytes") or 0)
+    if total_bytes > 0 and queue in ("restore.normal", "restore.low"):
+        try:
+            from shared.export_routing import pick_export_queue, pick_restore_queue
+            include_attachments = bool(spec_dict.get("includeAttachments", True))
+            if restore_type in ("EXPORT_PST", "EXPORT_ZIP"):
+                heavy_queue = pick_export_queue(total_bytes, include_attachments)
+            else:
+                heavy_queue = pick_restore_queue(total_bytes)
+            if heavy_queue:
+                queue = heavy_queue
+        except Exception:
+            # pick_*_queue is best-effort routing; never block the publish
+            # because of a config import quirk.
+            pass
+
     return {
         "jobId": job_id,
         "restoreType": restore_type,

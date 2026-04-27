@@ -31,22 +31,41 @@ AZURE_WORKLOAD_QUEUES = {
 }
 
 M365_RESOURCE_TYPES = [
+    # Tier-1 mailbox / drive resources (legacy, still in use for some
+    # tenants).
     ResourceType.MAILBOX,
     ResourceType.SHARED_MAILBOX,
     ResourceType.ROOM_MAILBOX,
     ResourceType.ONEDRIVE,
+    # Tier-2 per-workload children. Each ENTRA_USER discovered today
+    # gets one of each — USER_MAIL/USER_CALENDAR/USER_CONTACTS/
+    # USER_ONEDRIVE/USER_CHATS — and the actual backup data lives in
+    # these rows, not on the parent ENTRA_USER. Earlier versions of this
+    # list omitted them, which made "Backup all M365 now" silently skip
+    # ~60% of eligible content.
+    ResourceType.USER_MAIL,
+    ResourceType.USER_CALENDAR,
+    ResourceType.USER_CONTACTS,
+    ResourceType.USER_ONEDRIVE,
+    ResourceType.USER_CHATS,
+    # Group + SharePoint resources.
+    ResourceType.M365_GROUP,
     ResourceType.SHAREPOINT_SITE,
     ResourceType.TEAMS_CHANNEL,
     ResourceType.TEAMS_CHAT,
+    # Identity surface — Entra metadata is its own backup pipeline
+    # (entra-export worker), still triggered by the same datasource hit.
     ResourceType.ENTRA_USER,
     ResourceType.ENTRA_GROUP,
     ResourceType.ENTRA_APP,
     ResourceType.ENTRA_DEVICE,
     ResourceType.ENTRA_SERVICE_PRINCIPAL,
+    # Power Platform.
     ResourceType.POWER_BI,
     ResourceType.POWER_APPS,
     ResourceType.POWER_AUTOMATE,
     ResourceType.POWER_DLP,
+    # Misc M365 surfaces backed by their own workers.
     ResourceType.COPILOT,
     ResourceType.PLANNER,
     ResourceType.TODO,
@@ -489,6 +508,37 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
     except Exception:
         pass
 
+    # Blob cleanup — for BACKUP jobs only (RESTORE jobs export ZIPs,
+    # not snapshots). Fire-and-forget so the cancel endpoint returns
+    # 204 immediately while bytes are reclaimed in the background. The
+    # cleanup helper is idempotent: if a backup-worker beats us to it
+    # (worker also runs cleanup when it sees CANCELLED status on its
+    # next message pull), the second run is a no-op.
+    if job.type == JobType.BACKUP:
+        async def _cleanup_blobs(jid: UUID):
+            try:
+                from shared.backup_cleanup import (
+                    cleanup_cancelled_snapshots,
+                    default_container_resolver,
+                )
+                from shared.azure_storage import azure_storage_manager
+                from shared.database import async_session_factory
+                stats = await cleanup_cancelled_snapshots(
+                    job_id=jid,
+                    session_factory=async_session_factory,
+                    shard=azure_storage_manager.get_default_shard(),
+                    container_resolver=default_container_resolver,
+                )
+                print(f"[JOB_SERVICE] cancel-cleanup job={jid}: {stats}")
+            except Exception as exc:
+                print(f"[JOB_SERVICE] cancel-cleanup job={jid} failed: {exc}")
+
+        try:
+            import asyncio as _aio
+            _aio.create_task(_cleanup_blobs(job.id))
+        except Exception:
+            pass
+
 
 @app.post("/api/v1/jobs/{job_id}/retry", response_model=JobResponse)
 async def retry_job(job_id: str, db: AsyncSession = Depends(get_db)):
@@ -883,6 +933,31 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         if resource:
             tenant_id = str(resource.tenant_id)
             resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
+
+    # Estimate total selection size so the message_bus router can send
+    # whale jobs (>HEAVY_EXPORT_THRESHOLD_BYTES, default 20 GB) to
+    # restore.heavy automatically. Falls back to 0 (= normal queue) if
+    # the snapshot has no item rows yet (rare race) or the query errors.
+    total_bytes = 0
+    try:
+        from sqlalchemy import func as _func
+        if item_ids:
+            stmt = sa_select(_func.coalesce(_func.sum(SnapshotItem.content_size), 0)).where(
+                SnapshotItem.id.in_([UUID(i) for i in item_ids])
+            )
+        elif snapshot_ids:
+            stmt = sa_select(_func.coalesce(_func.sum(SnapshotItem.content_size), 0)).where(
+                SnapshotItem.snapshot_id.in_([UUID(s) for s in snapshot_ids])
+            )
+        else:
+            stmt = None
+        if stmt is not None:
+            total_bytes = int((await db.execute(stmt)).scalar_one() or 0)
+        spec["totalBytes"] = total_bytes
+    except Exception as size_exc:
+        # Router will fall back to restore.normal — non-fatal.
+        spec["totalBytes"] = 0
+        print(f"[JOB_SERVICE] totalBytes estimate failed (non-fatal): {size_exc}")
 
     job = Job(
         id=uuid4(),

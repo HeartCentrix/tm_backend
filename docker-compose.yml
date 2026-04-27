@@ -372,14 +372,21 @@ services:
     networks:
       - tm-network
     deploy:
-      # Default to a single replica. The worker's internal asyncio.Semaphore
-      # (BACKUP_CONCURRENCY, default 100) already fans out dozens of items
-      # concurrently per process, and multi-app Graph rotation spreads load
-      # across the configured apps regardless of replica count. Multiple
-      # replicas multiply DB connections, token caches, and RabbitMQ channels
-      # without proportional throughput gain. Override via BACKUP_WORKER_REPLICAS
-      # env var if a specific workload genuinely needs more parallelism.
+      # Production sizing for 250 TiB / 5K-user workloads:
+      #   replicas: 20  (override via BACKUP_WORKER_REPLICAS)
+      #   memory:   8 GiB / 4 GiB reserved
+      # The worker's internal asyncio.Semaphore (BACKUP_CONCURRENCY=100)
+      # fans out items per process; replicas multiply Graph throughput.
+      # Multi-app rotation across APP_{1..N}_CLIENT_ID spreads load across
+      # multiple Microsoft Graph apps to avoid per-app throttling.
       replicas: ${BACKUP_WORKER_REPLICAS:-1}
+      resources:
+        limits:
+          memory: ${BACKUP_WORKER_MEM_LIMIT:-8G}
+          cpus: "${BACKUP_WORKER_CPU_LIMIT:-4}"
+        reservations:
+          memory: ${BACKUP_WORKER_MEM_RESERVE:-2G}
+    mem_limit: ${BACKUP_WORKER_MEM_LIMIT:-8g}
 
   # Heavy-pool backup worker for oversized OneDrive drives (>100 GB default
   # via BACKUP_HEAVY_THRESHOLD_BYTES). Consumes backup.heavy so regular
@@ -431,13 +438,19 @@ services:
       redis:
         condition: service_healthy
     deploy:
-      replicas: 1
+      # Production sizing for 250 TiB / 5K-user workloads:
+      #   replicas: 5  (override via BACKUP_HEAVY_REPLICAS)
+      #   memory:   32 GiB — accommodates whale drives (200GB+ OneDrive)
+      # MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER=1 so each replica
+      # processes one whale at a time; 5 replicas = 5 simultaneous whales.
+      replicas: ${BACKUP_HEAVY_REPLICAS:-1}
       resources:
         limits:
-          memory: 16G
+          memory: ${BACKUP_HEAVY_MEM_LIMIT:-32G}
+          cpus: "${BACKUP_HEAVY_CPU_LIMIT:-8}"
         reservations:
-          memory: 4G
-    mem_limit: 16g
+          memory: ${BACKUP_HEAVY_MEM_RESERVE:-8G}
+    mem_limit: ${BACKUP_HEAVY_MEM_LIMIT:-32g}
     restart: unless-stopped
     networks:
       - tm-network
@@ -530,6 +543,7 @@ services:
       - tm-network
 
   restore-worker:
+    platform: linux/amd64
     build:
       context: .
       dockerfile: workers/restore-worker/Dockerfile
@@ -556,6 +570,35 @@ services:
       APP_3_TENANT_ID: ${APP_3_TENANT_ID:-}
       AZURE_AD_CLIENT_ID: ${AZURE_AD_CLIENT_ID}
       AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
+      # PST export — Aspose.Email license delivery
+      ASPOSE_LICENSE_PATH: ${ASPOSE_LICENSE_PATH:-}
+      ASPOSE_LICENSE_KV_SECRET_NAME: ${ASPOSE_LICENSE_KV_SECRET_NAME:-}
+      ASPOSE_LICENSE_KV_URL: ${ASPOSE_LICENSE_KV_URL:-}
+      ASPOSE_EMAIL_LIC_B64: ${ASPOSE_EMAIL_LIC_B64:-}
+      # PST export — production tunables (override per workload)
+      PST_WRITE_CONCURRENCY: ${PST_WRITE_CONCURRENCY:-1}
+      PST_DISK_OVERHEAD_MULTIPLIER: ${PST_DISK_OVERHEAD_MULTIPLIER:-2.0}
+      PST_DISK_FLOOR_BYTES: ${PST_DISK_FLOOR_BYTES:-268435456}
+      PST_MEMORY_LIMIT_MB: ${PST_MEMORY_LIMIT_MB:-0}
+      PST_MEMORY_CHECK_INTERVAL: ${PST_MEMORY_CHECK_INTERVAL:-50}
+      PST_GROUP_TIMEOUT_S: ${PST_GROUP_TIMEOUT_S:-7200}
+      PST_ITEM_RETRY_MAX: ${PST_ITEM_RETRY_MAX:-3}
+      PST_ITEM_RETRY_BACKOFF_BASE: ${PST_ITEM_RETRY_BACKOFF_BASE:-0.5}
+      PST_MAX_ATTACHMENT_BYTES: ${PST_MAX_ATTACHMENT_BYTES:-52428800}
+      # PST streaming mode tunables — bound memory regardless of mailbox size
+      PST_FETCH_BATCH_SIZE: ${PST_FETCH_BATCH_SIZE:-1000}
+      PST_GROUP_FLUSH_AT: ${PST_GROUP_FLUSH_AT:-1000}
+      PST_TOTAL_ACCUMULATED_CAP: ${PST_TOTAL_ACCUMULATED_CAP:-5000}
+      PST_AUTO_FOLDER_THRESHOLD: ${PST_AUTO_FOLDER_THRESHOLD:-5000}
+      # Rate limiting: scope=user (default) caps concurrency per
+      # mailbox/user — right for both single-tenant SaaS with many
+      # users and multi-tenant. scope=tenant caps per organisation.
+      # scope=disabled turns off limiting.
+      PST_RATE_LIMIT_SCOPE: ${PST_RATE_LIMIT_SCOPE:-user}
+      PST_RATE_LIMIT_PER_KEY: ${PST_RATE_LIMIT_PER_KEY:-3}
+      PST_CANCEL_CHECK_INTERVAL: ${PST_CANCEL_CHECK_INTERVAL:-10}
+      PST_ZIP_BLOCK_SIZE: ${PST_ZIP_BLOCK_SIZE:-4194304}
+      PST_METRICS_PORT: ${PST_METRICS_PORT:-9100}
     depends_on:
       postgres:
         condition: service_healthy
@@ -564,22 +607,29 @@ services:
     restart: unless-stopped
     networks:
       - tm-network
-    mem_limit: 4g
+    mem_limit: ${RESTORE_WORKER_MEM_LIMIT:-8g}
     deploy:
+      # Production sizing for 250 TiB / 5K-user workloads:
+      #   replicas: 12  (override via RESTORE_WORKER_REPLICAS)
+      #   memory:   8 GiB — handles concurrent small/medium PST exports.
+      # PST jobs ≥HEAVY_EXPORT_THRESHOLD_BYTES route to restore-worker-heavy.
       replicas: ${RESTORE_WORKER_REPLICAS:-2}
       resources:
         limits:
-          memory: 4G
+          memory: ${RESTORE_WORKER_MEM_LIMIT:-8G}
+          cpus: "${RESTORE_WORKER_CPU_LIMIT:-2}"
         reservations:
-          memory: 1G
+          memory: ${RESTORE_WORKER_MEM_RESERVE:-1G}
 
   restore-worker-heavy:
+    platform: linux/amd64
     build:
       context: .
       dockerfile: workers/restore-worker/Dockerfile
     container_name: tm_vault_restore_worker_heavy
     env_file: .env
     environment:
+      PYTHONUNBUFFERED: "1"
       DB_HOST: postgres
       RABBITMQ_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
@@ -602,19 +652,55 @@ services:
       AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
       RESTORE_WORKER_QUEUE: restore.heavy
       MAX_CONCURRENT_EXPORTS_PER_WORKER: 1
+      # PST export — Aspose.Email license delivery
+      ASPOSE_LICENSE_PATH: ${ASPOSE_LICENSE_PATH:-}
+      ASPOSE_LICENSE_KV_SECRET_NAME: ${ASPOSE_LICENSE_KV_SECRET_NAME:-}
+      ASPOSE_LICENSE_KV_URL: ${ASPOSE_LICENSE_KV_URL:-}
+      ASPOSE_EMAIL_LIC_B64: ${ASPOSE_EMAIL_LIC_B64:-}
+      # PST export — production tunables (override per workload)
+      PST_WRITE_CONCURRENCY: ${PST_WRITE_CONCURRENCY:-1}
+      PST_DISK_OVERHEAD_MULTIPLIER: ${PST_DISK_OVERHEAD_MULTIPLIER:-2.0}
+      PST_DISK_FLOOR_BYTES: ${PST_DISK_FLOOR_BYTES:-268435456}
+      PST_MEMORY_LIMIT_MB: ${PST_MEMORY_LIMIT_MB:-0}
+      PST_MEMORY_CHECK_INTERVAL: ${PST_MEMORY_CHECK_INTERVAL:-50}
+      PST_GROUP_TIMEOUT_S: ${PST_GROUP_TIMEOUT_S:-7200}
+      PST_ITEM_RETRY_MAX: ${PST_ITEM_RETRY_MAX:-3}
+      PST_ITEM_RETRY_BACKOFF_BASE: ${PST_ITEM_RETRY_BACKOFF_BASE:-0.5}
+      PST_MAX_ATTACHMENT_BYTES: ${PST_MAX_ATTACHMENT_BYTES:-52428800}
+      # PST streaming mode tunables — bound memory regardless of mailbox size
+      PST_FETCH_BATCH_SIZE: ${PST_FETCH_BATCH_SIZE:-1000}
+      PST_GROUP_FLUSH_AT: ${PST_GROUP_FLUSH_AT:-1000}
+      PST_TOTAL_ACCUMULATED_CAP: ${PST_TOTAL_ACCUMULATED_CAP:-5000}
+      PST_AUTO_FOLDER_THRESHOLD: ${PST_AUTO_FOLDER_THRESHOLD:-5000}
+      # Rate limiting: scope=user (default) caps concurrency per
+      # mailbox/user — right for both single-tenant SaaS with many
+      # users and multi-tenant. scope=tenant caps per organisation.
+      # scope=disabled turns off limiting.
+      PST_RATE_LIMIT_SCOPE: ${PST_RATE_LIMIT_SCOPE:-user}
+      PST_RATE_LIMIT_PER_KEY: ${PST_RATE_LIMIT_PER_KEY:-3}
+      PST_CANCEL_CHECK_INTERVAL: ${PST_CANCEL_CHECK_INTERVAL:-10}
+      PST_ZIP_BLOCK_SIZE: ${PST_ZIP_BLOCK_SIZE:-4194304}
+      PST_METRICS_PORT: ${PST_METRICS_PORT:-9100}
     depends_on:
       rabbitmq:
         condition: service_healthy
       postgres:
         condition: service_healthy
     deploy:
-      replicas: 1
+      # Production sizing for 250 TiB / 5K-user workloads:
+      #   replicas: 4   (override via RESTORE_HEAVY_REPLICAS)
+      #   memory:   32 GiB — fits Aspose .NET runtime + PST B-tree index
+      #                       for whale-mailbox PST exports (100GB+).
+      # MAX_CONCURRENT_EXPORTS_PER_WORKER=1 so each replica processes one
+      # whale at a time; 4 replicas = 4 simultaneous whale exports.
+      replicas: ${RESTORE_HEAVY_REPLICAS:-1}
       resources:
         limits:
-          memory: 16G
+          memory: ${RESTORE_HEAVY_MEM_LIMIT:-32G}
+          cpus: "${RESTORE_HEAVY_CPU_LIMIT:-8}"
         reservations:
-          memory: 4G
-    mem_limit: 16g
+          memory: ${RESTORE_HEAVY_MEM_RESERVE:-8G}
+    mem_limit: ${RESTORE_HEAVY_MEM_LIMIT:-32g}
     restart: unless-stopped
     networks:
       - tm-network
@@ -685,10 +771,109 @@ services:
     deploy:
       replicas: ${DR_WORKER_REPLICAS:-1}
 
+  # ---------------------------------------------------------------------------
+  # Observability — Prometheus + Grafana (gated by 'observability' profile)
+  # Bring up with: docker compose --profile observability up -d
+  # Scrapes metrics on the worker pods at :9100/metrics. Grafana on :3001.
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: tm_vault_prometheus
+    profiles: ["observability"]
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--storage.tsdb.path=/prometheus"
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: tm_vault_grafana
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./ops/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  # ---------------------------------------------------------------------------
+  # Postgres read-replica (gated by 'ha' profile). For true production HA
+  # use a managed service (Azure Database for PostgreSQL Flexible Server,
+  # AWS RDS, Cloud SQL) — this compose service is for dev-validating the
+  # app-side failover behaviour, not for production-grade replication.
+  # ---------------------------------------------------------------------------
+  postgres-replica:
+    image: postgres:16
+    container_name: tm_vault_db_replica
+    profiles: ["ha"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGUSER: replicator
+    command: >
+      bash -c "
+        until pg_basebackup --pgdata=/var/lib/postgresql/data -R --slot=replica_slot --host=postgres --port=5432; do
+          echo 'Waiting for primary to be ready...'; sleep 5;
+        done
+        echo 'standby_mode = on' >> /var/lib/postgresql/data/postgresql.conf
+        chown -R postgres:postgres /var/lib/postgresql/data
+        exec postgres
+      "
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
+  # ---------------------------------------------------------------------------
+  # Redis Sentinel (gated by 'ha' profile). For production: managed Redis
+  # (Azure Cache for Redis Premium, ElastiCache) or a self-hosted Sentinel
+  # cluster. This single-Sentinel setup validates app-side failover.
+  # ---------------------------------------------------------------------------
+  redis-sentinel:
+    image: bitnami/redis-sentinel:latest
+    container_name: tm_vault_redis_sentinel
+    profiles: ["ha"]
+    environment:
+      REDIS_MASTER_HOST: redis
+      REDIS_MASTER_SET: tmvault-master
+      REDIS_SENTINEL_QUORUM: "1"
+      REDIS_SENTINEL_DOWN_AFTER_MILLISECONDS: "10000"
+      REDIS_SENTINEL_FAILOVER_TIMEOUT: "30000"
+    ports:
+      - "26379:26379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
 volumes:
   postgres_data:
+  postgres_replica_data:
   redis_data:
   azurite_data:
+  prometheus_data:
+  grafana_data:
 
 networks:
   tm-network:
