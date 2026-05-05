@@ -570,11 +570,6 @@ services:
       APP_3_TENANT_ID: ${APP_3_TENANT_ID:-}
       AZURE_AD_CLIENT_ID: ${AZURE_AD_CLIENT_ID}
       AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
-      # PST export — Aspose.Email license delivery
-      ASPOSE_LICENSE_PATH: ${ASPOSE_LICENSE_PATH:-}
-      ASPOSE_LICENSE_KV_SECRET_NAME: ${ASPOSE_LICENSE_KV_SECRET_NAME:-}
-      ASPOSE_LICENSE_KV_URL: ${ASPOSE_LICENSE_KV_URL:-}
-      ASPOSE_EMAIL_LIC_B64: ${ASPOSE_EMAIL_LIC_B64:-}
       # PST export — production tunables (override per workload)
       PST_WRITE_CONCURRENCY: ${PST_WRITE_CONCURRENCY:-1}
       PST_DISK_OVERHEAD_MULTIPLIER: ${PST_DISK_OVERHEAD_MULTIPLIER:-2.0}
@@ -652,11 +647,6 @@ services:
       AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
       RESTORE_WORKER_QUEUE: restore.heavy
       MAX_CONCURRENT_EXPORTS_PER_WORKER: 1
-      # PST export — Aspose.Email license delivery
-      ASPOSE_LICENSE_PATH: ${ASPOSE_LICENSE_PATH:-}
-      ASPOSE_LICENSE_KV_SECRET_NAME: ${ASPOSE_LICENSE_KV_SECRET_NAME:-}
-      ASPOSE_LICENSE_KV_URL: ${ASPOSE_LICENSE_KV_URL:-}
-      ASPOSE_EMAIL_LIC_B64: ${ASPOSE_EMAIL_LIC_B64:-}
       # PST export — production tunables (override per workload)
       PST_WRITE_CONCURRENCY: ${PST_WRITE_CONCURRENCY:-1}
       PST_DISK_OVERHEAD_MULTIPLIER: ${PST_DISK_OVERHEAD_MULTIPLIER:-2.0}
@@ -689,8 +679,9 @@ services:
     deploy:
       # Production sizing for 250 TiB / 5K-user workloads:
       #   replicas: 4   (override via RESTORE_HEAVY_REPLICAS)
-      #   memory:   32 GiB — fits Aspose .NET runtime + PST B-tree index
-      #                       for whale-mailbox PST exports (100GB+).
+      #   memory:   32 GiB — headroom for in-flight pst_convert chunks +
+      #                       attachment payloads on whale-mailbox PST
+      #                       exports (100GB+).
       # MAX_CONCURRENT_EXPORTS_PER_WORKER=1 so each replica processes one
       # whale at a time; 4 replicas = 4 simultaneous whale exports.
       replicas: ${RESTORE_HEAVY_REPLICAS:-1}

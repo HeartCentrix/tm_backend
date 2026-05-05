@@ -1,8 +1,8 @@
 """Tests for PstGroupPlanner (and _safe_name helper) in pst_export.py.
 
-All aspose.* modules are absent in the test environment; pst_export.py itself
-never imports them at module level, so no sys.modules patching is required for
-these planner tests.
+pst_export.py no longer touches any external PST library at module
+level (it shells out to the bundled pst_convert binary at write time),
+so no sys.modules patching is required for these planner tests.
 """
 from __future__ import annotations
 

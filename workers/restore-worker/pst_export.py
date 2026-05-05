@@ -6,8 +6,9 @@ correct per-type writer, ZIPs the resulting ``.pst`` files, uploads the
 archive to blob storage, and reports progress via an optional async
 callback.
 
-All Aspose imports are lazy (never at module top level) because aspose-email
-is not installed in the local dev environment.
+PST file generation is delegated to the bundled ``pst_convert`` CLI
+(see :mod:`shared.pstwriter_cli`); this module owns planning, ZIP
+assembly, blob upload, checkpointing, and progress reporting.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Tunables (all env-configurable for production deployment)
 # ---------------------------------------------------------------------------
-# PST_WRITE_CONCURRENCY        (default 1)    — per-process Aspose semaphore
+# PST_WRITE_CONCURRENCY        (default 1)    — per-process pst_convert semaphore
 # PST_DISK_OVERHEAD_MULTIPLIER (default 2.0)  — how much disk per source byte
 # PST_DISK_FLOOR_BYTES         (default 256MB)— min free bytes to reserve
 # PST_MEMORY_LIMIT_MB          (default 0)    — RSS soft cap; 0=disabled
@@ -197,9 +198,9 @@ async def _memory_pressure_check(items_processed: int) -> None:
         await asyncio.sleep(0.1)
 
 # Per-type writers — imported at module top so tests can patch
-# ``pst_export.MailPstWriter`` etc.  The writer modules themselves keep
-# all ``aspose.*`` imports lazy, so importing them here is safe in the
-# dev/test environment.
+# ``pst_export.MailPstWriter`` etc. They wrap the bundled ``pst_convert``
+# CLI; spawning the binary is deferred to write() so importing this
+# module doesn't require the binary to be present.
 from pst_writers.mail import MailPstWriter
 from pst_writers.calendar import CalendarPstWriter
 from pst_writers.contact import ContactPstWriter
@@ -456,7 +457,6 @@ class PstExportOrchestrator:
         a single archive (the existing single-zip download contract).
         """
         from collections import defaultdict
-        from shared.aspose_license import apply_license
         from shared.azure_storage import upload_blob_with_retry_from_file  # noqa: F401  (used by _flush_group)
         # Lazy import metrics module — module-level safe_* helpers no-op
         # when the prometheus_client dep is missing or the HTTP server
@@ -464,8 +464,6 @@ class PstExportOrchestrator:
         from shared import pst_metrics as _m
         import time as _time
         _job_started_at = _time.monotonic()
-
-        apply_license()
         self.workdir.mkdir(parents=True, exist_ok=True)
 
         # Resolve storage shard if caller didn't pass one in.
@@ -925,20 +923,16 @@ class PstExportOrchestrator:
 
         Plan groups, dispatch writers, ZIP output, upload, return result.
         Steps:
-          1. ``apply_license()`` (Aspose.Email needs the metered licence).
-          2. Plan groups via :class:`PstGroupPlanner`.
-          3. For each group, dispatch the matching writer; collect PSTs.
-          4. ZIP all ``.pst`` files into ``{job_id}.zip`` (STORED — the
+          1. Plan groups via :class:`PstGroupPlanner`.
+          2. For each group, dispatch the matching writer; collect PSTs.
+          3. ZIP all ``.pst`` files into ``{job_id}.zip`` (STORED — the
              PSTs are already large/dense; deflate adds overhead).
-          5. Upload the archive (built-in cleanup deletes the local zip).
-          6. Cleanup local workdir.
-          7. Return result dict.
+          4. Upload the archive (built-in cleanup deletes the local zip).
+          5. Cleanup local workdir.
+          6. Return result dict.
         """
         import zipfile as _zipfile
-        from shared.aspose_license import apply_license  # lazy import
         from shared.azure_storage import upload_blob_with_retry_from_file
-
-        apply_license()
 
         self.workdir.mkdir(parents=True, exist_ok=True)
 
@@ -1051,11 +1045,10 @@ class PstExportOrchestrator:
                 # the whole job. We log, skip, and continue. The job result
                 # records skipped groups so the caller can decide on retry.
                 # Acquire the per-process write semaphore so concurrent jobs
-                # in the same worker process don't oversubscribe Aspose's
-                # .NET runtime (memory + GC pressure). Wall-clock timeout
-                # so a single hung group can't block the whole job
-                # indefinitely (e.g. corrupted MAPI item that loops in
-                # native .NET code).
+                # in the same worker process don't oversubscribe pst_convert
+                # (each invocation forks a child process + holds the chunk
+                # in memory). Wall-clock timeout so a single hung group
+                # can't block the whole job indefinitely.
                 try:
                     writer = WriterClass()
                     async with _get_write_semaphore():

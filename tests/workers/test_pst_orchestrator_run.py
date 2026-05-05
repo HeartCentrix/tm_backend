@@ -1,10 +1,9 @@
 """Tests for ``PstExportOrchestrator.run()`` — writer dispatch, ZIP
 bundling, blob upload, cleanup, and progress reporting.
 
-The orchestrator's lazy ``apply_license`` and ``upload_blob_with_retry_from_file``
-imports happen inside ``run()``; we patch them with ``patch.object`` on
-the live ``shared.aspose_license`` / ``shared.azure_storage`` modules
-loaded via the standard import machinery.
+The orchestrator's lazy ``upload_blob_with_retry_from_file`` import
+happens inside ``run()``; we patch it with ``patch.object`` on the live
+``shared.azure_storage`` module loaded via the standard import machinery.
 
 We mock the per-type writers by patching attributes on ``pst_export``
 itself — the orchestrator looks them up in a local ``writer_map`` that
@@ -40,10 +39,9 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 
-# Stub aspose.email.mapi so any nested writer import (in case the real
-# class is loaded somehow) does not blow up.
-sys.modules.setdefault("aspose.email.mapi", MagicMock())
-sys.modules.setdefault("aspose.email.storage.pst", MagicMock())
+# pst_convert is the bundled CLI now; production writers shell out to it
+# but tests stub the writer classes themselves so the binary is never
+# invoked here.
 
 
 # Pre-register pst_writers as a real importable package so pst_export's
@@ -167,14 +165,6 @@ def fake_shard():
 
 
 @pytest.fixture
-def fake_apply_license():
-    """Patch shared.aspose_license.apply_license — orchestrator imports lazily."""
-    import shared.aspose_license as al  # noqa: WPS433
-    with patch.object(al, "apply_license") as m:
-        yield m
-
-
-@pytest.fixture
 def fake_upload_success():
     """Default upload mock — returns success."""
     import shared.azure_storage as az
@@ -212,7 +202,7 @@ def isolate_workdir(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_returns_done_with_blob_path_and_counts(
-    patch_writers, fake_shard, fake_apply_license, fake_upload_success
+    patch_writers, fake_shard, fake_upload_success
 ):
     items = [
         _Item(_SNAP, "e1", "EMAIL"),
@@ -253,31 +243,12 @@ async def test_run_returns_done_with_blob_path_and_counts(
 
 
 # ---------------------------------------------------------------------------
-# Test 2 — apply_license called exactly once
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_run_calls_apply_license_once(
-    patch_writers, fake_shard, fake_apply_license, fake_upload_success
-):
-    orch = PstExportOrchestrator(
-        job_id="job-lic",
-        items=[_Item(_SNAP, "e1", "EMAIL")],
-        spec={},
-        storage_shard=fake_shard,
-        dest_container="exports-c",
-    )
-    await orch.run()
-    fake_apply_license.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# Test 3 — upload_blob_with_retry_from_file called with correct args
+# Test 2 — upload_blob_with_retry_from_file called with correct args
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_run_calls_upload_with_correct_container_and_blob_path(
-    patch_writers, fake_shard, fake_apply_license, fake_upload_success
+    patch_writers, fake_shard, fake_upload_success
 ):
     orch = PstExportOrchestrator(
         job_id="job-upload",
@@ -306,7 +277,7 @@ async def test_run_calls_upload_with_correct_container_and_blob_path(
 
 @pytest.mark.asyncio
 async def test_run_invokes_update_progress_callback_with_increasing_values(
-    patch_writers, fake_shard, fake_apply_license, fake_upload_success
+    patch_writers, fake_shard, fake_upload_success
 ):
     seen: list = []
 
@@ -344,7 +315,7 @@ async def test_run_invokes_update_progress_callback_with_increasing_values(
 
 @pytest.mark.asyncio
 async def test_run_returns_upload_failed_when_upload_fails(
-    patch_writers, fake_shard, fake_apply_license, fake_upload_failure
+    patch_writers, fake_shard, fake_upload_failure
 ):
     orch = PstExportOrchestrator(
         job_id="job-fail",
@@ -367,7 +338,7 @@ async def test_run_returns_upload_failed_when_upload_fails(
 
 @pytest.mark.asyncio
 async def test_run_empty_items_yields_zero_psts_but_still_done(
-    patch_writers, fake_shard, fake_apply_license, fake_upload_success
+    patch_writers, fake_shard, fake_upload_success
 ):
     orch = PstExportOrchestrator(
         job_id="job-empty",
@@ -393,7 +364,7 @@ async def test_run_empty_items_yields_zero_psts_but_still_done(
 
 @pytest.mark.asyncio
 async def test_run_cleans_up_workdir_after_upload(
-    patch_writers, fake_shard, fake_apply_license, fake_upload_success
+    patch_writers, fake_shard, fake_upload_success
 ):
     orch = PstExportOrchestrator(
         job_id="job-clean",
@@ -416,7 +387,7 @@ async def test_run_cleans_up_workdir_after_upload(
 
 @pytest.mark.asyncio
 async def test_run_falls_back_to_azure_storage_manager_when_shard_none(
-    patch_writers, fake_apply_license, fake_upload_success
+    patch_writers, fake_upload_success
 ):
     fake_shard = MagicMock(name="default_shard")
     fake_shard.ensure_container = AsyncMock(return_value=None)
