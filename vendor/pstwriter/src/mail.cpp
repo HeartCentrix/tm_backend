@@ -834,10 +834,20 @@ PcResult buildMailFolderPc(const M7FolderSchema& schema,
         props.push_back({ 0x3613u, PropType::Unicode,
                           schema.containerClassUtf16le, schema.containerClassSize,
                           PropStorageHint::Auto });
-    props.push_back({ 0x6635u, PropType::Int32,
-                      hiddenCountBytes.data(), 4u, PropStorageHint::Auto });
-    props.push_back({ 0x6636u, PropType::Int32,
-                      hiddenUnreadBytes.data(), 4u, PropStorageHint::Auto });
+    // PR_PstHiddenCount / PR_PstHiddenUnreadCount: only emit when non-zero.
+    // The Hierarchy-TC-row schema includes these at iBit 11/12, but the
+    // row builder never sets those CEB bits (HierarchyTcRow has no fields
+    // for them). When the PC carries 0x6635/0x6636 unconditionally, scanpst
+    // finds them in the child PC but absent in the parent's hierarchy row
+    // and flags "Hierarchy Table for X, row doesn't match sub-object".
+    // Emitting only when non-zero (i.e. when there are actual hidden
+    // subfolders) matches what real Outlook-emitted PSTs do.
+    if (schema.pstHiddenCount != 0u)
+        props.push_back({ 0x6635u, PropType::Int32,
+                          hiddenCountBytes.data(), 4u, PropStorageHint::Auto });
+    if (schema.pstHiddenUnreadCount != 0u)
+        props.push_back({ 0x6636u, PropType::Int32,
+                          hiddenUnreadBytes.data(), 4u, PropStorageHint::Auto });
 
     return buildPropertyContext(props.data(), props.size(), firstSubnodeNid);
 }

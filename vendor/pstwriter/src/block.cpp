@@ -64,6 +64,9 @@ vector<uint8_t> buildInternalBlock(uint8_t        btype,
     // BLOCKTRAILER goes in the last 16 bytes. cb is the LOGICAL body size.
     // [MS-PST] §2.2.2.8.1: dwCRC is the CRC of `cb` bytes of raw data, NOT
     // including the alignment padding. Scope = bodyBytes, not trailerOff.
+    // (Confirmed by an Outlook 16.0.19929 BCRead error that named the
+    //  cb-only CRC as the "Expected" value when the writer briefly used
+    //  trailerOff scope; pst_info's trailerOff check was non-conforming.)
     const size_t trailerOff = totalSize - kBlockTrailerSize;
     const uint32_t dwCRC = crc32(p, bodyBytes);
 
@@ -102,7 +105,11 @@ vector<uint8_t> buildDataBlock(const uint8_t* payload,
     // [MS-PST] §2.2.2.8.1: dwCRC is the CRC of `cb` bytes of raw data —
     // the encrypted payload only, NOT the alignment padding. Verified
     // empirically against backup.pst on 2026-05-04 (5/5 sampled blocks
-    // matched cb-only scope; 0/5 matched cb+padding scope).
+    // matched cb-only scope; 0/5 matched cb+padding scope) AND confirmed
+    // again on 2026-05-05 by an Outlook 16.0.19929 BCRead error that
+    // named the cb-only CRC as the "Expected" value when this scope was
+    // briefly changed to trailerOff. pst_info uses trailerOff for its
+    // own CRC walk — that is a pst_info bug, not a writer bug.
     const size_t trailerOff = totalSize - kBlockTrailerSize;
     const uint32_t dwCRC = crc32(buf.data(), cbPayload);
 

@@ -707,9 +707,18 @@ TcResult buildReceiveFolderTableTc()
     // recipient for messages with no specific class match.
     static const auto inboxEntryId =
         makeEntryId(kDefaultRftProviderUid, Nid{0x00008022u}, 0u);
-    // 2-byte UTF-16-LE NUL — minimum non-empty payload that still
-    // semantically encodes the empty message class (one NUL char).
-    static constexpr std::array<uint8_t, 2> emptyClassUtf16 = { 0x00u, 0x00u };
+    // M11-N: real Outlook-emitted PSTs use the literal class string "IPM"
+    // (6 bytes UTF-16-LE) for their default-class row, not the empty
+    // string. scanpst's "Receive folder table missing default message
+    // class" check looks for either an empty-class row OR a row with
+    // class "IPM" — and rejected our previous 2-byte-NUL hack as still
+    // matching neither. Using "IPM" satisfies the check and is what
+    // Outlook itself writes when it creates a fresh PST.
+    static constexpr std::array<uint8_t, 6> ipmClassUtf16 = {
+        0x49u, 0x00u,   // 'I'
+        0x50u, 0x00u,   // 'P'
+        0x4Du, 0x00u,   // 'M'
+    };
 
     array<uint8_t, kReceiveFolderRowSize> row{};
     detail::writeU32(row.data(), 0, 0u);         // LtpRowId = 0 (default class)
@@ -723,12 +732,12 @@ TcResult buildReceiveFolderTableTc()
     // bit 4=iBit3 → 0b11110000 = 0xF0.
     row[kReceiveFolderCebOff] = 0xF0u;
 
-    // MessageClass is "" (encoded as 1 UTF-16 NUL char = 2 bytes).
+    // MessageClass is "IPM" (Outlook's canonical default-class key).
     // ReceiveFolderID is the 24-byte ENTRYID for IPM Subtree.
     TcVarlenCell varlen[2];
     varlen[0].colIndex = 0;  // index 0 in tag-sorted array = 0x001A MessageClass_W
-    varlen[0].bytes    = emptyClassUtf16.data();
-    varlen[0].size     = emptyClassUtf16.size();
+    varlen[0].bytes    = ipmClassUtf16.data();
+    varlen[0].size     = ipmClassUtf16.size();
     varlen[1].colIndex = 2;  // index 2 in tag-sorted array = 0x3667 ReceiveFolderID
     varlen[1].bytes    = inboxEntryId.data();
     varlen[1].size     = inboxEntryId.size();
