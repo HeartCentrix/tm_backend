@@ -1005,14 +1005,16 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
 
             // Hierarchy TC (0 rows — M7 folders are flat; sub-folder
             // support is left to writeM7Pst callers via parentNid wiring).
-            scheduleNode(rec.hierarchyNid, Nid{0u},
+            // Per-folder sibling tables (HIER/CONTENTS/FAI) carry
+            // nidParent = owning folder NID per real-Outlook oracle.
+            scheduleNode(rec.hierarchyNid, rec.folderNid,
                          buildFolderHierarchyTc(nullptr, 0).hnBytes);
 
             // Contents TC — populated rows below.
             // (Defer to message-building loop; we'll patch the slot.)
 
             // FAI contents TC (0 rows)
-            scheduleNode(rec.faiNid, Nid{0u},
+            scheduleNode(rec.faiNid, rec.folderNid,
                          buildFolderFaiContentsTc().hnBytes);
         }
 
@@ -1043,7 +1045,7 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
         // the messages' NBT entries with nidParent=folder. M10 hardening
         // can populate the Contents TC view rows.
         for (auto& rec : folderRecs) {
-            scheduleNode(rec.contentsNid, Nid{0u},
+            scheduleNode(rec.contentsNid, rec.folderNid,
                          buildFolderContentsTc().hnBytes);
         }
 

@@ -393,11 +393,13 @@ WriteResult writeM9Pst(const M9PstConfig& config) noexcept
             auto pc = buildMailFolderPc(schema, kDummySub);
             scheduleNode(rec.folderNid, rec.src->parentNid, std::move(pc.hnBytes));
 
-            scheduleNode(rec.hierarchyNid, Nid{0u},
+            // Per-folder sibling tables (HIER/CONTENTS/FAI) carry
+            // nidParent = owning folder NID per real-Outlook oracle.
+            scheduleNode(rec.hierarchyNid, rec.folderNid,
                          buildFolderHierarchyTc(nullptr, 0).hnBytes);
-            scheduleNode(rec.contentsNid, Nid{0u},
+            scheduleNode(rec.contentsNid, rec.folderNid,
                          buildFolderContentsTc().hnBytes);
-            scheduleNode(rec.faiNid, Nid{0u},
+            scheduleNode(rec.faiNid, rec.folderNid,
                          buildFolderFaiContentsTc().hnBytes);
         }
 
