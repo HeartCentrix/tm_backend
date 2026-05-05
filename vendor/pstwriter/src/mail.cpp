@@ -1343,10 +1343,17 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
                 HierarchyTcRow row;
                 row.rowId = folderRecs[i].folderNid;
                 // folderNameStore stores [name, containerClass, name,
-                // containerClass, ...]. Display name is at index 2*i.
+                // containerClass, ...]. Display name at 2*i, container
+                // class at 2*i+1. (M11-M Tier 8: containerClass plumbed
+                // so the row's PR_CONTAINER_CLASS column matches the
+                // child folder's PC; otherwise scanpst flags "Hierarchy
+                // Table for X, row doesn't match sub-object".)
                 const auto& nameBuf = folderNameStore[2 * i];
-                row.displayNameUtf16le = nameBuf.data();
-                row.displayNameSize    = nameBuf.size();
+                const auto& ccBuf   = folderNameStore[2 * i + 1];
+                row.displayNameUtf16le    = nameBuf.data();
+                row.displayNameSize       = nameBuf.size();
+                row.containerClassUtf16le = ccBuf.empty() ? nullptr : ccBuf.data();
+                row.containerClassSize    = ccBuf.size();
                 row.contentCount       = folderRecs[i].contentCount;
                 row.contentUnreadCount = folderRecs[i].contentUnreadCount;
                 row.hasSubfolders      = false;

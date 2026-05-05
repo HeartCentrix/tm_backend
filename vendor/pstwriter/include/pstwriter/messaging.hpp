@@ -193,6 +193,16 @@ struct HierarchyTcRow {
 
     // PidTagSubfolders — true iff the child folder itself has children.
     bool hasSubfolders {false};
+
+    // PidTagContainerClass_W (0x3613001F) — UTF-16-LE class string for
+    // the child folder ("IPF.Note" for mail, "IPF.Contact" for contacts,
+    // etc.). M11-M (Tier 8): when set, the row emits CEB bit 10 and a
+    // varlen HID — must match the same string in the child folder's
+    // PC, or scanpst flags "row doesn't match sub-object" and Outlook
+    // strict mode rejects the file. Leave nullptr/0 only for folders
+    // whose PC also doesn't emit PR_CONTAINER_CLASS.
+    const uint8_t* containerClassUtf16le {nullptr};
+    size_t         containerClassSize    {0};
 };
 
 // ============================================================================

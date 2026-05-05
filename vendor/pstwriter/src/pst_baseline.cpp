@@ -11,6 +11,7 @@
 #include "types.hpp"
 
 #include <array>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -121,8 +122,18 @@ buildPstBaselineEntries(const array<uint8_t, 16>& providerUid,
     //     mapping per [MS-PST] §2.4.5. Required by scanpst.exe; absent
     //     surfaces as "Receive folder table missing" / "missing default
     //     message class" errors. (Tier 2 ISSUE G.)
-    out.push_back(mkEntry(Nid{0x00000617u}, Nid{0u},
-                          buildReceiveFolderTableTc().hnBytes));
+    //
+    // M11-M (Tier 7) diagnostic toggle: setting the environment variable
+    // PSTWRITER_OMIT_RFT=1 skips this emission entirely. Used to bisect
+    // which scanpst error is the actual real-Outlook open blocker. Has
+    // no effect on production builds (env var is unset by default).
+    {
+        const char* omitRft = std::getenv("PSTWRITER_OMIT_RFT");
+        if (omitRft == nullptr || omitRft[0] == '0' || omitRft[0] == '\0') {
+            out.push_back(mkEntry(Nid{0x00000617u}, Nid{0u},
+                                  buildReceiveFolderTableTc().hnBytes));
+        }
+    }
 
     // 7-8. Bare nodes
     out.push_back(mkEntry(Nid{0x000001E1u}, Nid{0u}, buildEmptyNodePayload()));

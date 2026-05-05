@@ -201,72 +201,86 @@ constexpr TcColumn kHierarchyCols[13] = {
 
 // Per-row matrix size derived from rgib (53 fixed + 2 CEB = 55).
 constexpr size_t kHierarchyRowSize = 55;
-// CEB byte count = ceil(13 / 8) = 2.
-constexpr size_t kHierarchyCebSize = 2;
+constexpr size_t kHierarchyCebOff  = 53;
 
-// CEB bit pattern for a "present" row: which columns of the 13 are
-// actually populated. Per §3.12 Row 0 (and the M6 default schema):
-// LtpRowId(0), LtpRowVer(1), DisplayName_W(2), ContentCount(3),
-// ContentUnreadCount(4), Subfolders(5), ReplChangenum(7) — 7 cells set.
-// Bit layout: byte 0 high-bit-first for iBit 0..7; byte 1 high-bit-first
-// for iBit 8..15.
-//   byte 0: iBit 0,1,2,3,4,5,_,7 → 0b11111101 = 0xFD
-//   byte 1: (iBit 8..12 all clear; iBit 13..15 unused) → 0x00
-constexpr uint8_t kHierarchyCebByte0 = 0xFDu;
-constexpr uint8_t kHierarchyCebByte1 = 0x00u;
+// Set the CEB bit for `iBit` (high-bit-first byte numbering — bit 0
+// of byte 0 is bit 7 of CEB[0]). Shared by all TC row builders below.
+inline void setCebBit(uint8_t* ceb, unsigned iBit) noexcept
+{
+    const unsigned byteIdx   = iBit / 8u;
+    const unsigned bitInByte = 7u - (iBit % 8u);
+    ceb[byteIdx] |= static_cast<uint8_t>(1u << bitInByte);
+}
 
 } // namespace
 
 TcResult buildFolderHierarchyTc(const HierarchyTcRow* rows, size_t rowCount)
 {
-    // Pre-pack each row's 55 bytes. Varlen DisplayName_W cells are slotted
-    // separately as TcVarlenCell entries; the writer patches the row's
-    // 4-byte HID slot at ibData=8 with the assigned HID.
     vector<array<uint8_t, kHierarchyRowSize>> rowBuffers(rowCount);
-    vector<TcVarlenCell>                      varlenStore;
-    varlenStore.reserve(rowCount);            // 1 varlen cell per row (DisplayName)
+    vector<TcRow>                             tcRows(rowCount);
+    vector<vector<TcVarlenCell>>              perRowVarlen(rowCount);
 
-    // Per-row varlen cells need stable storage during the buildTableContext
-    // call. We use a flat vector and per-row slices.
-    vector<TcRow>          tcRows(rowCount);
-    vector<vector<TcVarlenCell>> perRowVarlen(rowCount);
+    // colIndex constants — match kHierarchyCols tag-ascending order.
+    // The hierarchy row's DisplayName HID lives at colIndex=4 (0x3001),
+    // ContainerClass_W at colIndex=8 (0x3613).
+    constexpr size_t kDisplayNameColIdx    = 4;
+    constexpr size_t kContainerClassColIdx = 8;
 
     for (size_t r = 0; r < rowCount; ++r) {
         const HierarchyTcRow& src = rows[r];
         uint8_t* dst = rowBuffers[r].data();
         std::memset(dst, 0, kHierarchyRowSize);
+        uint8_t* ceb = dst + kHierarchyCebOff;
 
         // Bytes 0..3:   LtpRowId
         detail::writeU32(dst,  0, src.rowId.value);
         // Bytes 4..7:   LtpRowVer
         detail::writeU32(dst,  4, src.rowVer);
-        // Bytes 8..11:  DisplayName_W HID (placeholder; writer patches)
+        // Bytes 8..11:  DisplayName_W HID (writer patches)
         // Bytes 12..15: ContentCount
         detail::writeU32(dst, 12, src.contentCount);
         // Bytes 16..19: ContentUnreadCount
         detail::writeU32(dst, 16, src.contentUnreadCount);
-        // Bytes 20..23: ReplItemid (zero, CEB clear)
-        // Bytes 24..31: ReplChangenum (zero, CEB set per §3.12)
-        // Bytes 32..35: ReplVersionhistory HID (zero, CEB clear)
-        // Bytes 36..39: ReplFlags (zero, CEB clear)
-        // Bytes 40..43: ContainerClass_W HID (zero, CEB clear)
-        // Bytes 44..47: 0x6635 (zero, CEB clear)
-        // Bytes 48..51: 0x6636 (zero, CEB clear)
         // Byte  52:     Subfolders
         dst[52] = src.hasSubfolders ? 1u : 0u;
-        // Bytes 53..54: CEB
-        dst[53] = kHierarchyCebByte0;
-        dst[54] = kHierarchyCebByte1;
 
-        // Find the column-index of DisplayName_W in our schema (its
-        // colIndex is the position in kHierarchyCols, which is sorted by
-        // tag ascending — DisplayName tag 0x3001001F is at index 4).
-        constexpr size_t kDisplayNameColIdx = 4;
+        // M11-M (Tier 8): CEB now built dynamically based on what
+        // values are actually meaningful, matching what
+        // buildMailFolderPc / buildFolderPc emit in the child folder's
+        // PC at NID = src.rowId. Previous static `kHierarchyCebByte0=0xFD`
+        // claimed PR_CHANGENUM (iBit 7) was present even though the
+        // folder PC doesn't emit it, AND failed to claim PR_CONTAINER_CLASS
+        // (iBit 10) even when the folder PC has it. scanpst flagged this
+        // as "Hierarchy Table for X, row doesn't match sub-object" and
+        // real Outlook strict mode rejected the file.
+        //
+        // Always-present cells (folder PC always has these):
+        //   iBit 0  LtpRowId
+        //   iBit 1  LtpRowVer
+        //   iBit 3  ContentCount       (buildMailFolderPc / buildFolderPc)
+        //   iBit 4  ContentUnreadCount
+        //   iBit 5  Subfolders
+        // Conditional:
+        //   iBit 2  DisplayName        (set when src.displayNameSize > 0)
+        //   iBit 10 ContainerClass     (set when src.containerClassSize > 0)
+        setCebBit(ceb, 0);
+        setCebBit(ceb, 1);
+        setCebBit(ceb, 3);
+        setCebBit(ceb, 4);
+        setCebBit(ceb, 5);
 
         if (src.displayNameUtf16le != nullptr && src.displayNameSize > 0) {
             perRowVarlen[r].push_back({ kDisplayNameColIdx,
                                         src.displayNameUtf16le,
                                         src.displayNameSize });
+            setCebBit(ceb, 2);
+        }
+
+        if (src.containerClassUtf16le != nullptr && src.containerClassSize > 0) {
+            perRowVarlen[r].push_back({ kContainerClassColIdx,
+                                        src.containerClassUtf16le,
+                                        src.containerClassSize });
+            setCebBit(ceb, 10);
         }
 
         tcRows[r].rowId       = src.rowId.value;
@@ -384,14 +398,8 @@ constexpr size_t kColChangeKey               = 24;  // M11-I: 0x3013 (Binary)
 constexpr size_t kColLtpRowId                = 26;
 constexpr size_t kColLtpRowVer               = 27;
 
-// Set the CEB bit for `iBit` (high-bit-first byte numbering — bit 0
-// of byte 0 is bit 7 of CEB[0], same convention as the Hierarchy TC).
-inline void setCebBit(uint8_t* ceb, unsigned iBit) noexcept
-{
-    const unsigned byteIdx = iBit / 8u;
-    const unsigned bitInByte = 7u - (iBit % 8u);
-    ceb[byteIdx] |= static_cast<uint8_t>(1u << bitInByte);
-}
+// (M11-M: setCebBit moved up to file-scope anonymous namespace so the
+// Hierarchy row builder can use it. Definition at top of this file.)
 
 } // namespace
 
@@ -427,15 +435,24 @@ TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
         detail::writeU32(dst, 4, src.rowVer);
         setCebBit(ceb, 1);
 
-        // MessageStatus @ ibData=8, iBit=2 — always emit (default 0).
-        detail::writeU32(dst, 8, static_cast<uint32_t>(src.messageStatus));
-        setCebBit(ceb, 2);
+        // M11-M (Tier 8): CEB-bit setting is now CONDITIONAL on the
+        // value being meaningful (non-default), to match what
+        // buildMailPc actually emits at the referenced message NID.
+        // Previously we set CEB=True for cols whose PC property was
+        // never emitted (PR_MESSAGE_STATUS, PR_SENSITIVITY,
+        // PR_MESSAGE_TO_ME, PR_MESSAGE_CC_ME), which scanpst flagged
+        // as "Contents Table for X, row doesn't match sub-object".
 
-        // MessageFlags @ ibData=16, iBit=4 — always.
+        // MessageStatus @ ibData=8, iBit=2 — buildMailPc does NOT emit
+        // PR_MESSAGE_STATUS. Only set CEB if non-zero.
+        detail::writeU32(dst, 8, static_cast<uint32_t>(src.messageStatus));
+        if (src.messageStatus != 0) setCebBit(ceb, 2);
+
+        // MessageFlags @ ibData=16, iBit=4 — buildMailPc always emits.
         detail::writeU32(dst, 16, static_cast<uint32_t>(src.messageFlags));
         setCebBit(ceb, 4);
 
-        // Importance @ ibData=20, iBit=5 — always.
+        // Importance @ ibData=20, iBit=5 — buildMailPc always emits.
         detail::writeU32(dst, 20, static_cast<uint32_t>(src.importance));
         setCebBit(ceb, 5);
 
@@ -455,9 +472,10 @@ TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
         detail::writeU32(dst, 48, static_cast<uint32_t>(src.messageSize));
         setCebBit(ceb, 10);
 
-        // Sensitivity @ ibData=60, iBit=15 — always.
+        // Sensitivity @ ibData=60, iBit=15 — buildMailPc does NOT emit
+        // PR_SENSITIVITY. Only set CEB if non-zero. (M11-M)
         detail::writeU32(dst, 60, static_cast<uint32_t>(src.sensitivity));
-        setCebBit(ceb, 15);
+        if (src.sensitivity != 0) setCebBit(ceb, 15);
 
         // LastModificationTime @ ibData=80, iBit=20 — when non-zero.
         if (src.lastModificationTime != 0u) {
@@ -466,12 +484,13 @@ TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
         }
 
         // MessageToMe @ ibData=120, iBit=13 / MessageCcMe @ 121, iBit=14
-        // — always emit the boolean (0 = false). [M11-I: shifted from
-        // 116/117 to make room for ChangeKey HID at 116..119.]
+        // — buildMailPc does NOT emit PR_MESSAGE_TO_ME / PR_MESSAGE_CC_ME.
+        // Only set CEB when the boolean is true; otherwise leave clear so
+        // row matches PC. (M11-M)
         dst[120] = src.messageToMe ? 1u : 0u;
-        setCebBit(ceb, 13);
+        if (src.messageToMe) setCebBit(ceb, 13);
         dst[121] = src.messageCcMe ? 1u : 0u;
-        setCebBit(ceb, 14);
+        if (src.messageCcMe) setCebBit(ceb, 14);
 
         // ---- Varlen cells ----
         // The HID slot at each varlen column's ibData is left as zero;
@@ -673,37 +692,53 @@ constexpr std::array<uint8_t, 16> kDefaultRftProviderUid = {
 
 TcResult buildReceiveFolderTableTc()
 {
+    // M11-L P2: RFT row needs both:
+    //   1) LtpRowId = hash of message class. For default class "" we
+    //      use LtpRowId=0 — the conventional "default" key Outlook
+    //      looks up when receiving messages with unknown class.
+    //   2) MessageClass column emitted as a NON-EMPTY UTF-16-LE
+    //      payload (one NUL char = 2 bytes 0x00 0x00). A 0-byte
+    //      varlen value would leave HID=0 in the row cell, which
+    //      scanpst treats as "column missing" — same problem as
+    //      M11-K P5 (NameId map empty streams).
+    //   3) ReceiveFolderID = 24-byte ENTRYID for IPM Subtree.
+
     // Build the ENTRYID for IPM Subtree (NID 0x8022) — the default
     // recipient for messages with no specific class match.
     static const auto inboxEntryId =
         makeEntryId(kDefaultRftProviderUid, Nid{0x00008022u}, 0u);
+    // 2-byte UTF-16-LE NUL — minimum non-empty payload that still
+    // semantically encodes the empty message class (one NUL char).
+    static constexpr std::array<uint8_t, 2> emptyClassUtf16 = { 0x00u, 0x00u };
 
     array<uint8_t, kReceiveFolderRowSize> row{};
-    detail::writeU32(row.data(), 0, 1u);         // LtpRowId (1 = first row)
+    detail::writeU32(row.data(), 0, 0u);         // LtpRowId = 0 (default class)
     detail::writeU32(row.data(), 4, 1u);         // LtpRowVer
-    // Bytes 8..11: MessageClass_W HID (zero — buildTableContext patches
-    //              with the assigned HID for the empty-string varlen)
-    // Bytes 12..15: ReceiveFolderID HID (zero — patched with ENTRYID HID)
-    // Bytes 16..23: LastModificationTime (zero = absent, CEB clear)
-    // Byte 24: CEB. iBit 0,1,3 set (LtpRowId, LtpRowVer, ReceiveFolderID).
-    // MessageClass iBit=2 — empty string, but we still set CEB bit so
-    // scanpst sees the "default class" row. iBit 4 (LastModTime) clear.
-    // High-bit-first byte 0: iBits 0,1,2,3 → 0b11110000 = 0xF0.
+    // Bytes 8..11:  MessageClass_W HID  (writer patches with HID)
+    // Bytes 12..15: ReceiveFolderID HID (writer patches with HID)
+    // Bytes 16..23: LastModificationTime (0 = absent, CEB clear)
+    // Byte 24: CEB. iBits 0,1,2,3 set (LtpRowId, LtpRowVer,
+    //   MessageClass, ReceiveFolderID); iBit 4 (LastModTime) clear.
+    // High-bit-first byte 0: bit 7=iBit0, bit 6=iBit1, bit 5=iBit2,
+    // bit 4=iBit3 → 0b11110000 = 0xF0.
     row[kReceiveFolderCebOff] = 0xF0u;
 
-    // MessageClass is the empty string ("" = 0 bytes UTF-16-LE);
+    // MessageClass is "" (encoded as 1 UTF-16 NUL char = 2 bytes).
     // ReceiveFolderID is the 24-byte ENTRYID for IPM Subtree.
-    TcVarlenCell varlen[1];
-    varlen[0].colIndex = 2;  // index 2 = 0x3667 ReceiveFolderID in tag-sorted array
-    varlen[0].bytes    = inboxEntryId.data();
-    varlen[0].size     = inboxEntryId.size();
+    TcVarlenCell varlen[2];
+    varlen[0].colIndex = 0;  // index 0 in tag-sorted array = 0x001A MessageClass_W
+    varlen[0].bytes    = emptyClassUtf16.data();
+    varlen[0].size     = emptyClassUtf16.size();
+    varlen[1].colIndex = 2;  // index 2 in tag-sorted array = 0x3667 ReceiveFolderID
+    varlen[1].bytes    = inboxEntryId.data();
+    varlen[1].size     = inboxEntryId.size();
 
     TcRow tcRow{};
-    tcRow.rowId       = 1u;
+    tcRow.rowId       = 0u;
     tcRow.rowBytes    = row.data();
     tcRow.rowSize     = kReceiveFolderRowSize;
     tcRow.varlenCells = varlen;
-    tcRow.varlenCount = 1;
+    tcRow.varlenCount = 2;
 
     return buildTableContext(kReceiveFolderCols, 5, &tcRow, 1);
 }
@@ -711,39 +746,59 @@ TcResult buildReceiveFolderTableTc()
 // ----------------------------------------------------------------------------
 // buildSearchContentsTemplateTc — NID 0x610 Outgoing/Search Contents template.
 //
-// scanpst's NID 0x610 schema requires 17 columns per [MS-OXOSRCH] /
-// [MS-OXOMSG]. Earlier (M11-I) we delegated to buildFolderContentsTc,
-// but Contents has 28 columns (replication/retention) that don't
-// belong here, AND was missing 3 required ones:
-//   0x67F1  PR_PF_PROXY              Int32
-//   0x0E05  PR_PARENT_ENTRYID_W      Unicode (HID)  — NID 0x610 specific
-//   0x0E2A  PR_HASATTACH             Boolean
+// M11-L P1: REVERTED M11-K's 20-col dedicated schema. That schema put
+// the 8-byte 0x3008 LastModTime at ibData=76 AFTER the booleans (72-74),
+// giving TCI_4b=84 > TCI_1b=75 — violates [MS-PST] §2.3.4.1
+// `TCI_4b ≤ TCI_2b ≤ TCI_1b ≤ TCI_bm`. scanpst couldn't parse the
+// TCINFO and reported all 17 required columns as missing.
 //
-// M11-K P4: dedicated 19-column schema (17 required + LtpRowId/Ver).
+// New approach (per the Tier 6 prompt): take kContentsCols (28 cols)
+// as the base — Contents schema is known-valid — and ADD the 3 columns
+// scanpst flags as missing for NID 0x610:
+//   0x67F1  PR_PF_PROXY              Int32     (4 B)
+//   0x0E05  PR_PARENT_ENTRYID_W      Unicode   (4 B HID)
+//   0x0E2A  PR_HASATTACH             Boolean   (1 B)
+// Total: 31 cols. Booleans MessageToMe/MessageCcMe shift from
+// ibData=120/121 → 128/129 to make room for the two new 4-byte
+// cells at 120/124; HasAttach lands at 130. CEB region 122 → 131.
+// per-row endBm = 135 (was 126).
 // ----------------------------------------------------------------------------
 namespace {
 
-constexpr TcColumn kSearchContentsCols[20] = {
-    // tag-sorted ascending; 4-byte/8-byte cells in [0..71], 1-byte in
-    // [72..74], CEB (3 bytes for 20 iBits) at 75. endBm = 78.
+constexpr TcColumn kSearchContentsCols[31] = {
+    // tag-sorted ascending; 4/8-byte cells in [0..127], 1-byte in
+    // [128..130], CEB (4 bytes for 31 iBits) at 131. endBm = 135.
+    // Identical to kContentsCols layout for ibData 0..115; new cells
+    // and shifted booleans from 116 onwards.
     { 0x0017u, PropType::Int32,      20, 4,  5 },  // Importance
     { 0x001Au, PropType::Unicode,    12, 4,  3 },  // MessageClass_W
     { 0x0036u, PropType::Int32,      60, 4, 15 },  // Sensitivity
     { 0x0037u, PropType::Unicode,    28, 4,  7 },  // Subject_W
     { 0x0039u, PropType::SystemTime, 40, 8,  9 },  // ClientSubmitTime
     { 0x0042u, PropType::Unicode,    24, 4,  6 },  // SentRepresentingName_W
-    { 0x0057u, PropType::Boolean,    72, 1, 13 },  // MessageToMe
-    { 0x0058u, PropType::Boolean,    73, 1, 14 },  // MessageCcMe
+    { 0x0057u, PropType::Boolean,   128, 1, 13 },  // MessageToMe (M11-L: was 120)
+    { 0x0058u, PropType::Boolean,   129, 1, 14 },  // MessageCcMe (M11-L: was 121)
+    { 0x0070u, PropType::Unicode,    68, 4, 17 },  // ConversationTopic_W
+    { 0x0071u, PropType::Binary,     72, 4, 18 },  // ConversationIndex
     { 0x0E03u, PropType::Unicode,    56, 4, 12 },  // DisplayCc_W
     { 0x0E04u, PropType::Unicode,    52, 4, 11 },  // DisplayTo_W
-    { 0x0E05u, PropType::Unicode,    64, 4, 16 },  // ParentEntryID_W (M11-K)
+    { 0x0E05u, PropType::Unicode,   124, 4, 28 },  // ParentEntryID_W (NEW)
     { 0x0E06u, PropType::SystemTime, 32, 8,  8 },  // MessageDeliveryTime
     { 0x0E07u, PropType::Int32,      16, 4,  4 },  // MessageFlags
     { 0x0E08u, PropType::Int32,      48, 4, 10 },  // MessageSize
     { 0x0E17u, PropType::Int32,       8, 4,  2 },  // MessageStatus
-    { 0x0E2Au, PropType::Boolean,    74, 1, 17 },  // HasAttach (M11-K)
-    { 0x3008u, PropType::SystemTime, 76, 8, 18 },  // LastModTime
-    { 0x67F1u, PropType::Int32,      68, 4, 19 },  // PfProxy (M11-K)
+    { 0x0E2Au, PropType::Boolean,   130, 1, 30 },  // HasAttach (NEW)
+    { 0x0E30u, PropType::Binary,     88, 4, 21 },  // ReplItemId
+    { 0x0E33u, PropType::Int64,      92, 8, 22 },  // ReplChangenum
+    { 0x0E34u, PropType::Binary,    100, 4, 23 },  // ReplVersionhistory
+    { 0x0E38u, PropType::Int32,     112, 4, 26 },  // ReplFlags
+    { 0x0E3Cu, PropType::Binary,    108, 4, 25 },  // ReplCopiedfromVersionhistory
+    { 0x0E3Du, PropType::Binary,    104, 4, 24 },  // ReplCopiedfromItemid
+    { 0x1097u, PropType::Int32,      64, 4, 16 },  // ItemTemporaryFlags
+    { 0x3008u, PropType::SystemTime, 80, 8, 20 },  // LastModificationTime
+    { 0x3013u, PropType::Binary,    116, 4, 27 },  // ChangeKey
+    { 0x65C6u, PropType::Int32,      76, 4, 19 },  // SecureSubmitFlags
+    { 0x67F1u, PropType::Int32,     120, 4, 29 },  // PfProxy (NEW)
     { 0x67F2u, PropType::Int32,       0, 4,  0 },  // LtpRowId
     { 0x67F3u, PropType::Int32,       4, 4,  1 },  // LtpRowVer
 };
@@ -752,9 +807,8 @@ constexpr TcColumn kSearchContentsCols[20] = {
 
 TcResult buildSearchContentsTemplateTc()
 {
-    // Schema declared above; LtpRowVer omitted to keep iBit count at 19
-    // (≤ 24 for 3-byte CEB). Rows always 0 in M6 baseline — this is a
-    // template TC for Outlook to clone when a search folder is created.
+    // 0 rows — template that Outlook clones when it creates a real
+    // Outgoing/Search folder. M11-L: 31-col schema with valid TCINFO.
     return buildTableContext(kSearchContentsCols,
                              sizeof(kSearchContentsCols) / sizeof(kSearchContentsCols[0]),
                              nullptr, 0);
