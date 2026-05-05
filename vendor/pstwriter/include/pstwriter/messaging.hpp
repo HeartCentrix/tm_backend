@@ -227,20 +227,85 @@ TcResult buildFolderHierarchyTc(const HierarchyTcRow* rows,
                                 size_t                rowCount);
 
 // ============================================================================
+// ContentsTcRow — input to the row-populated buildFolderContentsTc(...).
+//
+// One row per message in the owning folder. Columns map to the §3.12
+// 27-col schema; cells whose source field is empty / zero are emitted
+// with their CEB bit clear (i.e. "absent"), matching real-Outlook
+// behaviour where missing values are signalled via CEB rather than
+// stored as zero/empty payloads.
+//
+// PidTagLtpRowId (rowId) is the message's own NID. Outlook's reader uses
+// it as the row's identity in the RowIndex BTH and as the link from a
+// contents-table view back to the message PC's NBT entry.
+//
+// Variable-size cells (Subject/MessageClass/...) are passed as
+// UTF-16-LE byte ranges (Unicode columns) or raw bytes
+// (PidTagConversationIndex). Caller owns the underlying storage and
+// must keep it alive for the duration of buildFolderContentsTc(...).
+// ============================================================================
+struct ContentsTcRow {
+    Nid             rowId;             // PidTagLtpRowId (= message NID)
+    uint32_t        rowVer        {0u};// PidTagLtpRowVer
+
+    // Inline fixed-size cells. Set the corresponding *Present flag to
+    // emit the cell with its CEB bit set; cells with the flag false are
+    // zeroed and CEB-cleared.
+    int32_t         importance       {1};   // 0x0017 (PidTagImportance; Normal=1)
+    int32_t         sensitivity      {0};   // 0x0036 (None=0)
+    int32_t         messageStatus    {0};   // 0x0E17
+    int32_t         messageFlags     {0};   // 0x0E07
+    int32_t         messageSize      {0};   // 0x0E08
+    bool            messageToMe      {false}; // 0x0057
+    bool            messageCcMe      {false}; // 0x0058
+
+    // SystemTime cells — pass FILETIME-100ns ticks. Zero = absent
+    // (CEB cleared); any non-zero value emits the cell with CEB set.
+    uint64_t        clientSubmitTime     {0u};   // 0x0039
+    uint64_t        messageDeliveryTime  {0u};   // 0x0E06
+    uint64_t        lastModificationTime {0u};   // 0x3008
+
+    // Variable-size cells — nullptr/0 = absent (CEB clear).
+    // Unicode cells carry UTF-16-LE bytes (no null terminator); the
+    // builder allocates the corresponding HN slot and patches the
+    // row-cell HID.
+    const uint8_t*  messageClassUtf16le         {nullptr};
+    size_t          messageClassSize            {0};   // 0x001A
+    const uint8_t*  subjectUtf16le              {nullptr};
+    size_t          subjectSize                 {0};   // 0x0037
+    const uint8_t*  sentRepresentingNameUtf16le {nullptr};
+    size_t          sentRepresentingNameSize    {0};   // 0x0042
+    const uint8_t*  conversationTopicUtf16le    {nullptr};
+    size_t          conversationTopicSize       {0};   // 0x0070
+    const uint8_t*  displayCcUtf16le            {nullptr};
+    size_t          displayCcSize               {0};   // 0x0E03
+    const uint8_t*  displayToUtf16le            {nullptr};
+    size_t          displayToSize               {0};   // 0x0E04
+    const uint8_t*  conversationIndexBytes      {nullptr};
+    size_t          conversationIndexSize       {0};   // 0x0071 (Binary)
+};
+
+// ============================================================================
 // buildFolderContentsTc — emit the §3.12-schema 27-column Contents TC.
 //
 // Used for: NID_CONTENTS_TABLE_TEMPLATE (0x060E) + per-folder contents
-// tables (0x012E, 0x802E, 0x804E, 0x806E from §2.7.1).
+// tables (0x012E, 0x802E, 0x804E, 0x806E from §2.7.1) + per-folder
+// user-folder Contents TCs (M7+).
 //
 // 27-column schema per [SPEC §3.12], sorted by tag ascending. Per-row
-// endBm = 122 (118 fixed + 4 CEB). Always 0-row in M6 — actual message
-// rows arrive in M7.
+// endBm = 122 (118 fixed + 4 CEB).
 //
-// The function takes no row argument: M6 emits "Columns Only" for every
-// Contents TC, matching §3.12's published "Row Matrix Data Not Present
-// (0 Rows)" state and §2.7.1's "Columns Only" minimal state.
+// No-arg overload emits "Columns Only" (0 rows) for the §2.7.1 baseline
+// tables and template TCs that match §3.12's "Row Matrix Data Not
+// Present" empty state.
+//
+// Row-populated overload emits one row per ContentsTcRow; used by M7+
+// per-folder Contents TCs to surface the messages each folder contains
+// in Outlook's message-list view.
 // ============================================================================
 TcResult buildFolderContentsTc();
+TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
+                               Nid firstSubnodeNid = Nid{0u});
 
 // ============================================================================
 // buildFolderFaiContentsTc — emit the §3.12-schema 17-column FAI Contents TC.

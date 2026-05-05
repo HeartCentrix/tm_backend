@@ -25,13 +25,26 @@ namespace pstwriter {
 
 namespace {
 
-// File offsets of the four post-header pages in the M2 skeleton.
-constexpr uint64_t kIbAMap = 0x0400;
-constexpr uint64_t kIbNbt  = 0x0600;
-constexpr uint64_t kIbBbt  = 0x0800;
-constexpr uint64_t kIbEof  = 0x0A00;
+// File offsets of the post-header pages in the M2 skeleton.
+//
+// Per [MS-PST] §2.6.1.1 + §3.2 sample, the FIRST AMap of a Unicode 2.0
+// PST sits at file offset 0x4400 — NOT 0x400 — leaving a 0x4000-byte
+// region after the HEADER for fixed-allocation content (zero-pad in
+// our minimal writer; real Outlook puts a DList there). Bytes
+// [0, kIbAMap) are not tracked by any AMap; they are permanent
+// HEADER region. AMap[0]'s bitmap covers [kIbAMap, kIbAMap + 0x3E000).
+//
+// Cross-check from the §3.2 sample: ROOT.ibAMapLast = 0x9B4400, so
+// `(0x9B4400 - 0x4400) / kAMapCoverage = exactly 40` — first AMap at
+// 0x4400, 41 AMaps total, AMap[40] at 0x9B4400. M11-G corrected this
+// from the long-standing wrong value of 0x400 (which made real
+// Outlook reject the file with `Read(@4400) ... ptype=84 expected`).
+constexpr uint64_t kIbAMap = 0x4400;
+constexpr uint64_t kIbNbt  = 0x4600;
+constexpr uint64_t kIbBbt  = 0x4800;
+constexpr uint64_t kIbEof  = 0x4A00;
 
-constexpr size_t kHeaderPadBytes = kIbAMap - kHeaderSize; // 0x400 - 0x234 = 460
+constexpr size_t kHeaderPadBytes = kIbAMap - kHeaderSize; // 0x4400 - 0x234 = 16844
 
 // Helper: write `n` bytes from `data` to `fp`. Returns true on full success.
 bool writeAll(FILE* fp, const void* data, size_t n) noexcept
@@ -52,11 +65,25 @@ uint64_t alignUp(uint64_t v, uint64_t a) noexcept
     return (v + (a - 1)) & ~(a - 1);
 }
 
+// Free bytes reported by AMap[0]'s bitmap. Coverage range is
+// [kIbAMap, kIbAMap + kAMapCoverage); bytes within range that are
+// below `fileEof` are marked allocated, the rest free. Bytes
+// [0, kIbAMap) are HEADER region — NOT tracked by any AMap.
+//
+// For multi-AMap files (fileEof > kIbAMap + kAMapCoverage), this
+// helper only describes AMap[0] — additional AMaps are emitted at
+// (kIbAMap + N × kAMapCoverage) and each carries its own
+// cbAMapFree contribution.
 uint64_t cbAMapFreeFor(uint64_t fileEof) noexcept
 {
-    const uint64_t setBits   = (fileEof + kBytesPerAMapBit - 1) / kBytesPerAMapBit;
+    const uint64_t coverageEnd  = kIbAMap + kAMapCoverage;
+    const uint64_t allocatedEnd = fileEof < coverageEnd ? fileEof : coverageEnd;
+    const uint64_t allocatedBytes =
+        allocatedEnd > kIbAMap ? (allocatedEnd - kIbAMap) : 0;
+    const uint64_t allocatedBits =
+        (allocatedBytes + kBytesPerAMapBit - 1) / kBytesPerAMapBit;
     const uint64_t totalBits = static_cast<uint64_t>(kAMapBitmapBytes) * 8ull;
-    return (totalBits - setBits) * kBytesPerAMapBit;
+    return (totalBits - allocatedBits) * kBytesPerAMapBit;
 }
 
 FILE* openWb(const string& path) noexcept
@@ -77,7 +104,8 @@ FILE* openWb(const string& path) noexcept
 // ===========================================================================
 WriteResult writeEmptyPst(const string& path) noexcept
 {
-    const Bid bidAMap = Bid::makeInternal(1ull); // 0x07
+    // AMap occupies internal bid index 1 in the M2 reservation table, but
+    // its PAGETRAILER.bid is set from its ib by buildAMap (M11-E).
     const Bid bidNbt  = Bid::makeInternal(2ull); // 0x0B
     const Bid bidBbt  = Bid::makeInternal(3ull); // 0x0F
     const Bid bidNextP{Bid::makeInternal(4ull)}; // 0x13
@@ -97,7 +125,7 @@ WriteResult writeEmptyPst(const string& path) noexcept
     populateFreshRgnid(state);
 
     const auto header = serializeHeader(state);
-    const auto amap   = buildAMap(bidAMap, Ib{kIbAMap}, kIbEof);
+    const auto amap   = buildAMap(Ib{kIbAMap}, kIbEof);
     const auto nbt    = buildEmptyNbtLeaf(bidNbt, Ib{kIbNbt});
     const auto bbt    = buildEmptyBbtLeaf(bidBbt, Ib{kIbBbt});
 
@@ -124,8 +152,8 @@ WriteResult writeEmptyPst(const string& path) noexcept
 // ===========================================================================
 namespace {
 
-// Internal multi-block layout, post-AMap:
-//   blocksStartIb = 0x600
+// Internal multi-block layout, post-AMap (M11-G: AMap moved to 0x4400):
+//   blocksStartIb = kIbAMap + kPageSize  (= 0x4600)
 //   for each block i:
 //       offsets[i] = current; current += sizeOnDisk(block i)
 //   bbtLeavesIb = alignUp(current, kPageSize)
@@ -133,11 +161,12 @@ namespace {
 //   bbtRootIb   = bbtLeavesIb + n_leaves * kPageSize  (or = lone leaf)
 //   nbtLeafIb   = (after BBT)
 //   ibFileEof   = nbtLeafIb + kPageSize
+constexpr uint64_t kBlocksStart = kIbAMap + kPageSize;   // 0x4600
 struct Layout {
-    uint64_t blocksStartIb = 0x600;
+    uint64_t blocksStartIb = kBlocksStart;
     vector<uint64_t> blockOffsets;        // ib of block i
     vector<size_t>   blockOnDiskSizes;    // total bytes of block i (multiple of 64)
-    uint64_t blocksEndIb = 0x600;         // exclusive
+    uint64_t blocksEndIb = kBlocksStart;  // exclusive
 
     vector<uint64_t> bbtLeafIbs;          // page-aligned offsets of BBT leaves
     uint64_t         bbtRootIb = 0;       // == bbtLeafIbs[0] if single leaf, else intermediate page
@@ -155,9 +184,10 @@ WriteResult buildAndWriteBlocksPst(const string&                    path,
                                    Bid bidBbtRoot,
                                    const vector<Bid>& bidBbtLeaves)
 {
-    // 1. Compute layout: pack blocks at 64-byte alignment from 0x600.
+    // 1. Compute layout: pack blocks at 64-byte alignment from kBlocksStart
+    //    (0x4600 — the byte right after AMap[0] at kIbAMap=0x4400).
     Layout L;
-    L.blocksStartIb = 0x600;
+    L.blocksStartIb = kBlocksStart;
 
     L.blockOffsets.reserve(blockBuffers.size());
     L.blockOnDiskSizes.reserve(blockBuffers.size());
@@ -263,9 +293,11 @@ WriteResult buildAndWriteBlocksPst(const string&                    path,
     // NBT root: empty leaf, M3 doesn't register nodes.
     const auto nbtPage = buildEmptyNbtLeaf(bidNbtLeaf, Ib{L.nbtLeafIb});
 
-    // 8. AMap: covers [0..ibFileEof) — every 64-byte unit is "allocated".
-    const Bid bidAMap = Bid::makeInternal(1ull); // 0x07
-    const auto amap   = buildAMap(bidAMap, Ib{kIbAMap}, L.ibFileEof);
+    // 8. AMap[0]: covers [kIbAMap, kIbAMap + kAMapCoverage). Bits for
+    // bytes within [kIbAMap, ibFileEof) are set; rest free. The 16 KB
+    // [0x400, 0x4400) HEADER region is NOT tracked by any AMap (M11-G).
+    // PAGETRAILER.bid set from ib by buildAMap (M11-E).
+    const auto amap   = buildAMap(Ib{kIbAMap}, L.ibFileEof);
 
     // 9. HEADER.
     WriterState state{};
@@ -357,8 +389,9 @@ WriteResult writeBlocksPst(const string&                  path,
         blockBids.push_back(Bid::makeData(i + 1ull));
     }
 
-    // First pass: provisional offsets at 64-byte alignment.
-    uint64_t cursor = 0x600;
+    // First pass: provisional offsets at 64-byte alignment, starting
+    // from kBlocksStart (= 0x4600 — right after AMap[0]).
+    uint64_t cursor = kBlocksStart;
     vector<uint64_t> ibs;
     ibs.reserve(dataBlocks.size());
     for (const auto& p : dataBlocks) {
@@ -430,8 +463,9 @@ WriteResult writeXBlockPst(const string&  path,
     vector<Bid>  blockBids;       blockBids.reserve(nDataBlocks + 1);
     vector<Ib>   blockIbs;        blockIbs.reserve(nDataBlocks + 1);
 
-    // Provisional offsets.
-    uint64_t cursor = 0x600;
+    // Provisional offsets, starting from kBlocksStart (= 0x4600 —
+    // right after AMap[0] at kIbAMap=0x4400, M11-G).
+    uint64_t cursor = kBlocksStart;
     vector<uint64_t> ibs;
     ibs.reserve(nDataBlocks + 1);
     for (size_t i = 0; i < nDataBlocks; ++i) {
@@ -508,7 +542,11 @@ WriteResult writeM5Pst(const string&                  path,
     }
 
     // ---- 1. Compute layout ------------------------------------------------
-    constexpr uint64_t kBlocksStart = 0x600;
+    // Blocks live immediately after AMap[0] (kIbAMap=0x4400 + 0x200).
+    // The 16 KB region [0x400, 0x4400) sits between HEADER and AMap[0]
+    // and is filled with zero bytes by the file-write path below;
+    // those bytes are HEADER region per [MS-PST] §2.6.1.1 (M11-G) and
+    // are not tracked by AMap[0]'s bitmap.
     uint64_t cursor = kBlocksStart;
     vector<uint64_t> blockIbs;
     blockIbs.reserve(blocks.size());
@@ -654,8 +692,8 @@ WriteResult writeM5Pst(const string&                  path,
     }
 
     // ---- 5. AMap + HEADER ------------------------------------------------
-    const Bid bidAMap = Bid::makeInternal(1ull); // 0x07
-    const auto amap   = buildAMap(bidAMap, Ib{kIbAMap}, ibFileEof);
+    // PAGETRAILER.bid set from ib by buildAMap (M11-E).
+    const auto amap   = buildAMap(Ib{kIbAMap}, ibFileEof);
 
     WriterState state{};
     state.dwUnique         = 1u;

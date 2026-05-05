@@ -393,13 +393,14 @@ WriteResult writeM9Pst(const M9PstConfig& config) noexcept
             auto pc = buildMailFolderPc(schema, kDummySub);
             scheduleNode(rec.folderNid, rec.src->parentNid, std::move(pc.hnBytes));
 
-            // Per-folder sibling tables (HIER/CONTENTS/FAI) carry
-            // nidParent = owning folder NID per real-Outlook oracle.
-            scheduleNode(rec.hierarchyNid, rec.folderNid,
+            // Sibling tables (HIER/CONTENTS/FAI) NBTENTRYs carry
+            // nidParent = 0 per [MS-PST] §3.12, confirmed via Aspose
+            // oracle. See KNOWN_UNVERIFIED.md M11-D.
+            scheduleNode(rec.hierarchyNid, Nid{0u},
                          buildFolderHierarchyTc(nullptr, 0).hnBytes);
-            scheduleNode(rec.contentsNid, rec.folderNid,
+            scheduleNode(rec.contentsNid, Nid{0u},
                          buildFolderContentsTc().hnBytes);
-            scheduleNode(rec.faiNid, rec.folderNid,
+            scheduleNode(rec.faiNid, Nid{0u},
                          buildFolderFaiContentsTc().hnBytes);
         }
 
@@ -445,7 +446,7 @@ WriteResult writeM9Pst(const M9PstConfig& config) noexcept
         // ============================================================
         // 7. Encode all blocks + assemble M5DataBlockSpec list.
         // ============================================================
-        constexpr uint64_t kBlocksStart = 0x600u;
+        constexpr uint64_t kBlocksStart = 0x4600u;  // M11-G: blocks live after AMap[0] @ 0x4400
 
         vector<M5DataBlockSpec> m5Blocks;
         vector<M5Node>          m5Nodes;

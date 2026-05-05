@@ -28,9 +28,13 @@ namespace pstwriter {
 // size in bytes — every 64-byte unit below `fileSize` becomes one set bit
 // in the bitmap; bytes beyond are zero (free).
 //
-// `bid` goes into the PAGETRAILER as the page's own BID (per
-// SPEC_GROUND_TRUTH and libpff).  wSig is 0 for AMap pages.
-array<uint8_t, kPageSize> buildAMap(Bid bid, Ib ibAMap, uint64_t fileSize) noexcept;
+// PAGETRAILER.bid is set to `ibAMap.value` (the page's own file offset).
+// Per [MS-PST] §2.2.2.7.2 + §2.6.1, real Outlook walks `Read(@ib)` and
+// asserts trailer.bid == ib for AMap (and PMap) pages; passing a raw
+// internal BID like `Bid::makeInternal(1)` here makes Outlook reject the
+// PST with "Outlook Data File Corruption / Read(@400): Expected bid=400
+// but read bid=6". See KNOWN_UNVERIFIED.md M11-E. wSig is 0 for AMap.
+array<uint8_t, kPageSize> buildAMap(Ib ibAMap, uint64_t fileSize) noexcept;
 
 // Empty NBT / BBT leaf pages (cEnt = 0, cLevel = 0).  cbEnt is fixed by
 // the page type per [MS-PST] §2.2.2.7.7.1: 32 for an NBT leaf, 24 for a

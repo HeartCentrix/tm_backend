@@ -340,6 +340,170 @@ TcResult buildFolderContentsTc()
     return buildTableContext(kContentsCols, 27, nullptr, 0);
 }
 
+namespace {
+
+// Per-row matrix size derived from the 27-col Contents schema:
+// 118 bytes of fixed data + 4-byte CEB = 122.
+constexpr size_t kContentsRowSize = 122;
+constexpr size_t kContentsCebOff  = 118;
+constexpr size_t kContentsCebSize = 4;
+
+// colIndex of each column in the tag-sorted kContentsCols[] schema.
+// (Matches the order kContentsCols is declared.) Used to address
+// varlen cells via TcVarlenCell.colIndex.
+constexpr size_t kColImportance              = 0;
+constexpr size_t kColMessageClass            = 1;
+constexpr size_t kColSensitivity             = 2;
+constexpr size_t kColSubject                 = 3;
+constexpr size_t kColClientSubmitTime        = 4;
+constexpr size_t kColSentRepresentingName    = 5;
+constexpr size_t kColMessageToMe             = 6;
+constexpr size_t kColMessageCcMe             = 7;
+constexpr size_t kColConversationTopic       = 8;
+constexpr size_t kColConversationIndex       = 9;
+constexpr size_t kColDisplayCc               = 10;
+constexpr size_t kColDisplayTo               = 11;
+constexpr size_t kColMessageDeliveryTime     = 12;
+constexpr size_t kColMessageFlags            = 13;
+constexpr size_t kColMessageSize             = 14;
+constexpr size_t kColMessageStatus           = 15;
+constexpr size_t kColLastModificationTime    = 23;
+constexpr size_t kColLtpRowId                = 25;
+constexpr size_t kColLtpRowVer               = 26;
+
+// Set the CEB bit for `iBit` (high-bit-first byte numbering — bit 0
+// of byte 0 is bit 7 of CEB[0], same convention as the Hierarchy TC).
+inline void setCebBit(uint8_t* ceb, unsigned iBit) noexcept
+{
+    const unsigned byteIdx = iBit / 8u;
+    const unsigned bitInByte = 7u - (iBit % 8u);
+    ceb[byteIdx] |= static_cast<uint8_t>(1u << bitInByte);
+}
+
+} // namespace
+
+TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
+                               Nid firstSubnodeNid)
+{
+    if (rowCount == 0u) {
+        return buildTableContext(kContentsCols, 27, nullptr, 0);
+    }
+
+    // Stable per-row buffers + varlen-cell descriptors. Pointers into
+    // these vectors must stay valid until buildTableContext returns;
+    // we reserve up front so push_back never reallocates.
+    vector<array<uint8_t, kContentsRowSize>> rowBuffers(rowCount);
+    vector<vector<TcVarlenCell>>             perRowVarlen(rowCount);
+    vector<TcRow>                            tcRows(rowCount);
+
+    for (size_t r = 0; r < rowCount; ++r) {
+        const ContentsTcRow& src = rows[r];
+        uint8_t* dst = rowBuffers[r].data();
+        std::memset(dst, 0, kContentsRowSize);
+
+        uint8_t* ceb = dst + kContentsCebOff;
+
+        // ---- Fixed Int32 / SystemTime / Boolean cells ----
+        // ibData / iBit values lifted verbatim from kContentsCols above.
+
+        // LtpRowId @ ibData=0, iBit=0 — always present.
+        detail::writeU32(dst, 0, src.rowId.value);
+        setCebBit(ceb, 0);
+
+        // LtpRowVer @ ibData=4, iBit=1 — always present.
+        detail::writeU32(dst, 4, src.rowVer);
+        setCebBit(ceb, 1);
+
+        // MessageStatus @ ibData=8, iBit=2 — always emit (default 0).
+        detail::writeU32(dst, 8, static_cast<uint32_t>(src.messageStatus));
+        setCebBit(ceb, 2);
+
+        // MessageFlags @ ibData=16, iBit=4 — always.
+        detail::writeU32(dst, 16, static_cast<uint32_t>(src.messageFlags));
+        setCebBit(ceb, 4);
+
+        // Importance @ ibData=20, iBit=5 — always.
+        detail::writeU32(dst, 20, static_cast<uint32_t>(src.importance));
+        setCebBit(ceb, 5);
+
+        // MessageDeliveryTime @ ibData=32, iBit=8 — when non-zero.
+        if (src.messageDeliveryTime != 0u) {
+            detail::writeU64(dst, 32, src.messageDeliveryTime);
+            setCebBit(ceb, 8);
+        }
+
+        // ClientSubmitTime @ ibData=40, iBit=9 — when non-zero.
+        if (src.clientSubmitTime != 0u) {
+            detail::writeU64(dst, 40, src.clientSubmitTime);
+            setCebBit(ceb, 9);
+        }
+
+        // MessageSize @ ibData=48, iBit=10 — always.
+        detail::writeU32(dst, 48, static_cast<uint32_t>(src.messageSize));
+        setCebBit(ceb, 10);
+
+        // Sensitivity @ ibData=60, iBit=15 — always.
+        detail::writeU32(dst, 60, static_cast<uint32_t>(src.sensitivity));
+        setCebBit(ceb, 15);
+
+        // LastModificationTime @ ibData=80, iBit=20 — when non-zero.
+        if (src.lastModificationTime != 0u) {
+            detail::writeU64(dst, 80, src.lastModificationTime);
+            setCebBit(ceb, 20);
+        }
+
+        // MessageToMe @ ibData=116, iBit=13 / MessageCcMe @ 117, iBit=14
+        // — always emit the boolean (0 = false).
+        dst[116] = src.messageToMe ? 1u : 0u;
+        setCebBit(ceb, 13);
+        dst[117] = src.messageCcMe ? 1u : 0u;
+        setCebBit(ceb, 14);
+
+        // ---- Varlen cells ----
+        // The HID slot at each varlen column's ibData is left as zero;
+        // buildTableContext patches it with the assigned HID after
+        // allocating the underlying HN range.
+        auto pushVarlen = [&](size_t colIdx, unsigned iBit,
+                              const uint8_t* bytes, size_t size) {
+            if (bytes == nullptr || size == 0u) return;
+            perRowVarlen[r].push_back({ colIdx, bytes, size });
+            setCebBit(ceb, iBit);
+        };
+
+        // MessageClass_W (colIdx=1, ibData=12, iBit=3)
+        pushVarlen(kColMessageClass, 3,
+                   src.messageClassUtf16le, src.messageClassSize);
+        // SentRepresentingName_W (colIdx=5, ibData=24, iBit=6)
+        pushVarlen(kColSentRepresentingName, 6,
+                   src.sentRepresentingNameUtf16le,
+                   src.sentRepresentingNameSize);
+        // Subject_W (colIdx=3, ibData=28, iBit=7)
+        pushVarlen(kColSubject, 7, src.subjectUtf16le, src.subjectSize);
+        // DisplayTo_W (colIdx=11, ibData=52, iBit=11)
+        pushVarlen(kColDisplayTo, 11, src.displayToUtf16le, src.displayToSize);
+        // DisplayCc_W (colIdx=10, ibData=56, iBit=12)
+        pushVarlen(kColDisplayCc, 12, src.displayCcUtf16le, src.displayCcSize);
+        // ConversationTopic_W (colIdx=8, ibData=68, iBit=17)
+        pushVarlen(kColConversationTopic, 17,
+                   src.conversationTopicUtf16le,
+                   src.conversationTopicSize);
+        // ConversationIndex (colIdx=9, ibData=72, iBit=18 — Binary)
+        pushVarlen(kColConversationIndex, 18,
+                   src.conversationIndexBytes,
+                   src.conversationIndexSize);
+
+        tcRows[r].rowId       = src.rowId.value;
+        tcRows[r].rowBytes    = rowBuffers[r].data();
+        tcRows[r].rowSize     = kContentsRowSize;
+        tcRows[r].varlenCells = perRowVarlen[r].empty()
+                                  ? nullptr : perRowVarlen[r].data();
+        tcRows[r].varlenCount = perRowVarlen[r].size();
+    }
+
+    return buildTableContext(kContentsCols, 27, tcRows.data(), rowCount,
+                             firstSubnodeNid);
+}
+
 TcResult buildFolderFaiContentsTc()
 {
     return buildTableContext(kFaiContentsCols, 17, nullptr, 0);
@@ -610,9 +774,10 @@ WriteResult writeM6Pst(const M6PstConfig& config) noexcept
         }
 
         // ---- Encode each node's payload as a data block ----
-        // Block layout starts at 0x600 (matches writeM5Pst's expectation).
+        // Block layout starts at 0x4600 (matches writeM5Pst's expectation:
+        // kIbAMap=0x4400 + 0x200 AMap page, M11-G).
         // BIDs assigned sequentially as Bid::makeData(i+1).
-        constexpr uint64_t kBlocksStart = 0x600u;
+        constexpr uint64_t kBlocksStart = 0x4600u;
         vector<M5DataBlockSpec> blocks;
         vector<M5Node>          m5nodes;
         blocks.reserve(27);

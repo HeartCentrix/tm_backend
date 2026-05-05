@@ -238,6 +238,12 @@ struct Bid {
         return Bid{ ((idx & 0x3FFFFFFFFFFFFFFFull) << 2) | 0x3ull };
     }
 
+    // AMap (and PMap) PAGETRAILER.bid is the page's own file offset per
+    // [MS-PST] §2.2.2.7.2 + §2.6.1 — Outlook walks `Read(@ib)` and asserts
+    // trailer.bid == ib. See KNOWN_UNVERIFIED.md M11-E for the diagnostic
+    // that exposed this ("Read(@400): Expected bid=400, but read bid=6").
+    constexpr static Bid makeAmap(uint64_t ib) noexcept { return Bid{ib}; }
+
     constexpr bool     isInternal() const noexcept { return (value & 0x2ull) != 0; }
     constexpr bool     isData()     const noexcept { return (value & 0x2ull) == 0; }
     constexpr uint64_t index()      const noexcept { return value >> 2; }

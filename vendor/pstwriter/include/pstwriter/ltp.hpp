@@ -347,21 +347,44 @@ TcRgib computeTcRgib(const TcColumn* cols, size_t colCount) noexcept;
 
 struct TcResult {
     vector<uint8_t>      hnBytes;
-    vector<PcSubnodeOut> subnodes;  // for future row-matrix-as-subnode promotion
+    // Row matrix subnode (when promoted because rows don't fit in HN).
+    // At most one entry: {firstSubnodeNid, /*pidTagId=*/0, rowMatrixBytes,
+    // rowMatrixSize}. Caller wraps these bytes via its data-block
+    // scheduling layer (with XBLOCK chaining if > 8176 B) and emplaces
+    // a SLENTRY pointing to the resulting BID under the row matrix's
+    // owning node. See [MS-PST] §2.3.4.4.1 (Row Matrix promotion).
+    vector<PcSubnodeOut> subnodes;
+    // Backing storage for `subnodes[i].data` pointers. PcSubnodeOut
+    // holds raw `const uint8_t*`, so the underlying bytes need an
+    // owner with the same lifetime as the TcResult. Callers should
+    // not touch this directly — only `subnodes`.
+    vector<vector<uint8_t>> ownedSubnodeBytes;
 };
 
-// Build a TC's HN body. M4 cut: single-block HN, no subnodes for
-// either Row Matrix or variable-size column values (those go in HN
-// allocations).
+// Build a TC's HN body.
+//
+// `firstSubnodeNid` is the NID the builder will assign to a promoted
+// row matrix when the row matrix + varlen payloads can't fit in a
+// single 8176-byte HN block. Pass Nid{0u} to forbid promotion (the
+// builder will throw std::length_error if the row matrix would
+// overflow). Passing a non-zero NID with nidType != HID enables
+// row-matrix-as-subnode promotion per [MS-PST] §2.3.4.4.1; in that
+// case TCINFO.hnidRows holds the NID directly (HNID NID branch) and
+// TcResult.subnodes carries the row-matrix bytes for caller-side
+// data-block scheduling.
 //
 // Throws:
 //   * std::invalid_argument — cbData not in {1,2,4,8}; iBit > 7*cCols;
 //     §2.3.4.4.1 requires PidTagLtpRowId at iBit=0/ibData=0 and
 //     PidTagLtpRowVer at iBit=1/ibData=4 (we don't enforce this,
-//     trust the caller); rowBytes null
-//   * std::length_error — HN body would exceed kMaxHnBodyBytes
+//     trust the caller); rowBytes null; firstSubnodeNid has nidType=HID
+//   * std::length_error — HN body would exceed kMaxHnBodyBytes AND
+//     promotion is disabled (firstSubnodeNid == 0) OR the residual
+//     HN body still exceeds the cap even after promoting the row matrix
+//     (e.g. too many varlen payloads in the parent HN).
 TcResult buildTableContext(const TcColumn* cols, size_t colCount,
-                           const TcRow*    rows, size_t rowCount);
+                           const TcRow*    rows, size_t rowCount,
+                           Nid             firstSubnodeNid = Nid{0u});
 
 // Convenience: encode a PT_MV_UNICODE value per [MS-PST] §2.3.3.4.2.
 // Layout:
