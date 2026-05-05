@@ -435,6 +435,24 @@ MailPcResult buildMailPc(const graph::GraphMessage& msg,
     if (!msg.internetMessageId.empty())
         pb.addUnicodeString(pid_local::kInternetMessageId, msg.internetMessageId);
 
+    // M11-K P1: PidTagSearchKey (PR_SEARCH_KEY, 0x300B0102) — required
+    // by [MS-OXCMSG] §2.2.1.4 on every IPM.* message. scanpst flags
+    // "Missing PR_SEARCH_KEY" without it; Outlook uses it for
+    // conversation tracking and duplicate detection.
+    //
+    // Seed for the deterministic 16-byte hash: internetMessageId when
+    // present (most stable), else subject+sentDateTime fallback.
+    {
+        std::string searchSeed = msg.internetMessageId;
+        if (searchSeed.empty()) {
+            searchSeed = msg.subject + "|" + msg.sentDateTime;
+        }
+        const auto messageSearchKey = graph::deriveMessageSearchKey(searchSeed);
+        pb.addBinary(pid_local::kSearchKey,
+                     vector<uint8_t>(messageSearchKey.begin(),
+                                     messageSearchKey.end()));
+    }
+
     // Conversation index (raw bytes)
     if (!msg.conversationIndex.empty())
         pb.addBinary(pid_local::kConversationIndex,
@@ -714,7 +732,23 @@ MailPcResult buildAttachmentPc(const graph::Attachment&  att,
 
     const uint32_t method = (att.kind == graph::AttachmentKind::Item) ? 5u : 1u;
     pb.addInt32(pid_local::kAttachMethod, method);
-    pb.addInt32(pid_local::kAttachSize, static_cast<uint32_t>(att.size));
+    // M11-K P2: PR_ATTACH_SIZE (PidTagAttachSize, 0x0E200003) — required
+    // by [MS-OXCMSG] §2.2.2. Some Graph payloads omit `attachment.size`
+    // or report 0; in those cases scanpst flags "missing or invalid
+    // PR_ATTACH_SIZE". Fall back to the actual content length plus a
+    // ~512-byte metadata-overhead estimate, ensuring a non-zero value
+    // for every attachment.
+    {
+        uint32_t reportedSize = static_cast<uint32_t>(att.size);
+        if (reportedSize == 0u) {
+            // Graph didn't report or reported 0; compute from actual data.
+            const size_t metadataOverhead = 512u;
+            reportedSize = static_cast<uint32_t>(att.contentBytes.size() +
+                                                 metadataOverhead);
+            if (reportedSize == 0u) reportedSize = 512u;  // empty attachment
+        }
+        pb.addInt32(pid_local::kAttachSize, reportedSize);
+    }
     pb.addInt32(pid_local::kRenderingPosition, static_cast<uint32_t>(-1));
 
     if (!att.name.empty()) {

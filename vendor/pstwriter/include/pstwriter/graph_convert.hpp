@@ -122,5 +122,20 @@ constexpr std::array<uint8_t, 16> kOneOffProviderUid = {{
 // ----------------------------------------------------------------------------
 std::array<uint8_t, 16> deriveSearchKey(const std::string& smtpAddress);
 
+// ----------------------------------------------------------------------------
+// deriveMessageSearchKey
+//
+// 16-byte deterministic search key for a message PC's PidTagSearchKey
+// (0x300B0102). Per [MS-OXCMSG] §2.2.1.4, every IPM.* message MUST have
+// PR_SEARCH_KEY — Outlook uses it for conversation tracking and dup
+// detection. Derived from a stable seed string (typically the
+// `internetMessageId` if non-empty, else `subject + sentDateTime`).
+//
+// Implementation: two-pass FNV-1a 64-bit hash with different offset
+// bases, packed little-endian into 16 bytes. Stable across builds; not
+// cryptographic. (M11-K P1.)
+// ----------------------------------------------------------------------------
+std::array<uint8_t, 16> deriveMessageSearchKey(const std::string& seed);
+
 } // namespace graph
 } // namespace pstwriter

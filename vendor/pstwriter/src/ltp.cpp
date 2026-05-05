@@ -41,25 +41,54 @@ vector<uint8_t> buildHeapOnNode(const HnAllocation* allocs,
     // immediately follows the last allocation. Total HN body size =
     // ibHnpm + HNPAGEMAP size.
     // ------------------------------------------------------------------
+    // Pre-flight: cumulative cursor past all user allocations. If this
+    // is not DWORD-aligned, we need to insert a "phantom" allocation
+    // that absorbs the alignment pad — see M11-H below.
+    uint16_t cursorAfterUser = static_cast<uint16_t>(kHnHdrSize);
+    for (size_t i = 0; i < allocCount; ++i) {
+        cursorAfterUser = static_cast<uint16_t>(cursorAfterUser + allocs[i].size);
+    }
+    const uint16_t ibHnpm = static_cast<uint16_t>((cursorAfterUser + 3u) & ~uint32_t{3u});
+    const bool     hasPhantom = (cursorAfterUser != ibHnpm);
+
+    // HNPAGEMAP must start at a 4-byte (DWORD) boundary. [MS-PST]
+    // §2.3.1.5 prose: "rgibAlloc[cAlloc] points to the location of
+    // the next allocation. This in turn implies that the value MUST
+    // be DWORD-aligned." Real-Outlook scanpst confirms this — it
+    // flags `ibLast != ibHnpm` on every HN as an error in recovery.
+    //
+    // If cumulative user-alloc cursor is not DWORD-aligned, the
+    // simplest fix (push ibHnpm as the sentinel) makes the LAST user
+    // allocation appear N bytes longer to consumers (the pad bytes
+    // get attributed to it), which corrupts PT_BINARY values and
+    // bloats PT_UNICODE strings. Instead we insert a "phantom"
+    // allocation between the last user data and ibHnpm — bytes
+    // [cursorAfterUser, ibHnpm) become a separate (zero-filled)
+    // allocation. cAlloc grows by 1 in this case; user allocations
+    // keep their exact size when consumers compute it via
+    // rgibAlloc[i+1] - rgibAlloc[i]. The phantom HID is unreferenced.
+    //
+    // Note the §3.11 spec sample places the sentinel at ibHnpm-1
+    // without a phantom (cAlloc=7, rgibAlloc[7]=0x1BB, ibHnpm=0x1BC).
+    // We follow [MS-PST] §2.3.1.5 prose + scanpst, which makes the
+    // §3.11 byte-diff test diverge at the rgibAlloc[cAlloc] slot and
+    // (when phantom needed) at cAlloc itself. (M11-H.)
+    const uint16_t cAlloc = static_cast<uint16_t>(allocCount + (hasPhantom ? 1u : 0u));
+
     vector<uint16_t> ibAlloc;
-    ibAlloc.reserve(allocCount + 1);
-    uint16_t cursor = static_cast<uint16_t>(kHnHdrSize);  // first alloc starts after HNHDR
+    ibAlloc.reserve(static_cast<size_t>(cAlloc) + 1u);
+    uint16_t cursor = static_cast<uint16_t>(kHnHdrSize);
     for (size_t i = 0; i < allocCount; ++i) {
         ibAlloc.push_back(cursor);
         cursor = static_cast<uint16_t>(cursor + allocs[i].size);
     }
-    ibAlloc.push_back(cursor);  // sentinel: where the next-to-allocate would begin
-
-    // HNPAGEMAP must start at a 4-byte (DWORD) boundary. Empirically
-    // confirmed by [MS-PST] §3.8 (allocs end at 0xEC, naturally DWORD-
-    // aligned, ibHnpm=0xEC) AND §3.11 (allocs end at 0x1BB, 1 byte of
-    // alignment pad before ibHnpm=0x1BC). The pad bytes between the
-    // sentinel and ibHnpm are zero-filled and belong to neither the
-    // user allocations nor the HNPAGEMAP.
-    const uint16_t ibHnpm = static_cast<uint16_t>((cursor + 3u) & ~uint32_t{3u});
+    if (hasPhantom) {
+        ibAlloc.push_back(cursor);  // start of phantom = end of last user alloc
+    }
+    ibAlloc.push_back(ibHnpm);      // sentinel = ibHnpm (DWORD-aligned, M11-H)
 
     const size_t   pageMapBytes  = kHnPageMapHdrSize
-                                 + (allocCount + 1) * kHnPageMapEntrySize;
+                                 + (static_cast<size_t>(cAlloc) + 1u) * kHnPageMapEntrySize;
     const size_t   totalSize     = static_cast<size_t>(ibHnpm) + pageMapBytes;
 
     vector<uint8_t> out(totalSize, 0u);
@@ -85,12 +114,22 @@ vector<uint8_t> buildHeapOnNode(const HnAllocation* allocs,
     }
 
     // ------------------------------------------------------------------
-    // HNPAGEMAP ([MS-PST] §2.3.1.5) — at offset ibHnpm.
+    // HNPAGEMAP ([MS-PST] §2.3.1.5) — at offset ibHnpm. cAlloc covers
+    // user allocations PLUS the M11-H phantom (when present). cFree
+    // counts zero-size user allocations (M11-J: was hardcoded 0;
+    // scanpst flagged "free alloc count doesn't match (computed=N,
+    // expected=0)" on every empty TC, blocking column validation).
+    // The phantom is NOT counted as free — it has size 1..3 bytes.
     // ------------------------------------------------------------------
+    uint16_t cFree = 0;
+    for (size_t i = 0; i < allocCount; ++i) {
+        if (allocs[i].size == 0u) ++cFree;
+    }
+
     const size_t pmOff = ibHnpm;
-    writeU16(out.data(), pmOff + 0, static_cast<uint16_t>(allocCount));  // cAlloc
-    writeU16(out.data(), pmOff + 2, 0u);                                  // cFree
-    for (size_t i = 0; i <= allocCount; ++i) {
+    writeU16(out.data(), pmOff + 0, cAlloc);                              // cAlloc
+    writeU16(out.data(), pmOff + 2, cFree);                               // cFree (M11-J)
+    for (size_t i = 0; i <= cAlloc; ++i) {
         writeU16(out.data(),
                  pmOff + kHnPageMapHdrSize + i * kHnPageMapEntrySize,
                  ibAlloc[i]);
@@ -673,10 +712,16 @@ TcResult buildTableContext(const TcColumn* cols, size_t colCount,
             total      += rowMatrixSize;        // row matrix inline
             allocCount += 1u;
         }
-        size_t cursor = kHnHdrSize + total;
-        cursor = (cursor + 3u) & ~size_t{3u};   // DWORD-align HNPAGEMAP
+        const size_t cursorRaw     = kHnHdrSize + total;
+        const size_t cursorAligned = (cursorRaw + 3u) & ~size_t{3u};
+        // M11-H: a phantom allocation absorbs the alignment pad when
+        // cumulative cursor is not DWORD-aligned, adding one more
+        // rgibAlloc entry (2 bytes) to HNPAGEMAP.
+        if (cursorRaw != cursorAligned) {
+            allocCount += 1u;
+        }
         const size_t hnpmSize = 4u + 2u * (allocCount + 1u);
-        return cursor + hnpmSize;
+        return cursorAligned + hnpmSize;
     };
 
     const size_t estIfInline = estimateHnSize(/*promoted=*/false);

@@ -210,8 +210,11 @@ constexpr Nid kNidSpoolerQueue           { 0x000002E1u };
 
 // ============================================================================
 // BID — Block Identifier (64-bit). [MS-PST] §2.2.2.2
-//   bit[0]       reserved 'A' flag (1 = internal)
-//   bit[1]       'B' flag         (1 = internal block, 0 = data block)
+//   bit[0]       'A' flag         — reserved, MUST be 0 per spec
+//                                  (M11-J: was previously set to 1 by
+//                                  makeInternal under an unverified
+//                                  assumption; scanpst rejects)
+//   bit[1]       'i' flag         (1 = internal block, 0 = data block)
 //   bits[63:2]   bidIndex (monotonic counter)
 //
 // On disk the *raw* 64-bit value is stored. Counters increment by 4
@@ -232,10 +235,16 @@ struct Bid {
     constexpr static Bid makeInternal(uint64_t idx) noexcept
     {
         // bit[1] set => internal block (XBLOCK/XXBLOCK/SLBLOCK/SIBLOCK).
-        // The spec requires bit[1] = 1 for any internal BID. Bit[0] is also
-        // commonly set on internal blocks; pstwriter sets both to be safe and
-        // consistent with what Outlook produces.
-        return Bid{ ((idx & 0x3FFFFFFFFFFFFFFFull) << 2) | 0x3ull };
+        // [MS-PST] §2.2.2.2: bit[0] is the "A" reserved field (MUST be
+        // 0); bit[1] is the "i" internal flag. Earlier pstwriter set
+        // BOTH bits on the unverified assumption that Outlook produces
+        // that pattern — real-Outlook scanpst.exe rejects it:
+        //   !!Invalid block (bid=7, ...): BID is attached (7)
+        //   !!Subnodes block (bid=7) not found in BBT
+        // The NBT->BBT lookup for `bidSub` then fails, so messages can't
+        // reach their recipient/attachment subnode trees ("Items not
+        // found"). M11-J: only set bit[1], leave bit[0]=0 per spec.
+        return Bid{ ((idx & 0x3FFFFFFFFFFFFFFFull) << 2) | 0x2ull };
     }
 
     // AMap (and PMap) PAGETRAILER.bid is the page's own file offset per

@@ -54,6 +54,13 @@ buildPstBaselineEntries(const array<uint8_t, 16>& providerUid,
     const auto nameSpamSearch    = u16le("Spam Search Folder");
     const auto nameDeletedItems  = u16le("Deleted Items");
     const auto pstDisplay        = u16le(pstDisplayName);
+    // M11-J P3: Root Folder (NID 0x122) per [MS-PST] §2.4.3 must carry
+    // PR_DISPLAY_NAME or scanpst flags it missing. Reuse the PST display
+    // name when set, falling back to "Outlook Data File" — the conventional
+    // root folder name in real-Outlook PSTs.
+    const auto nameRootFolder    = pstDisplay.empty()
+                                     ? u16le("Outlook Data File")
+                                     : pstDisplay;
 
     // firstSubnodeNid required by buildPropertyContext but unused here
     // (no subnode-promoted props in baseline schemas).
@@ -78,7 +85,11 @@ buildPstBaselineEntries(const array<uint8_t, 16>& providerUid,
     // 3. Root Folder PC (0x122; nidParent = self)
     {
         FolderPcSchema rs{};
-        rs.hasSubfolders = true;
+        // M11-J P3: PR_DISPLAY_NAME populated so scanpst doesn't flag
+        // "Folder (nid=122): Missing PR_DISPLAY_NAME".
+        rs.displayNameUtf16le = nameRootFolder.data();
+        rs.displayNameSize    = nameRootFolder.size();
+        rs.hasSubfolders      = true;
         auto pc = buildFolderPc(rs, kDummySub);
         out.push_back(mkEntry(Nid{0x00000122u}, Nid{0x00000122u}, std::move(pc.hnBytes)));
     }
@@ -105,6 +116,13 @@ buildPstBaselineEntries(const array<uint8_t, 16>& providerUid,
     // 5-6. Root Contents + FAI Contents
     out.push_back(mkEntry(Nid{0x0000012Eu}, Nid{0u}, buildFolderContentsTc().hnBytes));
     out.push_back(mkEntry(Nid{0x0000012Fu}, Nid{0u}, buildFolderFaiContentsTc().hnBytes));
+
+    // 6b. Receive Folder Table (0x0617) — minimal 1-row default-class
+    //     mapping per [MS-PST] §2.4.5. Required by scanpst.exe; absent
+    //     surfaces as "Receive folder table missing" / "missing default
+    //     message class" errors. (Tier 2 ISSUE G.)
+    out.push_back(mkEntry(Nid{0x00000617u}, Nid{0u},
+                          buildReceiveFolderTableTc().hnBytes));
 
     // 7-8. Bare nodes
     out.push_back(mkEntry(Nid{0x000001E1u}, Nid{0u}, buildEmptyNodePayload()));
@@ -172,6 +190,7 @@ void registerBaselineReservedNids(M5Allocator& alloc)
     constexpr uint32_t kReserved[] = {
         0x0000012Du, 0x0000012Eu, 0x0000012Fu,
         0x0000060Du, 0x0000060Eu, 0x0000060Fu, 0x00000610u,
+        0x00000617u,                          // ReceiveFolderTable (Tier 2 G)
         0x00000671u, 0x00000692u,
         0x00002223u,
         0x00008022u, 0x0000802Du, 0x0000802Eu, 0x0000802Fu,

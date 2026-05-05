@@ -339,5 +339,36 @@ std::array<uint8_t, 16> deriveSearchKey(const string& smtpAddress)
     return out;
 }
 
+// ============================================================================
+// deriveMessageSearchKey (M11-K P1)
+//
+// 16-byte deterministic hash for a message PC's PidTagSearchKey. Two
+// FNV-1a 64-bit passes with swapped offset basis values produce two
+// independent 8-byte halves; packed little-endian into the 16-byte
+// output. Stable across builds and platforms.
+// ============================================================================
+std::array<uint8_t, 16> deriveMessageSearchKey(const string& seed)
+{
+    constexpr uint64_t kFnvBasisA = 0xCBF29CE484222325ull;
+    constexpr uint64_t kFnvBasisB = 0x100000001B3ull;
+    constexpr uint64_t kFnvPrime  = 0x100000001B3ull;
+
+    uint64_t h1 = kFnvBasisA;
+    uint64_t h2 = kFnvBasisB;
+    for (char c : seed) {
+        const uint8_t b = static_cast<uint8_t>(c);
+        h1 ^= b;            h1 *= kFnvPrime;
+        h2 ^= (b ^ 0xA5u);  h2 *= kFnvPrime;
+    }
+    // Mix in a fixed sentinel so empty seeds produce a non-zero key.
+    h1 ^= 0x53454152u;  // "SEAR"
+    h2 ^= 0x4348454Bu;  // "CHEK"
+
+    std::array<uint8_t, 16> out{};
+    for (int i = 0; i < 8; ++i) out[i]     = static_cast<uint8_t>(h1 >> (i * 8));
+    for (int i = 0; i < 8; ++i) out[8 + i] = static_cast<uint8_t>(h2 >> (i * 8));
+    return out;
+}
+
 } // namespace graph
 } // namespace pstwriter

@@ -238,7 +238,13 @@ WriteResult buildAndWriteBlocksPst(const string&                    path,
         const auto t = readBlockTrailer(blockBuffers[i].data(),
                                         blockBuffers[i].size());
         e.cb   = t.cb;
-        e.cRef = 1u;
+        // M11-K P6: cRef=2 matches Aspose-produced PSTs and clears
+        // scanpst's "BBT entry has different refcount in RBT (1 vs 2)"
+        // error (which is now `!!` in Outlook 16 strict mode, was `??`).
+        // The minimum legal cRef per [MS-PST] §2.2.2.7.7.3 is 1; Outlook
+        // strict-validation expects 2 because Outlook's own block-tree
+        // walker counts ROOT and NBT-entry references as separate refs.
+        e.cRef = 2u;
         bbtEntries.push_back(e);
     }
     sort(bbtEntries.begin(), bbtEntries.end(),
@@ -617,7 +623,9 @@ WriteResult writeM5Pst(const string&                  path,
         BbtEntry e;
         e.bref = Bref{blocks[i].bid, Ib{blockIbs[i]}};
         e.cb   = blocks[i].cb;
-        e.cRef = 1u;
+        // M11-K P6: cRef=2 matches Aspose; satisfies Outlook 16 strict
+        // validation. See M3 BBT writeBlocksPst path for full rationale.
+        e.cRef = 2u;
         bbtEntries.push_back(e);
     }
     std::sort(bbtEntries.begin(), bbtEntries.end(),

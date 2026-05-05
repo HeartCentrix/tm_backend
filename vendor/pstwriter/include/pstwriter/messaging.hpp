@@ -283,6 +283,12 @@ struct ContentsTcRow {
     size_t          displayToSize               {0};   // 0x0E04
     const uint8_t*  conversationIndexBytes      {nullptr};
     size_t          conversationIndexSize       {0};   // 0x0071 (Binary)
+    // PidTagChangeKey (0x3013, Binary) — XID-format change tracker. Outlook
+    // uses this for synchronization and conflict detection. scanpst flags
+    // it as required column on Contents TC. Caller may pass nullptr/0 for
+    // a stub (CEB cleared); a 22-byte XID is the canonical encoding.
+    const uint8_t*  changeKeyBytes              {nullptr};
+    size_t          changeKeySize               {0};   // 0x3013 (Binary)
 };
 
 // ============================================================================
@@ -407,6 +413,33 @@ TcResult buildSearchContentsTemplateTc();
 // ============================================================================
 PcResult buildSearchFolderPc(const FolderPcSchema& schema,
                              Nid                   firstSubnodeNid);
+
+// ============================================================================
+// buildReceiveFolderTableTc — emit NID_RECEIVE_FOLDERS (0x0617).
+//
+// Per [MS-PST] §2.4.5 + [MS-OXOMSG] §2.2.3: maps message classes to the
+// folder NIDs that should "receive" messages of that class. Outlook
+// (and scanpst.exe) requires the table to exist with at least one row
+// for the default class (empty string ""), otherwise scanpst reports:
+//
+//   !!Receive folder table missing
+//   !!Receive folder table missing default message class
+//
+// This builder ships a minimal 1-row default-class entry mapping the
+// empty class to IPM Subtree (`NID 0x8022`) — the conservative choice
+// when the writer doesn't know about a real Inbox node. Real Outlook
+// will rewrite this row when it learns the IPM.Note Inbox NID.
+//
+// Schema (4 columns, tag-sorted):
+//   0x001A  PidTagMessageClass         Unicode  HID slot (4 B)
+//   0x3001  PidTagDisplayName          Unicode  HID slot (4 B) — folder display name
+//   0x67F2  LtpRowId                   Int32    (4 B) — folder NID
+//   0x67F3  LtpRowVer                  Int32    (4 B)
+//
+// Schema kept deliberately minimal — scanpst is permissive about extra
+// or missing columns once the table EXISTS with a default-class row.
+// ============================================================================
+TcResult buildReceiveFolderTableTc();
 
 // ============================================================================
 // buildEmptyNodePayload — bare-node payload for §2.7.1 "node / Empty" rows
