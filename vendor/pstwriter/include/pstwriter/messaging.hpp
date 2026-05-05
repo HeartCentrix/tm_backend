@@ -227,20 +227,73 @@ TcResult buildFolderHierarchyTc(const HierarchyTcRow* rows,
                                 size_t                rowCount);
 
 // ============================================================================
+// ContentsTcRow — input to buildFolderContentsTc(rows, rowCount).
+//
+// One row per message in the folder. PidTagLtpRowId is the message's NID;
+// strict readers (Outlook, online PST viewers honoring [MS-OXCFOLD] §3.1.4)
+// enumerate folder contents by walking this TC, NOT by rescanning the NBT
+// for nodes whose nidParent matches the folder. An empty Contents TC for
+// a folder that contains messages surfaces as "error reading folder" in
+// those readers.
+//
+// Variable-length cells (Subject_W, MessageClass_W, SentRepresentingName_W,
+// DisplayTo_W, DisplayCc_W, ConversationTopic_W, ConversationIndex) are
+// supplied as raw byte spans the caller has pre-encoded. UTF-16-LE for
+// strings; raw bytes for ConversationIndex. Caller owns the storage and
+// must keep it alive across the buildFolderContentsTc call.
+// ============================================================================
+struct ContentsTcRow {
+    // PidTagLtpRowId — message NID. REQUIRED.
+    Nid      rowId;
+    // PidTagLtpRowVer — row version counter. 0 acceptable.
+    uint32_t rowVer {0u};
+
+    // Fixed-width scalar cells.
+    uint32_t messageStatus       {0u};   // PidTagMessageStatus
+    uint32_t messageFlags        {0u};   // PidTagMessageFlags
+    uint32_t importance          {1u};   // PidTagImportance (default Normal)
+    uint32_t sensitivity         {0u};   // PidTagSensitivity (default Normal)
+    uint32_t messageSize         {0u};   // PidTagMessageSize
+    uint64_t messageDeliveryTime {0u};   // PidTagMessageDeliveryTime (FILETIME ticks)
+    uint64_t clientSubmitTime    {0u};   // PidTagClientSubmitTime
+    uint64_t lastModificationTime{0u};   // PidTagLastModificationTime
+    bool     messageToMe         {false};// PidTagMessageToMe
+    bool     messageCcMe         {false};// PidTagMessageCcMe
+
+    // Variable-length cells. Empty (size 0) → CEB bit cleared.
+    const uint8_t* messageClassUtf16le        {nullptr};
+    size_t         messageClassSize           {0};
+    const uint8_t* subjectUtf16le             {nullptr};
+    size_t         subjectSize                {0};
+    const uint8_t* sentRepresentingNameUtf16le{nullptr};
+    size_t         sentRepresentingNameSize   {0};
+    const uint8_t* displayToUtf16le           {nullptr};
+    size_t         displayToSize              {0};
+    const uint8_t* displayCcUtf16le           {nullptr};
+    size_t         displayCcSize              {0};
+    const uint8_t* conversationTopicUtf16le   {nullptr};
+    size_t         conversationTopicSize      {0};
+    const uint8_t* conversationIndexBytes     {nullptr};
+    size_t         conversationIndexSize      {0};
+};
+
+// ============================================================================
 // buildFolderContentsTc — emit the §3.12-schema 27-column Contents TC.
 //
 // Used for: NID_CONTENTS_TABLE_TEMPLATE (0x060E) + per-folder contents
 // tables (0x012E, 0x802E, 0x804E, 0x806E from §2.7.1).
 //
 // 27-column schema per [SPEC §3.12], sorted by tag ascending. Per-row
-// endBm = 122 (118 fixed + 4 CEB). Always 0-row in M6 — actual message
-// rows arrive in M7.
+// endBm = 122 (118 fixed + 4 CEB).
 //
-// The function takes no row argument: M6 emits "Columns Only" for every
-// Contents TC, matching §3.12's published "Row Matrix Data Not Present
-// (0 Rows)" state and §2.7.1's "Columns Only" minimal state.
+// Two overloads:
+//   * 0-arg: emits "Columns Only" empty TC. Used for spec-mandated empty
+//     baseline tables (§2.7.1) where no contents exist.
+//   * (rows, rowCount): emits a populated TC. Used for any folder whose
+//     NBT contains messages — required for [MS-OXCFOLD]-strict readers.
 // ============================================================================
 TcResult buildFolderContentsTc();
+TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount);
 
 // ============================================================================
 // buildFolderFaiContentsTc — emit the §3.12-schema 17-column FAI Contents TC.

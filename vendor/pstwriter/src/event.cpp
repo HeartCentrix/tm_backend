@@ -373,8 +373,40 @@ WriteResult writeM9Pst(const M9PstConfig& config) noexcept
         }
 
         // ============================================================
-        // 4. Per folder: PC + sibling tables.
+        // 4a. Pre-allocate event NIDs per folder so the Contents TC can
+        //     carry one row per event (PidTagLtpRowId = event NID).
         // ============================================================
+        struct EventRecord {
+            const graph::GraphEvent* src;
+            FolderRecord*            folder;
+            Nid                      eventNid;
+        };
+        vector<EventRecord> eventRecs;
+        for (auto& rec : folderRecs) {
+            for (const auto* ev : rec.src->events) {
+                if (ev == nullptr) continue;
+                EventRecord er;
+                er.src      = ev;
+                er.folder   = &rec;
+                er.eventNid = alloc.allocate(NidType::NormalMessage);
+                eventRecs.push_back(er);
+            }
+        }
+
+        // ============================================================
+        // 4b. Per folder: PC + sibling tables (Contents now populated).
+        // ============================================================
+        vector<vector<uint8_t>> contentsRowStore;
+        contentsRowStore.reserve(eventRecs.size() * 6 + 16);
+        auto pushUtf16 = [&](const string& utf8,
+                             const uint8_t** outPtr,
+                             size_t* outSize) {
+            if (utf8.empty()) { *outPtr = nullptr; *outSize = 0; return; }
+            contentsRowStore.emplace_back(graph::utf8ToUtf16le(utf8));
+            *outPtr  = contentsRowStore.back().data();
+            *outSize = contentsRowStore.back().size();
+        };
+
         for (auto& rec : folderRecs) {
             folderBufStore.push_back(u16le(rec.src->displayName));
             const auto& nameBuf = folderBufStore.back();
@@ -397,8 +429,46 @@ WriteResult writeM9Pst(const M9PstConfig& config) noexcept
             // nidParent = owning folder NID per real-Outlook oracle.
             scheduleNode(rec.hierarchyNid, rec.folderNid,
                          buildFolderHierarchyTc(nullptr, 0).hnBytes);
-            scheduleNode(rec.contentsNid, rec.folderNid,
-                         buildFolderContentsTc().hnBytes);
+
+            // Populated Contents TC — one row per event. MessageClass
+            // = "IPM.Appointment" (per [MS-OXOCAL] §2.2.1).
+            vector<ContentsTcRow> rows;
+            rows.reserve(rec.src->events.size());
+            for (auto& er : eventRecs) {
+                if (er.folder != &rec) continue;
+                const graph::GraphEvent& ev = *er.src;
+
+                ContentsTcRow row;
+                row.rowId         = er.eventNid;
+                row.rowVer        = 0u;
+                row.messageStatus = 0u;
+                row.messageFlags  = 0u;
+                row.importance    = static_cast<uint32_t>(ev.importance);
+                row.sensitivity   = 0u;
+                row.messageSize   = 0u;
+                if (!ev.lastModifiedDateTime.empty())
+                    row.lastModificationTime =
+                        graph::isoToFiletimeTicks(ev.lastModifiedDateTime);
+
+                pushUtf16(string("IPM.Appointment"),
+                          &row.messageClassUtf16le, &row.messageClassSize);
+                pushUtf16(ev.subject,
+                          &row.subjectUtf16le, &row.subjectSize);
+                pushUtf16(ev.subject,
+                          &row.conversationTopicUtf16le,
+                          &row.conversationTopicSize);
+                if (ev.hasOrganizer && !ev.organizer.name.empty()) {
+                    pushUtf16(ev.organizer.name,
+                              &row.sentRepresentingNameUtf16le,
+                              &row.sentRepresentingNameSize);
+                }
+
+                rows.push_back(row);
+            }
+            auto tc = buildFolderContentsTc(
+                rows.empty() ? nullptr : rows.data(), rows.size());
+            scheduleNode(rec.contentsNid, rec.folderNid, std::move(tc.hnBytes));
+
             scheduleNode(rec.faiNid, rec.folderNid,
                          buildFolderFaiContentsTc().hnBytes);
         }
@@ -426,20 +496,17 @@ WriteResult writeM9Pst(const M9PstConfig& config) noexcept
         }
 
         // ============================================================
-        // 6. Per event: event PC. No subnodes for M9 Phase C.
+        // 6. Per event: event PC. NIDs were pre-allocated in step 4a so
+        //    the Contents TC could reference them.
         // ============================================================
-        for (auto& rec : folderRecs) {
-            for (const auto* ev : rec.src->events) {
-                if (ev == nullptr) continue;
-                const Nid eventNid = alloc.allocate(NidType::NormalMessage);
+        for (auto& er : eventRecs) {
+            MailPcBuildContext ctx;
+            ctx.providerUid  = config.providerUid;
+            // NID type 0x1F (LTP) — see mail.cpp note.
+            ctx.subnodeStart = Nid{(er.eventNid.value & ~uint32_t{0x1Fu}) + 0x10000u + 0x1Fu};
 
-                MailPcBuildContext ctx;
-                ctx.providerUid  = config.providerUid;
-                ctx.subnodeStart = Nid{(eventNid.value & ~uint32_t{0x1Fu}) + 0x10000u + 0x1u};
-
-                MailPcResult pc = buildEventPc(*ev, ctx);
-                scheduleNode(eventNid, rec.folderNid, std::move(pc.hnBytes));
-            }
+            MailPcResult pc = buildEventPc(*er.src, ctx);
+            scheduleNode(er.eventNid, er.folder->folderNid, std::move(pc.hnBytes));
         }
 
         // ============================================================

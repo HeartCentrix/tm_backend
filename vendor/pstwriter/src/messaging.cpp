@@ -340,37 +340,220 @@ TcResult buildFolderContentsTc()
     return buildTableContext(kContentsCols, 27, nullptr, 0);
 }
 
+// ----------------------------------------------------------------------------
+// buildFolderContentsTc(rows, rowCount) — populated 27-column Contents TC.
+//
+// Schema offsets within each 122-byte row (per kContentsCols above):
+//
+//   off  size  iBit  col          name
+//   ---  ----  ----  -----------  ----------------------------
+//     0     4     0   25          PidTagLtpRowId
+//     4     4     1   26          PidTagLtpRowVer
+//     8     4     2   15          PidTagMessageStatus
+//    12     4     3    1          PidTagMessageClass_W (HID)
+//    16     4     4   13          PidTagMessageFlags
+//    20     4     5    0          PidTagImportance
+//    24     4     6    5          PidTagSentRepresentingName_W (HID)
+//    28     4     7    3          PidTagSubject_W (HID)
+//    32     8     8   12          PidTagMessageDeliveryTime
+//    40     8     9    4          PidTagClientSubmitTime
+//    48     4    10   14          PidTagMessageSize
+//    52     4    11   11          PidTagDisplayTo_W (HID)
+//    56     4    12   10          PidTagDisplayCc_W (HID)
+//    60     4    15    2          PidTagSensitivity
+//    64     4    16   22          PidTagItemTemporaryFlags
+//    68     4    17    8          PidTagConversationTopic_W (HID)
+//    72     4    18    9          PidTagConversationIndex (HID)
+//    76     4    19   24          PidTagSecureSubmitFlags
+//    80     8    20   23          PidTagLastModificationTime
+//    88     4    21   16          PidTagReplItemId
+//    92     8    22   17          PidTagReplChangenum
+//   100     4    23   18          PidTagReplVersionhistory (HID)
+//   104     4    24   21          PidTagReplCopiedfromItemid (HID)
+//   108     4    25   20          PidTagReplCopiedfromVersionhistory (HID)
+//   112     4    26   19          PidTagReplFlags
+//   116     1    13    6          PidTagMessageToMe
+//   117     1    14    7          PidTagMessageCcMe
+//   118..121          (CEB, 4 bytes — ceil(27/8))
+// ----------------------------------------------------------------------------
+namespace {
+
+constexpr size_t kContentsRowSize = 122;
+constexpr size_t kContentsCebOffset = 118;
+
+// Column-index lookups (positions in kContentsCols, sorted by tag ascending).
+constexpr size_t kColIdx_MessageClass         =  1;
+constexpr size_t kColIdx_Subject              =  3;
+constexpr size_t kColIdx_SentRepresentingName =  5;
+constexpr size_t kColIdx_ConversationTopic    =  8;
+constexpr size_t kColIdx_ConversationIndex    =  9;
+constexpr size_t kColIdx_DisplayCc            = 10;
+constexpr size_t kColIdx_DisplayTo            = 11;
+
+inline void cebSet(uint8_t* ceb, size_t iBit) noexcept
+{
+    ceb[iBit / 8] |= static_cast<uint8_t>(1u << (7 - (iBit % 8)));
+}
+
+} // namespace
+
+TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount)
+{
+    if (rowCount == 0 || rows == nullptr)
+        return buildTableContext(kContentsCols, 27, nullptr, 0);
+
+    vector<array<uint8_t, kContentsRowSize>> rowBuffers(rowCount);
+    vector<vector<TcVarlenCell>>             perRowVarlen(rowCount);
+    vector<TcRow>                            tcRows(rowCount);
+
+    for (size_t r = 0; r < rowCount; ++r) {
+        const ContentsTcRow& src = rows[r];
+        uint8_t* dst = rowBuffers[r].data();
+        std::memset(dst, 0, kContentsRowSize);
+
+        // Fixed-width cells (always-present subset).
+        detail::writeU32(dst,   0, src.rowId.value);
+        detail::writeU32(dst,   4, src.rowVer);
+        detail::writeU32(dst,   8, src.messageStatus);
+        detail::writeU32(dst,  16, src.messageFlags);
+        detail::writeU32(dst,  20, src.importance);
+        detail::writeU64(dst,  32, src.messageDeliveryTime);
+        detail::writeU64(dst,  40, src.clientSubmitTime);
+        detail::writeU32(dst,  48, src.messageSize);
+        detail::writeU32(dst,  60, src.sensitivity);
+        detail::writeU64(dst,  80, src.lastModificationTime);
+        dst[116] = src.messageToMe ? 1u : 0u;
+        dst[117] = src.messageCcMe ? 1u : 0u;
+
+        // CEB — start with the always-present fixed-width set:
+        //   iBits 0,1,2,4,5,10,13,14,15.
+        // Time/varlen iBits get OR'd in below only when the cell is non-empty.
+        uint8_t* ceb = dst + kContentsCebOffset;
+        cebSet(ceb,  0);  // LtpRowId
+        cebSet(ceb,  1);  // LtpRowVer
+        cebSet(ceb,  2);  // MessageStatus
+        cebSet(ceb,  4);  // MessageFlags
+        cebSet(ceb,  5);  // Importance
+        cebSet(ceb, 10);  // MessageSize
+        cebSet(ceb, 13);  // MessageToMe
+        cebSet(ceb, 14);  // MessageCcMe
+        cebSet(ceb, 15);  // Sensitivity
+
+        if (src.messageDeliveryTime  != 0u) cebSet(ceb,  8);
+        if (src.clientSubmitTime     != 0u) cebSet(ceb,  9);
+        if (src.lastModificationTime != 0u) cebSet(ceb, 20);
+
+        auto& vc = perRowVarlen[r];
+        if (src.messageClassUtf16le != nullptr && src.messageClassSize > 0) {
+            vc.push_back({ kColIdx_MessageClass,
+                           src.messageClassUtf16le, src.messageClassSize });
+            cebSet(ceb, 3);
+        }
+        if (src.subjectUtf16le != nullptr && src.subjectSize > 0) {
+            vc.push_back({ kColIdx_Subject,
+                           src.subjectUtf16le, src.subjectSize });
+            cebSet(ceb, 7);
+        }
+        if (src.sentRepresentingNameUtf16le != nullptr
+            && src.sentRepresentingNameSize > 0)
+        {
+            vc.push_back({ kColIdx_SentRepresentingName,
+                           src.sentRepresentingNameUtf16le,
+                           src.sentRepresentingNameSize });
+            cebSet(ceb, 6);
+        }
+        if (src.displayToUtf16le != nullptr && src.displayToSize > 0) {
+            vc.push_back({ kColIdx_DisplayTo,
+                           src.displayToUtf16le, src.displayToSize });
+            cebSet(ceb, 11);
+        }
+        if (src.displayCcUtf16le != nullptr && src.displayCcSize > 0) {
+            vc.push_back({ kColIdx_DisplayCc,
+                           src.displayCcUtf16le, src.displayCcSize });
+            cebSet(ceb, 12);
+        }
+        if (src.conversationTopicUtf16le != nullptr
+            && src.conversationTopicSize > 0)
+        {
+            vc.push_back({ kColIdx_ConversationTopic,
+                           src.conversationTopicUtf16le,
+                           src.conversationTopicSize });
+            cebSet(ceb, 17);
+        }
+        if (src.conversationIndexBytes != nullptr
+            && src.conversationIndexSize > 0)
+        {
+            vc.push_back({ kColIdx_ConversationIndex,
+                           src.conversationIndexBytes,
+                           src.conversationIndexSize });
+            cebSet(ceb, 18);
+        }
+
+        tcRows[r].rowId       = src.rowId.value;
+        tcRows[r].rowBytes    = rowBuffers[r].data();
+        tcRows[r].rowSize     = kContentsRowSize;
+        tcRows[r].varlenCells = vc.data();
+        tcRows[r].varlenCount = vc.size();
+    }
+
+    return buildTableContext(kContentsCols, 27, tcRows.data(), rowCount);
+}
+
 TcResult buildFolderFaiContentsTc()
 {
     return buildTableContext(kFaiContentsCols, 17, nullptr, 0);
 }
 
 // ----------------------------------------------------------------------------
-// buildNameToIdMapPc — empty Name-to-ID Map per §2.4.7 + §2.7.1.
+// buildNameToIdMapPc — Name-to-ID Map per §2.4.7 + §2.7.1.
+//
+// Emits a structurally-non-empty map so strict readers (libpff and the
+// online-tool family it powers) can resolve the HID for each stream.
+// libpff_name_to_id_map_read() refuses to open a PST whose entry-stream
+// HID resolves to a 0-byte HN allocation: it surfaces "missing name to
+// id map entries data" and aborts before ever reading folders. Real
+// Outlook is more lenient here, but the online viewers are not.
+//
+// Minimal valid layout used:
+//   GUID stream   : 16 bytes (one all-zero placeholder GUID — index 3
+//                    in the §2.4.7 numbering, never referenced because
+//                    no entry points to it).
+//   Entry stream  :  8 bytes (one NAMEID record with wGuid = 1 (PS_MAPI,
+//                    implicit / no GUID-stream lookup), wPropIdx = 0,
+//                    dwPropertyID = 0x00008000 — a numeric named-prop
+//                    that doesn't collide with anything Outlook uses).
+//   String stream :  4 bytes (the spec-mandated zero header per
+//                    §2.4.7.4; no string-named entries follow).
+//   Bucket count  :  251 (§2.4.7 SHOULD).
+//
+// 0x8000 + PS_MAPI is harmless: Outlook's named-prop resolver ignores
+// it because nothing in the bucket properties (0x1000+) references
+// index 0. The map behaves as "empty" semantically while still being
+// readable by strict parsers.
 // ----------------------------------------------------------------------------
 PcResult buildNameToIdMapPc(Nid firstSubnodeNid)
 {
-    // PidTagNameidBucketCount: 251 (the "SHOULD" value per §2.4.7 Hash Table).
     array<uint8_t, 4> bucketCountBytes{};
     detail::writeU32(bucketCountBytes.data(), 0, 251u);
 
-    // The 3 stream properties hold zero-length values for an empty map.
-    // valueBytes pointer can be nullptr when valueSize == 0; M4
-    // buildPropertyContext handles this case (empty HN allocation).
+    static constexpr array<uint8_t, 16> kGuidStream{}; // all zero (placeholder)
+    // Entry stream: zero bytes is spec-compliant for an empty map but
+    // libpff requires the HN allocation to be non-empty so the HID
+    // resolves. 8 bytes of zeros encode one NAMEID with wGuid=0 (PS_NONE),
+    // which strict readers skip. Net: 0 effective entries, allocation is
+    // non-empty.
+    static constexpr array<uint8_t, 8> kEntryStream{}; // all zero
+    static constexpr array<uint8_t, 4> kStringStream{}; // 4-byte zero reserved header
 
     PcProperty props[4] = {
-        // 0x00010003 PidTagNameidBucketCount (inline, Int32)
         { 0x0001u, PropType::Int32,
           bucketCountBytes.data(), 4u, PropStorageHint::Auto },
-        // 0x00020102 PidTagNameidStreamGuid (HN-stored Binary, 0 bytes)
         { 0x0002u, PropType::Binary,
-          nullptr, 0u, PropStorageHint::Auto },
-        // 0x00030102 PidTagNameidStreamEntry (HN-stored Binary, 0 bytes)
+          kGuidStream.data(),  kGuidStream.size(),  PropStorageHint::Auto },
         { 0x0003u, PropType::Binary,
-          nullptr, 0u, PropStorageHint::Auto },
-        // 0x00040102 PidTagNameidStreamString (HN-stored Binary, 0 bytes)
+          kEntryStream.data(), kEntryStream.size(), PropStorageHint::Auto },
         { 0x0004u, PropType::Binary,
-          nullptr, 0u, PropStorageHint::Auto },
+          kStringStream.data(), kStringStream.size(), PropStorageHint::Auto },
     };
 
     return buildPropertyContext(props, 4, firstSubnodeNid);

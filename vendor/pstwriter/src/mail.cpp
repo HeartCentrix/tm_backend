@@ -888,7 +888,11 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
         // Storage for per-folder UTF-16-LE display names (must outlive
         // schema struct usage).
         vector<vector<uint8_t>> folderNameStore;
-        folderNameStore.reserve(config.folders.size());
+        // Two entries per folder (displayName + containerClass). Under-
+        // reserving here causes the inner vector's data() pointer to dangle
+        // after the second push_back reallocates, surfacing as a corrupt
+        // folder-PC display name in strict readers.
+        folderNameStore.reserve(config.folders.size() * 2);
 
         const Nid kDummySub{0x00000041u};
 
@@ -1038,15 +1042,102 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
             }
         }
 
-        // Build per-folder Contents TC.
-        // Reuse the M6 27-col schema (it's still 0-row in M6); M7 emits
-        // populated rows. For simplicity we keep emitting 0-row Contents
-        // TCs at the folder level — Outlook builds the contents view from
-        // the messages' NBT entries with nidParent=folder. M10 hardening
-        // can populate the Contents TC view rows.
-        for (auto& rec : folderRecs) {
-            scheduleNode(rec.contentsNid, rec.folderNid,
-                         buildFolderContentsTc().hnBytes);
+        // Build per-folder Contents TC with one row per message.
+        //
+        // Strict readers ([MS-OXCFOLD] §3.1.4) enumerate folder contents by
+        // walking the Contents TC, NOT by rescanning the NBT for nodes whose
+        // nidParent matches the folder. An empty Contents TC for a folder
+        // that contains messages surfaces as "error reading folder" in those
+        // readers (Aspose.Email-based readers tolerate it via NBT-fallback).
+        //
+        // Per-message UTF-16 buffers are stashed in `contentsRowStore` so
+        // the ContentsTcRow byte-span pointers stay valid until each
+        // buildFolderContentsTc call returns.
+        {
+            vector<vector<uint8_t>> contentsRowStore;
+            contentsRowStore.reserve(msgRecs.size() * 10 + 16);
+
+            auto pushUtf16 = [&](const string& utf8,
+                                 const uint8_t** outPtr,
+                                 size_t* outSize) {
+                if (utf8.empty()) { *outPtr = nullptr; *outSize = 0; return; }
+                contentsRowStore.emplace_back(graph::utf8ToUtf16le(utf8));
+                *outPtr  = contentsRowStore.back().data();
+                *outSize = contentsRowStore.back().size();
+            };
+            auto pushBytes = [&](const vector<uint8_t>& src,
+                                 const uint8_t** outPtr,
+                                 size_t* outSize) {
+                if (src.empty()) { *outPtr = nullptr; *outSize = 0; return; }
+                contentsRowStore.emplace_back(src);
+                *outPtr  = contentsRowStore.back().data();
+                *outSize = contentsRowStore.back().size();
+            };
+
+            for (auto& rec : folderRecs) {
+                vector<ContentsTcRow> rows;
+                rows.reserve(rec.src->messages.size());
+
+                for (auto& mr : msgRecs) {
+                    if (mr.folder != &rec) continue;
+                    const graph::GraphMessage& m = *mr.src;
+
+                    ContentsTcRow row;
+                    row.rowId          = mr.messageNid;
+                    row.rowVer         = 0u;
+                    row.messageStatus  = 0u;
+                    row.messageFlags   = computeMessageFlags(m);
+                    row.importance     = static_cast<uint32_t>(m.importance);
+                    row.sensitivity    = 0u;
+                    row.messageSize    = estimateMessageSize(m);
+                    if (!m.receivedDateTime.empty())
+                        row.messageDeliveryTime =
+                            graph::isoToFiletimeTicks(m.receivedDateTime);
+                    if (!m.sentDateTime.empty())
+                        row.clientSubmitTime =
+                            graph::isoToFiletimeTicks(m.sentDateTime);
+                    if (!m.lastModifiedDateTime.empty())
+                        row.lastModificationTime =
+                            graph::isoToFiletimeTicks(m.lastModifiedDateTime);
+
+                    pushUtf16(string("IPM.Note"),
+                              &row.messageClassUtf16le, &row.messageClassSize);
+                    pushUtf16(m.subject,
+                              &row.subjectUtf16le, &row.subjectSize);
+
+                    const auto subjParts = splitSubject(m.subject);
+                    pushUtf16(subjParts.normalized.empty()
+                                ? m.subject : subjParts.normalized,
+                              &row.conversationTopicUtf16le,
+                              &row.conversationTopicSize);
+
+                    const graph::EmailAddress* sender = nullptr;
+                    if      (m.hasSender) sender = &m.sender;
+                    else if (m.hasFrom)   sender = &m.from;
+                    if (sender != nullptr && !sender->name.empty()) {
+                        pushUtf16(sender->name,
+                                  &row.sentRepresentingNameUtf16le,
+                                  &row.sentRepresentingNameSize);
+                    }
+
+                    pushUtf16(joinRecipientDisplay(m.toRecipients),
+                              &row.displayToUtf16le, &row.displayToSize);
+                    pushUtf16(joinRecipientDisplay(m.ccRecipients),
+                              &row.displayCcUtf16le, &row.displayCcSize);
+
+                    pushBytes(m.conversationIndex,
+                              &row.conversationIndexBytes,
+                              &row.conversationIndexSize);
+
+                    rows.push_back(row);
+                }
+
+                auto tc = buildFolderContentsTc(
+                    rows.empty() ? nullptr : rows.data(), rows.size());
+                // nidParent = owning folder NID per remote-branch oracle.
+                scheduleNode(rec.contentsNid, rec.folderNid,
+                             std::move(tc.hnBytes));
+            }
         }
 
         // ============================================================
@@ -1089,7 +1180,13 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
             // subnodeStart for body promotion — pick high NID values
             // unlikely to collide with subnode-tree NIDs (0x671, 0x692,
             // attachment NIDs).
-            ctx.subnodeStart = Nid{(mr.messageNid.value & ~uint32_t{0x1Fu}) + 0x10000u + 0x1u};
+            // NID type 0x1F (LTP) is the spec-canonical type for
+            // PC/TC body-promoted subnodes. Type 0x01 (INTERNAL) is
+            // reserved for SLBLOCK / SIBLOCK index pages — strict readers
+            // (libpff, online PST viewers) refuse to dereference user data
+            // through an INTERNAL-typed NID and surface the body as
+            // "missing value data".
+            ctx.subnodeStart = Nid{(mr.messageNid.value & ~uint32_t{0x1Fu}) + 0x10000u + 0x1Fu};
 
             // Build mail PC
             MailPcResult pc = buildMailPc(m, ctx);

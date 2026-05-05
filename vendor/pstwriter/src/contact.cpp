@@ -413,8 +413,42 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
         }
 
         // ============================================================
-        // 4. Per folder: PC + sibling tables.
+        // 4a. Pre-allocate contact NIDs per folder so the Contents TC can
+        //     carry one row per contact (PidTagLtpRowId = contact NID).
         // ============================================================
+        struct ContactRecord {
+            const graph::GraphContact* src;
+            FolderRecord*              folder;
+            Nid                        contactNid;
+        };
+        vector<ContactRecord> contactRecs;
+        for (auto& rec : folderRecs) {
+            for (const auto* c : rec.src->contacts) {
+                if (c == nullptr) continue;
+                ContactRecord cr;
+                cr.src        = c;
+                cr.folder     = &rec;
+                cr.contactNid = alloc.allocate(NidType::NormalMessage);
+                contactRecs.push_back(cr);
+            }
+        }
+
+        // ============================================================
+        // 4b. Per folder: PC + sibling tables (Contents now populated).
+        // ============================================================
+        // UTF-16 buffer storage for ContentsTcRow byte spans. Reserved up
+        // front so the outer vector never reallocates during emplace_back.
+        vector<vector<uint8_t>> contentsRowStore;
+        contentsRowStore.reserve(contactRecs.size() * 6 + 16);
+        auto pushUtf16 = [&](const string& utf8,
+                             const uint8_t** outPtr,
+                             size_t* outSize) {
+            if (utf8.empty()) { *outPtr = nullptr; *outSize = 0; return; }
+            contentsRowStore.emplace_back(graph::utf8ToUtf16le(utf8));
+            *outPtr  = contentsRowStore.back().data();
+            *outSize = contentsRowStore.back().size();
+        };
+
         for (auto& rec : folderRecs) {
             folderBufStore.push_back(u16le(rec.src->displayName));
             const auto& nameBuf = folderBufStore.back();
@@ -437,8 +471,41 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             // nidParent = owning folder NID per real-Outlook oracle.
             scheduleNode(rec.hierarchyNid, rec.folderNid,
                          buildFolderHierarchyTc(nullptr, 0).hnBytes);
-            scheduleNode(rec.contentsNid, rec.folderNid,
-                         buildFolderContentsTc().hnBytes);
+
+            // Populated Contents TC — one row per contact, schema-equivalent
+            // to mail's Contents TC (Subject_W carries displayName, etc.).
+            vector<ContentsTcRow> rows;
+            rows.reserve(rec.src->contacts.size());
+            for (auto& cr : contactRecs) {
+                if (cr.folder != &rec) continue;
+                const graph::GraphContact& c = *cr.src;
+
+                ContentsTcRow row;
+                row.rowId         = cr.contactNid;
+                row.rowVer        = 0u;
+                row.messageStatus = 0u;
+                row.messageFlags  = 0u;          // contacts: no flags
+                row.importance    = 1u;          // Normal
+                row.sensitivity   = 0u;
+                row.messageSize   = 0u;
+                if (!c.lastModifiedDateTime.empty())
+                    row.lastModificationTime =
+                        graph::isoToFiletimeTicks(c.lastModifiedDateTime);
+
+                pushUtf16(string("IPM.Contact"),
+                          &row.messageClassUtf16le, &row.messageClassSize);
+                pushUtf16(c.displayName,
+                          &row.subjectUtf16le, &row.subjectSize);
+                pushUtf16(c.displayName,
+                          &row.conversationTopicUtf16le,
+                          &row.conversationTopicSize);
+
+                rows.push_back(row);
+            }
+            auto tc = buildFolderContentsTc(
+                rows.empty() ? nullptr : rows.data(), rows.size());
+            scheduleNode(rec.contentsNid, rec.folderNid, std::move(tc.hnBytes));
+
             scheduleNode(rec.faiNid, rec.folderNid,
                          buildFolderFaiContentsTc().hnBytes);
         }
@@ -466,22 +533,19 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
         }
 
         // ============================================================
-        // 6. Per contact: contact PC. No subnodes for M8 Phase C.
+        // 6. Per contact: contact PC. NIDs were pre-allocated in step 4a
+        //    so the Contents TC could reference them.
         // ============================================================
-        for (auto& rec : folderRecs) {
-            for (const auto* c : rec.src->contacts) {
-                if (c == nullptr) continue;
-                const Nid contactNid = alloc.allocate(NidType::NormalMessage);
+        for (auto& cr : contactRecs) {
+            MailPcBuildContext ctx;
+            ctx.providerUid  = config.providerUid;
+            // NID type 0x1F (LTP) — see mail.cpp note. Type 0x01 INTERNAL
+            // is reserved for subnode-index pages.
+            ctx.subnodeStart = Nid{(cr.contactNid.value & ~uint32_t{0x1Fu}) + 0x10000u + 0x1Fu};
 
-                MailPcBuildContext ctx;
-                ctx.providerUid  = config.providerUid;
-                ctx.subnodeStart = Nid{(contactNid.value & ~uint32_t{0x1Fu}) + 0x10000u + 0x1u};
-
-                MailPcResult pc = buildContactPc(*c, ctx);
-                // M8 Phase C: contact PC has no subnodes (we emit only
-                // top-level scalar PidTags). Drop pc.subnodes.
-                scheduleNode(contactNid, rec.folderNid, std::move(pc.hnBytes));
-            }
+            MailPcResult pc = buildContactPc(*cr.src, ctx);
+            // M8 Phase C: contact PC has no subnodes.
+            scheduleNode(cr.contactNid, cr.folder->folderNid, std::move(pc.hnBytes));
         }
 
         // ============================================================

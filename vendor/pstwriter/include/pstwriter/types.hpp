@@ -232,10 +232,12 @@ struct Bid {
     constexpr static Bid makeInternal(uint64_t idx) noexcept
     {
         // bit[1] set => internal block (XBLOCK/XXBLOCK/SLBLOCK/SIBLOCK).
-        // The spec requires bit[1] = 1 for any internal BID. Bit[0] is also
-        // commonly set on internal blocks; pstwriter sets both to be safe and
-        // consistent with what Outlook produces.
-        return Bid{ ((idx & 0x3FFFFFFFFFFFFFFFull) << 2) | 0x3ull };
+        // [MS-PST] §2.2.2.2: bit[0] (the 'A' flag) MUST be zero — only
+        // bit[1] is meaningful. Strict readers (libpff and the online
+        // viewers built on it) AND-mask BIDs by 0xFFFE for index lookups,
+        // so a stray bit[0] would silently desync our writer's BID from
+        // what the reader queries against the BBT.
+        return Bid{ ((idx & 0x3FFFFFFFFFFFFFFFull) << 2) | 0x2ull };
     }
 
     constexpr bool     isInternal() const noexcept { return (value & 0x2ull) != 0; }
