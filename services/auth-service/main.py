@@ -14,7 +14,14 @@ from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession, async_session_factory
 from shared.models import PlatformUser, UserRoleMapping, Organization, UserRole, Tenant, TenantType, TenantStatus, AdminConsentToken, Resource, ResourceType
 from shared.power_bi_client import PowerBIClient
-from shared.security import create_access_token, create_refresh_token, decode_token, get_current_user_from_token
+from shared.security import (
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    get_current_user_from_token,
+    is_refresh_token_revoked,
+    revoke_refresh_token,
+)
 from shared.schemas import (
     UserResponse, LoginResponse, RefreshTokenRequest, RefreshTokenResponse,
     MicrosoftAuthUrlResponse, OAuthCallbackRequest,
@@ -165,8 +172,15 @@ async def get_azure_datasource_url(state: Optional[str] = Query(None)):
     return MicrosoftAuthUrlResponse(url=auth_url, state=csrf_state)
 
 
+_POWER_BI_STATE_COOKIE = "power_bi_oauth_state"
+# 10 min — long enough for the user to complete the MS sign-in but short
+# enough that abandoned flows don't leave dead nonces lying around.
+_POWER_BI_STATE_TTL_SECONDS = 600
+
+
 @app.get("/api/v1/auth/power-bi/url", response_model=MicrosoftAuthUrlResponse)
 async def get_power_bi_url(
+    response: Response,
     tenant_id: str = Query(..., alias="tenantId"),
     state: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_user_from_token),
@@ -195,6 +209,24 @@ async def get_power_bi_url(
         "prompt": "consent",
     }
     auth_url = f"https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?{urlencode(params)}"
+
+    # Stash the CSRF nonce in an HttpOnly cookie so JS (and therefore XSS)
+    # can't read or forge it. The callback handler compares this cookie to
+    # the `state` echoed back through the OAuth flow; equality is the only
+    # acceptance criterion. Server-side validation makes the check
+    # authoritative — even if the SPA loses or skips its own state check,
+    # the backend rejects mismatches.
+    response.set_cookie(
+        _POWER_BI_STATE_COOKIE,
+        csrf_state,
+        max_age=_POWER_BI_STATE_TTL_SECONDS,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        domain=settings.COOKIE_DOMAIN,
+        path="/",
+    )
+
     return MicrosoftAuthUrlResponse(url=auth_url, state=csrf_state)
 
 
@@ -674,10 +706,44 @@ async def azure_datasource_callback(
 @app.post("/api/v1/auth/power-bi/callback", response_model=AdminConsentTokenResponse)
 async def power_bi_callback(
     callback: PowerBIOAuthCallbackRequest,
+    response: Response,
+    http_request: Request,
     current_user: dict = Depends(get_current_user_from_token),
     db: AsyncSession = Depends(get_db),
 ):
     """Store delegated Power BI/Fabric refresh token for AFI-style service-user onboarding."""
+    # CSRF check: the state nonce was issued as an HttpOnly cookie when the
+    # SPA called /power-bi/url. JS (and therefore XSS) can't read or forge
+    # the cookie, so an attacker who controls the SPA can't supply a
+    # pre-known state value. Compare with constant time, then clear the
+    # cookie so the same nonce can't be replayed.
+    expected_state = http_request.cookies.get(_POWER_BI_STATE_COOKIE)
+    if not expected_state or not callback.state or not secrets.compare_digest(
+        expected_state, callback.state
+    ):
+        # Clear any stale cookie before rejecting so the next attempt starts
+        # clean instead of reusing a leaked nonce.
+        response.delete_cookie(
+            _POWER_BI_STATE_COOKIE,
+            path="/",
+            domain=settings.COOKIE_DOMAIN,
+            secure=settings.COOKIE_SECURE,
+            samesite=settings.COOKIE_SAMESITE,
+            httponly=True,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Power BI sign-in state did not match. Please try again.",
+        )
+    response.delete_cookie(
+        _POWER_BI_STATE_COOKIE,
+        path="/",
+        domain=settings.COOKIE_DOMAIN,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        httponly=True,
+    )
+
     org_id = UUID(current_user["org_id"]) if current_user.get("org_id") else None
     stmt = select(Tenant).where(Tenant.id == UUID(callback.tenantId))
     if org_id:
@@ -1069,6 +1135,13 @@ async def refresh_token(
         raise HTTPException(status_code=401, detail="Missing refresh token")
 
     payload = decode_token(raw_token, expected_type="refresh")
+
+    # Revocation check: a stolen refresh token replayed after the legitimate
+    # user already rotated it (or after explicit logout) lands here.
+    old_jti = payload.get("jti")
+    if old_jti and await is_refresh_token_revoked(old_jti):
+        raise HTTPException(status_code=401, detail="Refresh token revoked")
+
     token_data = {
         "sub": payload.get("sub"),
         "email": payload.get("email"),
@@ -1080,13 +1153,46 @@ async def refresh_token(
     new_refresh_token = create_refresh_token(token_data)
     expires_in = settings.JWT_EXPIRATION_HOURS * 3600
 
+    # Refresh-token rotation: revoke the just-used jti so the same token
+    # can't be used twice. TTL = remaining lifetime of the old token, so the
+    # denylist entry expires naturally and Redis doesn't grow unbounded.
+    if old_jti:
+        old_exp = payload.get("exp")
+        if isinstance(old_exp, (int, float)):
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            remaining = max(1, int(old_exp) - now_ts)
+        else:
+            remaining = settings.JWT_REFRESH_EXPIRATION_DAYS * 86400
+        await revoke_refresh_token(old_jti, remaining)
+
     _set_auth_cookies(response, access_token, new_refresh_token)
 
     return RefreshTokenResponse(accessToken=access_token, refreshToken=new_refresh_token, expiresIn=expires_in)
 
 
 @app.post("/api/v1/auth/logout")
-async def logout(response: Response):
+async def logout(response: Response, http_request: Request):
+    # Revoke the refresh token's jti so a copy stolen before logout can't be
+    # used to mint new sessions. Best-effort — if Redis is down or the cookie
+    # is malformed, still clear the cookies and return success so the client
+    # transitions to the signed-out state.
+    cookie_token = http_request.cookies.get("refresh_token")
+    if cookie_token:
+        try:
+            payload = decode_token(cookie_token, expected_type="refresh")
+            jti = payload.get("jti")
+            exp = payload.get("exp")
+            if jti:
+                if isinstance(exp, (int, float)):
+                    now_ts = int(datetime.now(timezone.utc).timestamp())
+                    remaining = max(1, int(exp) - now_ts)
+                else:
+                    remaining = settings.JWT_REFRESH_EXPIRATION_DAYS * 86400
+                await revoke_refresh_token(jti, remaining)
+        except HTTPException:
+            # Already-expired or tampered token — nothing to revoke.
+            pass
+
     _clear_auth_cookies(response)
     return {"message": "Logged out successfully"}
 

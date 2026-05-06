@@ -84,13 +84,18 @@ class Settings:
             parsed = urlparse(railway_rabbitmq_url)
             self.RABBITMQ_HOST = parsed.hostname or "localhost"
             self.RABBITMQ_PORT = parsed.port or 5672
-            self.RABBITMQ_USER = parsed.username or "guest"
-            self.RABBITMQ_PASSWORD = parsed.password or "guest"
+            # Empty rather than "guest" — the RABBITMQ_URL property fails
+            # closed if creds aren't supplied, which is safer than silently
+            # connecting as the default RabbitMQ user.
+            self.RABBITMQ_USER = parsed.username or ""
+            self.RABBITMQ_PASSWORD = parsed.password or ""
         else:
             self.RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
             self.RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
-            self.RABBITMQ_USER = os.getenv("RABBITMQ_USERNAME") or os.getenv("RABBITMQ_USER", "guest")
-            self.RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
+            self.RABBITMQ_USER = (
+                os.getenv("RABBITMQ_USERNAME") or os.getenv("RABBITMQ_USER", "")
+            )
+            self.RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "")
         self.RABBITMQ_ENABLED = os.getenv("RABBITMQ_ENABLED", "false").lower() in ("true", "1", "yes")
         self.AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "")
         self.AZURE_STORAGE_ACCOUNT_KEY = os.getenv("AZURE_STORAGE_ACCOUNT_KEY", "")
@@ -601,7 +606,25 @@ class Settings:
 
     @property
     def RABBITMQ_URL(self) -> str:
-        return f"amqp://{self.RABBITMQ_USER}:{self.RABBITMQ_PASSWORD}@{self.RABBITMQ_HOST}:{self.RABBITMQ_PORT}/"
+        # Refuse to hand out a connection URL with the default RabbitMQ
+        # guest:guest credential. Any process that can reach the broker on
+        # those credentials gets full publish/consume rights, including the
+        # storage.toggle queue that drives storage-backend switching.
+        # Callers that have built a RABBITMQ_URL env var directly bypass this
+        # entirely (and are responsible for their own credentials).
+        u = self.RABBITMQ_USER
+        p = self.RABBITMQ_PASSWORD
+        if not u or not p:
+            raise RuntimeError(
+                "RabbitMQ credentials not set. Provide RABBITMQ_URL or set "
+                "RABBITMQ_USERNAME and RABBITMQ_PASSWORD."
+            )
+        if u == "guest" and p == "guest":
+            raise RuntimeError(
+                "Refusing to connect to RabbitMQ with the default guest:guest "
+                "credential. Provision a dedicated user."
+            )
+        return f"amqp://{u}:{p}@{self.RABBITMQ_HOST}:{self.RABBITMQ_PORT}/"
 
 
 settings = Settings()

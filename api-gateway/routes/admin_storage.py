@@ -71,10 +71,32 @@ def _rmq_url() -> str:
     url = os.getenv("RABBITMQ_URL")
     if url:
         return url
-    u = os.getenv("RABBITMQ_USERNAME", os.getenv("RABBITMQ_USER", "guest"))
-    p = os.getenv("RABBITMQ_PASSWORD", "guest")
-    h = os.getenv("RABBITMQ_HOST", "localhost")
+    # Refuse to publish to storage.toggle with the default RabbitMQ
+    # guest:guest credential. The publisher half of the same attack: an
+    # operator who forgets to set RABBITMQ_PASSWORD would otherwise have
+    # this gateway endpoint authenticating to the broker as `guest`, which
+    # is the credential built into every stock RabbitMQ image.
+    u = os.getenv("RABBITMQ_USERNAME") or os.getenv("RABBITMQ_USER")
+    p = os.getenv("RABBITMQ_PASSWORD")
+    h = os.getenv("RABBITMQ_HOST")
     port = os.getenv("RABBITMQ_PORT", "5672")
+    missing = [name for name, val in (
+        ("RABBITMQ_USERNAME (or RABBITMQ_USER)", u),
+        ("RABBITMQ_PASSWORD", p),
+        ("RABBITMQ_HOST", h),
+    ) if not val]
+    if missing:
+        raise RuntimeError(
+            "Missing required RabbitMQ env vars: "
+            + ", ".join(missing)
+            + ". Set RABBITMQ_URL, or all of "
+            "RABBITMQ_USERNAME/RABBITMQ_PASSWORD/RABBITMQ_HOST."
+        )
+    if u == "guest" and p == "guest":
+        raise RuntimeError(
+            "Refusing to connect to RabbitMQ with the default guest:guest "
+            "credential. Provision a dedicated user for api-gateway."
+        )
     return f"amqp://{u}:{p}@{h}:{port}/"
 
 

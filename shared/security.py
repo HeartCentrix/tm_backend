@@ -75,8 +75,82 @@ def create_refresh_token(data: dict) -> str:
 
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + timedelta(days=settings.JWT_REFRESH_EXPIRATION_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
+    # `jti` lets us revoke an individual refresh token without rotating the
+    # signing secret. The auth-service stamps the JTI into a Redis denylist
+    # on rotation/logout; decode_token's caller checks the denylist on
+    # refresh paths (see is_refresh_token_revoked / revoke_refresh_token).
+    to_encode.update({"exp": expire, "type": "refresh", "jti": str(uuid.uuid4())})
     return jwt.encode(to_encode, settings.REFRESH_TOKEN_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+
+# ==================== Refresh-token revocation (denylist) ====================
+#
+# Refresh tokens carry a `jti` claim. On every successful /auth/refresh we
+# add the *used* jti to a Redis-backed denylist with TTL = remaining token
+# lifetime, then issue a new refresh token with a fresh jti. If the same
+# refresh token is presented twice (legitimate user race or replay attack),
+# the second use sees the jti in the denylist and is rejected. /auth/logout
+# also revokes the current jti.
+#
+# The auth-service is the only caller; we keep these helpers async and the
+# rest of decode_token sync so every authenticated request doesn't pay a
+# Redis round-trip. Access tokens are short-lived (hours) and aren't checked
+# against the denylist — use the secret rotation lever for mass revocation
+# of access tokens.
+
+_REVOCATION_KEY_PREFIX = "jwt_revoked:"
+_revocation_redis: Optional[Any] = None
+
+
+async def _get_revocation_redis():
+    """Lazy async Redis client for the revocation denylist. None when disabled."""
+    global _revocation_redis
+    if _revocation_redis is not None:
+        return _revocation_redis
+    if not settings.REDIS_ENABLED:
+        return None
+    try:
+        from redis.asyncio import Redis
+        _revocation_redis = Redis(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB,
+            decode_responses=True,
+            socket_timeout=2,
+            socket_connect_timeout=2,
+        )
+        return _revocation_redis
+    except Exception:
+        return None
+
+
+async def revoke_refresh_token(jti: str, ttl_seconds: int) -> None:
+    """Add a refresh-token jti to the denylist for the rest of its lifetime."""
+    if not jti:
+        return
+    client = await _get_revocation_redis()
+    if client is None:
+        return
+    try:
+        await client.setex(f"{_REVOCATION_KEY_PREFIX}{jti}", max(1, ttl_seconds), "1")
+    except Exception:
+        # Best-effort: if Redis is down we can't add to the denylist. Log via
+        # the FastAPI runtime if the caller wants — return None either way so
+        # logout/refresh don't 500 on a transient Redis hiccup.
+        return
+
+
+async def is_refresh_token_revoked(jti: str) -> bool:
+    """Return True when the jti has been revoked. Fail-open on Redis errors."""
+    if not jti:
+        return False
+    client = await _get_revocation_redis()
+    if client is None:
+        return False
+    try:
+        return bool(await client.exists(f"{_REVOCATION_KEY_PREFIX}{jti}"))
+    except Exception:
+        return False
 
 
 def _unauthorized(detail: str):

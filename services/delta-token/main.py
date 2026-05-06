@@ -9,11 +9,14 @@ Responsibilities:
 - Invalidate tokens when full sync is required
 - Track delta token history for debugging
 """
+import hashlib
+import logging
 import secrets
+import time
 import uuid
 from datetime import datetime
 from typing import Dict, Optional, List
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +28,17 @@ from shared.models import Resource, Tenant, Snapshot
 from shared.config import settings
 
 app = FastAPI(title="Delta Token Service", version="2.0.0")
+
+# Dedicated audit logger for invalidation events. Stays distinct from the
+# default uvicorn / app logger so the audit trail is easy to ship to a SIEM
+# without being drowned out by request access logs.
+audit_log = logging.getLogger("delta_token.audit")
+
+# Per-resource invalidation rate limit. Force-full-sync is destructive (one
+# call can amplify into thousands of Graph API requests on the next backup),
+# so we cap how often the same resource can be invalidated. The limit lives
+# in Redis so it spans replicas; falls open if Redis isn't configured.
+INVALIDATION_MIN_INTERVAL_SECONDS = 60
 
 
 def require_internal_api_key(
@@ -200,34 +214,107 @@ async def save_delta_token(request: DeltaTokenRequest):
     "/delta-token/{resource_id}",
     dependencies=[Depends(require_internal_api_key)],
 )
-async def invalidate_delta_token(resource_id: str, folder_id: Optional[str] = None):
+async def invalidate_delta_token(
+    resource_id: str,
+    request: Request,
+    folder_id: Optional[str] = None,
+    confirm: Optional[str] = None,
+    x_internal_api_key: Optional[str] = Header(default=None, alias="X-Internal-Api-Key"),
+):
     """
     Invalidate delta token (forces full sync on next backup)
-    
+
     Use cases:
     - Delta token corruption detected
     - Schema mismatch
     - Manual full sync requested
+
+    Requires `?confirm=force-full-sync` to acknowledge the cost — a full
+    Graph API resync of a large mailbox / SharePoint library can burn
+    significant API quota. Loops that hit every resource still need to pass
+    the flag per call, which makes accidental bulk invalidation harder.
+    Per-resource rate-limited (one invalidation per
+    INVALIDATION_MIN_INTERVAL_SECONDS) so a malicious caller who somehow
+    obtained the internal API key can't spray-invalidate every tenant.
     """
-    # Remove from Redis
+    # Validate UUID before doing anything else — guards against `resource_id`
+    # injection patterns leaking into Redis keys / log lines.
+    try:
+        resource_uuid = uuid.UUID(resource_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="resource_id must be a UUID",
+        )
+
+    if confirm != "force-full-sync":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Confirmation required. Pass ?confirm=force-full-sync to "
+                "acknowledge that this will trigger a full Graph API resync."
+            ),
+        )
+
+    # Caller fingerprint for the audit log: don't log the API key itself
+    # (it'd end up in log aggregators), but a hash prefix makes it possible
+    # to correlate which credential is being used for invalidation storms.
+    api_key_fp = (
+        hashlib.sha256(x_internal_api_key.encode()).hexdigest()[:12]
+        if x_internal_api_key
+        else "none"
+    )
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Per-resource rate limit. Sliding-window simulated via SETEX: the key
+    # exists for INVALIDATION_MIN_INTERVAL_SECONDS after the first hit, and
+    # any second hit within that window is rejected. Falls open when Redis
+    # isn't configured (legacy single-process dev / Redis-disabled deploys).
+    rate_key = f"delta_token_rl:{resource_id}:{folder_id or '*'}"
+    if redis_client:
+        # SET … NX EX returns None when the key already existed (rate-limited).
+        first = await redis_client.set(
+            rate_key, "1", ex=INVALIDATION_MIN_INTERVAL_SECONDS, nx=True
+        )
+        if not first:
+            audit_log.warning(
+                "delta_token.invalidate.rate_limited "
+                "resource_id=%s folder_id=%s caller_ip=%s api_key_fp=%s",
+                resource_id, folder_id, client_ip, api_key_fp,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"Resource invalidated within the last "
+                    f"{INVALIDATION_MIN_INTERVAL_SECONDS}s. Try again later."
+                ),
+            )
+
+    audit_log.info(
+        "delta_token.invalidate "
+        "resource_id=%s folder_id=%s caller_ip=%s api_key_fp=%s",
+        resource_id, folder_id, client_ip, api_key_fp,
+    )
+
+    # Remove from Redis cache.
     if redis_client:
         cache_key = build_cache_key(resource_id, folder_id)
         await redis_client.delete(cache_key)
-    
-    # Clear from latest snapshot
+
+    # Clear from latest snapshot.
     async with async_session_factory() as session:
         snapshot_result = await session.execute(
             select(Snapshot)
-            .where(Snapshot.resource_id == uuid.UUID(resource_id))
+            .where(Snapshot.resource_id == resource_uuid)
             .order_by(Snapshot.started_at.desc())
             .limit(1)
         )
         snapshot = snapshot_result.scalars().first()
-        
+
         if snapshot:
             snapshot.delta_token = None
             await session.commit()
-    
+
     return {"status": "invalidated", "resource_id": resource_id}
 
 

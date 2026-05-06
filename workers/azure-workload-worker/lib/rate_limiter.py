@@ -22,7 +22,8 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Dict, Optional
+from collections import deque
+from typing import Deque, Dict, Optional
 
 try:
     from redis.asyncio import Redis
@@ -97,7 +98,11 @@ class AzureApiRateLimiter:
 
         # In-process fallback counters (used only when Redis is disabled —
         # e.g. local single-process dev). NOT safe across processes.
-        self._fallback_zsets: Dict[str, list] = {}
+        # `deque` instead of `list` so cleanup is amortized O(1) per acquire
+        # — popleft() drops one expired entry without realloc — versus the
+        # O(n) list comprehension the previous implementation ran on every
+        # acquire (which built GC pressure and stalled under sustained load).
+        self._fallback_windows: Dict[str, Deque[float]] = {}
         self._fallback_lock = asyncio.Lock()
 
     async def _get_redis(self) -> Optional[Redis]:
@@ -158,10 +163,17 @@ class AzureApiRateLimiter:
                     exc,
                 )
 
-        # In-process fallback — pure-Python sliding window
+        # In-process fallback — pure-Python sliding window. Sorted by
+        # insertion order (timestamps grow monotonically per key under the
+        # lock), so expired entries are always at the front; popleft drops
+        # them in O(1) each instead of rebuilding the whole list. Each
+        # entry is popped at most once, so amortized cost per acquire is
+        # O(1). Deque size is bounded by `limit` because we reject the add
+        # when count >= limit, so memory per key is O(limit) not unbounded.
         async with self._fallback_lock:
-            entries = self._fallback_zsets.setdefault(key, [])
-            entries[:] = [t for t in entries if t > cutoff]
+            entries = self._fallback_windows.setdefault(key, deque())
+            while entries and entries[0] <= cutoff:
+                entries.popleft()
             if len(entries) >= limit:
                 return len(entries)
             entries.append(now)
@@ -244,8 +256,12 @@ class AzureApiRateLimiter:
             except Exception as exc:
                 logger.warning("[RateLimiter] Redis status read failed: %s", exc)
         async with self._fallback_lock:
-            entries = self._fallback_zsets.get(key, [])
-            return sum(1 for t in entries if t > cutoff)
+            entries = self._fallback_windows.get(key)
+            if entries is None:
+                return 0
+            while entries and entries[0] <= cutoff:
+                entries.popleft()
+            return len(entries)
 
     async def get_status(self, subscription_id: str) -> Dict[str, int]:
         """Get current API usage stats for a subscription.
