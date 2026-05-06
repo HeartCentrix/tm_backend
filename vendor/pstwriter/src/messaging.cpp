@@ -300,12 +300,22 @@ TcResult buildFolderHierarchyTc(const HierarchyTcRow* rows, size_t rowCount)
 // ----------------------------------------------------------------------------
 namespace {
 
-// 28-col schema (was 27) — adds PidTagChangeKey (0x3013) at iBit 27.
-// scanpst flags 0x3013 as required Contents-TC column. The HID slot
-// for ChangeKey takes the 4-byte slot at ibData=116 (formerly the
-// MessageToMe boolean), pushing the booleans to 120/121 and CEB to 122.
-// Per-row endBm = 126 (122 fixed + 4 CEB). [Tier 3 ISSUE H.]
-constexpr TcColumn kContentsCols[28] = {
+// 29-col schema (Round L) — byte-diff against real-Outlook backup.pst
+// revealed our 28-col layout was missing PR_SEARCH_KEY (0x300B0102)
+// AND had several ibData/iBit positions that didn't match what scanpst
+// expects. Backup.pst's Contents Table:
+//   * 29 columns (we had 28; missing 0x300B PR_SEARCH_KEY)
+//   * row size 130 bytes (we had 126)
+//   * CEB at offset 126 (we had 122)
+//   * Booleans (0x0057/0x0058) at 124/125 (we had 120/121)
+//   * ChangeKey (0x3013) moved from 116 to 76; SecureSubmitFlags from 76
+//     to 80; Repl* group all shifted 4 bytes; LastModificationTime from
+//     80 to 84
+//
+// [MS-PST] §3.12 lists 26 required cols; the 29th (PR_SEARCH_KEY) is
+// real-Outlook-specific. scanpst's "row doesn't match sub-object" check
+// validates the schema matches this 29-col layout.
+constexpr TcColumn kContentsCols[29] = {
     // tag-sorted ascending
     { 0x0017u, PropType::Int32,      20, 4,  5 },  // Importance
     { 0x001Au, PropType::Unicode,    12, 4,  3 },  // MessageClass_W
@@ -313,8 +323,8 @@ constexpr TcColumn kContentsCols[28] = {
     { 0x0037u, PropType::Unicode,    28, 4,  7 },  // Subject_W
     { 0x0039u, PropType::SystemTime, 40, 8,  9 },  // ClientSubmitTime
     { 0x0042u, PropType::Unicode,    24, 4,  6 },  // SentRepresentingName_W
-    { 0x0057u, PropType::Boolean,   120, 1, 13 },  // MessageToMe (was 116)
-    { 0x0058u, PropType::Boolean,   121, 1, 14 },  // MessageCcMe (was 117)
+    { 0x0057u, PropType::Boolean,   124, 1, 13 },  // MessageToMe (Round L: 120→124)
+    { 0x0058u, PropType::Boolean,   125, 1, 14 },  // MessageCcMe (Round L: 121→125)
     { 0x0070u, PropType::Unicode,    68, 4, 17 },  // ConversationTopic_W
     { 0x0071u, PropType::Binary,     72, 4, 18 },  // ConversationIndex
     { 0x0E03u, PropType::Unicode,    56, 4, 12 },  // DisplayCc_W
@@ -323,17 +333,17 @@ constexpr TcColumn kContentsCols[28] = {
     { 0x0E07u, PropType::Int32,      16, 4,  4 },  // MessageFlags
     { 0x0E08u, PropType::Int32,      48, 4, 10 },  // MessageSize
     { 0x0E17u, PropType::Int32,       8, 4,  2 },  // MessageStatus
-    // M11-J: 0x0E30 is PtypBinary, not Int32 (scanpst expects 0x0E300102).
-    { 0x0E30u, PropType::Binary,     88, 4, 21 },  // ReplItemId (Binary HID)
-    { 0x0E33u, PropType::Int64,      92, 8, 22 },  // ReplChangenum
-    { 0x0E34u, PropType::Binary,    100, 4, 23 },  // ReplVersionhistory
-    { 0x0E38u, PropType::Int32,     112, 4, 26 },  // ReplFlags
-    { 0x0E3Cu, PropType::Binary,    108, 4, 25 },  // ReplCopiedfromVersionhistory
-    { 0x0E3Du, PropType::Binary,    104, 4, 24 },  // ReplCopiedfromItemid
+    { 0x0E30u, PropType::Binary,     92, 4, 22 },  // ReplItemId (Round L: 88→92, iBit 21→22)
+    { 0x0E33u, PropType::Int64,      96, 8, 23 },  // ReplChangenum (Round L: 92→96)
+    { 0x0E34u, PropType::Binary,    104, 4, 24 },  // ReplVersionhistory (Round L: 100→104)
+    { 0x0E38u, PropType::Int32,     116, 4, 27 },  // ReplFlags (Round L: 112→116)
+    { 0x0E3Cu, PropType::Binary,    112, 4, 26 },  // ReplCopiedfromVersionhistory (Round L: 108→112)
+    { 0x0E3Du, PropType::Binary,    108, 4, 25 },  // ReplCopiedfromItemid (Round L: 104→108)
     { 0x1097u, PropType::Int32,      64, 4, 16 },  // ItemTemporaryFlags
-    { 0x3008u, PropType::SystemTime, 80, 8, 20 },  // LastModificationTime
-    { 0x3013u, PropType::Binary,    116, 4, 27 },  // ChangeKey (NEW: Tier 3 H)
-    { 0x65C6u, PropType::Int32,      76, 4, 19 },  // SecureSubmitFlags
+    { 0x300Bu, PropType::Binary,    120, 4, 28 },  // PR_SEARCH_KEY (Round L: NEW)
+    { 0x3008u, PropType::SystemTime, 84, 8, 21 },  // LastModificationTime (Round L: 80→84, iBit 20→21)
+    { 0x3013u, PropType::Binary,     76, 4, 19 },  // ChangeKey (Round L: 116→76, iBit 27→19)
+    { 0x65C6u, PropType::Int32,      80, 4, 20 },  // SecureSubmitFlags (Round L: 76→80, iBit 19→20)
     { 0x67F2u, PropType::Int32,       0, 4,  0 },  // LtpRowId
     { 0x67F3u, PropType::Int32,       4, 4,  1 },  // LtpRowVer
 };
@@ -363,15 +373,15 @@ constexpr TcColumn kFaiContentsCols[17] = {
 
 TcResult buildFolderContentsTc()
 {
-    return buildTableContext(kContentsCols, 28, nullptr, 0);
+    return buildTableContext(kContentsCols, 29, nullptr, 0);
 }
 
 namespace {
 
-// Per-row matrix size derived from the 28-col Contents schema (M11-I):
-// 122 bytes of fixed data + 4-byte CEB = 126.
-constexpr size_t kContentsRowSize = 126;
-constexpr size_t kContentsCebOff  = 122;
+// Per-row matrix size derived from the 29-col Contents schema (Round L):
+// 126 bytes of fixed data + 4-byte CEB = 130.
+constexpr size_t kContentsRowSize = 130;
+constexpr size_t kContentsCebOff  = 126;
 constexpr size_t kContentsCebSize = 4;
 
 // colIndex of each column in the tag-sorted kContentsCols[] schema.
@@ -393,10 +403,12 @@ constexpr size_t kColMessageDeliveryTime     = 12;
 constexpr size_t kColMessageFlags            = 13;
 constexpr size_t kColMessageSize             = 14;
 constexpr size_t kColMessageStatus           = 15;
-constexpr size_t kColLastModificationTime    = 23;
-constexpr size_t kColChangeKey               = 24;  // M11-I: 0x3013 (Binary)
-constexpr size_t kColLtpRowId                = 26;
-constexpr size_t kColLtpRowVer               = 27;
+// Round L: indices 16-22 unchanged (ItemTemporaryFlags + Repl* family)
+constexpr size_t kColPrSearchKey             = 23;  // 0x300B (Binary, Round L)
+constexpr size_t kColLastModificationTime    = 24;  // (was 23)
+constexpr size_t kColChangeKey               = 25;  // 0x3013 (was 24)
+constexpr size_t kColLtpRowId                = 27;  // (was 26)
+constexpr size_t kColLtpRowVer               = 28;  // (was 27)
 
 // (M11-M: setCebBit moved up to file-scope anonymous namespace so the
 // Hierarchy row builder can use it. Definition at top of this file.)
@@ -407,7 +419,7 @@ TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
                                Nid firstSubnodeNid)
 {
     if (rowCount == 0u) {
-        return buildTableContext(kContentsCols, 28, nullptr, 0);
+        return buildTableContext(kContentsCols, 29, nullptr, 0);
     }
 
     // Stable per-row buffers + varlen-cell descriptors. Pointers into
@@ -435,18 +447,18 @@ TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
         detail::writeU32(dst, 4, src.rowVer);
         setCebBit(ceb, 1);
 
-        // M11-M (Tier 8): CEB-bit setting is now CONDITIONAL on the
-        // value being meaningful (non-default), to match what
-        // buildMailPc actually emits at the referenced message NID.
-        // Previously we set CEB=True for cols whose PC property was
-        // never emitted (PR_MESSAGE_STATUS, PR_SENSITIVITY,
-        // PR_MESSAGE_TO_ME, PR_MESSAGE_CC_ME), which scanpst flagged
-        // as "Contents Table for X, row doesn't match sub-object".
+        // Round F follow-up (replaces M11-M Tier 8): per [MS-PST]
+        // §2.4.4.5.1 ALL 26 Contents-TC required columns have "Copied?
+        // Y" — every column MUST appear on both the row (CEB bit set)
+        // and the message PC. M11-M had made these conditional to
+        // match an incomplete PC; scanpst still flagged "row doesn't
+        // match sub-object". Restoring unconditional CEB bits now that
+        // buildMailPc emits the matching PC defaults (Sensitivity=0,
+        // MessageStatus=0, MessageToMe=false, MessageCcMe=false).
 
-        // MessageStatus @ ibData=8, iBit=2 — buildMailPc does NOT emit
-        // PR_MESSAGE_STATUS. Only set CEB if non-zero.
+        // MessageStatus @ ibData=8, iBit=2 — always set (PC default 0).
         detail::writeU32(dst, 8, static_cast<uint32_t>(src.messageStatus));
-        if (src.messageStatus != 0) setCebBit(ceb, 2);
+        setCebBit(ceb, 2);
 
         // MessageFlags @ ibData=16, iBit=4 — buildMailPc always emits.
         detail::writeU32(dst, 16, static_cast<uint32_t>(src.messageFlags));
@@ -472,25 +484,23 @@ TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
         detail::writeU32(dst, 48, static_cast<uint32_t>(src.messageSize));
         setCebBit(ceb, 10);
 
-        // Sensitivity @ ibData=60, iBit=15 — buildMailPc does NOT emit
-        // PR_SENSITIVITY. Only set CEB if non-zero. (M11-M)
+        // Sensitivity @ ibData=60, iBit=15 — always set (PC default 0).
         detail::writeU32(dst, 60, static_cast<uint32_t>(src.sensitivity));
-        if (src.sensitivity != 0) setCebBit(ceb, 15);
+        setCebBit(ceb, 15);
 
-        // LastModificationTime @ ibData=80, iBit=20 — when non-zero.
+        // LastModificationTime @ ibData=84, iBit=21 (Round L: 80→84, 20→21).
         if (src.lastModificationTime != 0u) {
-            detail::writeU64(dst, 80, src.lastModificationTime);
-            setCebBit(ceb, 20);
+            detail::writeU64(dst, 84, src.lastModificationTime);
+            setCebBit(ceb, 21);
         }
 
-        // MessageToMe @ ibData=120, iBit=13 / MessageCcMe @ 121, iBit=14
-        // — buildMailPc does NOT emit PR_MESSAGE_TO_ME / PR_MESSAGE_CC_ME.
-        // Only set CEB when the boolean is true; otherwise leave clear so
-        // row matches PC. (M11-M)
-        dst[120] = src.messageToMe ? 1u : 0u;
-        if (src.messageToMe) setCebBit(ceb, 13);
-        dst[121] = src.messageCcMe ? 1u : 0u;
-        if (src.messageCcMe) setCebBit(ceb, 14);
+        // MessageToMe @ ibData=124, iBit=13 / MessageCcMe @ 125, iBit=14
+        // — always set (PC defaults to false / 0). Round L: 120/121→124/125
+        // because PR_SEARCH_KEY (0x300B) HID slot occupies 120-123.
+        dst[124] = src.messageToMe ? 1u : 0u;
+        setCebBit(ceb, 13);
+        dst[125] = src.messageCcMe ? 1u : 0u;
+        setCebBit(ceb, 14);
 
         // ---- Varlen cells ----
         // The HID slot at each varlen column's ibData is left as zero;
@@ -524,9 +534,12 @@ TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
         pushVarlen(kColConversationIndex, 18,
                    src.conversationIndexBytes,
                    src.conversationIndexSize);
-        // ChangeKey (colIdx=24, ibData=116, iBit=27 — Binary, M11-I)
-        pushVarlen(kColChangeKey, 27,
+        // ChangeKey (Round L: colIdx 24→25, ibData 116→76, iBit 27→19)
+        pushVarlen(kColChangeKey, 19,
                    src.changeKeyBytes, src.changeKeySize);
+        // PR_SEARCH_KEY (Round L: NEW colIdx 23, ibData 120, iBit 28 — Binary)
+        pushVarlen(kColPrSearchKey, 28,
+                   src.searchKeyBytes, src.searchKeySize);
 
         tcRows[r].rowId       = src.rowId.value;
         tcRows[r].rowBytes    = rowBuffers[r].data();
@@ -536,7 +549,7 @@ TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
         tcRows[r].varlenCount = perRowVarlen[r].size();
     }
 
-    return buildTableContext(kContentsCols, 28, tcRows.data(), rowCount,
+    return buildTableContext(kContentsCols, 29, tcRows.data(), rowCount,
                              firstSubnodeNid);
 }
 
@@ -668,17 +681,25 @@ TcResult buildAttachmentTemplateTc()
 // ----------------------------------------------------------------------------
 namespace {
 
-constexpr TcColumn kReceiveFolderCols[5] = {
-    // tag-sorted ascending; 4-byte cells [0..15], CEB at 16. endBm=17.
-    { 0x001Au, PropType::Unicode,    8, 4,  2 },  // MessageClass_W (HID; key column)
-    { 0x3008u, PropType::SystemTime, 16, 8,  4 }, // LastModificationTime (8 B)
+// M11-N round 16: scanpst flagged
+//   "TC (nid=62B) missing required column (66050003)"
+// PidTagPstHashFolder (0x6605, Int32) is the per-row CRC-32 hash of the
+// MessageClass — Outlook uses it as the BTH key. With LtpRowId=0 +
+// rowID=0, scanpst's BTH walker reports "keys overlap (dwkey=0,
+// dwkeyMin=0)". Adding 0x6605 + setting LtpRowId/RowID to a non-zero
+// hash satisfies both findings.
+constexpr TcColumn kReceiveFolderCols[6] = {
+    // tag-sorted ascending; cells laid out 4-byte first then 8-byte.
+    { 0x001Au, PropType::Unicode,    8, 4,  2 },  // MessageClass_W
+    { 0x3008u, PropType::SystemTime, 20, 8,  5 }, // LastModificationTime (8 B)
     { 0x3667u, PropType::Binary,    12, 4,  3 },  // ReceiveFolderID (HID; ENTRYID)
+    { 0x6605u, PropType::Int32,     16, 4,  4 },  // PidTagPstHashFolder (round-16)
     { 0x67F2u, PropType::Int32,      0, 4,  0 },  // LtpRowId
     { 0x67F3u, PropType::Int32,      4, 4,  1 },  // LtpRowVer
 };
-// 24 bytes fixed (4+4+4+4+8) + 1 CEB byte = 25.
-constexpr size_t kReceiveFolderRowSize = 25;
-constexpr size_t kReceiveFolderCebOff  = 24;
+// 28 bytes fixed (4+4+4+4+4+8) + 1 CEB byte = 29.
+constexpr size_t kReceiveFolderRowSize = 29;
+constexpr size_t kReceiveFolderCebOff  = 28;
 
 // Default ProviderUID — used when the writer doesn't have access to
 // the message-store's actual ProviderUID for ENTRYID construction.
@@ -720,36 +741,76 @@ TcResult buildReceiveFolderTableTc()
         0x4Du, 0x00u,   // 'M'
     };
 
-    array<uint8_t, kReceiveFolderRowSize> row{};
-    detail::writeU32(row.data(), 0, 0u);         // LtpRowId = 0 (default class)
-    detail::writeU32(row.data(), 4, 1u);         // LtpRowVer
-    // Bytes 8..11:  MessageClass_W HID  (writer patches with HID)
-    // Bytes 12..15: ReceiveFolderID HID (writer patches with HID)
-    // Bytes 16..23: LastModificationTime (0 = absent, CEB clear)
-    // Byte 24: CEB. iBits 0,1,2,3 set (LtpRowId, LtpRowVer,
-    //   MessageClass, ReceiveFolderID); iBit 4 (LastModTime) clear.
-    // High-bit-first byte 0: bit 7=iBit0, bit 6=iBit1, bit 5=iBit2,
-    // bit 4=iBit3 → 0b11110000 = 0xF0.
-    row[kReceiveFolderCebOff] = 0xF0u;
+    // M11-N round 17: scanpst's "RFT row (0), bad NID (6E1F4F31)" check
+    // validates LtpRowId/RowID as a real NID (low 5 bits = nidType).
+    // 0x6E1F4F31 ends in 0x11 (AttachmentTable type) — invalid for an
+    // RFT row. Use IPM Subtree's NID (0x8022 = NormalFolder type 0x02)
+    // — semantically "this row maps the IPM class to the IPM Subtree
+    // folder" — which is also the value the row's ReceiveFolderID
+    // ENTRYID points at.
+    constexpr uint32_t kIpmHashFolder = 0x00008022u;
 
-    // MessageClass is "IPM" (Outlook's canonical default-class key).
-    // ReceiveFolderID is the 24-byte ENTRYID for IPM Subtree.
-    TcVarlenCell varlen[2];
-    varlen[0].colIndex = 0;  // index 0 in tag-sorted array = 0x001A MessageClass_W
-    varlen[0].bytes    = ipmClassUtf16.data();
-    varlen[0].size     = ipmClassUtf16.size();
-    varlen[1].colIndex = 2;  // index 2 in tag-sorted array = 0x3667 ReceiveFolderID
-    varlen[1].bytes    = inboxEntryId.data();
-    varlen[1].size     = inboxEntryId.size();
+    // M11-N round 18: emit TWO rows so scanpst's "missing default
+    // message class" check passes. Real Outlook RFTs have:
+    //   row 1: class="" (empty string, the catch-all default)
+    //   row 2: class="IPM" (any IPM.* class falls through here)
+    // both pointing to IPM Subtree. The two distinct LtpRowIds also
+    // give the underlying BTH a non-degenerate keyspace.
+    static array<uint8_t, kReceiveFolderRowSize> row1{};  // default ""
+    static array<uint8_t, kReceiveFolderRowSize> row2{};  // "IPM"
+    static bool rowsInit = false;
+    if (!rowsInit) {
+        // Row 1: default class (""). Round 18 used 0x22 — scanpst rejected
+        // with "missing NID (22)" because that NID doesn't exist in our
+        // NBT. Round 19: use 0x122 (Root Folder NID — emitted by
+        // pst_baseline.cpp). Distinct from row 2's 0x8022 so the BTH
+        // keys are non-degenerate.
+        constexpr uint32_t kEmptyClassRowId = 0x00000122u;
+        detail::writeU32(row1.data(),  0, kEmptyClassRowId);
+        detail::writeU32(row1.data(),  4, 1u);                // LtpRowVer
+        detail::writeU32(row1.data(), 16, kEmptyClassRowId);  // PstHashFolder
+        row1[kReceiveFolderCebOff] = 0xF8u;                   // bits 0..4 set
 
-    TcRow tcRow{};
-    tcRow.rowId       = 0u;
-    tcRow.rowBytes    = row.data();
-    tcRow.rowSize     = kReceiveFolderRowSize;
-    tcRow.varlenCells = varlen;
-    tcRow.varlenCount = 2;
+        // Row 2: LtpRowId=IPM Subtree NID, class="IPM"
+        detail::writeU32(row2.data(),  0, kIpmHashFolder);
+        detail::writeU32(row2.data(),  4, 1u);
+        detail::writeU32(row2.data(), 16, kIpmHashFolder);
+        row2[kReceiveFolderCebOff] = 0xF8u;
+        rowsInit = true;
+    }
 
-    return buildTableContext(kReceiveFolderCols, 5, &tcRow, 1);
+    // varlen cells: row 1 has only ReceiveFolderID (no class string —
+    // empty class is encoded as "no varlen cell at colIndex 0").
+    // Actually: scanpst rejected zero-length class earlier ("HID=0").
+    // Use a single zero-byte UTF-16-LE NUL (2 bytes) for "empty" — the
+    // distinguishing factor from row 2's "IPM" (6 bytes) is the byte length.
+    static constexpr std::array<uint8_t, 2> emptyClassUtf16 = { 0x00u, 0x00u };
+
+    TcVarlenCell varlen1[2];
+    varlen1[0].colIndex = 0; varlen1[0].bytes = emptyClassUtf16.data();
+    varlen1[0].size     = emptyClassUtf16.size();
+    varlen1[1].colIndex = 2; varlen1[1].bytes = inboxEntryId.data();
+    varlen1[1].size     = inboxEntryId.size();
+
+    TcVarlenCell varlen2[2];
+    varlen2[0].colIndex = 0; varlen2[0].bytes = ipmClassUtf16.data();
+    varlen2[0].size     = ipmClassUtf16.size();
+    varlen2[1].colIndex = 2; varlen2[1].bytes = inboxEntryId.data();
+    varlen2[1].size     = inboxEntryId.size();
+
+    TcRow tcRows[2];
+    tcRows[0].rowId       = 0x00000122u;
+    tcRows[0].rowBytes    = row1.data();
+    tcRows[0].rowSize     = kReceiveFolderRowSize;
+    tcRows[0].varlenCells = varlen1;
+    tcRows[0].varlenCount = 2;
+    tcRows[1].rowId       = kIpmHashFolder;
+    tcRows[1].rowBytes    = row2.data();
+    tcRows[1].rowSize     = kReceiveFolderRowSize;
+    tcRows[1].varlenCells = varlen2;
+    tcRows[1].varlenCount = 2;
+
+    return buildTableContext(kReceiveFolderCols, 6, tcRows, 2);
 }
 
 // ----------------------------------------------------------------------------
@@ -824,13 +885,237 @@ TcResult buildSearchContentsTemplateTc()
 }
 
 // ----------------------------------------------------------------------------
+// Scanpst-required additional template TCs at NID 0x6B6 / 0x6D7 / 0x6F8.
+//
+// scanpst.exe (Outlook 16.0.19929) flagged "TC (nid=X) missing required
+// column (Y)" after we first emitted these as generic Hierarchy/Contents
+// FAI shapes. The columns scanpst names per NID:
+//   0x6B6: 0x0E370102 (PtypBinary)
+//   0x6D7: 0x0E3E0102 (PtypBinary), 0x0E310102 (PtypBinary)
+//   0x6F8: 0x30070040 (PtypSystemTime), 0x0E330014 (PtypInteger64)
+// All also need the mandatory PidTagLtpRowId/RowVer columns at
+// iBit=0/ibData=0 and iBit=1/ibData=4 per [MS-PST] §2.3.4.4.1.
+//
+// 0 rows in each — these are templates Outlook clones when it spins up
+// the runtime objects that own these column sets.
+// ----------------------------------------------------------------------------
+namespace {
+
+// 0x6B6: scanpst's required-column list grows across rounds. After
+// round 3 it asked for 0x0E330014 (Int64) and 0x0E380003 (Int32) on
+// top of the original 0x0E370102 (Binary). All three are Exchange
+// replication tags — PR_REPL_CHANGENUM / PR_REPL_FLAGS / PR_REPL_TIME.
+constexpr TcColumn kTemplate6B6Cols[5] = {
+    // tag-sorted ascending; ibData laid out 4-byte cells then 8-byte.
+    { 0x0E33u, PropType::Int64,    12, 8,  3 },  // ReplChangenum
+    { 0x0E37u, PropType::Binary,    8, 4,  2 },  // ReplTime (Binary HID)
+    { 0x0E38u, PropType::Int32,    20, 4,  4 },  // ReplFlags
+    { 0x67F2u, PropType::Int32,     0, 4,  0 },  // LtpRowId
+    { 0x67F3u, PropType::Int32,     4, 4,  1 },  // LtpRowVer
+};
+
+// 0x6D7: round-3 added 0x0E30/0x0E33/0x0E34/0x0E38/0x001A on top of
+// the original 0x0E3E/0x0E31. Looks like a comprehensive folder-
+// replication template — all standard PR_REPL_* tags plus
+// PR_MESSAGE_CLASS.
+constexpr TcColumn kTemplate6D7Cols[9] = {
+    // tag-sorted ascending; cells laid out 4-byte first then 8-byte.
+    { 0x001Au, PropType::Unicode,   8, 4,  2 },  // MessageClass (Unicode HID)
+    { 0x0E30u, PropType::Binary,   12, 4,  3 },  // ReplItemId (Binary HID)
+    { 0x0E31u, PropType::Binary,   16, 4,  4 },  // (originally required)
+    { 0x0E33u, PropType::Int64,    28, 8,  6 },  // ReplChangenum
+    { 0x0E34u, PropType::Binary,   20, 4,  5 },  // ReplVersionhistory (Binary HID)
+    { 0x0E38u, PropType::Int32,    24, 4,  7 },  // ReplFlags
+    { 0x0E3Eu, PropType::Binary,   36, 4,  8 },  // (originally required)
+    { 0x67F2u, PropType::Int32,     0, 4,  0 },  // LtpRowId
+    { 0x67F3u, PropType::Int32,     4, 4,  1 },  // LtpRowVer
+};
+
+constexpr TcColumn kTemplate6F8Cols[4] = {
+    { 0x0E33u, PropType::Int64,    16, 8,  3 },  // required by scanpst
+    { 0x3007u, PropType::SystemTime, 8, 8,  2 }, // required by scanpst
+    { 0x67F2u, PropType::Int32,     0, 4,  0 },
+    { 0x67F3u, PropType::Int32,     4, 4,  1 },
+};
+
+} // namespace
+
+TcResult buildTemplate6B6Tc()
+{
+    return buildTableContext(kTemplate6B6Cols,
+                             sizeof(kTemplate6B6Cols) / sizeof(kTemplate6B6Cols[0]),
+                             nullptr, 0);
+}
+
+TcResult buildTemplate6D7Tc()
+{
+    return buildTableContext(kTemplate6D7Cols,
+                             sizeof(kTemplate6D7Cols) / sizeof(kTemplate6D7Cols[0]),
+                             nullptr, 0);
+}
+
+TcResult buildTemplate6F8Tc()
+{
+    return buildTableContext(kTemplate6F8Cols,
+                             sizeof(kTemplate6F8Cols) / sizeof(kTemplate6F8Cols[0]),
+                             nullptr, 0);
+}
+
+// ----------------------------------------------------------------------------
+// Minimal valid empty TC with only the mandatory PidTagLtpRowId /
+// PidTagLtpRowVer columns. Used as a stand-in for the search-management
+// queue (NID 0x1E1), search activity list (NID 0x201), per-search-folder
+// update queues (e.g. 0x2226), and criteria objects (e.g. 0x2227) — for
+// none of which [MS-PST] pins an explicit column schema. scanpst rejects
+// the previous buildEmptyNodePayload() (4 zero bytes) as "corrupt update
+// queue" / "corrupt search activity list", but accepts a valid 0-row TC.
+// ----------------------------------------------------------------------------
+namespace {
+
+constexpr TcColumn kMinimalTcCols[2] = {
+    { 0x67F2u, PropType::Int32, 0, 4, 0 },  // LtpRowId
+    { 0x67F3u, PropType::Int32, 4, 4, 1 },  // LtpRowVer
+};
+
+} // namespace
+
+TcResult buildMinimalEmptyTc()
+{
+    return buildTableContext(kMinimalTcCols, 2, nullptr, 0);
+}
+
+// ----------------------------------------------------------------------------
+// buildSearchActivityListTc — Search Activity List (NID 0x201).
+//
+// Round 5 emitted this as buildMinimalEmptyTc; scanpst still flagged
+// "Search activity list corrupt" + "SAL missing entry (nid=2223)".
+// SAL is a TC with one row per active search folder — emit a single row
+// referencing the Spam Search Folder (NID 0x2223) so both errors clear.
+// Schema is the same minimal shape; the row's LtpRowId carries the
+// search folder NID.
+// ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// buildOutgoingQueueTc — Outgoing Queue Table (NID 0x64C type 0x0C).
+//
+// Round 15 added NID 0x64C with the generic Folder-Contents schema;
+// scanpst replied:
+//   "TC (nid=64C) missing required column (0E140003)"
+//   "TC (nid=64C) missing required column (0E100003)"
+// 0x0E14 / 0x0E10 are PT_LONG (Int32) tags scanpst expects on the
+// outgoing-queue TC. Likely PR_SUBMIT_FLAGS / PR_PARENT_KEY-like
+// outgoing-queue properties. Empty (0-row) TC; the queue is normally
+// empty unless mail is in transit.
+// ----------------------------------------------------------------------------
+namespace {
+
+// Round 17: scanpst additionally flagged "TC (nid=64C) missing required
+// column (00390040)" — PR_CLIENT_SUBMIT_TIME (SystemTime 8B). Added as
+// a 5th column at ibData=16 (the 8-byte slot).
+constexpr TcColumn kOutgoingQueueCols[5] = {
+    // tag-sorted ascending; 4-byte cells then the 8-byte SystemTime.
+    { 0x0039u, PropType::SystemTime, 16, 8,  4 },  // ClientSubmitTime (round 17)
+    { 0x0E10u, PropType::Int32,       8, 4,  2 },  // required by scanpst
+    { 0x0E14u, PropType::Int32,      12, 4,  3 },  // required by scanpst
+    { 0x67F2u, PropType::Int32,       0, 4,  0 },  // LtpRowId
+    { 0x67F3u, PropType::Int32,       4, 4,  1 },  // LtpRowVer
+};
+
+} // namespace
+
+TcResult buildOutgoingQueueTc()
+{
+    return buildTableContext(kOutgoingQueueCols, 5, nullptr, 0);
+}
+
+TcResult buildSearchActivityListTc()
+{
+    array<uint8_t, 9> rowBytes{};
+    detail::writeU32(rowBytes.data(), 0, 0x00002223u);  // LtpRowId = NID 0x2223
+    detail::writeU32(rowBytes.data(), 4, 1u);           // LtpRowVer
+    rowBytes[8] = 0xC0u;  // CEB byte: bits 0+1 set (LtpRowId/RowVer present)
+
+    TcRow tcRow{};
+    tcRow.rowId       = 0x00002223u;
+    tcRow.rowBytes    = rowBytes.data();
+    tcRow.rowSize     = 9u;
+    tcRow.varlenCells = nullptr;
+    tcRow.varlenCount = 0u;
+
+    return buildTableContext(kMinimalTcCols, 2, &tcRow, 1);
+}
+
+// ----------------------------------------------------------------------------
+// buildSearchCriteriaObjectPc — Search Criteria Object (NID type 0x07).
+//
+// Round 5 emitted this as a TC (bClientSig=0x7C). scanpst replied
+// "HN bad signature" + "Search folder missing search flags". Round 6
+// switched to a PC with PR_SEARCH_FOLDER_FLAGS (0x6841) — fixed the
+// bad-signature finding but "missing search flags" persisted: 0x6841
+// is actually PR_SEARCH_FOLDER_TEMPLATE_ID, not the flag scanpst wants.
+//
+// Round 7: emit PR_FOLDER_FLAGS (0x66CD, Int32) which is the canonical
+// "folder flags" property, plus keep PR_SEARCH_FOLDER_FLAGS (0x6841)
+// for completeness. Initial value 0x4 sets the SEARCH_FOLDER bit per
+// real-Outlook search-folder defaults.
+// ----------------------------------------------------------------------------
+PcResult buildSearchCriteriaObjectPc(Nid firstSubnodeNid)
+{
+    // Round L: byte-diff against real-Outlook backup.pst showed the
+    // SCO at NID 0x2227 carries EXACTLY ONE property: 0x660B (Int32) = 0.
+    // That's the "search flags" property scanpst's HMP walker checks
+    // for. Rounds 5-K guessed at every plausible MAPI tag (PR_FOLDER_FLAGS,
+    // 0x6840, PR_SEARCH_FOLDER_TEMPLATE_ID, PR_SEARCH_FLAGS=0x36C2, ...);
+    // none worked because the actual tag is 0x660B which isn't in any
+    // public MAPI documentation.
+    array<uint8_t, 4> searchFlagsBytes{};
+    detail::writeU32(searchFlagsBytes.data(), 0, 0u);
+
+    PcProperty props[1] = {
+        { 0x660Bu, PropType::Int32,
+          searchFlagsBytes.data(), 4u, PropStorageHint::Auto },
+    };
+
+    return buildPropertyContext(props, 1, firstSubnodeNid);
+}
+
+// ----------------------------------------------------------------------------
 // buildSearchFolderPc — best-guess; reuses regular FolderPc schema.
 // KNOWN_UNVERIFIED: spec doesn't pin Search Folder PC's exact property set.
 // ----------------------------------------------------------------------------
 PcResult buildSearchFolderPc(const FolderPcSchema& schema,
                              Nid                   firstSubnodeNid)
 {
-    return buildFolderPc(schema, firstSubnodeNid);
+    // Round 21: scanpst's "Search folder (nid=2227) missing search flags"
+    // wasn't satisfied by emitting PR_FOLDER_FLAGS on the criteria-object
+    // PC at 0x2227. Maybe scanpst checks PR_FOLDER_FLAGS on the search-
+    // folder PC itself (0x2223). Build a regular folder PC + tack on
+    // PR_FOLDER_FLAGS=4 (SEARCH_FOLDER bit).
+    array<uint8_t, 4> contentCountBytes{};
+    detail::writeU32(contentCountBytes.data(), 0, schema.contentCount);
+    array<uint8_t, 4> contentUnreadBytes{};
+    detail::writeU32(contentUnreadBytes.data(), 0, schema.contentUnreadCount);
+    array<uint8_t, 1> subfoldersBytes{
+        static_cast<uint8_t>(schema.hasSubfolders ? 1u : 0u)
+    };
+    array<uint8_t, 4> folderFlagsBytes{};
+    // Round J: FLDFLAG_SEARCH = 0x2 per [MS-OXCFOLD] (was 0x4 = FLDFLAG_NORMAL).
+    detail::writeU32(folderFlagsBytes.data(), 0, 0x00000002u);
+
+    vector<PcProperty> props;
+    props.reserve(5);
+    if (schema.displayNameSize > 0)
+        props.push_back({ 0x3001u, PropType::Unicode,
+                          schema.displayNameUtf16le, schema.displayNameSize,
+                          PropStorageHint::Auto });
+    props.push_back({ 0x3602u, PropType::Int32,
+                      contentCountBytes.data(), 4u, PropStorageHint::Auto });
+    props.push_back({ 0x3603u, PropType::Int32,
+                      contentUnreadBytes.data(), 4u, PropStorageHint::Auto });
+    props.push_back({ 0x360Au, PropType::Boolean,
+                      subfoldersBytes.data(), 1u, PropStorageHint::Auto });
+    props.push_back({ 0x66CDu, PropType::Int32,           // PR_FOLDER_FLAGS
+                      folderFlagsBytes.data(), 4u, PropStorageHint::Auto });
+    return buildPropertyContext(props.data(), props.size(), firstSubnodeNid);
 }
 
 // ----------------------------------------------------------------------------
@@ -1000,10 +1285,13 @@ WriteResult writeM6Pst(const M6PstConfig& config) noexcept
         }
 
         // ---- Encode each node's payload as a data block ----
-        // Block layout starts at 0x4600 (matches writeM5Pst's expectation:
-        // kIbAMap=0x4400 + 0x200 AMap page, M11-G).
-        // BIDs assigned sequentially as Bid::makeData(i+1).
-        constexpr uint64_t kBlocksStart = 0x4600u;
+        // Block layout starts at 0x4800 (kIbAMap=0x4400 + AMap + PMap).
+        // MUST match writer.cpp's kBlocksStart — wSig in block trailers
+        // is computed from bid XOR ib at build time and must agree with
+        // the file offset Outlook later sees. Round-A re-introduced PMap
+        // at 0x4600 (with all-0xFF body, not zeros), shifting blocks by
+        // one page.
+        constexpr uint64_t kBlocksStart = 0x4800u;
         vector<M5DataBlockSpec> blocks;
         vector<M5Node>          m5nodes;
         blocks.reserve(27);

@@ -56,6 +56,10 @@ struct MailPcBuildContext {
     // non-HID NID (NidType != HID). Subsequent allocations are
     // subnodeStart, subnodeStart + 4, +8 ... in pidTag-ascending order.
     Nid subnodeStart {0u};
+
+    // Round L+: message's own NID — used to populate PR_LtpRowId on
+    // the message PC (matching row's LtpRowId for identity check).
+    Nid messageNid  {0u};
 };
 
 struct MailPcSubnode {

@@ -726,13 +726,12 @@ TcResult buildTableContext(const TcColumn* cols, size_t colCount,
 
     const size_t estIfInline = estimateHnSize(/*promoted=*/false);
     bool promote = false;
-    if (estIfInline > kMaxHnBodyBytes && rowCount > 0u) {
-        if (firstSubnodeNid.value == 0u) {
-            throw std::length_error(
-                "buildTableContext: HN body exceeds single-block cap (8176); "
-                "pass firstSubnodeNid (with nidType != HID) to enable "
-                "row-matrix-as-subnode promotion per [MS-PST] §2.3.4.4.1");
-        }
+    // Round L: backup.pst byte-diff shows real Outlook ALWAYS puts the
+    // Contents Table row matrix in a subnode (hnidRows=NID, not HID),
+    // even for small tables that would fit in HN. scanpst's
+    // "row doesn't match sub-object" check apparently requires this.
+    // Force promotion whenever rows exist and a subnode NID is provided.
+    if (rowCount > 0u && firstSubnodeNid.value != 0u) {
         const size_t estIfPromoted = estimateHnSize(/*promoted=*/true);
         if (estIfPromoted > kMaxHnBodyBytes) {
             throw std::length_error(
@@ -741,6 +740,12 @@ TcResult buildTableContext(const TcColumn* cols, size_t colCount,
                 "parent HN are themselves too large");
         }
         promote = true;
+    } else if (estIfInline > kMaxHnBodyBytes && rowCount > 0u) {
+        // No subnode NID provided but inline overflows — error.
+        throw std::length_error(
+            "buildTableContext: HN body exceeds single-block cap (8176); "
+            "pass firstSubnodeNid (with nidType != HID) to enable "
+            "row-matrix-as-subnode promotion per [MS-PST] §2.3.4.4.1");
     }
 
     // ---- Patch row-matrix varlen HIDs with the right slot start ----

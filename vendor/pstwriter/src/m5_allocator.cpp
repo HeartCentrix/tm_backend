@@ -89,6 +89,14 @@ M5Allocator::M5Allocator() noexcept
     }
     nextIndex_[static_cast<size_t>(NidType::HID)      & 0x1Fu] = 1u;
     nextIndex_[static_cast<size_t>(NidType::Internal) & 0x1Fu] = 1u;
+    // Round L (byte-diff vs backup.pst): real-Outlook PSTs allocate
+    // messages at idx ≥ 0x10001, separate from folder/table idx range
+    // (≤ ~0x400). Sharing idx 0x400 between folder NID 0x8002 (type 02)
+    // and message NID 0x8004 (type 04) appears to trip scanpst's
+    // "Contents Table for X, row doesn't match sub-object" check —
+    // scanpst's NBT walker doesn't expect the same idx to host both.
+    nextIndex_[static_cast<size_t>(NidType::NormalMessage) & 0x1Fu] = 0x10001u;
+    nextIndex_[static_cast<size_t>(NidType::AssocMessage)  & 0x1Fu] = 0x10001u;
 
     // Reserve the 14 spec-mandated NIDs.
     for (size_t i = 0; i < kReservedCount; ++i) {

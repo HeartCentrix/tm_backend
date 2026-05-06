@@ -140,6 +140,14 @@ public:
         addProp(tag, PropType::Boolean, slot.data(), 1u);
     }
 
+    void addInt64(uint16_t tag, uint64_t v)
+    {
+        wide_.push_back({});
+        auto& slot = wide_.back();
+        detail::writeU64(slot.data(), 0, v);
+        addProp(tag, PropType::Int64, slot.data(), 8u);
+    }
+
     void addSystemTime(uint16_t tag, uint64_t ticks)
     {
         wide_.push_back({});
@@ -388,6 +396,16 @@ MailPcResult buildMailPc(const graph::GraphMessage& msg,
     pb.addBoolean(pid_local::kHasAttachments,
                   !msg.attachments.empty() || msg.hasAttachments);
 
+    // Round F+ (kept): default values for 4 cols the row carries unconditionally.
+    pb.addInt32  (0x0036u, 0u);    // PR_SENSITIVITY
+    pb.addInt32  (0x0E17u, 0u);    // PR_MESSAGE_STATUS
+    pb.addBoolean(0x0057u, false); // PR_MESSAGE_TO_ME
+    pb.addBoolean(0x0058u, false); // PR_MESSAGE_CC_ME
+    // Round L speculative additions (0x0E2F PidTagLtpParentNid, 0x67F2
+    // PR_LtpRowId, 0x67F3 PR_LtpRowVer on the PC) had no scanpst delta.
+    // Reverted — the row⇄PC mismatch is at a structural level not
+    // visible to our decoder.
+
     // PidTagObjectType = MAPI_MESSAGE (5). Outlook uses it to discriminate
     // PCs at the protocol level; missing values surface as "unknown item".
     pb.addInt32(pid_local::kObjectType, 5u);
@@ -404,12 +422,22 @@ MailPcResult buildMailPc(const graph::GraphMessage& msg,
     // message-list "To" column reads PidTagDisplayTo directly (it does NOT
     // re-derive from the recipient TC at view time); a missing value shows
     // a blank "To" column even when the recipient TC is fully populated.
-    pb.addUnicodeString(pid_local::kDisplayTo,
-                        joinRecipientDisplay(msg.toRecipients));
-    pb.addUnicodeString(pid_local::kDisplayCc,
-                        joinRecipientDisplay(msg.ccRecipients));
-    pb.addUnicodeString(pid_local::kDisplayBcc,
-                        joinRecipientDisplay(msg.bccRecipients));
+    //
+    // Round F: only emit when the joined display string is non-empty.
+    // Previously we always emitted (even as ""), which caused scanpst's
+    // "Contents Table for X, row doesn't match sub-object" — the
+    // Contents-TC row only sets the CEB bit when displayCc/Bcc was
+    // non-empty (mail.cpp Round F building), so emitting an empty PC
+    // property meant PC had it / row didn't → mismatch on every message
+    // without CC or BCC.
+    {
+        const string displayTo  = joinRecipientDisplay(msg.toRecipients);
+        const string displayCc  = joinRecipientDisplay(msg.ccRecipients);
+        const string displayBcc = joinRecipientDisplay(msg.bccRecipients);
+        if (!displayTo.empty())  pb.addUnicodeString(pid_local::kDisplayTo,  displayTo);
+        if (!displayCc.empty())  pb.addUnicodeString(pid_local::kDisplayCc,  displayCc);
+        if (!displayBcc.empty()) pb.addUnicodeString(pid_local::kDisplayBcc, displayBcc);
+    }
 
     // Times
     if (!msg.createdDateTime.empty())
@@ -453,10 +481,18 @@ MailPcResult buildMailPc(const graph::GraphMessage& msg,
                                      messageSearchKey.end()));
     }
 
-    // Conversation index (raw bytes)
-    if (!msg.conversationIndex.empty())
-        pb.addBinary(pid_local::kConversationIndex,
-                     vector<uint8_t>(msg.conversationIndex));
+    // Conversation index (raw bytes). Round L: backup.pst byte-diff
+    // shows scanpst requires PR_CONVERSATION_INDEX on every Contents-TC
+    // row (CEB bit 18 always set). Synthesize a stub when missing —
+    // 22-byte canonical format: 1 header byte + 5 timestamp + 16 GUID.
+    {
+        vector<uint8_t> ci = msg.conversationIndex;
+        if (ci.empty()) {
+            ci.resize(22, 0u);
+            ci[0] = 0x01u;  // header byte
+        }
+        pb.addBinary(pid_local::kConversationIndex, std::move(ci));
+    }
 
     // Internet headers (Phase D / always emit when present)
     if (!msg.internetMessageHeaders.empty()) {
@@ -987,6 +1023,18 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
             nodes.push_back(std::move(n));
         };
 
+        // Round B: empty basic queue node ([MS-PST] §2.4.8.3) — NBT entry
+        // with bidData=0 and no block in the BBT. Used for SMQ (0x1E1),
+        // SAL (0x201), per-search-folder SUQ (0x2226).
+        auto scheduleEmptyQueue = [&](Nid nid, Nid parent) {
+            M7Node n;
+            n.nid       = nid;
+            n.nidParent = parent;
+            n.bidData   = Bid{0u};
+            n.bidSub    = Bid{0u};
+            nodes.push_back(std::move(n));
+        };
+
         auto scheduleDataBlock = [&](vector<uint8_t> body) -> Bid {
             M7Block b;
             b.bid       = allocDataBid();
@@ -1080,7 +1128,11 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
         for (auto& e : buildPstBaselineEntries(config.providerUid,
                                                 config.pstDisplayName))
         {
-            scheduleNode(e.nid, e.nidParent, std::move(e.body));
+            if (e.isEmptyQueue) {
+                scheduleEmptyQueue(e.nid, e.nidParent);
+            } else {
+                scheduleNode(e.nid, e.nidParent, std::move(e.body));
+            }
         }
 
         // 2. Pre-register reserved NIDs into the allocator.
@@ -1154,19 +1206,21 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
             auto pc = buildMailFolderPc(schema, kDummySub);
             scheduleNode(rec.folderNid, rec.src->parentNid, std::move(pc.hnBytes));
 
-            // Hierarchy TC (0 rows — M7 folders are flat; sub-folder
-            // support is left to writeM7Pst callers via parentNid wiring).
-            // Sibling tables (HIER/CONTENTS/FAI) NBTENTRYs carry
-            // nidParent = 0 per [MS-PST] §3.12, confirmed via Aspose
-            // oracle. See KNOWN_UNVERIFIED.md M11-D.
-            scheduleNode(rec.hierarchyNid, Nid{0u},
+            // Round F++: Sibling tables (HIER/CONTENTS/FAI) NBTENTRYs
+            // carry nidParent = the owning folder NID. The earlier
+            // comment said "nidParent=0 per spec §3.12" but byte
+            // decoding of round36 + spec §2.2.2.7.7.4.1 read jointly
+            // suggest scanpst's "row doesn't match sub-object" check
+            // resolves the row's owning folder via this field. The
+            // user-folder block (0x8002) is the natural owner.
+            scheduleNode(rec.hierarchyNid, rec.folderNid,
                          buildFolderHierarchyTc(nullptr, 0).hnBytes);
 
             // Contents TC — populated rows below.
             // (Defer to message-building loop; we'll patch the slot.)
 
             // FAI contents TC (0 rows)
-            scheduleNode(rec.faiNid, Nid{0u},
+            scheduleNode(rec.faiNid, rec.folderNid,
                          buildFolderFaiContentsTc().hnBytes);
         }
 
@@ -1211,6 +1265,13 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
             vector<uint8_t> conversationTopic;
             vector<uint8_t> displayTo;
             vector<uint8_t> displayCc;
+            // Round L: PR_SEARCH_KEY (0x300B) — required by real-Outlook
+            // 29-col Contents TC schema. Same 16-byte hash we put on the
+            // message PC.
+            vector<uint8_t> searchKey;
+            // Round L: stub ConversationIndex for the row when message
+            // has none (matches the PC-side stub).
+            vector<uint8_t> conversationIndex;
         };
 
         for (auto& rec : folderRecs) {
@@ -1230,6 +1291,18 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
                 auto& b = bufs.back();
 
                 b.messageClass = u16le("IPM.Note");
+
+                // Round L: derive PR_SEARCH_KEY identically to the
+                // message PC (same seed → same 16-byte hash → row and
+                // PC match byte-for-byte).
+                {
+                    std::string searchSeed = m.internetMessageId;
+                    if (searchSeed.empty()) {
+                        searchSeed = m.subject + "|" + m.sentDateTime;
+                    }
+                    const auto sk = graph::deriveMessageSearchKey(searchSeed);
+                    b.searchKey = vector<uint8_t>(sk.begin(), sk.end());
+                }
 
                 if (!m.subject.empty()) {
                     b.subject = u16le(m.subject);
@@ -1294,19 +1367,29 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
                     row.displayCcUtf16le = b.displayCc.data();
                     row.displayCcSize    = b.displayCc.size();
                 }
-                if (!m.conversationIndex.empty()) {
-                    row.conversationIndexBytes = m.conversationIndex.data();
-                    row.conversationIndexSize  = m.conversationIndex.size();
+                // Round L: always emit ConversationIndex (real or 22-byte stub)
+                {
+                    if (!m.conversationIndex.empty()) {
+                        b.conversationIndex = m.conversationIndex;
+                    } else {
+                        b.conversationIndex.assign(22, 0u);
+                        b.conversationIndex[0] = 0x01u;
+                    }
+                    row.conversationIndexBytes = b.conversationIndex.data();
+                    row.conversationIndexSize  = b.conversationIndex.size();
+                }
+                if (!b.searchKey.empty()) {
+                    row.searchKeyBytes = b.searchKey.data();
+                    row.searchKeySize  = b.searchKey.size();
                 }
                 contentRows.push_back(row);
             }
 
-            // Subnode NID for the (possibly promoted) row matrix. Lives
-            // in the contentsNid's own subnode-tree namespace, so it
-            // doesn't collide with top-level NBT NIDs. NidType ≠ HID
-            // is required for HNID NID-branch decoding per §2.3.3.2.
+            // Subnode NID for the row matrix. Backup.pst byte-diff
+            // (Round L) shows real Outlook uses NidType::LtpReserved
+            // (0x1F) here, not Internal (0x01). NID 0x3F = idx 1, type 0x1F.
             const Nid kRowMatrixSubnode{
-                (static_cast<uint32_t>(NidType::Internal)) | (1u << 5)};
+                (static_cast<uint32_t>(NidType::LtpReserved)) | (1u << 5)};
 
             auto tc = buildFolderContentsTc(
                 contentRows.empty() ? nullptr : contentRows.data(),
@@ -1337,18 +1420,43 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
                 contentsBidSub = slb.bid;
                 slBlocks.push_back(std::move(slb));
             }
-            scheduleNode(rec.contentsNid, Nid{0u},
+            scheduleNode(rec.contentsNid, rec.folderNid,
                          std::move(tc.hnBytes), contentsBidSub);
         }
 
         // ============================================================
-        // 4. IPM Subtree Hierarchy TC: 1 row per user folder.
+        // 4. IPM Subtree Hierarchy TC: 1 row per user folder + the
+        //    baseline Deleted Items folder (NID 0x8062).
         // ============================================================
         {
             // Need stable storage for HierarchyTcRow's display-name
             // pointers — the rows array references into folderNameStore.
             vector<HierarchyTcRow> ipmHierRows;
-            ipmHierRows.reserve(folderRecs.size());
+            ipmHierRows.reserve(folderRecs.size() + 1u);
+
+            // M11-N: inject a row for Deleted Items (NID 0x8062). The
+            // baseline emits the folder PC as a child of IPM Subtree
+            // (parent=0x8022), but the Hierarchy TC at 0x802D is built
+            // here from folderRecs only — Deleted Items was never listed
+            // and scanpst flagged it as orphaned with
+            // "Adding folder (nid=8062) back to the database".
+            //
+            // Stable storage for the name lives in this static buffer
+            // since folderNameStore is indexed strictly by folderRecs.
+            static const auto kDeletedItemsName = u16le("Deleted Items");
+            {
+                HierarchyTcRow di;
+                di.rowId                  = Nid{0x00008062u};
+                di.displayNameUtf16le     = kDeletedItemsName.data();
+                di.displayNameSize        = kDeletedItemsName.size();
+                di.containerClassUtf16le  = nullptr;
+                di.containerClassSize     = 0;
+                di.contentCount           = 0;
+                di.contentUnreadCount     = 0;
+                di.hasSubfolders          = false;
+                ipmHierRows.push_back(di);
+            }
+
             for (size_t i = 0; i < folderRecs.size(); ++i) {
                 HierarchyTcRow row;
                 row.rowId = folderRecs[i].folderNid;
@@ -1385,6 +1493,7 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
 
             MailPcBuildContext ctx;
             ctx.providerUid  = config.providerUid;
+            ctx.messageNid   = mr.messageNid;
             // subnodeStart for body promotion — pick high NID values
             // unlikely to collide with subnode-tree NIDs (0x671, 0x692,
             // attachment NIDs).
@@ -1424,32 +1533,34 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
                 slEntries.emplace_back(Nid{0x00000692u}, recipBid, Bid{0u});
             }
 
-            // 5c. Attachments
-            if (!m.attachments.empty()) {
+            // 5c. Attachments — Round I: always emit the attachment TC
+            // at 0x671 in the message's subnode tree (empty when no
+            // attachments). scanpst's "Contents Table for X, row
+            // doesn't match sub-object" check may verify every message
+            // has both 0x692 recipient table AND 0x671 attachment
+            // table — matches what real Outlook always emits.
+            vector<Nid> attNids;
+            {
                 vector<AttachmentTcRow> attRows;
-                attRows.reserve(m.attachments.size());
-
-                // First, pre-allocate attachment subnode NIDs so the
-                // attachment TC rows can carry them.
-                vector<Nid> attNids;
-                attNids.reserve(m.attachments.size());
-                for (size_t i = 0; i < m.attachments.size(); ++i) {
-                    // Subnode NID: NidType::Attachment, idx=(i+1).
-                    // These NIDs live in the message's subnode tree
-                    // namespace; they don't collide with top-level NBT.
-                    attNids.push_back(Nid(NidType::Attachment,
-                                          static_cast<uint32_t>(i + 1)));
-                }
-
-                for (size_t i = 0; i < m.attachments.size(); ++i) {
-                    AttachmentTcRow row;
-                    row.attachmentNid = attNids[i];
-                    row.attachment    = &m.attachments[i];
-                    attRows.push_back(row);
+                if (!m.attachments.empty()) {
+                    attNids.reserve(m.attachments.size());
+                    attRows.reserve(m.attachments.size());
+                    for (size_t i = 0; i < m.attachments.size(); ++i) {
+                        attNids.push_back(Nid(NidType::Attachment,
+                                              static_cast<uint32_t>(i + 1)));
+                    }
+                    for (size_t i = 0; i < m.attachments.size(); ++i) {
+                        AttachmentTcRow row;
+                        row.attachmentNid = attNids[i];
+                        row.attachment    = &m.attachments[i];
+                        attRows.push_back(row);
+                    }
                 }
                 auto attTc = buildAttachmentTc(attRows);
                 const Bid attTcBid = scheduleDataBlock(std::move(attTc.hnBytes));
                 slEntries.emplace_back(Nid{0x00000671u}, attTcBid, Bid{0u});
+            }
+            if (!m.attachments.empty()) {
 
                 // Per-attachment PC + (optionally) data subnode.
                 for (size_t i = 0; i < m.attachments.size(); ++i) {
@@ -1501,8 +1612,14 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
         // ============================================================
         // Block order: data blocks first (in the order scheduled), then
         // SLBLOCKs. IBs assigned sequentially with 64-byte alignment.
-        // 0x4600 = 0x4400 (kIbAMap, M11-G) + 0x200 (AMap page).
-        constexpr uint64_t kBlocksStart = 0x4600u;
+        // 0x4800 = 0x4400 (kIbAMap) + 0x200 (AMap) + 0x200 (PMap). MUST
+        // match writer.cpp's kBlocksStart — wSig in block trailers
+        // (computed from bid XOR ib at build time) must agree with the
+        // file offset Outlook later sees, else BCRead wSig-mismatch.
+        // Round-A (re-)introduces PMap[0] at 0x4600 with all-0xFF body —
+        // the round-12 quarantine was caused by a zero-bitmap PMap, not
+        // by PMap presence itself.
+        constexpr uint64_t kBlocksStart = 0x4800u;
 
         vector<M5DataBlockSpec> m5Blocks;
         vector<M5Node>          m5Nodes;

@@ -39,12 +39,22 @@ namespace {
 // 0x4400, 41 AMaps total, AMap[40] at 0x9B4400. M11-G corrected this
 // from the long-standing wrong value of 0x400 (which made real
 // Outlook reject the file with `Read(@4400) ... ptype=84 expected`).
-constexpr uint64_t kIbAMap = 0x4400;
-constexpr uint64_t kIbNbt  = 0x4600;
-constexpr uint64_t kIbBbt  = 0x4800;
-constexpr uint64_t kIbEof  = 0x4A00;
+constexpr uint64_t kIbDList = 0x4200;  // DLISTPAGE — required by scanpst
+constexpr uint64_t kIbAMap  = 0x4400;
+// PMap page at 0x4600 — [MS-PST] §2.6 mandates the page be physically
+// present even though PMap is deprecated for use (DList replaced it).
+// The bitmap is filled with 0xFF (PMap inverse semantics: bit=1 means
+// FREE) to byte-match real Outlook PSTs (round-11 used a zero-bitmap,
+// which Outlook quarantined because zero meant "all allocated"
+// inconsistent with the AMap).
+constexpr uint64_t kIbPMap  = 0x4600;
+constexpr uint64_t kIbNbt   = 0x4800;
+constexpr uint64_t kIbBbt   = 0x4A00;
+constexpr uint64_t kIbEof   = 0x4C00;
 
-constexpr size_t kHeaderPadBytes = kIbAMap - kHeaderSize; // 0x4400 - 0x234 = 16844
+// Pad up to the DList (everything between HEADER and 0x4200 is zero).
+constexpr size_t kHeaderPadBytes   = kIbDList - kHeaderSize;  // 0x4200 - 0x234 = 16332
+// (Legacy name kept for any callers still doing the pre-DList full pad.)
 
 // Helper: write `n` bytes from `data` to `fp`. Returns true on full success.
 bool writeAll(FILE* fp, const void* data, size_t n) noexcept
@@ -125,7 +135,9 @@ WriteResult writeEmptyPst(const string& path) noexcept
     populateFreshRgnid(state);
 
     const auto header = serializeHeader(state);
+    const auto dlist  = buildDListPage(kIbDList, kIbAMap, kIbEof);
     const auto amap   = buildAMap(Ib{kIbAMap}, kIbEof);
+    const auto pmap   = buildEmptyPMap(kIbPMap);
     const auto nbt    = buildEmptyNbtLeaf(bidNbt, Ib{kIbNbt});
     const auto bbt    = buildEmptyBbtLeaf(bidBbt, Ib{kIbBbt});
 
@@ -135,12 +147,15 @@ WriteResult writeEmptyPst(const string& path) noexcept
     bool ok = true;
     ok = ok && writeAll(fp, header.data(), header.size());
     {
+        // Header pad: 0x234..0x4200 (16332 bytes), then DLISTPAGE at 0x4200.
         const vector<uint8_t> pad(kHeaderPadBytes, uint8_t{0});
         ok = ok && writeAll(fp, pad.data(), pad.size());
     }
-    ok = ok && writeAll(fp, amap.data(), amap.size());
-    ok = ok && writeAll(fp, nbt.data(),  nbt.size());
-    ok = ok && writeAll(fp, bbt.data(),  bbt.size());
+    ok = ok && writeAll(fp, dlist.data(), dlist.size());
+    ok = ok && writeAll(fp, amap.data(),  amap.size());
+    ok = ok && writeAll(fp, pmap.data(),  pmap.size());
+    ok = ok && writeAll(fp, nbt.data(),   nbt.size());
+    ok = ok && writeAll(fp, bbt.data(),   bbt.size());
 
     if (std::fclose(fp) != 0) return fail("fclose failed");
     if (!ok) return fail("fwrite truncated");
@@ -152,8 +167,8 @@ WriteResult writeEmptyPst(const string& path) noexcept
 // ===========================================================================
 namespace {
 
-// Internal multi-block layout, post-AMap (M11-G: AMap moved to 0x4400):
-//   blocksStartIb = kIbAMap + kPageSize  (= 0x4600)
+// Internal multi-block layout, post-AMap+PMap (M11-G + Round-A):
+//   blocksStartIb = kIbAMap + 2 × kPageSize  (= 0x4800; AMap + PMap)
 //   for each block i:
 //       offsets[i] = current; current += sizeOnDisk(block i)
 //   bbtLeavesIb = alignUp(current, kPageSize)
@@ -161,7 +176,7 @@ namespace {
 //   bbtRootIb   = bbtLeavesIb + n_leaves * kPageSize  (or = lone leaf)
 //   nbtLeafIb   = (after BBT)
 //   ibFileEof   = nbtLeafIb + kPageSize
-constexpr uint64_t kBlocksStart = kIbAMap + kPageSize;   // 0x4600
+constexpr uint64_t kBlocksStart = kIbPMap + kPageSize;   // 0x4800 (after PMap)
 struct Layout {
     uint64_t blocksStartIb = kBlocksStart;
     vector<uint64_t> blockOffsets;        // ib of block i
@@ -305,6 +320,13 @@ WriteResult buildAndWriteBlocksPst(const string&                    path,
     // PAGETRAILER.bid set from ib by buildAMap (M11-E).
     const auto amap   = buildAMap(Ib{kIbAMap}, L.ibFileEof);
 
+    // PMap[0] at 0x4600 — [MS-PST] §2.6 mandated, body all-0xFF (Round-A).
+    const auto pmap   = buildEmptyPMap(kIbPMap);
+
+    // DLISTPAGE at 0x4200 — required by scanpst (M11-N). See the
+    // buildDListPage commentary in page.cpp for why this matters.
+    const auto dlist  = buildDListPage(kIbDList, kIbAMap, L.ibFileEof);
+
     // 9. HEADER.
     WriterState state{};
     state.dwUnique         = 1u;
@@ -342,9 +364,11 @@ WriteResult buildAndWriteBlocksPst(const string&                    path,
     };
 
     emit(header.data(), header.size());          // 0x000..0x233
-    padTo(kIbAMap);                              // 0x234..0x3FF
-    emit(amap.data(), amap.size());              // 0x400..0x5FF
-    padTo(L.blocksStartIb);                      // (already 0x600 if no blocks-prefix gap)
+    padTo(kIbDList);                             // 0x234..0x41FF (zero-pad)
+    emit(dlist.data(), dlist.size());            // 0x4200..0x43FF (DLISTPAGE)
+    emit(amap.data(), amap.size());              // 0x4400..0x45FF (AMap[0])
+    emit(pmap.data(), pmap.size());              // 0x4600..0x47FF (PMap[0])
+    padTo(L.blocksStartIb);                      // 0x4800 onward (blocks)
 
     for (const auto& blk : blockBuffers) {
         emit(blk.data(), blk.size());
@@ -699,9 +723,14 @@ WriteResult writeM5Pst(const string&                  path,
         nbtRootPage = nbtLeafPages.front();
     }
 
-    // ---- 5. AMap + HEADER ------------------------------------------------
+    // ---- 5. AMap + PMap + HEADER ----------------------------------------
     // PAGETRAILER.bid set from ib by buildAMap (M11-E).
     const auto amap   = buildAMap(Ib{kIbAMap}, ibFileEof);
+    // PMap[0] at 0x4600 — [MS-PST] §2.6 mandated (Round-A), body all-0xFF.
+    const auto pmap   = buildEmptyPMap(kIbPMap);
+    // DLISTPAGE at 0x4200 — required by scanpst (M11-N). See the
+    // buildDListPage commentary in page.cpp.
+    const auto dlist  = buildDListPage(kIbDList, kIbAMap, ibFileEof);
 
     WriterState state{};
     state.dwUnique         = 1u;
@@ -715,6 +744,33 @@ WriteResult writeM5Pst(const string&                  path,
     state.root.brefNbt     = Bref{nbtRootBid, Ib{nbtRootIb}};
     state.root.brefBbt     = Bref{bbtRootBid, Ib{bbtRootIb}};
     populateFreshRgnid(state);
+
+    // M11-N: bump rgnid[] counts up to the actual max NID idx allocated,
+    // PRESERVING the per-type low marker from populateFreshRgnid (which
+    // mimics real-Outlook backup.pst's pattern: low marker is NOT the
+    // array index — it's a per-type-group constant). Forcing low=type
+    // surfaced as scanpst "Folder invalid high-water-mark" earlier.
+    {
+        uint32_t maxIdxByType[32] = {};
+        bool seen[32] = {};
+        for (const auto& n : nodes) {
+            const uint32_t t = static_cast<uint32_t>(n.nid.value) & 0x1Fu;
+            const uint32_t idx = static_cast<uint32_t>(n.nid.value) >> 5;
+            if (!seen[t] || idx > maxIdxByType[t]) {
+                maxIdxByType[t] = idx;
+                seen[t] = true;
+            }
+        }
+        for (uint32_t t = 0; t < 32u; ++t) {
+            if (!seen[t]) continue;
+            const uint32_t lowMarker = state.rgnid[t] & 0x1Fu;
+            const uint32_t nextIdx   = maxIdxByType[t] + 1u;
+            const uint32_t newRgnid  = (nextIdx << 5) | lowMarker;
+            if (newRgnid > state.rgnid[t]) {
+                state.rgnid[t] = newRgnid;
+            }
+        }
+    }
 
     const auto header = serializeHeader(state);
 
@@ -738,8 +794,10 @@ WriteResult writeM5Pst(const string&                  path,
     };
 
     emit(header.data(), header.size());
-    padTo(kIbAMap);
+    padTo(kIbDList);
+    emit(dlist.data(), dlist.size());
     emit(amap.data(), amap.size());
+    emit(pmap.data(), pmap.size());
     padTo(kBlocksStart);
     for (const auto& b : blocks) {
         emit(b.encodedBlock.data(), b.encodedBlock.size());

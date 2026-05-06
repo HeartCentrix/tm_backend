@@ -36,6 +36,26 @@ namespace pstwriter {
 // but read bid=6". See KNOWN_UNVERIFIED.md M11-E. wSig is 0 for AMap.
 array<uint8_t, kPageSize> buildAMap(Ib ibAMap, uint64_t fileSize) noexcept;
 
+// ============================================================================
+// buildEmptyPMap — emit an empty PMap page at file offset 0x4600
+// ([MS-PST] §2.2.2.7.3). Required by scanpst even in fAMapValid=0x02
+// mode (where PMap data is unused) — scanpst always validates the slot.
+// Without this, scanpst raises five "PMap page @17920" errors as it
+// reads our first data block and tries to parse it as a PMap.
+// ============================================================================
+array<uint8_t, kPageSize> buildEmptyPMap(uint64_t ibPMap) noexcept;
+
+// ============================================================================
+// buildDListPage — emit the DLISTPAGE at file offset 0x4200 ([MS-PST]
+// §2.2.2.7.4). Without it, scanpst surfaces "PMap page @17920" errors
+// because its DList lookup falls through to the zero-pad bytes there
+// and treats them as a corrupt PMap. ibDList = 0x4200, ibAMap = 0x4400
+// in the M2 skeleton.
+// ============================================================================
+array<uint8_t, kPageSize> buildDListPage(uint64_t ibDList,
+                                         uint64_t ibAMap,
+                                         uint64_t fileEof) noexcept;
+
 // Empty NBT / BBT leaf pages (cEnt = 0, cLevel = 0).  cbEnt is fixed by
 // the page type per [MS-PST] §2.2.2.7.7.1: 32 for an NBT leaf, 24 for a
 // BBT leaf.  wSig is computed from (ib ^ bid.value).

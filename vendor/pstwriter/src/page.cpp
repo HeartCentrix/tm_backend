@@ -65,6 +65,91 @@ array<uint8_t, kPageSize> buildAMap(Ib ibAMap, uint64_t fileSize) noexcept
 }
 
 // ============================================================================
+// PMap page ([MS-PST] §2.2.2.7.3) at fixed offset 0x4600.
+//
+// PMap is deprecated for use (DList superseded it) but [MS-PST] §2.6 still
+// requires the page to be physically present at 0x4600 + N×0x1F0000 with
+// a valid PAGETRAILER (PTYPE=0x83, correct CRC).
+//
+// PMap inverse semantics: bit=1 means *free*, bit=0 means *allocated*.
+// Real Outlook backup.pst files ship the PMap bitmap as ALL 0xFF (every
+// page free) because PMap is unused at runtime — the bytes are vestigial.
+// Earlier round-11 attempt zero-filled the bitmap (= "all allocated"),
+// which was inconsistent with the AMap and triggered Outlook's
+// auto-quarantine. 0xFF is the byte-for-byte match we see in real PSTs.
+// ============================================================================
+array<uint8_t, kPageSize> buildEmptyPMap(uint64_t ibPMap) noexcept
+{
+    array<uint8_t, kPageSize> page{};
+    for (size_t i = 0; i < kPageBodySize; ++i) page[i] = 0xFFu;
+    writePageTrailer(page, ptype::kPMap, Bid::makeAmap(ibPMap), Ib{ibPMap});
+    return page;
+}
+
+// ============================================================================
+// DList page ([MS-PST] §2.2.2.7.4) at fixed offset 0x4200.
+//
+// Real Outlook always emits a DLISTPAGE at 0x4200 (just before the first
+// AMap at 0x4400). Without it, scanpst reads zero bytes there and
+// surfaces "PMap page @17920 …" errors — its DList lookup directs it
+// to validate offset 0x4600 as a PMap page, which in our writer is the
+// first data block. Procmon trace confirmed the DList read at 0x4200
+// happens before every PMap-error logging burst.
+//
+// DLISTPAGE body layout (496 bytes):
+//   [0]      bFlags             — 0 (no backfill in progress)
+//   [1]      cEntDList          — number of entries (1 for single-AMap PSTs)
+//   [2..3]   wPadding           — 0
+//   [4..7]   ulCurrentPage      — 0 (current AMap index)
+//   [8..]    rgEntDList         — DLISTPAGEENT array (4 bytes each)
+//   [...]    rgPadding          — zero-fill to 496
+//
+// DLISTPAGEENT (4 bytes, packed LE):
+//   bits  0..19  dwPageNum   — AMap page index (0-based)
+//   bits 20..31  dwFreeSlots — free 64-byte slots in that AMap
+// ============================================================================
+array<uint8_t, kPageSize> buildDListPage(uint64_t ibDList,
+                                         uint64_t ibAMap,
+                                         uint64_t fileEof) noexcept
+{
+    array<uint8_t, kPageSize> page{};
+
+    // Free-slot count for AMap[0]. AMap[0] covers [ibAMap, ibAMap +
+    // kAMapCoverage). Allocated bytes are everything from ibAMap up to
+    // min(fileEof, coverageEnd). Free bytes are the rest of the
+    // coverage. Slots are 64-byte units (kBytesPerAMapBit).
+    const uint64_t coverageEnd  = ibAMap + kAMapCoverage;
+    const uint64_t allocatedEnd = fileEof < coverageEnd ? fileEof : coverageEnd;
+    const uint64_t allocatedBytes =
+        allocatedEnd > ibAMap ? (allocatedEnd - ibAMap) : 0;
+    const uint64_t freeBytes = (kAMapCoverage > allocatedBytes)
+                                 ? (kAMapCoverage - allocatedBytes) : 0;
+    const uint32_t freeSlots = static_cast<uint32_t>(freeBytes / kBytesPerAMapBit);
+
+    // Round 8 emitted DList with cEntDList=1 (one entry for AMap[0])
+    // and Outlook accepted it (file would scan-pst-repair through). Round
+    // 12 changed cEntDList=0 to mirror real backup.pst's cEntDList=8
+    // pattern, but that triggered Outlook auto-quarantine. Reverting to
+    // the round-8 format — cEntDList=1 with the AMap[0] entry.
+    page[0] = 0;        // bFlags
+    page[1] = 1;        // cEntDList — one entry for AMap[0]
+    // [2..3] wPadding — left zero
+    writeU32(page.data(), 4, 0u);  // ulCurrentPage = 0 (AMap[0])
+
+    // rgEntDList[0] — pack {dwFreeSlots(12) << 20 | dwPageNum(20)}.
+    const uint32_t entry =
+        (static_cast<uint32_t>(freeSlots & 0xFFFu) << 20)
+      | (0u & 0xFFFFFu);  // dwPageNum = 0
+    writeU32(page.data(), 8, entry);
+
+    // PAGETRAILER. Bid for DList follows the same convention as AMap:
+    // PAGETRAILER.bid == ib. Verified by an empirical Outlook open in
+    // M11-E. ptype = 0x9C (kDList).
+    writePageTrailer(page, ptype::kDList, Bid::makeAmap(ibDList), Ib{ibDList});
+    return page;
+}
+
+// ============================================================================
 // Empty BTPAGE leaves ([MS-PST] §2.2.2.7.7)
 // ============================================================================
 namespace {

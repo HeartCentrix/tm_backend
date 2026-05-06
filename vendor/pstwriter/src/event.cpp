@@ -333,11 +333,25 @@ WriteResult writeM9Pst(const M9PstConfig& config) noexcept
             nodes.push_back(std::move(n));
         };
 
+        // Round B: empty basic queue node — bidData=0, no block. See mail.cpp.
+        auto scheduleEmptyQueue = [&](Nid nid, Nid parent) {
+            M9NodeBuild n;
+            n.nid       = nid;
+            n.nidParent = parent;
+            n.bidData   = Bid{0u};
+            n.bidSub    = Bid{0u};
+            nodes.push_back(std::move(n));
+        };
+
         // 1. Mandatory baseline nodes (excludes 0x802D/0x802E/0x802F).
         for (auto& e : buildPstBaselineEntries(config.providerUid,
                                                 config.pstDisplayName))
         {
-            scheduleNode(e.nid, e.nidParent, std::move(e.body));
+            if (e.isEmptyQueue) {
+                scheduleEmptyQueue(e.nid, e.nidParent);
+            } else {
+                scheduleNode(e.nid, e.nidParent, std::move(e.body));
+            }
         }
 
         // 2. Pre-register reserved NIDs into the allocator.
@@ -446,7 +460,11 @@ WriteResult writeM9Pst(const M9PstConfig& config) noexcept
         // ============================================================
         // 7. Encode all blocks + assemble M5DataBlockSpec list.
         // ============================================================
-        constexpr uint64_t kBlocksStart = 0x4600u;  // M11-G: blocks live after AMap[0] @ 0x4400
+        // Blocks live AFTER AMap[0] @ 0x4400 + PMap[0] @ 0x4600 (Round-A).
+        // Must match writer.cpp::kBlocksStart — block-trailer wSig
+        // (= bid XOR ib at build time) must equal what Outlook computes
+        // from the file offset.
+        constexpr uint64_t kBlocksStart = 0x4800u;
 
         vector<M5DataBlockSpec> m5Blocks;
         vector<M5Node>          m5Nodes;

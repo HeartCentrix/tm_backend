@@ -299,6 +299,12 @@ struct ContentsTcRow {
     // a stub (CEB cleared); a 22-byte XID is the canonical encoding.
     const uint8_t*  changeKeyBytes              {nullptr};
     size_t          changeKeySize               {0};   // 0x3013 (Binary)
+    // Round L: PR_SEARCH_KEY (0x300B, Binary) — required Contents-TC
+    // column per real-Outlook backup.pst byte-diff. Without it, the
+    // TC schema has 28 cols vs. backup's 29, and scanpst flags
+    // "Contents Table for X, row doesn't match sub-object".
+    const uint8_t*  searchKeyBytes              {nullptr};
+    size_t          searchKeySize               {0};   // 0x300B (Binary)
 };
 
 // ============================================================================
@@ -410,6 +416,51 @@ TcResult buildAttachmentTemplateTc();
 // search folders need extra columns (search criteria, search state).
 // ============================================================================
 TcResult buildSearchContentsTemplateTc();
+
+// ============================================================================
+// Scanpst-required additional template TCs at NID 0x6B6 / 0x6D7 / 0x6F8.
+// Each emits a 0-row TC with the columns scanpst (Outlook 16.0.19929)
+// names as required:
+//   0x6B6: 0x0E370102 (PtypBinary) + LtpRowId/RowVer
+//   0x6D7: 0x0E3E0102, 0x0E310102 (both PtypBinary) + LtpRowId/RowVer
+//   0x6F8: 0x30070040 (PtypSystemTime), 0x0E330014 (PtypInteger64) + LtpRowId/RowVer
+// Without these, scanpst surfaces "TC (nid=X) missing required column".
+// ============================================================================
+TcResult buildTemplate6B6Tc();
+TcResult buildTemplate6D7Tc();
+TcResult buildTemplate6F8Tc();
+
+// ============================================================================
+// buildMinimalEmptyTc — 2-column 0-row TC (LtpRowId/RowVer only). Used
+// for nodes that scanpst expects to be valid TCs but for which no
+// explicit column schema is documented (search update queues, criteria
+// objects, search activity list, search management queue). Replacing
+// buildEmptyNodePayload() with this resolves "corrupt update queue" /
+// "corrupt search activity list" findings.
+// ============================================================================
+TcResult buildMinimalEmptyTc();
+
+// ============================================================================
+// buildOutgoingQueueTc — emit NID 0x64C OutgoingQueueTable (M11-N round 16)
+// with the columns scanpst requires (0x0E10, 0x0E14, plus mandatory
+// LtpRowId/RowVer). 0-row TC; the queue is empty in steady state.
+// ============================================================================
+TcResult buildOutgoingQueueTc();
+
+// ============================================================================
+// buildSearchActivityListTc — emit NID 0x201 Search Activity List with
+// one row per active search folder (currently just 0x2223 Spam Search).
+// Resolves "Search activity list corrupt" + "SAL missing entry (nid=2223)".
+// ============================================================================
+TcResult buildSearchActivityListTc();
+
+// ============================================================================
+// buildSearchCriteriaObjectPc — emit a PC for a Search Criteria Object
+// (NID type 0x07) carrying PR_SEARCH_FOLDER_FLAGS. Resolves the
+// "HN bad signature" + "missing search flags" finding scanpst raises
+// when this NID is emitted as a TC.
+// ============================================================================
+PcResult buildSearchCriteriaObjectPc(Nid firstSubnodeNid);
 
 // ============================================================================
 // buildSearchFolderPc — emit Search Folder PC (NID 0x2223 = Spam search Folder).

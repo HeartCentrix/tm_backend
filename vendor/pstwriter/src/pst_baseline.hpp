@@ -38,6 +38,11 @@ struct PstBaselineEntry {
     Nid                  nid;
     Nid                  nidParent;
     std::vector<uint8_t> body;
+    // Round B: when true, the entry represents an empty queue node
+    // ([MS-PST] §2.4.8.3 Basic Queue Node). Caller emits the NBT entry
+    // with bidData=0 (no block) and skips body altogether. The `body`
+    // vector MUST be empty in this case.
+    bool                 isEmptyQueue = false;
 };
 
 // Build the 24 mandatory nodes (27 minus the 3 IPM Subtree sibling tables).

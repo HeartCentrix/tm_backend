@@ -97,15 +97,43 @@ void appendBlockTrailer(vector<uint8_t>& bytes,
 // ============================================================================
 void populateFreshRgnid(WriterState& s) noexcept
 {
+    // Format matches a real Outlook-emitted PST (backup.pst, byte-diff
+    // against round9.pst). Each entry is (count << 5) | lowMarker, where
+    // `count` is the next-available NID index for that type (or a per-type
+    // group), and `lowMarker` is a per-type byte that does NOT necessarily
+    // equal the array index. The low markers below mirror Outlook's
+    // observed pattern; ours previously forced low=arrayIndex which
+    // surfaced as "Folder invalid high-water-mark" via scanpst.
+    //
+    // Per-type defaults observed in backup.pst:
+    //   types 0x00, 0x01, 0x05-0x0c, 0x10-0x1e, 0x1f-base: low = 0x00
+    //   types 0x02, 0x0d, 0x0e, 0x0f (folder + sibling tables): low = 0x04
+    //   type 0x04 (NormalMessage): low = 0x0c
+    //   type 0x1f (LTP / heap): low = 0x08
+    //
+    // Counts default to 0x20 (= 32, the spec-mandated boundary between
+    // reserved and user NIDs). Per-type higher floors:
+    //   0x03 (SearchFolder): 0x200
+    //   0x04 (NormalMessage): 0x800 (Outlook reserves ~2K for incoming)
+    //   0x08 (AssocMessage):  0x400
     for (uint32_t nidType = 0; nidType < 32; ++nidType) {
-        uint32_t startIdx;
+        uint32_t count;
+        uint32_t lowMarker;
         switch (nidType) {
-        case 0x03u: startIdx = 0x4000u;  break;
-        case 0x04u: startIdx = 0x10000u; break;
-        case 0x08u: startIdx = 0x8000u;  break;
-        default:    startIdx = 0x400u;   break;
+        case 0x02u: case 0x0Du: case 0x0Eu: case 0x0Fu:
+            count = 0x20u; lowMarker = 0x04u; break;
+        case 0x03u:
+            count = 0x200u; lowMarker = 0x00u; break;
+        case 0x04u:
+            count = 0x800u; lowMarker = 0x0Cu; break;
+        case 0x08u:
+            count = 0x400u; lowMarker = 0x00u; break;
+        case 0x1Fu:
+            count = 0x23u; lowMarker = 0x08u; break;
+        default:
+            count = 0x20u; lowMarker = 0x00u; break;
         }
-        s.rgnid[nidType] = (startIdx << 5) | (nidType & 0x1Fu);
+        s.rgnid[nidType] = (count << 5) | (lowMarker & 0x1Fu);
     }
 }
 
