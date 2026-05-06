@@ -7,7 +7,7 @@ from urllib.parse import urlencode
 import secrets
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import select, String
 
 from shared.config import settings
@@ -69,6 +69,46 @@ async def health():
     return {"status": "ok", "service": "auth"}
 
 
+def _set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
+    """Issue the HttpOnly access/refresh cookies that the SPA uses for auth.
+
+    HttpOnly = JS can't read them, so XSS can't exfiltrate. SameSite + Secure
+    block the obvious CSRF / network-leak paths. The browser auto-attaches
+    them to fetch() calls when `credentials: 'include'` is set.
+    """
+    common = {
+        "httponly": True,
+        "secure": settings.COOKIE_SECURE,
+        "samesite": settings.COOKIE_SAMESITE,
+        "domain": settings.COOKIE_DOMAIN,
+        "path": "/",
+    }
+    response.set_cookie(
+        "access_token",
+        access_token,
+        max_age=settings.JWT_EXPIRATION_HOURS * 3600,
+        **common,
+    )
+    response.set_cookie(
+        "refresh_token",
+        refresh_token,
+        max_age=settings.JWT_REFRESH_EXPIRATION_DAYS * 86400,
+        **common,
+    )
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    common = {
+        "domain": settings.COOKIE_DOMAIN,
+        "path": "/",
+        "secure": settings.COOKIE_SECURE,
+        "samesite": settings.COOKIE_SAMESITE,
+        "httponly": True,
+    }
+    response.delete_cookie("access_token", **common)
+    response.delete_cookie("refresh_token", **common)
+
+
 @app.get("/api/v1/auth/microsoft/url", response_model=MicrosoftAuthUrlResponse)
 async def get_microsoft_login_url(state: Optional[str] = Query(None)):
     csrf_state = state or secrets.token_urlsafe(32)
@@ -76,7 +116,10 @@ async def get_microsoft_login_url(state: Optional[str] = Query(None)):
         "client_id": settings.MICROSOFT_CLIENT_ID,
         "response_type": "code",
         "redirect_uri": f"{settings.FRONTEND_URL}/auth/callback",
-        "response_mode": "query",
+        # Fragment delivery keeps the auth code (and any error params) out of
+        # server access logs and Referer headers — fragments are never sent
+        # over the wire. The SPA reads window.location.hash on landing.
+        "response_mode": "fragment",
         "scope": "openid profile email offline_access User.Read",
         "state": csrf_state,
     }
@@ -109,7 +152,8 @@ async def get_azure_datasource_url(state: Optional[str] = Query(None)):
         "client_id": settings.MICROSOFT_CLIENT_ID,
         "response_type": "code",
         "redirect_uri": f"{settings.FRONTEND_URL}/azure-datasource-callback",
-        "response_mode": "query",
+        # Fragment delivery — see /microsoft/url for rationale.
+        "response_mode": "fragment",
         "scope": "https://management.azure.com/.default openid",
         "state": csrf_state,
     }
@@ -144,7 +188,8 @@ async def get_power_bi_url(
         "client_id": settings.EFFECTIVE_POWER_BI_CLIENT_ID,
         "response_type": "code",
         "redirect_uri": f"{settings.FRONTEND_URL}/power-bi-callback",
-        "response_mode": "query",
+        # Fragment delivery — see /microsoft/url for rationale.
+        "response_mode": "fragment",
         "scope": _power_bi_authorize_scopes(),
         "state": csrf_state,
         "prompt": "consent",
@@ -154,7 +199,7 @@ async def get_power_bi_url(
 
 
 @app.post("/api/v1/auth/callback", response_model=LoginResponse)
-async def oauth_callback(callback: OAuthCallbackRequest, db: AsyncSession = Depends(get_db)):
+async def oauth_callback(callback: OAuthCallbackRequest, response: Response, db: AsyncSession = Depends(get_db)):
     async with httpx.AsyncClient() as client:
         token_response = await client.post(
             settings.MICROSOFT_TOKEN_URL,
@@ -229,7 +274,9 @@ async def oauth_callback(callback: OAuthCallbackRequest, db: AsyncSession = Depe
     access_token = create_access_token(token_data)
     refresh_token = create_refresh_token(token_data)
     expires_in = settings.JWT_EXPIRATION_HOURS * 3600
-    
+
+    _set_auth_cookies(response, access_token, refresh_token)
+
     return LoginResponse(
         accessToken=access_token,
         refreshToken=refresh_token,
@@ -1008,8 +1055,20 @@ async def get_power_bi_readiness(
 
 
 @app.post("/api/v1/auth/refresh", response_model=RefreshTokenResponse)
-async def refresh_token(request: RefreshTokenRequest):
-    payload = decode_token(request.refreshToken)
+async def refresh_token(
+    response: Response,
+    http_request: Request,
+    request: Optional[RefreshTokenRequest] = None,
+):
+    # Cookie-first: the SPA no longer holds the refresh token in JS, so the
+    # request body is empty. Fall back to the body for non-browser callers.
+    cookie_token = http_request.cookies.get("refresh_token")
+    body_token = request.refreshToken if request is not None else None
+    raw_token = cookie_token or body_token
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing refresh token")
+
+    payload = decode_token(raw_token, expected_type="refresh")
     token_data = {
         "sub": payload.get("sub"),
         "email": payload.get("email"),
@@ -1020,11 +1079,15 @@ async def refresh_token(request: RefreshTokenRequest):
     access_token = create_access_token(token_data)
     new_refresh_token = create_refresh_token(token_data)
     expires_in = settings.JWT_EXPIRATION_HOURS * 3600
+
+    _set_auth_cookies(response, access_token, new_refresh_token)
+
     return RefreshTokenResponse(accessToken=access_token, refreshToken=new_refresh_token, expiresIn=expires_in)
 
 
 @app.post("/api/v1/auth/logout")
-async def logout():
+async def logout(response: Response):
+    _clear_auth_cookies(response)
     return {"message": "Logged out successfully"}
 
 

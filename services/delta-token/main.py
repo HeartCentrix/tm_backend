@@ -9,10 +9,11 @@ Responsibilities:
 - Invalidate tokens when full sync is required
 - Track delta token history for debugging
 """
+import secrets
 import uuid
 from datetime import datetime
 from typing import Dict, Optional, List
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +25,31 @@ from shared.models import Resource, Tenant, Snapshot
 from shared.config import settings
 
 app = FastAPI(title="Delta Token Service", version="2.0.0")
+
+
+def require_internal_api_key(
+    x_internal_api_key: Optional[str] = Header(default=None, alias="X-Internal-Api-Key"),
+) -> None:
+    """Reject any request that doesn't carry the internal-services shared secret.
+
+    Delta tokens are tenant-scoped Microsoft Graph sync credentials — leaking or
+    poisoning them lets an attacker exfiltrate incremental sync context or force
+    expensive full resyncs. Fail closed when the secret isn't configured so a
+    misconfigured deploy can't silently expose the routes.
+    """
+    expected = settings.INTERNAL_API_KEY
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="INTERNAL_API_KEY not configured",
+        )
+    if not x_internal_api_key or not secrets.compare_digest(
+        x_internal_api_key, expected
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing internal API key",
+        )
 
 # Redis for fast token caching
 redis_client: Optional[Redis] = None
@@ -88,7 +114,11 @@ async def health_check():
     return {"status": "healthy", "service": "delta-token"}
 
 
-@app.get("/delta-token/{resource_id}", response_model=DeltaTokenResponse)
+@app.get(
+    "/delta-token/{resource_id}",
+    response_model=DeltaTokenResponse,
+    dependencies=[Depends(require_internal_api_key)],
+)
 async def get_delta_token(resource_id: str, folder_id: Optional[str] = None):
     """
     Get delta token for a resource
@@ -138,7 +168,7 @@ async def get_delta_token(resource_id: str, folder_id: Optional[str] = None):
     )
 
 
-@app.post("/delta-token")
+@app.post("/delta-token", dependencies=[Depends(require_internal_api_key)])
 async def save_delta_token(request: DeltaTokenRequest):
     """
     Save delta token after successful backup
@@ -166,7 +196,10 @@ async def save_delta_token(request: DeltaTokenRequest):
     }
 
 
-@app.delete("/delta-token/{resource_id}")
+@app.delete(
+    "/delta-token/{resource_id}",
+    dependencies=[Depends(require_internal_api_key)],
+)
 async def invalidate_delta_token(resource_id: str, folder_id: Optional[str] = None):
     """
     Invalidate delta token (forces full sync on next backup)
@@ -198,7 +231,10 @@ async def invalidate_delta_token(resource_id: str, folder_id: Optional[str] = No
     return {"status": "invalidated", "resource_id": resource_id}
 
 
-@app.get("/delta-token/history/{resource_id}")
+@app.get(
+    "/delta-token/history/{resource_id}",
+    dependencies=[Depends(require_internal_api_key)],
+)
 async def get_delta_token_history(resource_id: str, limit: int = 10):
     """Get delta token history for a resource"""
     async with async_session_factory() as session:
@@ -223,7 +259,7 @@ async def get_delta_token_history(resource_id: str, limit: int = 10):
         return {"history": history, "total": len(history)}
 
 
-@app.get("/delta-tokens/bulk")
+@app.get("/delta-tokens/bulk", dependencies=[Depends(require_internal_api_key)])
 async def get_bulk_delta_tokens(resource_ids: str):
     """
     Get delta tokens for multiple resources at once

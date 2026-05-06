@@ -93,10 +93,34 @@ async def proxy_request(service: str, path: str, request: Request, timeout: http
 
     # Build headers (forward auth)
     headers = {}
-    if "authorization" in request.headers:
-        headers["Authorization"] = request.headers["authorization"]
+    # Cookie-first: the SPA stores its access token in an HttpOnly cookie, so
+    # the browser sends the cookie automatically and the Authorization header
+    # from the client is either absent or a stale "Bearer null" left over
+    # from in-flight code paths. Translate cookie -> Bearer so upstream
+    # services keep their existing HTTPBearer auth dependency unchanged.
+    cookie_token = request.cookies.get("access_token")
+    incoming_auth = request.headers.get("authorization", "")
+    looks_junk = incoming_auth.lower() in (
+        "",
+        "bearer",
+        "bearer ",
+        "bearer null",
+        "bearer undefined",
+    )
+    if cookie_token and looks_junk:
+        headers["Authorization"] = f"Bearer {cookie_token}"
+    elif incoming_auth and not looks_junk:
+        headers["Authorization"] = incoming_auth
+    elif cookie_token:
+        # Both present and the header looks valid — prefer the explicit
+        # Authorization header so service-to-service calls aren't overridden.
+        headers["Authorization"] = incoming_auth or f"Bearer {cookie_token}"
     if "content-type" in request.headers:
         headers["Content-Type"] = request.headers["content-type"]
+    # Forward the Cookie header too so the auth-service can read refresh_token
+    # on POST /auth/refresh (cookie-first refresh path).
+    if "cookie" in request.headers:
+        headers["Cookie"] = request.headers["cookie"]
 
     # Retry up to 3 times with exponential backoff
     last_error = None
