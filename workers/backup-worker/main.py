@@ -2715,9 +2715,20 @@ class BackupWorker:
                 if content_bytes is not None:
                     content_hash = hashlib.sha256(content_bytes).hexdigest()
                     size = len(content_bytes)
+                    # Hash the (msg_id, att_id) tuple — Graph IDs are ~150
+                    # base64 chars each, so the raw concatenation produced a
+                    # 330+ char path component that exceeded the 255-byte
+                    # filesystem name-length limit on SeaweedFS / ext4.
+                    # sha1 hex = 40 chars, deterministic, collision-resistant
+                    # for our purposes; same (msg_id, att_id) tuple still
+                    # maps to the same blob_path so dedup behaviour is
+                    # preserved.
+                    _att_key = hashlib.sha1(
+                        f"{msg_id}_{att_id}".encode()
+                    ).hexdigest()
                     blob_path = azure_storage_manager.build_blob_path(
                         str(tenant.id), str(resource.id), str(snapshot.id),
-                        f"att_{msg_id}_{att_id}",
+                        f"att_{_att_key}",
                     )
                     try:
                         # Content-addressable dedup — same attachment
@@ -2938,9 +2949,15 @@ class BackupWorker:
             if content_bytes is not None:
                 content_hash = hashlib.sha256(content_bytes).hexdigest()
                 size = len(content_bytes)
+                # Same length-mitigation as the USER_MAIL path above —
+                # raw msg_id + att_id concatenation overflows the 255-byte
+                # filename limit on SeaweedFS / ext4.
+                _catt_key = hashlib.sha1(
+                    f"{msg_id}_{att_id}".encode()
+                ).hexdigest()
                 blob_path = azure_storage_manager.build_blob_path(
                     str(tenant.id), str(resource.id), str(snapshot.id),
-                    f"catt_{msg_id}_{att_id}",
+                    f"catt_{_catt_key}",
                 )
                 try:
                     async with sem:
@@ -8042,9 +8059,15 @@ class BackupWorker:
                     if content_bytes is None:
                         continue
                     content_hash = hashlib.sha256(content_bytes).hexdigest()
+                    # Same length-mitigation as the USER_MAIL path —
+                    # raw msg_id + att_id concatenation overflows the
+                    # 255-byte filename limit on SeaweedFS / ext4.
+                    _att_key = hashlib.sha1(
+                        f"{msg_id}_{att_id}".encode()
+                    ).hexdigest()
                     blob_path = azure_storage_manager.build_blob_path(
                         str(tenant.id), str(resource.id), str(snapshot.id),
-                        f"att_{msg_id}_{att_id}",
+                        f"att_{_att_key}",
                     )
                     upload_result = await upload_blob_with_retry(
                         container, blob_path, content_bytes, shard, max_retries=3,

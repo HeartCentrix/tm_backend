@@ -1672,7 +1672,7 @@ class RestoreWorker:
         message: Dict,
         spec: Dict,
     ) -> Dict:
-        """Export items as PST archive(s) using Aspose.Email."""
+        """Export items as PST archive(s) via the bundled pst_convert CLI."""
         import uuid as _uuid
         from shared.azure_storage import azure_storage_manager
         from shared.models import Job as _Job

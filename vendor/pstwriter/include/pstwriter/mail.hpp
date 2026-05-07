@@ -1,0 +1,256 @@
+// pstwriter/mail.hpp
+//
+// M7 — Mail message builders. Layered on M4 (PC/TC), M6 (folder PC),
+// and M7 Phase A (graph_message + graph_convert utilities).
+//
+// Public surface:
+//   buildMailPc(GraphMessage)            — IPM.Note PC bytes for one message
+//   buildRecipientRow(Recipient, idx)    — packs one row of the recipient TC
+//   buildRecipientTc(rows)               — populates recipient TC with rows
+//   buildAttachmentRow(Attachment, idx)  — packs one row of the attachment TC
+//   buildAttachmentTc(rows)              — populates attachment TC with rows
+//   buildAttachmentPc(Attachment)        — per-attachment PC carrying the data
+//   writeM7Pst(M7PstConfig)              — Phase E end-to-end PST writer
+
+#pragma once
+
+#include "graph_message.hpp"
+#include "ltp.hpp"
+#include "messaging.hpp"
+#include "types.hpp"
+#include "writer.hpp"
+
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace pstwriter {
+
+// ============================================================================
+// PidTagMessageFlags bits — [MS-OXOMSG] §2.2.1.6.
+// ============================================================================
+constexpr uint32_t kMsgFlagRead         = 0x00000001u;  // mfRead
+constexpr uint32_t kMsgFlagUnmodified   = 0x00000002u;  // mfUnmodified
+constexpr uint32_t kMsgFlagSubmit       = 0x00000004u;  // mfSubmit
+constexpr uint32_t kMsgFlagUnsent       = 0x00000008u;  // mfUnsent
+constexpr uint32_t kMsgFlagHasAttach    = 0x00000010u;  // mfHasAttach
+constexpr uint32_t kMsgFlagFromMe       = 0x00000020u;  // mfFromMe
+
+// ============================================================================
+// MailPcBuildContext
+//
+// Caller-supplied wiring for buildMailPc. The Provider UID is the PST's
+// 16-byte identity (same value used by the message store at M6); EntryID
+// generation for sender/recipient slots needs it.
+//
+// `subnodeStart` is the first NID assigned to a subnode-promoted property
+// (large body, attachments, recipients). The builder allocates strictly
+// monotonic NIDs and reports back which NIDs it consumed via the
+// MailPcResult.allocatedSubnodes vector.
+// ============================================================================
+struct MailPcBuildContext {
+    std::array<uint8_t, 16> providerUid {};
+
+    // First NID the builder may use for HN-overflow promotion. Must be a
+    // non-HID NID (NidType != HID). Subsequent allocations are
+    // subnodeStart, subnodeStart + 4, +8 ... in pidTag-ascending order.
+    Nid subnodeStart {0u};
+
+    // Round L+: message's own NID — used to populate PR_LtpRowId on
+    // the message PC (matching row's LtpRowId for identity check).
+    Nid messageNid  {0u};
+};
+
+struct MailPcSubnode {
+    Nid             nid;
+    uint16_t        pidTagId;
+    std::vector<uint8_t> bytes;   // value bytes — caller must encode in a data block
+};
+
+struct MailPcResult {
+    std::vector<uint8_t>       hnBytes;
+    std::vector<MailPcSubnode> subnodes;
+};
+
+// ============================================================================
+// buildMailPc — emit an IPM.Note PC for a single Graph message.
+//
+// Properties emitted (subset of the M7 mapping table — see
+// MILESTONES.md "Graph Message → PST property mapping table"):
+//
+//   Group A — top-level:
+//     0x001A  PidTagMessageClass_W       Unicode    "IPM.Note"
+//     0x0037  PidTagSubject_W            Unicode    UTF-16-LE
+//     0x1000  PidTagBody_W               Unicode    plain-text body
+//     0x10130102 PidTagBodyHtml          Binary     HTML body (Phase C)
+//     0x0017  PidTagImportance           Int32
+//     0x0E07  PidTagMessageFlags         Int32      bitfield
+//     0x0E1B  PidTagHasAttachments       Boolean
+//     0x3007  PidTagCreationTime         SystemTime
+//     0x3008  PidTagLastModificationTime SystemTime
+//     0x0039  PidTagClientSubmitTime     SystemTime
+//     0x0E06  PidTagMessageDeliveryTime  SystemTime
+//     0x1035  PidTagInternetMessageId_W  Unicode
+//     0x0071  PidTagConversationIndex    Binary
+//
+//   Group B — sender (when GraphMessage has sender / from):
+//     0x0C1A  PidTagSenderName_W           Unicode
+//     0x0C1F  PidTagSenderEmailAddress_W   Unicode
+//     0x0C1E  PidTagSenderAddressType_W    Unicode  "SMTP"
+//     0x0C19  PidTagSenderEntryId          Binary   OneOff EntryID
+//     0x0C1D  PidTagSenderSearchKey        Binary   16-byte search key
+//     0x0042  PidTagSentRepresentingName_W ...      (5 mirror props)
+//     etc.
+//
+// Subnode-promoted properties (body > 3580 bytes, large headers) are
+// returned in MailPcResult.subnodes. Caller is responsible for:
+//   1. Wrapping each subnode's bytes in a data block (M3 buildDataBlock).
+//   2. Building the SLBLOCK for the message PC's bidSub.
+//   3. Wiring everything in writeM5Pst.
+//
+// Throws:
+//   * std::invalid_argument — context.subnodeStart has nidType=HID,
+//                              or providerUid all-zero.
+//   * std::length_error    — total HN body exceeds kMaxHnBodyBytes.
+// ============================================================================
+MailPcResult buildMailPc(const graph::GraphMessage& msg,
+                         const MailPcBuildContext&  ctx);
+
+// ============================================================================
+// Recipient TC builder
+//
+// One row per Graph recipient (To/Cc/Bcc combined). Per [MS-PST]
+// "Recipient Table Template" + §3.13 schema, the table has 14 columns.
+//
+// `rows` are presented in the To/Cc/Bcc concatenation order Outlook
+// expects; each row's PidTagRecipientType is set per the source bucket.
+//
+// Returns a TC HN body. The recipient TC always lives in a subnode of
+// the message PC (the message's bidSub references its block).
+// ============================================================================
+TcResult buildRecipientTc(const std::vector<graph::Recipient>& recipients);
+
+// ============================================================================
+// Attachment TC builder
+//
+// Returns a TC HN body for the attachment row index of one message.
+// Attachment data lives in a separate Attachment PC (see
+// buildAttachmentPc) — each row's PidTagLtpRowId is the NID of that PC.
+// ============================================================================
+struct AttachmentTcRow {
+    Nid                       attachmentNid;
+    const graph::Attachment*  attachment;
+};
+
+TcResult buildAttachmentTc(const std::vector<AttachmentTcRow>& rows);
+
+// ============================================================================
+// Attachment PC builder
+//
+// Per-attachment PC carrying:
+//   * PidTagAttachMethod (1 = afByValue, 5 = afEmbeddedMessage)
+//   * PidTagAttachFilenameW / PidTagAttachLongFilename_W / PidTagDisplayName_W
+//   * PidTagAttachMimeTag_W (optional)
+//   * PidTagAttachContentId_W (optional, inline images)
+//   * PidTagRenderingPosition (-1 = no inline)
+//   * PidTagAttachSize
+//   * PidTagAttachDataBinary  — fileAttachment raw bytes
+//     OR
+//   * PidTagAttachDataObject  — itemAttachment embedded message PC bytes
+//
+// File-attachment data > 3580 bytes is subnode-promoted; the returned
+// MailPcResult.subnodes list captures each promotion.
+// ============================================================================
+MailPcResult buildAttachmentPc(const graph::Attachment&   att,
+                               const MailPcBuildContext&  ctx);
+
+// ============================================================================
+// M7 folder schema — extends M6's FolderPcSchema with PidTagContainerClass.
+//
+// Per Decision 6 in M7 pre-flight: PidTagContainerClass distinguishes
+// folder types ("IPF.Note" for mail). M7 folders also include
+// PidTagPstHiddenCount/Unread (0x6635/0x6636) for full Outlook
+// compatibility.
+// ============================================================================
+struct M7FolderSchema {
+    // Core display + counts (same as M6).
+    const uint8_t* displayNameUtf16le {nullptr};
+    size_t         displayNameSize    {0};
+    uint32_t       contentCount       {0u};
+    uint32_t       contentUnreadCount {0u};
+    bool           hasSubfolders      {false};
+
+    // PidTagContainerClass UTF-16-LE bytes, e.g. "IPF.Note" for mail.
+    // May be empty for folders that don't carry a container class.
+    const uint8_t* containerClassUtf16le {nullptr};
+    size_t         containerClassSize    {0};
+
+    // PidTagPstHiddenCount / PidTagPstHiddenUnread (0x6635 / 0x6636).
+    uint32_t pstHiddenCount       {0u};
+    uint32_t pstHiddenUnreadCount {0u};
+};
+
+// Build an M7-format folder PC. When `containerClassSize == 0`, the
+// builder degrades to the M6 4-property schema for backward compat.
+PcResult buildMailFolderPc(const M7FolderSchema& schema,
+                           Nid                   firstSubnodeNid);
+
+// ============================================================================
+// M7 — Internet headers serialization.
+//
+// Serialize an array of Graph internet headers back to the RFC 2822
+// header block format. Each header rendered as
+//   "Name: Value\r\n"
+// concatenated. Used to populate PidTagTransportMessageHeaders (UTF-16).
+// ============================================================================
+std::string serializeInternetHeaders(
+    const std::vector<graph::InternetMessageHeader>& headers);
+
+// ============================================================================
+// M7 — Folder tree
+//
+// Flat description of one mail folder under IPM Subtree. M7's folder
+// hierarchy is flat: a list of M7Folder entries, each with a parent NID.
+// Container class defaults to "IPF.Note".
+// ============================================================================
+struct M7Folder {
+    std::string  displayName;       // UTF-8
+    Nid          nid;                // assigned by caller (use M5Allocator)
+    Nid          parentNid;          // typically IPM Subtree (0x8022) or another M7Folder
+    std::string  containerClass {"IPF.Note"};
+
+    // Messages contained in this folder, in the order they should appear
+    // in the Contents TC.
+    std::vector<const graph::GraphMessage*> messages;
+};
+
+// ============================================================================
+// M7 — End-to-end writer.
+//
+// Produces a PST containing:
+//   * The 27 §2.7.1 mandatory nodes (delegated to M6 writer pattern).
+//   * For each M7Folder: a Folder PC (NormalFolder type) + Hierarchy /
+//     Contents / FAI Contents tables.
+//   * For each message in each folder: a Message PC (NormalMessage type),
+//     plus a Recipient TC (RecipientTable type) and Attachment TC
+//     (AttachmentTable type) when needed, plus Attachment PCs (Attachment
+//     type) and data subnodes for binary attachments.
+//   * IPM Subtree's Hierarchy TC populated with rows for each top-level
+//     M7Folder.
+// ============================================================================
+struct M7PstConfig {
+    std::string             path;
+    std::array<uint8_t, 16> providerUid;
+
+    // Display name embedded into the message store + Top of Personal Folders.
+    std::string             pstDisplayName  {"M7 Mail PST"};
+
+    // Folder tree. Order significant — first folder is conceptually
+    // "Inbox" but the writer doesn't enforce naming.
+    std::vector<M7Folder>   folders;
+};
+
+WriteResult writeM7Pst(const M7PstConfig& config) noexcept;
+
+} // namespace pstwriter

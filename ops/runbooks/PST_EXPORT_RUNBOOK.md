@@ -5,6 +5,23 @@ operations, observability, troubleshooting, and disaster recovery.
 
 ---
 
+## 0. PST writer (post-Aspose)
+
+PST files are produced by the bundled `pst_convert` CLI built from
+`vendor/pstwriter` (the C++17 source vendored in this repo). The
+restore-worker Docker image ships the binary at
+`/usr/local/bin/pst_convert`; the Python wrapper lives in
+`shared/pstwriter_cli.py`.
+
+- Refresh the vendored sources from upstream `PST Dev`: see
+  `vendor/pstwriter/README.md`.
+- Override the binary path for ad-hoc dev (e.g. point at a Windows
+  build): set `PSTWRITER_CLI=/abs/path/to/pst_convert(.exe)`.
+- No license required. The Aspose.Email dependency was removed; the
+  `shared.aspose_license` module is now a deprecation no-op.
+
+---
+
 ## 1. Architecture overview
 
 ```
@@ -112,7 +129,10 @@ docker compose logs restore-worker --since=10m | grep -E "upload|stream_zip"
 **Common causes:**
 - **Azure Storage quota / network** — check `AZURE_STORAGE_*` env vars
 - **Wrong blob container** — verify `dest_container` in logs matches what exists
-- **Aspose license expired** — see logs for `TRIAL mode` warning
+- **`pst_convert` binary missing** — see logs for `pst_convert binary not found`
+  or `[pstwriter_cli] FAILED rc=…`. Recover by rebuilding the worker image
+  (`docker compose build restore-worker`) so the multi-stage build re-emits
+  `/usr/local/bin/pst_convert` from `vendor/pstwriter`.
 
 **Fix:**
 ```bash
@@ -192,7 +212,8 @@ docker compose exec postgres psql -U postgres -d railway -c \
 **Common causes:**
 - **RabbitMQ redelivered + processing** — check log for two workers on same job_id
 - **DB session deadlock on progress callback** — fixed in `5fcd01d`, ensure deployed
-- **Hung `aspose.email` call** — `PST_GROUP_TIMEOUT_S` should kill at 4h
+- **Hung `pst_convert` invocation** — `PSTWRITER_CLI_TIMEOUT_S` (default 1h
+  per chunk) and `PST_GROUP_TIMEOUT_S` (default 4h per group) cap runaways
 
 **Fix:**
 ```bash

@@ -84,7 +84,7 @@ def init(metrics_port: Optional[int] = None) -> bool:
         # (most under 1m, 99p around 1h, whales out to 4h+).
         job_duration_seconds = Histogram(
             "pst_export_job_duration_seconds",
-            "Wall-clock duration of a PST job (apply_license to final blob upload)",
+            "Wall-clock duration of a PST job (planning to final blob upload)",
             ["granularity", "status"],
             buckets=(5, 10, 30, 60, 300, 900, 1800, 3600, 7200, 14400),
         )

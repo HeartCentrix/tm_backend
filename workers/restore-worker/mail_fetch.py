@@ -166,8 +166,9 @@ async def gather_attachments(
     for path in att_paths:
         # Probe size before streaming. If shard exposes blob metadata,
         # use it; otherwise fall through and let the streaming consumer
-        # see the bytes (Aspose's MailMessage.load will OOM if too big,
-        # but at least the rest of the message processes).
+        # see the bytes (the mail writer base64-inlines them, so a single
+        # huge attachment can balloon the JSON payload — but at least
+        # the rest of the message processes).
         size = -1
         try:
             if hasattr(shard, "get_blob_size"):
