@@ -43,10 +43,34 @@ def _rmq_url() -> str:
     url = os.getenv("RABBITMQ_URL")
     if url:
         return url
-    u = os.getenv("RABBITMQ_USERNAME", os.getenv("RABBITMQ_USER", "guest"))
-    p = os.getenv("RABBITMQ_PASSWORD", "guest")
-    h = os.getenv("RABBITMQ_HOST", "localhost")
+    # Fail closed when credentials aren't supplied. The storage.toggle queue
+    # drives storage-backend switching for the whole deployment; anyone who
+    # can publish to it can trigger unauthorized azure↔onprem migrations.
+    # Defaulting to RabbitMQ's well-known guest:guest would let any process
+    # with network access to the broker push toggle messages, so we refuse
+    # to start instead of silently using a default that ships in every
+    # RabbitMQ image. Set RABBITMQ_URL or RABBITMQ_USERNAME/PASSWORD/HOST.
+    u = os.getenv("RABBITMQ_USERNAME") or os.getenv("RABBITMQ_USER")
+    p = os.getenv("RABBITMQ_PASSWORD")
+    h = os.getenv("RABBITMQ_HOST")
     port = os.getenv("RABBITMQ_PORT", "5672")
+    missing = [name for name, val in (
+        ("RABBITMQ_USERNAME (or RABBITMQ_USER)", u),
+        ("RABBITMQ_PASSWORD", p),
+        ("RABBITMQ_HOST", h),
+    ) if not val]
+    if missing:
+        raise RuntimeError(
+            "Missing required RabbitMQ env vars: "
+            + ", ".join(missing)
+            + ". Set RABBITMQ_URL, or all of "
+            "RABBITMQ_USERNAME/RABBITMQ_PASSWORD/RABBITMQ_HOST."
+        )
+    if u == "guest" and p == "guest":
+        raise RuntimeError(
+            "Refusing to connect with the default guest:guest RabbitMQ "
+            "credential. Provision a dedicated user for storage-toggle-worker."
+        )
     return f"amqp://{u}:{p}@{h}:{port}/"
 
 

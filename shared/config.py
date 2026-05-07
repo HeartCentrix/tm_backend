@@ -33,6 +33,37 @@ class Settings:
         self.JWT_ALGORITHM = "HS256"
         self.JWT_EXPIRATION_HOURS = 8
         self.JWT_REFRESH_EXPIRATION_DAYS = 7
+        # Distinct per-class secrets prevent access<->refresh token swaps. Fall
+        # back to JWT_SECRET so existing single-secret deployments keep booting;
+        # the type-claim check in decode_token is the primary defense.
+        self.ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET", "") or self.JWT_SECRET
+        self.REFRESH_TOKEN_SECRET = os.getenv("REFRESH_TOKEN_SECRET", "") or self.JWT_SECRET
+        # Shared secret for service-to-service calls on internal-only services
+        # (delta-token, etc.). Callers send it as the X-Internal-Api-Key header.
+        # Must be set in every environment — empty disables the affected
+        # services (they fail closed with 503).
+        self.INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
+
+        # Auth cookies (HttpOnly access_token / refresh_token). The browser
+        # never reads them — XSS can no longer steal a Bearer token from
+        # localStorage. `Secure` is auto-on when FRONTEND_URL is https; on
+        # local http://localhost dev we must leave it off so the browser
+        # accepts the cookie at all. Override with COOKIE_SECURE=true|false.
+        cookie_secure_env = os.getenv("COOKIE_SECURE", "").strip().lower()
+        _frontend_url_for_cookie = os.getenv("FRONTEND_URL", "http://localhost:4200")
+        if cookie_secure_env in ("true", "1", "yes"):
+            self.COOKIE_SECURE = True
+        elif cookie_secure_env in ("false", "0", "no"):
+            self.COOKIE_SECURE = False
+        else:
+            self.COOKIE_SECURE = _frontend_url_for_cookie.startswith("https://")
+        # SameSite=Strict blocks the cookie on every cross-site request,
+        # including link-clicks from email/Slack into the SPA. Override
+        # to "lax" via env if you want deep links to keep the session.
+        self.COOKIE_SAMESITE = os.getenv("COOKIE_SAMESITE", "strict").strip().lower()
+        # Cookie domain (omit to default to the request host). Set when
+        # the SPA and the API are on sibling subdomains.
+        self.COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN", "") or None
 
         # Railway provides REDIS_URL; fall back to individual vars
         railway_redis_url = os.getenv("REDIS_URL")
@@ -53,13 +84,18 @@ class Settings:
             parsed = urlparse(railway_rabbitmq_url)
             self.RABBITMQ_HOST = parsed.hostname or "localhost"
             self.RABBITMQ_PORT = parsed.port or 5672
-            self.RABBITMQ_USER = parsed.username or "guest"
-            self.RABBITMQ_PASSWORD = parsed.password or "guest"
+            # Empty rather than "guest" — the RABBITMQ_URL property fails
+            # closed if creds aren't supplied, which is safer than silently
+            # connecting as the default RabbitMQ user.
+            self.RABBITMQ_USER = parsed.username or ""
+            self.RABBITMQ_PASSWORD = parsed.password or ""
         else:
             self.RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
             self.RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
-            self.RABBITMQ_USER = os.getenv("RABBITMQ_USERNAME") or os.getenv("RABBITMQ_USER", "guest")
-            self.RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
+            self.RABBITMQ_USER = (
+                os.getenv("RABBITMQ_USERNAME") or os.getenv("RABBITMQ_USER", "")
+            )
+            self.RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "")
         self.RABBITMQ_ENABLED = os.getenv("RABBITMQ_ENABLED", "false").lower() in ("true", "1", "yes")
         self.AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "")
         self.AZURE_STORAGE_ACCOUNT_KEY = os.getenv("AZURE_STORAGE_ACCOUNT_KEY", "")
@@ -570,7 +606,25 @@ class Settings:
 
     @property
     def RABBITMQ_URL(self) -> str:
-        return f"amqp://{self.RABBITMQ_USER}:{self.RABBITMQ_PASSWORD}@{self.RABBITMQ_HOST}:{self.RABBITMQ_PORT}/"
+        # Refuse to hand out a connection URL with the default RabbitMQ
+        # guest:guest credential. Any process that can reach the broker on
+        # those credentials gets full publish/consume rights, including the
+        # storage.toggle queue that drives storage-backend switching.
+        # Callers that have built a RABBITMQ_URL env var directly bypass this
+        # entirely (and are responsible for their own credentials).
+        u = self.RABBITMQ_USER
+        p = self.RABBITMQ_PASSWORD
+        if not u or not p:
+            raise RuntimeError(
+                "RabbitMQ credentials not set. Provide RABBITMQ_URL or set "
+                "RABBITMQ_USERNAME and RABBITMQ_PASSWORD."
+            )
+        if u == "guest" and p == "guest":
+            raise RuntimeError(
+                "Refusing to connect to RabbitMQ with the default guest:guest "
+                "credential. Provision a dedicated user."
+            )
+        return f"amqp://{u}:{p}@{self.RABBITMQ_HOST}:{self.RABBITMQ_PORT}/"
 
 
 settings = Settings()
