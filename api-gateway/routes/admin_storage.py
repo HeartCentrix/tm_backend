@@ -34,18 +34,26 @@ router = APIRouter(prefix="/api/admin/storage", tags=["admin-storage"])
 
 
 async def _require_user_from_header_or_query(request: Request) -> dict:
-    """Auth dep that reads the JWT from either the Authorization header or
-    a `?token=<jwt>` query param. The query-param fallback exists so the
+    """Auth dep that reads the JWT from (in order) the Authorization
+    header, a `?token=<jwt>` query param, or the `access_token` HttpOnly
+    cookie set by /auth/callback. The query-param fallback exists so the
     SSE `/events/{id}/stream` endpoint can be consumed by browser
     EventSource() objects, which cannot attach custom Authorization
-    headers. Role checks are intentionally omitted — any authenticated
-    user is allowed to read storage status and submit toggles."""
+    headers. The cookie fallback exists because admin_storage is mounted
+    directly on the gateway (not behind proxy_request), so the
+    cookie→Bearer translation in main.py:proxy_request never runs for
+    these routes — without this fallback, the SPA's cookie-only fetch()
+    calls would 401. Role checks are intentionally omitted — any
+    authenticated user is allowed to read storage status and submit
+    toggles."""
     auth = request.headers.get("authorization") or ""
     token: str | None = None
     if auth.lower().startswith("bearer "):
         token = auth[7:].strip()
     if not token:
         token = request.query_params.get("token")
+    if not token:
+        token = request.cookies.get("access_token")
     if not token:
         raise HTTPException(status_code=401, detail="missing bearer token")
     return _get_user_from_token(token)
