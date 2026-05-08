@@ -22,18 +22,19 @@ from email import encoders
 from email.utils import parseaddr, formataddr
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy import select, desc, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.database import async_session_factory, init_db
 from shared.models import (
-    ReportConfig, ReportHistory, Organization,
+    ReportConfig, ReportHistory,
     Job, Resource, Tenant, Snapshot,
     JobType, JobStatus, ResourceStatus, ResourceType
 )
 from shared.config import settings
+from shared.security import get_current_user_from_token
 
 app = FastAPI(title="Report Service", version="1.0.0")
 
@@ -118,15 +119,15 @@ class ReportHistoryResponse(BaseModel):
 
 # ==================== Helper Functions ====================
 
-async def get_org_id_from_token(token: str) -> Optional[str]:
-    """Extract org_id from JWT token (simplified - use proper auth in production)"""
-    async with async_session_factory() as session:
-        result = await session.execute(select(Organization.id).limit(1))
-        org = result.scalar_one_or_none()
-        return str(org) if org else None
+
+def _require_org_id(current_user: dict) -> str:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(status_code=403, detail="User is not bound to an organization")
+    return org_id
 
 
-async def save_report_history(session, config, report_type, period_start, period_end, 
+async def save_report_history(session, config, report_type, period_start, period_end,
                               total_backups, successful_backups, failed_backups,
                               is_empty=False, report_data=None, delivery_status=None):
     """Save report to history table"""
@@ -509,14 +510,17 @@ async def health():
 
 
 @app.get("/api/v1/reports/config", response_model=ReportConfigResponse)
-async def get_report_config():
+async def get_report_config(current_user: dict = Depends(get_current_user_from_token)):
     """Get the current report configuration"""
+    org_id = _require_org_id(current_user)
     async with async_session_factory() as session:
-        result = await session.execute(select(ReportConfig).limit(1))
+        result = await session.execute(
+            select(ReportConfig).where(ReportConfig.org_id == org_id)
+        )
         config = result.scalar_one_or_none()
-        
+
         if not config:
-            config = ReportConfig(org_id=None)
+            config = ReportConfig(org_id=org_id)
             session.add(config)
             await session.commit()
             await session.refresh(config)
@@ -538,17 +542,23 @@ async def get_report_config():
 
 
 @app.post("/api/v1/reports/config", response_model=ReportConfigResponse)
-async def create_report_config(config_data: ReportConfigCreate):
+async def create_report_config(
+    config_data: ReportConfigCreate,
+    current_user: dict = Depends(get_current_user_from_token),
+):
     """Create a new report configuration"""
+    org_id = _require_org_id(current_user)
     async with async_session_factory() as session:
-        result = await session.execute(select(ReportConfig).limit(1))
+        result = await session.execute(
+            select(ReportConfig).where(ReportConfig.org_id == org_id)
+        )
         existing = result.scalar_one_or_none()
-        
+
         if existing:
             raise HTTPException(status_code=400, detail="Configuration already exists. Use PUT to update.")
 
         config = ReportConfig(
-            org_id=None,
+            org_id=org_id,
             enabled=config_data.enabled,
             schedule_type=config_data.schedule_type,
             send_empty_report=config_data.send_empty_report,
@@ -579,12 +589,18 @@ async def create_report_config(config_data: ReportConfigCreate):
 
 
 @app.put("/api/v1/reports/config", response_model=ReportConfigResponse)
-async def update_report_config(config_data: ReportConfigUpdate):
+async def update_report_config(
+    config_data: ReportConfigUpdate,
+    current_user: dict = Depends(get_current_user_from_token),
+):
     """Update the report configuration"""
+    org_id = _require_org_id(current_user)
     async with async_session_factory() as session:
-        result = await session.execute(select(ReportConfig).limit(1))
+        result = await session.execute(
+            select(ReportConfig).where(ReportConfig.org_id == org_id)
+        )
         config = result.scalar_one_or_none()
-        
+
         if not config:
             raise HTTPException(status_code=404, detail="Configuration not found")
 
@@ -628,15 +644,21 @@ async def update_report_config(config_data: ReportConfigUpdate):
 async def get_report_history(
     limit: int = Query(default=50, le=200),
     offset: int = 0,
-    report_type: Optional[str] = None
+    report_type: Optional[str] = None,
+    current_user: dict = Depends(get_current_user_from_token),
 ):
     """Get report sending history"""
+    org_id = _require_org_id(current_user)
     async with async_session_factory() as session:
-        query = select(ReportHistory).order_by(desc(ReportHistory.generated_at))
-        
+        query = (
+            select(ReportHistory)
+            .where(ReportHistory.org_id == org_id)
+            .order_by(desc(ReportHistory.generated_at))
+        )
+
         if report_type:
             query = query.where(ReportHistory.report_type == report_type.upper())
-        
+
         query = query.limit(limit).offset(offset)
         result = await session.execute(query)
         reports = result.scalars().all()
@@ -665,12 +687,21 @@ async def get_report_history(
 
 
 @app.get("/api/v1/reports/history/{report_id}", response_model=ReportHistoryResponse)
-async def get_report_history_detail(report_id: str):
+async def get_report_history_detail(
+    report_id: str,
+    current_user: dict = Depends(get_current_user_from_token),
+):
     """Get detailed information about a specific report"""
+    org_id = _require_org_id(current_user)
     async with async_session_factory() as session:
-        result = await session.execute(select(ReportHistory).where(ReportHistory.id == report_id))
+        result = await session.execute(
+            select(ReportHistory).where(
+                ReportHistory.id == report_id,
+                ReportHistory.org_id == org_id,
+            )
+        )
         report = result.scalar_one_or_none()
-        
+
         if not report:
             raise HTTPException(status_code=404, detail="Report not found")
 

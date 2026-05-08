@@ -71,6 +71,30 @@ def _power_bi_code_redeem_scopes() -> str:
     return " ".join(dict.fromkeys(PowerBIClient.POWER_BI_DELEGATED_SCOPE.split()))
 
 
+async def _load_token_claims_from_db(db: AsyncSession, user_id: UUID) -> Optional[dict]:
+    # Single source of truth for the claims we stamp into access/refresh tokens.
+    # /refresh and /me both go through this so role grants/revokes and tenant
+    # reassignments take effect on the next refresh instead of being frozen
+    # into the user's original login token for its full lifetime.
+    user = (
+        await db.execute(select(PlatformUser).where(PlatformUser.id == user_id))
+    ).scalar_one_or_none()
+    if user is None:
+        return None
+    roles = (
+        await db.execute(
+            select(UserRoleMapping).where(UserRoleMapping.user_id == user.id)
+        )
+    ).scalars().all()
+    return {
+        "sub": str(user.id),
+        "email": user.email,
+        "roles": [r.role.value for r in roles],
+        "orgId": str(user.org_id) if user.org_id else None,
+        "tenantIds": [str(user.tenant_id)] if user.tenant_id else [],
+    }
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "auth"}
@@ -290,19 +314,12 @@ async def oauth_callback(callback: OAuthCallbackRequest, response: Response, db:
     user.last_login_at = now
     user.updated_at = now
     await db.flush()
-    
-    roles_stmt = select(UserRoleMapping).where(UserRoleMapping.user_id == user.id)
-    roles_result = await db.execute(roles_stmt)
-    user_roles = [r.role.value for r in roles_result.scalars().all()]
-    
-    token_data = {
-        "sub": str(user.id),
-        "email": user.email,
-        "roles": user_roles,
-        "orgId": str(user.org_id) if user.org_id else None,
-        "tenantIds": [str(user.tenant_id)] if user.tenant_id else [],
-    }
-    
+
+    token_data = await _load_token_claims_from_db(db, user.id)
+    if token_data is None:
+        raise HTTPException(status_code=500, detail="Failed to load user claims after login")
+    user_roles = token_data["roles"]
+
     access_token = create_access_token(token_data)
     refresh_token = create_refresh_token(token_data)
     expires_in = settings.JWT_EXPIRATION_HOURS * 3600
@@ -1125,6 +1142,7 @@ async def refresh_token(
     response: Response,
     http_request: Request,
     request: Optional[RefreshTokenRequest] = None,
+    db: AsyncSession = Depends(get_db),
 ):
     # Cookie-first: the SPA no longer holds the refresh token in JS, so the
     # request body is empty. Fall back to the body for non-browser callers.
@@ -1142,13 +1160,21 @@ async def refresh_token(
     if old_jti and await is_refresh_token_revoked(old_jti):
         raise HTTPException(status_code=401, detail="Refresh token revoked")
 
-    token_data = {
-        "sub": payload.get("sub"),
-        "email": payload.get("email"),
-        "roles": payload.get("roles", []),
-        "orgId": payload.get("orgId"),
-        "tenantIds": payload.get("tenantIds", []),
-    }
+    # Re-read claims from the DB rather than echoing the previous payload — an
+    # admin role grant/revoke or tenant reassignment between login and refresh
+    # would otherwise stay frozen into the user's session for the refresh
+    # token's full lifetime.
+    sub = payload.get("sub")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Refresh token missing subject")
+    try:
+        user_uuid = UUID(sub)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Refresh token has invalid subject")
+    token_data = await _load_token_claims_from_db(db, user_uuid)
+    if token_data is None:
+        raise HTTPException(status_code=401, detail="User no longer exists")
+
     access_token = create_access_token(token_data)
     new_refresh_token = create_refresh_token(token_data)
     expires_in = settings.JWT_EXPIRATION_HOURS * 3600
@@ -1205,15 +1231,23 @@ async def get_me(
     stmt = select(PlatformUser).where(PlatformUser.id == UUID(user["id"]))
     result = await db.execute(stmt)
     platform_user = result.scalar_one_or_none()
-    
+
     if not platform_user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
+    # Don't echo `user["roles"]` from the JWT — those are frozen at login time
+    # and stay stale until refresh. The UI calls /me to learn the current
+    # permission set, so it must come from UserRoleMapping.
+    roles_result = await db.execute(
+        select(UserRoleMapping).where(UserRoleMapping.user_id == platform_user.id)
+    )
+    fresh_roles = [r.role.value for r in roles_result.scalars().all()]
+
     return UserResponse(
         id=str(platform_user.id),
         email=platform_user.email,
         name=platform_user.name,
-        roles=user["roles"],
+        roles=fresh_roles,
         organizationId=str(platform_user.org_id) if platform_user.org_id else "",
         tenantId=str(platform_user.tenant_id) if platform_user.tenant_id else None,
     )
