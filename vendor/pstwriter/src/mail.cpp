@@ -1501,6 +1501,20 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
 
             // Build mail PC
             MailPcResult pc = buildMailPc(m, ctx);
+            // Each PC build consumes ctx.subnodeStart and the next
+            // (subnodes.size() - 1) consecutive NIDs, stride 0x20 (one
+            // NID-index step — buildPropertyContext advances `nextNid`
+            // by `1 << 5`). The caller MUST bump ctx.subnodeStart past
+            // those consumed NIDs before the next builder uses ctx,
+            // otherwise sibling PCs (each attachment) collide on the
+            // same starting NID and Outlook errors with "messaging
+            // interfaces returned an unknown error" when walking the
+            // subnode tree (duplicate SLENTRY NIDs are illegal per
+            // [MS-PST] §2.2.2.8.3.3.1.1).
+            if (!pc.subnodes.empty()) {
+                ctx.subnodeStart = Nid{ctx.subnodeStart.value
+                    + static_cast<uint32_t>(pc.subnodes.size()) * (uint32_t{1} << 5)};
+            }
 
             // Build SLBLOCK entries from PC's subnodes (large body etc.)
             vector<SlEntry> slEntries;
@@ -1575,6 +1589,17 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
                     for (auto& s : attPc.subnodes) {
                         const Bid sBid = schedulePayload(std::move(s.bytes));
                         slEntries.emplace_back(s.nid, sBid, Bid{0u});
+                    }
+                    // Bump ctx.subnodeStart past this attachment's NIDs
+                    // before the next attachment reuses the same ctx.
+                    // Without this, every attachment's contentBytes
+                    // subnode would re-allocate at the same starting NID
+                    // and the SLBLOCK ends up with duplicate-NID
+                    // SLENTRYs — the source of "messaging interfaces
+                    // returned an unknown error" on Outlook open.
+                    if (!attPc.subnodes.empty()) {
+                        ctx.subnodeStart = Nid{ctx.subnodeStart.value
+                            + static_cast<uint32_t>(attPc.subnodes.size()) * (uint32_t{1} << 5)};
                     }
                 }
             }

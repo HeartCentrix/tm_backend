@@ -577,14 +577,89 @@ WriteResult writeM5Pst(const string&                  path,
     // and is filled with zero bytes by the file-write path below;
     // those bytes are HEADER region per [MS-PST] §2.6.1.1 (M11-G) and
     // are not tracked by AMap[0]'s bitmap.
+    //
+    // Multi-AMap: each AMap[N] covers kAMapCoverage = 253952 bytes and
+    // sits at the fixed file offset kIbAMap + N * kAMapCoverage. AMap[0]
+    // is always emitted at 0x4400 by the file-write step below; AMap[1+]
+    // get inserted INTO the block region whenever a placement would cross
+    // the next slot boundary. Outlook validates that each AMap slot
+    // contains a real AMap PAGETRAILER (ptype=0x84), so when our content
+    // grows past 0x42400 we MUST place AMap[1] there — anything else
+    // surfaces as "Outlook Data File Corruption / PCGetPage past EOF".
+    //
+    // We track AMap[0] (always present) and any inserted AMap[N>=1] in
+    // `amapIbs`. The placement helper consults `amapIbs.size()` to know
+    // which slot index to test next; callers append the just-decided slot
+    // before bumping the cursor past it.
+    vector<uint64_t> amapIbs;
+    amapIbs.push_back(kIbAMap);  // AMap[0] at 0x4400 always present
+
     uint64_t cursor = kBlocksStart;
+
+    auto place = [&](size_t size, size_t align) -> uint64_t {
+        // Snap cursor up to the requested alignment first.
+        cursor = alignUp(cursor, align);
+
+        // Ensure the [cursor, cursor+size) range does not overlap any
+        // upcoming AMap slot. AMap[N] is at (kIbAMap + N*kAMapCoverage)
+        // for the next index N = amapIbs.size(). If the slot intersects
+        // our placement, record AMap[N] and bump cursor to slotEnd. Loop
+        // because a single placement could span multiple slabs (huge
+        // single block — kMaxBlockPayload = 8176 won't, but we stay
+        // general-purpose).
+        while (true) {
+            const size_t   N         = amapIbs.size();
+            const uint64_t slotStart = kIbAMap + static_cast<uint64_t>(N) * kAMapCoverage;
+            const uint64_t slotEnd   = slotStart + kPageSize;
+
+            if (slotStart >= cursor + static_cast<uint64_t>(size)) break;  // slot is past us
+            // Slot intersects [cursor, cursor+size). Insert AMap[N].
+            amapIbs.push_back(slotStart);
+            cursor = slotEnd;
+            cursor = alignUp(cursor, align);
+            // Loop to test the *next* slot — covers degenerate cases
+            // where alignment + AMap pages combined push us further.
+        }
+
+        const uint64_t placed = cursor;
+        cursor += size;
+        return placed;
+    };
+
     vector<uint64_t> blockIbs;
     blockIbs.reserve(blocks.size());
     for (const auto& b : blocks) {
-        blockIbs.push_back(cursor);
-        cursor += b.encodedBlock.size();
+        // Blocks come pre-sized to a multiple of 64 (kBlockOnDiskAlign);
+        // align=64 keeps the cursor on that grid even after AMap bumps.
+        blockIbs.push_back(place(b.encodedBlock.size(), 64));
     }
     cursor = alignUp(cursor, kPageSize);
+
+    // Caller-provided encoded blocks bake `wSig = (ib ^ bid)`-derived bytes
+    // into the BLOCKTRAILER (offset = encodedBlock.size() - kBlockTrailerSize
+    // + 2). Mail.cpp's writeM7Pst pre-encodes these against a *linear*
+    // 0x4800-onwards layout that does NOT account for AMap[1+] insertions;
+    // multi-AMap layout shifts blocks past those slots and invalidates
+    // every shifted block's wSig. Outlook surfaces the mismatch as
+    // "BCRead(@<ib>): Expected … wSig=… but read … wSig=…" on first open.
+    //
+    // The block payload is encrypted by CryptPermute (a fixed byte
+    // permutation, independent of ib) and the BID/CRC fields are also
+    // ib-independent, so we only need to patch wSig in the trailer to
+    // match the new ib. Mutate a local copy so the caller's
+    // M5DataBlockSpec.encodedBlock is not aliased.
+    vector<vector<uint8_t>> blockBytes;
+    blockBytes.reserve(blocks.size());
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        blockBytes.emplace_back(blocks[i].encodedBlock);
+        const size_t total = blockBytes[i].size();
+        if (total < kBlockTrailerSize) continue;  // malformed; let writer fail later
+        const uint16_t newSig = computeBlockSig(blocks[i].bid, Ib{blockIbs[i]});
+        // wSig is at offset 2 of the trailer; trailer starts at end-16.
+        const size_t sigOff = total - kBlockTrailerSize + 2;
+        blockBytes[i][sigOff]     = static_cast<uint8_t>(newSig & 0xFFu);
+        blockBytes[i][sigOff + 1] = static_cast<uint8_t>((newSig >> 8) & 0xFFu);
+    }
 
     // BBT plumbing
     const size_t nBbtLeaves =
@@ -594,12 +669,12 @@ WriteResult writeM5Pst(const string&                  path,
     vector<uint64_t> bbtLeafIbs;
     bbtLeafIbs.reserve(nBbtLeaves);
     for (size_t i = 0; i < nBbtLeaves; ++i) {
-        bbtLeafIbs.push_back(cursor);
-        cursor += kPageSize;
+        bbtLeafIbs.push_back(place(kPageSize, kPageSize));
     }
-    const bool   hasBbtIntermediate = (nBbtLeaves > 1);
-    const uint64_t bbtRootIb        = hasBbtIntermediate ? cursor : bbtLeafIbs.front();
-    if (hasBbtIntermediate) cursor += kPageSize;
+    const bool     hasBbtIntermediate = (nBbtLeaves > 1);
+    const uint64_t bbtRootIb          = hasBbtIntermediate
+                                            ? place(kPageSize, kPageSize)
+                                            : bbtLeafIbs.front();
 
     // NBT plumbing
     const size_t nNbtLeaves =
@@ -609,12 +684,12 @@ WriteResult writeM5Pst(const string&                  path,
     vector<uint64_t> nbtLeafIbs;
     nbtLeafIbs.reserve(nNbtLeaves);
     for (size_t i = 0; i < nNbtLeaves; ++i) {
-        nbtLeafIbs.push_back(cursor);
-        cursor += kPageSize;
+        nbtLeafIbs.push_back(place(kPageSize, kPageSize));
     }
-    const bool   hasNbtIntermediate = (nNbtLeaves > 1);
-    const uint64_t nbtRootIb        = hasNbtIntermediate ? cursor : nbtLeafIbs.front();
-    if (hasNbtIntermediate) cursor += kPageSize;
+    const bool     hasNbtIntermediate = (nNbtLeaves > 1);
+    const uint64_t nbtRootIb          = hasNbtIntermediate
+                                            ? place(kPageSize, kPageSize)
+                                            : nbtLeafIbs.front();
 
     const uint64_t ibFileEof = cursor;
 
@@ -724,21 +799,35 @@ WriteResult writeM5Pst(const string&                  path,
     }
 
     // ---- 5. AMap + PMap + HEADER ----------------------------------------
-    // PAGETRAILER.bid set from ib by buildAMap (M11-E).
-    const auto amap   = buildAMap(Ib{kIbAMap}, ibFileEof);
+    // Build one AMap page per recorded slot. PAGETRAILER.bid is derived
+    // from the page's own ib by buildAMap (M11-E), so each AMap[N] is
+    // self-consistent; its bitmap covers [ibN, ibN + kAMapCoverage),
+    // marking bytes up to min(coverage, ibFileEof - ibN) as allocated.
+    vector<array<uint8_t, kPageSize>> amaps;
+    amaps.reserve(amapIbs.size());
+    uint64_t cbAMapFreeTotal = 0;
+    for (uint64_t ibN : amapIbs) {
+        amaps.push_back(buildAMap(Ib{ibN}, ibFileEof));
+        const uint64_t coverageEnd  = ibN + kAMapCoverage;
+        const uint64_t allocatedEnd = ibFileEof < coverageEnd ? ibFileEof : coverageEnd;
+        const uint64_t allocatedB   = allocatedEnd > ibN ? (allocatedEnd - ibN) : 0;
+        const uint64_t freeBytes    = (kAMapCoverage > allocatedB)
+                                          ? (kAMapCoverage - allocatedB) : 0;
+        cbAMapFreeTotal += freeBytes;
+    }
     // PMap[0] at 0x4600 — [MS-PST] §2.6 mandated (Round-A), body all-0xFF.
     const auto pmap   = buildEmptyPMap(kIbPMap);
-    // DLISTPAGE at 0x4200 — required by scanpst (M11-N). See the
-    // buildDListPage commentary in page.cpp.
-    const auto dlist  = buildDListPage(kIbDList, kIbAMap, ibFileEof);
+    // DLISTPAGE at 0x4200 — one rgEntDList[] entry per AMap, so scanpst's
+    // free-space lookup can find every AMap, not just AMap[0].
+    const auto dlist  = buildDListPageMulti(kIbDList, amapIbs, ibFileEof);
 
     WriterState state{};
     state.dwUnique         = 1u;
     state.bidNextP         = nextPageBid;
     state.bidNextB         = Bid::makeData(blocks.size() + 1ull);
     state.root.ibFileEof   = Ib{ibFileEof};
-    state.root.ibAMapLast  = Ib{kIbAMap};
-    state.root.cbAMapFree  = cbAMapFreeFor(ibFileEof);
+    state.root.ibAMapLast  = Ib{amapIbs.back()};
+    state.root.cbAMapFree  = cbAMapFreeTotal;
     state.root.cbPMapFree  = 0ull;
     state.root.fAMapValid  = kAMapValid2;
     state.root.brefNbt     = Bref{nbtRootBid, Ib{nbtRootIb}};
@@ -793,30 +882,47 @@ WriteResult writeM5Pst(const string&                  path,
         writtenIb += n;
     };
 
+    // Helper: pad up to `targetIb`, emitting AMap[N>=1] pages whenever a
+    // padded region crosses one of their fixed slots. AMap[0] is written
+    // explicitly below at 0x4400; this only handles AMap[1..N-1].
+    size_t nextExtraAMap = 1;  // next index into amapIbs to consider
+    auto padToWithAMaps = [&](uint64_t targetIb) {
+        while (nextExtraAMap < amapIbs.size()
+               && amapIbs[nextExtraAMap] < targetIb)
+        {
+            const uint64_t ibN = amapIbs[nextExtraAMap];
+            padTo(ibN);
+            emit(amaps[nextExtraAMap].data(), amaps[nextExtraAMap].size());
+            ++nextExtraAMap;
+        }
+        padTo(targetIb);
+    };
+
     emit(header.data(), header.size());
     padTo(kIbDList);
     emit(dlist.data(), dlist.size());
-    emit(amap.data(), amap.size());
+    emit(amaps[0].data(), amaps[0].size());          // AMap[0] @ 0x4400
     emit(pmap.data(), pmap.size());
     padTo(kBlocksStart);
-    for (const auto& b : blocks) {
-        emit(b.encodedBlock.data(), b.encodedBlock.size());
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        padToWithAMaps(blockIbs[i]);
+        emit(blockBytes[i].data(), blockBytes[i].size());
     }
     // BBT leaves
     for (size_t i = 0; i < nBbtLeaves; ++i) {
         if (!hasBbtIntermediate) break; // single-leaf case writes via root below
-        padTo(bbtLeafIbs[i]);
+        padToWithAMaps(bbtLeafIbs[i]);
         emit(bbtLeafPages[i].data(), bbtLeafPages[i].size());
     }
-    padTo(bbtRootIb);
+    padToWithAMaps(bbtRootIb);
     emit(bbtRootPage.data(), bbtRootPage.size());
     // NBT leaves
     for (size_t i = 0; i < nNbtLeaves; ++i) {
         if (!hasNbtIntermediate) break;
-        padTo(nbtLeafIbs[i]);
+        padToWithAMaps(nbtLeafIbs[i]);
         emit(nbtLeafPages[i].data(), nbtLeafPages[i].size());
     }
-    padTo(nbtRootIb);
+    padToWithAMaps(nbtRootIb);
     emit(nbtRootPage.data(), nbtRootPage.size());
 
     if (std::fclose(fp) != 0) return fail("fclose failed");

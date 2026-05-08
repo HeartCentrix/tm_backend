@@ -17,6 +17,7 @@
 
 #include <array>
 #include <cstdint>
+#include <vector>
 
 using namespace std;
 
@@ -55,6 +56,17 @@ array<uint8_t, kPageSize> buildEmptyPMap(uint64_t ibPMap) noexcept;
 array<uint8_t, kPageSize> buildDListPage(uint64_t ibDList,
                                          uint64_t ibAMap,
                                          uint64_t fileEof) noexcept;
+
+// ============================================================================
+// buildDListPageMulti — multi-AMap variant of buildDListPage. Emits one
+// DLISTPAGEENT per AMap whose ib is in `amapIbs` (ordered, AMap[0] first).
+// Each AMap[N] sits at file offset `kIbAMap + N * kAMapCoverage`; this
+// helper computes its dwPageNum from that fixed slot index and its
+// dwFreeSlots from min(coverage, fileEof - ibAMapN).
+// ============================================================================
+array<uint8_t, kPageSize> buildDListPageMulti(uint64_t                       ibDList,
+                                              const std::vector<uint64_t>&   amapIbs,
+                                              uint64_t                       fileEof) noexcept;
 
 // Empty NBT / BBT leaf pages (cEnt = 0, cLevel = 0).  cbEnt is fixed by
 // the page type per [MS-PST] §2.2.2.7.7.1: 32 for an NBT leaf, 24 for a

@@ -4,9 +4,10 @@ attachments) → pstwriter ``pst_convert mail``.
 Per-item flow:
 1. ``mail_fetch.fetch_message`` — load the Graph message JSON (inline or
    from blob storage).
-2. ``mail_fetch.gather_attachments`` — build streaming refs for each
-   attachment blob.
-3. Drain each attachment ref into bytes, base64-encode, and inject as a
+2. Read sibling ``EMAIL_ATTACHMENT`` SnapshotItems off
+   ``item._email_attachment_items`` (stamped by ``PstExportOrchestrator``
+   from a pre-fetched index keyed by ``parent_item_id``).
+3. Download each attachment blob, base64-encode, and inject as a
    ``#microsoft.graph.fileAttachment`` entry on the message JSON. The
    pstwriter library reads ``contentBytes`` directly out of these
    entries, so no EML round-trip is needed.
@@ -34,15 +35,6 @@ from .base import PstWriterBase, MAX_ATTACHMENT_BYTES  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
-async def _drain(ref) -> bytes:
-    """Drain an ``AttachmentRef``'s async stream into a single bytes blob."""
-    chunks: list[bytes] = []
-    async for chunk in ref.data_stream:
-        if chunk:
-            chunks.append(chunk)
-    return b"".join(chunks)
-
-
 class MailPstWriter(PstWriterBase):
     item_type = "EMAIL"
     cli_kind = "mail"
@@ -54,7 +46,7 @@ class MailPstWriter(PstWriterBase):
     async def _collect_graph_item(self, item, shard, source_container: str):
         """Return the Graph message JSON for this item with attachment
         bytes inlined as base64. ``None`` when the body cannot be located."""
-        from mail_fetch import fetch_message, gather_attachments
+        from mail_fetch import fetch_message
 
         msg_json = await fetch_message(item, shard, source_container)
         if msg_json is None:
@@ -69,53 +61,79 @@ class MailPstWriter(PstWriterBase):
         # caller-visible state by appending attachments to it.
         msg_json = dict(msg_json)
 
-        att_paths = getattr(item, "attachment_blob_paths", []) or []
-        if att_paths:
-            try:
-                refs = await gather_attachments(
-                    att_paths, shard, source_container,
-                    include_attachments=True,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "gather_attachments failed for %s (continuing without): %s",
-                    getattr(item, "external_id", "?"), exc,
-                )
-                refs = []
-
+        # Sibling EMAIL_ATTACHMENT items are pre-fetched by the orchestrator
+        # and stamped on each EMAIL item as ``_email_attachment_items``. They
+        # carry ``blob_path`` (bytes location), ``name``, and an extra_data
+        # dict with ``attachment_kind``, ``content_type``, ``is_inline``,
+        # ``content_id``. We download the bytes lazily here so a chunk's
+        # peak memory is one attachment payload, not the whole mailbox.
+        email_atts = getattr(item, "_email_attachment_items", None) or []
+        print(
+            f"[mail.collect] ext_id={getattr(item, 'external_id', '?')[:40]}... "
+            f"email_atts={len(email_atts)}",
+            flush=True,
+        )
+        if email_atts:
             inline_atts: list[dict] = []
-            for ref in refs:
-                try:
-                    data = await _drain(ref)
-                except Exception as exc:
-                    logger.warning(
-                        "attachment drain failed for %s/%s: %s",
-                        getattr(item, "external_id", "?"),
-                        getattr(ref, "name", "?"), exc,
-                    )
+            for att in email_atts:
+                blob_path = getattr(att, "blob_path", None)
+                _att_name = getattr(att, "name", "?")
+                if not blob_path:
+                    print(f"[mail.collect] DROP no_blob_path att={_att_name}", flush=True)
                     continue
+                ed = (getattr(att, "extra_data", None) or {})
+                kind = (ed.get("attachment_kind") or "").lower()
+                # itemAttachment / referenceAttachment can't roundtrip via
+                # contentBytes — pstwriter's mail CLI only consumes
+                # fileAttachment. The live-restore path handles them via
+                # Graph POST; for PST export they're skipped (matches the
+                # legacy MBOX/EML behaviour).
+                if kind and "fileattachment" not in kind:
+                    print(f"[mail.collect] DROP non_file_kind={kind} att={_att_name}", flush=True)
+                    continue
+                # Route by the attachment's own backend_id rather than the
+                # orchestrator-passed `shard`. The orchestrator passes the
+                # currently-active default shard, but a snapshot taken on
+                # SeaweedFS (then later toggled to Azure, or vice versa)
+                # still has its bytes on the original backend; the
+                # SnapshotItem.backend_id column is the source of truth.
+                # azure_storage_manager.get_shard_for_item resolves to the
+                # correct backend's shard via shared.storage.router.
+                from shared.azure_storage import azure_storage_manager
+                att_shard = azure_storage_manager.get_shard_for_item(att)
+                print(f"[mail.collect] att={_att_name} backend_id={getattr(att,'backend_id','?')} shard={type(att_shard).__name__} container={source_container} path_len={len(blob_path)}", flush=True)
+                try:
+                    data = await att_shard.download_blob(source_container, blob_path)
+                except Exception as exc:
+                    print(f"[mail.collect] DOWNLOAD_EXC att={_att_name}: {type(exc).__name__}: {exc}", flush=True)
+                    continue
+                print(f"[mail.collect] att={_att_name} download_returned={'None' if data is None else f'{len(data)} bytes'}", flush=True)
                 if not data:
                     continue
                 if len(data) > MAX_ATTACHMENT_BYTES:
-                    # gather_attachments already replaces oversize blobs
-                    # with text placeholders before we get here, but a
-                    # belt-and-braces guard keeps a misconfigured shard
-                    # from blowing the JSON payload up.
-                    logger.warning(
-                        "skipping oversize attachment %s (%d bytes > %d cap)",
-                        getattr(ref, "name", "?"), len(data),
-                        MAX_ATTACHMENT_BYTES,
-                    )
+                    print(f"[mail.collect] DROP oversize att={_att_name} bytes={len(data)} cap={MAX_ATTACHMENT_BYTES}", flush=True)
                     continue
-                inline_atts.append({
+                att_dict = {
                     "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": getattr(ref, "name", "attachment"),
-                    "contentType": getattr(ref, "content_type", None)
+                    "name": getattr(att, "name", None) or "attachment",
+                    "contentType": ed.get("content_type")
                                    or "application/octet-stream",
                     "contentBytes": base64.b64encode(data).decode("ascii"),
                     "size": len(data),
-                })
+                    "isInline": bool(ed.get("is_inline")),
+                }
+                # Preserve original Content-ID so inline images in the
+                # restored HTML body still resolve via cid:xxx references.
+                cid = ed.get("content_id") or ed.get("contentId")
+                if cid:
+                    att_dict["contentId"] = str(cid).strip("<>")
+                inline_atts.append(att_dict)
 
+            print(
+                f"[mail.collect] inline_atts_built={len(inline_atts)} "
+                f"for ext_id={getattr(item, 'external_id', '?')[:40]}...",
+                flush=True,
+            )
             if inline_atts:
                 # Replace any metadata-only attachments array on the source
                 # JSON with our resolved-bytes list. Graph delivers
