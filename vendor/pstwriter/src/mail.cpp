@@ -1576,27 +1576,67 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
             }
             if (!m.attachments.empty()) {
 
-                // Per-attachment PC + (optionally) data subnode.
+                // Per-attachment PC + (optionally) nested SLBLOCK for data subnodes.
+                //
+                // Per [MS-PST] §2.4.6.1.4, an Attachment object's binary
+                // payload (PidTagAttachDataBinary, promoted to a subnode
+                // when it overflows the 8176-byte HN cap) MUST live in
+                // the attachment's OWN sub-SLBLOCK — referenced via the
+                // attachment SLENTRY's bidSub field — not in the parent
+                // message's SLBLOCK alongside the attachment PC.
+                //
+                // Earlier rounds parked the attachment data subnode flat
+                // in the parent SLBLOCK with a Bid{0} bidSub on the
+                // attachment SLENTRY. Outlook walked the message subnode
+                // tree, found the attachment PC, looked up its
+                // PtagAttachDataBinary subnode reference inside the
+                // attachment's (empty) bidSub, found nothing, and bailed
+                // with "messaging interfaces returned an unknown error".
+                // Single-attachment messages happened to work only when
+                // the binary fit inline (≤8176 bytes); two-attachment
+                // and large-attachment messages always failed. Round57's
+                // working PST simply had no data subnodes at all.
                 for (size_t i = 0; i < m.attachments.size(); ++i) {
                     auto attPc = buildAttachmentPc(m.attachments[i], ctx);
                     const Bid attPcBid = scheduleDataBlock(std::move(attPc.hnBytes));
-                    slEntries.emplace_back(attNids[i], attPcBid, Bid{0u});
 
-                    // Attachment PC subnodes (large data) — schedule each
-                    // through schedulePayload so multi-MB attachment
-                    // contentBytes are chained via XBLOCK/XXBLOCK rather
-                    // than truncated at the 8176-byte single-block cap.
-                    for (auto& s : attPc.subnodes) {
-                        const Bid sBid = schedulePayload(std::move(s.bytes));
-                        slEntries.emplace_back(s.nid, sBid, Bid{0u});
+                    // Build per-attachment nested SLBLOCK if attPc
+                    // produced data subnodes (PdfAttach.contentBytes
+                    // promoted via XBLOCK chain for the 246kB Payslip
+                    // and 254kB TDS attachments in the test corpus).
+                    Bid attBidSub{0u};
+                    if (!attPc.subnodes.empty()) {
+                        vector<SlEntry> attSubEntries;
+                        attSubEntries.reserve(attPc.subnodes.size());
+                        for (auto& s : attPc.subnodes) {
+                            const Bid sBid = schedulePayload(std::move(s.bytes));
+                            attSubEntries.emplace_back(s.nid, sBid, Bid{0u});
+                        }
+                        // SLENTRY array sorted ascending by NID per
+                        // [MS-PST] §2.2.2.8.3.3.1.
+                        std::sort(attSubEntries.begin(), attSubEntries.end(),
+                                  [](const SlEntry& a, const SlEntry& b) {
+                                      return a.nid.value < b.nid.value;
+                                  });
+                        M7SlBlock attSlb;
+                        attSlb.bid     = allocInternalBid();
+                        attSlb.entries = std::move(attSubEntries);
+                        attBidSub      = attSlb.bid;
+                        slBlocks.push_back(std::move(attSlb));
                     }
+
+                    // Attachment PC SLENTRY in the parent SLBLOCK now
+                    // carries bidSub pointing to its own SLBLOCK so the
+                    // PtagAttachDataBinary lookup resolves correctly.
+                    slEntries.emplace_back(attNids[i], attPcBid, attBidSub);
+
                     // Bump ctx.subnodeStart past this attachment's NIDs
                     // before the next attachment reuses the same ctx.
                     // Without this, every attachment's contentBytes
                     // subnode would re-allocate at the same starting NID
-                    // and the SLBLOCK ends up with duplicate-NID
-                    // SLENTRYs — the source of "messaging interfaces
-                    // returned an unknown error" on Outlook open.
+                    // — duplicate SLENTRY NIDs are illegal per [MS-PST]
+                    // §2.2.2.8.3.3.1.1 and historically produced the
+                    // same "messaging interfaces" error before this fix.
                     if (!attPc.subnodes.empty()) {
                         ctx.subnodeStart = Nid{ctx.subnodeStart.value
                             + static_cast<uint32_t>(attPc.subnodes.size()) * (uint32_t{1} << 5)};

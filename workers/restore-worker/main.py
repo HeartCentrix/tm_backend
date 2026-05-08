@@ -1711,10 +1711,30 @@ class RestoreWorker:
                     flush=True,
                 )
 
-        source_container = (
-            azure_storage_manager.get_container_name(tenant_id, "email")
-            if tenant_id else "mailbox"
-        )
+        # Candidate containers for mail-bearing exports. Mail bytes have
+        # shipped under several workload prefixes over time:
+        #   - "email"          — Tier-2 USER_MAIL backups + standalone
+        #                        backup_mailbox after the 2026-05-08
+        #                        container alignment.
+        #   - "mailbox"        — legacy MAILBOX bulk path before alignment.
+        #   - "group-mailbox"  — group mailboxes materialised under
+        #                        ENTRA_GROUP / DYNAMIC_GROUP backups.
+        # Cross-snapshot dedup can leave a USER_MAIL row with a blob_path
+        # whose bytes only exist in the legacy "mailbox" container. The
+        # PST exporter must therefore try each candidate in order rather
+        # than hard-coding "email". The list propagates as `source_container`
+        # straight through the orchestrator → writer → download helpers,
+        # which now accept a sequence as well as a single string.
+        if tenant_id:
+            source_container_candidates = tuple(
+                azure_storage_manager.get_container_name(tenant_id, w)
+                for w in ("email", "mailbox", "group-mailbox")
+            )
+        else:
+            source_container_candidates = ("mailbox",)
+        # Pass the tuple as `source_container`. Existing `: str` annotations
+        # are untyped at runtime; the helpers normalise via _normalize_containers.
+        source_container = source_container_candidates
         dest_container = (
             azure_storage_manager.get_container_name(tenant_id, "exports")
             if tenant_id else "exports"

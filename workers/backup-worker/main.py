@@ -213,7 +213,7 @@ async def _update_job_pct(job_id, pct: int) -> None:
 import aio_pika
 from aio_pika import IncomingMessage
 import httpx
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -665,6 +665,18 @@ class BackupWorker:
         "POWER_APPS": "_backup_metadata_only", "POWER_AUTOMATE": "_backup_metadata_only",
         "POWER_DLP": "_backup_metadata_only",
         "RESOURCE_GROUP": "_backup_metadata_only", "DYNAMIC_GROUP": "_backup_metadata_only",
+        # Tier-2 per-user content. The real implementation lives in
+        # _backup_user_content_parallel (line ~1052) which the mass-backup
+        # path exercises via _backup_resource_group. Single-resource
+        # triggers used to fall through to _backup_metadata_only and
+        # write 1 stub row per resource; _backup_user_content_single is a
+        # thin wrapper that runs the parallel handler against [resource]
+        # so /trigger-user/<USER_MAIL_id> actually pulls mail+attachments.
+        "USER_MAIL": "_backup_user_content_single",
+        "USER_ONEDRIVE": "_backup_user_content_single",
+        "USER_CONTACTS": "_backup_user_content_single",
+        "USER_CALENDAR": "_backup_user_content_single",
+        "USER_CHATS": "_backup_user_content_single",
     }
 
     async def _process_single_backup(self, job_id: uuid.UUID, message: Dict, resource_id: str):
@@ -1248,14 +1260,20 @@ class BackupWorker:
                                 f"{type(e).__name__}: {e} "
                                 f"(kept {len(local_out)})"
                             )
-                        if delta_out:
-                            mail_new_tokens[fid or "__all__"] = delta_out
-
                         # Streaming persist — if snapshot is in scope,
                         # bulk-insert THIS folder's msgs now. Gather
                         # raw dicts off the tuples we just built, hand
                         # them to _stream_persist_folder_items, then
                         # bump the snapshot row's live counters.
+                        #
+                        # NOTE: delta-token persistence is gated on the
+                        # streaming commit succeeding. Advancing the
+                        # delta-link before rows commit means a subsequent
+                        # run starts from "no changes" even though the
+                        # rows are missing — that's how mailboxes get
+                        # stuck at 0 items after a transient write
+                        # failure (Task #20).
+                        persist_ok = not (_mail_streaming_enabled and local_out)
                         if _mail_streaming_enabled and local_out:
                             folder_path_val = (
                                 folder_tree.get(fid) if fid else ""
@@ -1273,6 +1291,7 @@ class BackupWorker:
                                 nonlocal _mail_persisted_total, _mail_persisted_bytes
                                 _mail_persisted_total += n
                                 _mail_persisted_bytes += b
+                                persist_ok = True
                                 try:
                                     async with async_session_factory() as _s2:
                                         snap = await _s2.get(
@@ -1311,6 +1330,19 @@ class BackupWorker:
                                     f"{type(persist_err).__name__}: "
                                     f"{persist_err}"
                                 )
+
+                        # Only stash the delta token after rows committed.
+                        # If persist_err fired above, leave the existing
+                        # token in place so the next run re-pulls this
+                        # folder's pages instead of skipping them.
+                        if delta_out and persist_ok:
+                            mail_new_tokens[fid or "__all__"] = delta_out
+                        elif delta_out and not persist_ok:
+                            print(
+                                f"[{self.worker_id}] [USER_MAIL] folder "
+                                f"{fid[:8] if fid else '__all__'} "
+                                f"holding delta token — persistence failed"
+                            )
 
                         mail_progress["folders_done"] += 1
                         mail_progress["msgs"] += len(local_out)
@@ -2497,7 +2529,20 @@ class BackupWorker:
                                 f"without att items."
                             )
 
-                total_items = len(items_data) + len(att_items) + total_hosted_items
+                # Count from the DB rather than `len(items_data)` because the
+                # USER_MAIL streaming-persist path filters items_data down to
+                # attachment-candidates (so the generic persist step doesn't
+                # re-hash 10k bodies) — that filter would otherwise mask the
+                # real EMAIL row count and the UI would show "37 items" for a
+                # 950-row snapshot.
+                async with async_session_factory() as _count_sess:
+                    persisted_count = (await _count_sess.execute(
+                        select(func.count(SnapshotItem.id)).where(
+                            SnapshotItem.snapshot_id == snapshot.id,
+                        )
+                    )).scalar() or 0
+                fallback_total = len(items_data) + len(att_items) + total_hosted_items
+                total_items = max(persisted_count, fallback_total)
                 bytes_total += att_bytes
 
                 async with async_session_factory() as session:
@@ -4613,6 +4658,12 @@ class BackupWorker:
                     mbx_sem = asyncio.Semaphore(max(1, mbx_fanout))
                     persist_lock = asyncio.Lock()
                     totals = {"items": 0, "bytes": 0, "folders_done": 0}
+                    # Accumulate messages flagged hasAttachments so the
+                    # post-drain pass can list+download attachment binaries
+                    # as separate EMAIL_ATTACHMENT SnapshotItem rows. Without
+                    # this, restored .pst files have empty attachment stubs
+                    # because the exporter has nothing to inline.
+                    att_msgs_global: List[Dict[str, Any]] = []
                     start = time.monotonic()
 
                     print(
@@ -4704,14 +4755,25 @@ class BackupWorker:
                                 f"{type(e).__name__}: {e} "
                                 f"(kept {len(folder_msgs)})"
                             )
-                        if delta_out:
-                            new_tokens[fid or "__all__"] = delta_out
+                        # NOTE: delta-token persistence is gated on
+                        # streaming commit success below (Task #20).
+                        # Advancing the deltaLink before rows commit
+                        # silently strands the folder at "no changes"
+                        # on subsequent runs — that's the failure mode
+                        # we saw in the Akshat Verma mailbox where 922
+                        # messages had been pulled but persistence
+                        # raced behind a token write.
+                        persist_ok = not folder_msgs
 
                         if folder_msgs:
+                            for _m in folder_msgs:
+                                if _m.get("hasAttachments"):
+                                    att_msgs_global.append(_m)
                             try:
                                 n, b = await _stream_persist(folder_msgs, folder_path)
                                 totals["items"] += n
                                 totals["bytes"] += b
+                                persist_ok = True
                                 try:
                                     async with async_session_factory() as _s2:
                                         snap = await _s2.get(Snapshot, snapshot.id)
@@ -4748,6 +4810,15 @@ class BackupWorker:
                                     f"{persist_err}"
                                 )
 
+                        if delta_out and persist_ok:
+                            new_tokens[fid or "__all__"] = delta_out
+                        elif delta_out and not persist_ok:
+                            print(
+                                f"[{self.worker_id}] [MAILBOX] folder "
+                                f"{fid[:8] if fid else '__all__'} "
+                                f"holding delta token — persistence failed"
+                            )
+
                         totals["folders_done"] += 1
                         if totals["folders_done"] % 5 == 0:
                             print(
@@ -4781,6 +4852,60 @@ class BackupWorker:
                         f"{len(folder_ids)} folders in {elapsed:.1f}s "
                         f"({rate:.1f} msg/s)"
                     )
+
+                    # Post-drain attachment capture. Mirrors the
+                    # standalone backup_mailbox handler — fileAttachment
+                    # binaries land in blob as EMAIL_ATTACHMENT rows
+                    # keyed by parent_item_id so the PST exporter can
+                    # rebuild #microsoft.graph.fileAttachment entries.
+                    if att_msgs_global:
+                        try:
+                            att_shard = azure_storage_manager.get_shard_for_resource(
+                                str(resource.id), str(tenant.id),
+                            )
+                            # Same container alignment as the standalone
+                            # backup_mailbox handler — write to "email" so
+                            # the PST exporter (which reads from
+                            # backup-email-<tenant>) finds the bytes.
+                            att_container = azure_storage_manager.get_container_name(
+                                str(tenant.id), "email",
+                            )
+                            att_count, att_bytes = await self._backup_message_attachments(
+                                graph_client, resource, snapshot, tenant,
+                                att_container, att_shard, att_msgs_global,
+                            )
+                            totals["items"] += att_count
+                            totals["bytes"] += att_bytes
+                            print(
+                                f"[{self.worker_id}] [MAILBOX] {user_label}: "
+                                f"captured {att_count} attachment(s) "
+                                f"from {len(att_msgs_global)} flagged message(s), "
+                                f"{att_bytes} bytes"
+                            )
+                            # Refresh live snapshot counters so the UI
+                            # reflects the EMAIL_ATTACHMENT rows that
+                            # _backup_message_attachments just inserted.
+                            try:
+                                async with async_session_factory() as _s3:
+                                    snap = await _s3.get(Snapshot, snapshot.id)
+                                    if snap is not None:
+                                        snap.item_count = totals["items"]
+                                        snap.new_item_count = totals["items"]
+                                        snap.bytes_total = totals["bytes"]
+                                        snap.bytes_added = totals["bytes"]
+                                        await _s3.commit()
+                            except Exception as bump_err:
+                                print(
+                                    f"[{self.worker_id}] [MAILBOX] "
+                                    f"post-attach counter bump failed: "
+                                    f"{bump_err}"
+                                )
+                        except Exception as att_err:
+                            print(
+                                f"[{self.worker_id}] [MAILBOX] {user_label}: "
+                                f"attachment capture failed: "
+                                f"{type(att_err).__name__}: {att_err}"
+                            )
 
                     # Persist per-folder delta tokens (merge, don't
                     # overwrite — failed folders keep their old tok).
@@ -6809,6 +6934,52 @@ class BackupWorker:
             "manual_actions": manual_actions,
         }, blob_bytes
 
+    async def _backup_user_content_single(self, graph_client: GraphClient, resource: Resource,
+                                           snapshot: Snapshot, tenant: Tenant, message: Dict) -> Dict:
+        """Single-resource entry point for the Tier-2 USER_* content types.
+
+        ``_backup_user_content_parallel`` is the real implementation but only
+        the mass-backup path (`_backup_resource_group`) called it; single-
+        resource triggers used to fall through to ``_backup_metadata_only``
+        and write a 1-row stub. This wrapper hands the parallel handler a
+        list of one resource so /trigger-user/<id> behaves the same as a
+        bulk run for a single user.
+
+        The parallel handler creates its own snapshot internally, so the
+        outer ``snapshot`` row created by ``_process_single_backup`` is
+        marked completed-stub here (item_count = real handler's result)
+        rather than left orphaned.
+        """
+        import uuid as _uuid
+        job_id_raw = (message or {}).get("jobId") or (message or {}).get("job_id")
+        try:
+            job_id = _uuid.UUID(str(job_id_raw)) if job_id_raw else _uuid.uuid4()
+        except Exception:
+            job_id = _uuid.uuid4()
+        result = await self._backup_user_content_parallel(
+            [resource], graph_client, tenant, message, job_id,
+        )
+        # Make the outer "ghost" snapshot reflect the parallel handler's
+        # totals so the UI doesn't show two rows (one with 0 items, one
+        # with the real count) for the same trigger.
+        try:
+            async with async_session_factory() as _s:
+                snap = await _s.get(Snapshot, snapshot.id)
+                if snap is not None:
+                    items = int(result.get("item_count", 0) or 0)
+                    bytes_total = int(result.get("bytes_added", 0) or 0)
+                    snap.item_count = items
+                    snap.new_item_count = items
+                    snap.bytes_total = bytes_total
+                    snap.bytes_added = bytes_total
+                    await _s.commit()
+        except Exception as _bump_err:
+            print(
+                f"[{self.worker_id}] [USER_CONTENT_SINGLE] outer snapshot "
+                f"counter bump failed: {_bump_err}",
+            )
+        return result
+
     async def _backup_metadata_only(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                                     tenant: Tenant, message: Dict) -> Dict:
         """Dispatcher for workloads routed through the 'metadata-only' entry point.
@@ -7916,7 +8087,14 @@ class BackupWorker:
         item_count = 0
         bytes_added = 0
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
-        container = azure_storage_manager.get_container_name(str(tenant.id), "mailbox")
+        # Write to the "email" workload container so the restore-side PST
+        # exporter (which resolves source_container via "email") can find
+        # both message bodies and attachment binaries from the same place.
+        # Earlier mailbox runs landed in "backup-mailbox-<tenant>"; the
+        # restore path hard-codes "backup-email-<tenant>", which produced
+        # silent attachment-download failures (download_returned=None)
+        # even though the bytes were uploaded successfully.
+        container = azure_storage_manager.get_container_name(str(tenant.id), "email")
 
         # Upload ALL messages in parallel, batch DB insert per 50-msg chunk
         batch_size = 50

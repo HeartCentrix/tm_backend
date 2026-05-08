@@ -934,9 +934,15 @@ azure_storage_manager = AzureStorageManager()
 # cover secondary containers the worker may also write into (e.g. group mailboxes
 # materialized while processing an ENTRA_GROUP).
 RESOURCE_TYPE_TO_WORKLOADS: Dict[str, Tuple[str, ...]] = {
-    "MAILBOX": ("mailbox",),
-    "SHARED_MAILBOX": ("mailbox",),
-    "ROOM_MAILBOX": ("mailbox",),
+    # Tier-1 mailboxes have historically split across two containers:
+    # legacy snapshots wrote to "mailbox" (backup-worker pre-2026-05-08
+    # alignment), the standalone backup_mailbox handler now writes to
+    # "email" to match the Tier-2 USER_MAIL convention, and dedup against
+    # cross-snapshot content_hashes can produce rows whose blob_path lives
+    # in either bucket. List both so the restore resolver tries each.
+    "MAILBOX": ("email", "mailbox"),
+    "SHARED_MAILBOX": ("email", "mailbox"),
+    "ROOM_MAILBOX": ("email", "mailbox"),
     "ONEDRIVE": ("files",),
     "SHAREPOINT_SITE": ("files",),
     "TEAMS_CHANNEL": ("teams",),
@@ -1345,13 +1351,48 @@ async def upload_blob_with_dedup(
                     min_size_bytes=min_size_bytes,
                 )
             if existing:
-                return {
-                    "success": True,
-                    "blob_path": existing,
-                    "blob_url": existing,
-                    "size_bytes": len(content),
-                    "method": "dedup_hit",
-                }
+                # Container-aware dedup. The dedup index tracks
+                # (tenant_id, content_hash) → blob_path, but NOT which
+                # workload-container the bytes live in. Cross-workload
+                # collisions (e.g. a MAILBOX-snapshot attachment with
+                # the same content_hash as a USER_MAIL upload) leave
+                # the existing blob_path readable only from the writer's
+                # original container. A naive dedup_hit would then hand
+                # the new SnapshotItem a path that the restore-side
+                # workload-container resolver can't open, producing
+                # silent "no attachments in PST" failures.
+                #
+                # Probe the path against ``container_name`` (the active
+                # writer's target). If it exists, safely reuse. If not,
+                # fall through to a real upload so the new row is
+                # anchored in the active container.
+                ok = False
+                try:
+                    if hasattr(shard, "get_blob_properties"):
+                        props = await shard.get_blob_properties(
+                            container_name, existing,
+                        )
+                        if props is not None:
+                            size = (
+                                getattr(props, "size", None)
+                                if not isinstance(props, dict)
+                                else props.get("size")
+                            )
+                            ok = bool(size and size > 0)
+                except Exception:
+                    ok = False
+                if ok:
+                    return {
+                        "success": True,
+                        "blob_path": existing,
+                        "blob_url": existing,
+                        "size_bytes": len(content),
+                        "method": "dedup_hit",
+                    }
+                # Existing blob is not readable from container_name —
+                # likely lives in a sibling workload container. Fall
+                # through to a real upload so this row's blob_path is
+                # always reachable from its writer's container.
         except Exception:
             # Dedup is advisory — a DB hiccup must not block the backup.
             pass

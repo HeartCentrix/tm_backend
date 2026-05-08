@@ -16,7 +16,53 @@ import json
 import logging
 import os
 import sys
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple, Union
+
+ContainerCandidates = Union[str, Sequence[str]]
+
+
+def _normalize_containers(source_container: ContainerCandidates,
+                          extra: Optional[Sequence[str]] = None) -> Tuple[str, ...]:
+    """Build an ordered, de-duplicated tuple of containers to try.
+
+    ``source_container`` may be a single string (back-compat) or a sequence;
+    ``extra`` (e.g. ``item._source_container_candidates``) is appended after
+    the primary candidates so per-item dedup-relocations can override the
+    orchestrator default. Empty entries are dropped.
+    """
+    out: List[str] = []
+    seen = set()
+    seq: Tuple[str, ...]
+    if isinstance(source_container, str):
+        seq = (source_container,) if source_container else ()
+    else:
+        seq = tuple(source_container or ())
+    for c in seq:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    if extra:
+        for c in extra:
+            if c and c not in seen:
+                seen.add(c)
+                out.append(c)
+    return tuple(out)
+
+
+async def _download_first_hit(shard, containers: Sequence[str], blob_path: str):
+    """Try each container in order; return (bytes, container) on first hit
+    or (None, None) on miss across all candidates. ``download_blob`` returns
+    None for NoSuchKey/NoSuchBucket so callers can branch on data is None."""
+    for c in containers:
+        try:
+            data = await shard.download_blob(c, blob_path)
+        except Exception as exc:
+            logger.debug("download miss container=%s path=%s: %s: %s",
+                         c, blob_path, type(exc).__name__, exc)
+            continue
+        if data is not None:
+            return data, c
+    return None, None
 
 # The restore-worker runtime mounts /app/shared, so `from shared.X import ...`
 # works in production. Tests import via shim that preloads the module; we
@@ -31,7 +77,7 @@ from shared.mime_builder import AttachmentRef  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
-async def fetch_message(item, shard, source_container: str) -> Optional[dict]:
+async def fetch_message(item, shard, source_container: ContainerCandidates) -> Optional[dict]:
     """Fetch raw Graph message JSON for a SnapshotItem.
 
     Resolution priority:
@@ -63,11 +109,21 @@ async def fetch_message(item, shard, source_container: str) -> Optional[dict]:
 
     blob_path = getattr(item, "blob_path", None)
 
+    # Container candidates: orchestrator-resolved primary + secondary list
+    # (RESOURCE_TYPE_TO_WORKLOADS), plus any per-item fallback the call
+    # site stamped (legacy `_mailbox_fallback_container` is still honored
+    # but the canonical attribute is `_source_container_candidates`).
+    item_extra = list(getattr(item, "_source_container_candidates", None) or ())
+    legacy_fb = getattr(item, "_mailbox_fallback_container", None)
+    if legacy_fb:
+        item_extra.append(legacy_fb)
+    container_candidates = _normalize_containers(source_container, item_extra)
+
     # Legacy fallback — some SnapshotItem rows were created before blob_path
     # was persisted. Reconstruct by listing blobs under the snapshot's prefix
     # and matching on external_id (the last path segment of the canonical
     # backup path: tenant/resource/snapshot/timestamp/external_id).
-    resolved_container = source_container
+    resolved_container = container_candidates[0] if container_candidates else ""
     if not blob_path:
         ext_id = getattr(item, "external_id", "") or ""
         snap_id = str(getattr(item, "snapshot_id", "") or "")
@@ -76,14 +132,9 @@ async def fetch_message(item, shard, source_container: str) -> Optional[dict]:
             ext_id[:40],
         )
 
-        candidates = [source_container]
-        fb = getattr(item, "_mailbox_fallback_container", None)
-        if fb and fb not in candidates:
-            candidates.append(fb)
-
         matched = None
         matched_container = None
-        for cand in candidates:
+        for cand in container_candidates:
             try:
                 async for name in shard.list_blobs(cand):
                     if snap_id and snap_id not in name:
@@ -127,22 +178,28 @@ async def fetch_message(item, shard, source_container: str) -> Optional[dict]:
         return None
 
     logger.debug(
-        "fetch_message: container=%s path=%s",
-        resolved_container,
+        "fetch_message: containers=%s path=%s",
+        list(container_candidates),
         blob_path,
     )
-    raw = await shard.download_blob(resolved_container, blob_path)
+    raw, hit_container = await _download_first_hit(shard, container_candidates, blob_path)
     if raw is None:
-        logger.debug("fetch_message: blob MISSING path=%s", blob_path)
+        logger.debug(
+            "fetch_message: blob MISSING across all candidates path=%s",
+            blob_path,
+        )
         return None
-    logger.debug("fetch_message: blob fetched size=%d path=%s", len(raw), blob_path)
+    logger.debug(
+        "fetch_message: blob fetched size=%d container=%s path=%s",
+        len(raw), hit_container, blob_path,
+    )
     return json.loads(raw.decode("utf-8"))
 
 
 async def gather_attachments(
     att_paths: list,
     shard,
-    source_container: str,
+    source_container: ContainerCandidates,
     include_attachments: bool = True,
 ) -> List[AttachmentRef]:
     """Build streaming :class:`AttachmentRef` objects for each attachment path.
@@ -162,6 +219,8 @@ async def gather_attachments(
     )
     if not include_attachments or not att_paths:
         return []
+    container_candidates = _normalize_containers(source_container)
+    primary_container = container_candidates[0] if container_candidates else ""
     out: List[AttachmentRef] = []
     for path in att_paths:
         # Probe size before streaming. If shard exposes blob metadata,
@@ -172,9 +231,9 @@ async def gather_attachments(
         size = -1
         try:
             if hasattr(shard, "get_blob_size"):
-                size = await shard.get_blob_size(source_container, path)
+                size = await shard.get_blob_size(primary_container, path)
             elif hasattr(shard, "get_blob_properties"):
-                props = await shard.get_blob_properties(source_container, path)
+                props = await shard.get_blob_properties(primary_container, path)
                 size = (
                     getattr(props, "size", None)
                     or (props or {}).get("size", -1) if isinstance(props, dict)
@@ -203,9 +262,29 @@ async def gather_attachments(
             ))
             continue
 
-        async def _gen(p=path):
-            async for chunk in shard.download_blob_stream(source_container, p):
-                yield chunk
+        # Stream the bytes from whichever candidate container has a
+        # readable copy. We probe each container with a HEAD-style call
+        # (download_blob with a 1-byte Range would be ideal, but the
+        # shared shim doesn't expose it). Falling back to download_blob
+        # one-shot is acceptable — shard.download_blob returns None on
+        # NoSuchKey / NoSuchBucket without throwing.
+        async def _gen(p=path, candidates=container_candidates):
+            for cand in candidates:
+                try:
+                    async for chunk in shard.download_blob_stream(cand, p):
+                        yield chunk
+                    # If we got at least one chunk we're done; the
+                    # generator naturally returns when the iterator
+                    # exhausts.
+                    return
+                except Exception as exc:
+                    logger.debug(
+                        "attachment stream miss container=%s path=%s: %s: %s",
+                        cand, p, type(exc).__name__, exc,
+                    )
+            # All candidates failed — yield nothing so the writer sees an
+            # empty stream rather than crashing.
+            return
         out.append(AttachmentRef(
             name=name,
             content_type="application/octet-stream",

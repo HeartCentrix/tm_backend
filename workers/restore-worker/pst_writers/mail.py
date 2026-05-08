@@ -100,14 +100,40 @@ class MailPstWriter(PstWriterBase):
                 # azure_storage_manager.get_shard_for_item resolves to the
                 # correct backend's shard via shared.storage.router.
                 from shared.azure_storage import azure_storage_manager
+                from mail_fetch import _normalize_containers, _download_first_hit
                 att_shard = azure_storage_manager.get_shard_for_item(att)
-                print(f"[mail.collect] att={_att_name} backend_id={getattr(att,'backend_id','?')} shard={type(att_shard).__name__} container={source_container} path_len={len(blob_path)}", flush=True)
+                # Build candidate list: orchestrator's source_container
+                # (which may itself be a sequence) + any per-item override
+                # the dedup-relocation pass stamped on the row. Walking the
+                # list is required because cross-snapshot dedup can hand us
+                # a blob_path anchored in a sibling resource's workload
+                # container (e.g. MAILBOX-era "backup-mailbox-<tenant>")
+                # while the active container is "backup-email-<tenant>".
+                item_extra = list(getattr(att, "_source_container_candidates", None) or ())
+                legacy_fb = getattr(att, "_mailbox_fallback_container", None)
+                if legacy_fb:
+                    item_extra.append(legacy_fb)
+                container_candidates = _normalize_containers(source_container, item_extra)
+                print(
+                    f"[mail.collect] att={_att_name} "
+                    f"backend_id={getattr(att,'backend_id','?')} "
+                    f"shard={type(att_shard).__name__} "
+                    f"containers={list(container_candidates)} "
+                    f"path_len={len(blob_path)}",
+                    flush=True,
+                )
                 try:
-                    data = await att_shard.download_blob(source_container, blob_path)
+                    data, hit_container = await _download_first_hit(
+                        att_shard, container_candidates, blob_path,
+                    )
                 except Exception as exc:
                     print(f"[mail.collect] DOWNLOAD_EXC att={_att_name}: {type(exc).__name__}: {exc}", flush=True)
                     continue
-                print(f"[mail.collect] att={_att_name} download_returned={'None' if data is None else f'{len(data)} bytes'}", flush=True)
+                print(
+                    f"[mail.collect] att={_att_name} "
+                    f"download_returned={'None' if data is None else f'{len(data)} bytes from {hit_container}'}",
+                    flush=True,
+                )
                 if not data:
                     continue
                 if len(data) > MAX_ATTACHMENT_BYTES:
