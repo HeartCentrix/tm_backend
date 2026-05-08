@@ -150,6 +150,53 @@ array<uint8_t, kPageSize> buildDListPage(uint64_t ibDList,
 }
 
 // ============================================================================
+// Multi-AMap DLISTPAGE. cEntDList = amapIbs.size(); one rgEntDList[N] per
+// AMap, with dwPageNum = (ibAMapN - kIbAMap) / kAMapCoverage and
+// dwFreeSlots derived from kAMapCoverage minus min(coverage, fileEof-ibN).
+// kIbAMap is taken from the first entry (must be 0x4400 in well-formed PSTs).
+// ============================================================================
+array<uint8_t, kPageSize> buildDListPageMulti(uint64_t                     ibDList,
+                                              const std::vector<uint64_t>& amapIbs,
+                                              uint64_t                     fileEof) noexcept
+{
+    array<uint8_t, kPageSize> page{};
+    if (amapIbs.empty()) {
+        // No AMaps: emit empty DList. Should not happen in practice.
+        writePageTrailer(page, ptype::kDList, Bid::makeAmap(ibDList), Ib{ibDList});
+        return page;
+    }
+
+    const uint64_t ibAMap0 = amapIbs.front();
+
+    page[0] = 0;                                              // bFlags
+    page[1] = static_cast<uint8_t>(amapIbs.size());           // cEntDList
+    // [2..3] wPadding — left zero
+    writeU32(page.data(), 4, 0u);                             // ulCurrentPage = AMap[0]
+
+    // rgEntDList[N], 4 bytes each, packed as
+    //   bits  0..19 dwPageNum   (= (ibAMapN - ibAMap0) / kAMapCoverage)
+    //   bits 20..31 dwFreeSlots (free 64-byte slots in that AMap)
+    for (size_t i = 0; i < amapIbs.size(); ++i) {
+        const uint64_t ibN          = amapIbs[i];
+        const uint32_t pageNum      = static_cast<uint32_t>(
+                                          (ibN - ibAMap0) / kAMapCoverage);
+        const uint64_t coverageEnd  = ibN + kAMapCoverage;
+        const uint64_t allocatedEnd = fileEof < coverageEnd ? fileEof : coverageEnd;
+        const uint64_t allocatedB   = allocatedEnd > ibN ? (allocatedEnd - ibN) : 0;
+        const uint64_t freeBytes    = (kAMapCoverage > allocatedB)
+                                          ? (kAMapCoverage - allocatedB) : 0;
+        const uint32_t freeSlots    = static_cast<uint32_t>(
+                                          freeBytes / kBytesPerAMapBit);
+        const uint32_t entry        = (static_cast<uint32_t>(freeSlots & 0xFFFu) << 20)
+                                    | (pageNum & 0xFFFFFu);
+        writeU32(page.data(), 8 + i * 4, entry);
+    }
+
+    writePageTrailer(page, ptype::kDList, Bid::makeAmap(ibDList), Ib{ibDList});
+    return page;
+}
+
+// ============================================================================
 // Empty BTPAGE leaves ([MS-PST] §2.2.2.7.7)
 // ============================================================================
 namespace {

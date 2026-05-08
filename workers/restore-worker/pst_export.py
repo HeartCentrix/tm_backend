@@ -360,6 +360,7 @@ class PstExportOrchestrator:
         checkpoint_loader=None,    # async () -> dict | None
         checkpoint_saver=None,     # async (dict) -> None
         item_stream_factory=None,  # callable -> async-iterator of [SnapshotItem] batches
+        attachment_index=None,     # dict[str, list[SnapshotItem]] keyed by parent EMAIL.external_id
     ):
         self.job_id = job_id
         self.items = items
@@ -380,6 +381,14 @@ class PstExportOrchestrator:
         self.checkpoint_loader = checkpoint_loader
         self.checkpoint_saver = checkpoint_saver
         self.item_stream_factory = item_stream_factory
+        # Attachment index: { parent_email_external_id: [EMAIL_ATTACHMENT SnapshotItem, ...] }
+        # Pre-fetched by the caller (one query per export) because the streaming
+        # path orders rows by external_id, so attachments arrive AFTER their
+        # parent email — by which time the parent may have already flushed if
+        # we tried to build the index from the stream itself. Stamped onto
+        # each EMAIL item as ``_email_attachment_items`` immediately before
+        # the per-group writer.write() call.
+        self.attachment_index: dict = attachment_index or {}
         # Optional cancellation hook — async fn that returns True if the
         # job has been cancelled (Job.status='CANCELLED' in DB). Polled
         # every PST_CANCEL_CHECK_INTERVAL items.
@@ -526,6 +535,12 @@ class PstExportOrchestrator:
             """Write one group's accumulated items to a PST, upload to
             blob, delete the local file, update checkpoint. Memory and
             disk are reclaimed in this single function."""
+            print(
+                f"[pst_export.FLUSH_TOP] group_key={group_key} "
+                f"accumulated_size={len(accumulated.get(group_key, []))} "
+                f"index_size={len(self.attachment_index)}",
+                flush=True,
+            )
             items_to_write = accumulated.pop(group_key, [])
             if not items_to_write:
                 return
@@ -541,6 +556,25 @@ class PstExportOrchestrator:
                 })
                 failed_counts[item_type] += len(items_to_write)
                 return
+
+            # Stamp pre-fetched attachment siblings onto each EMAIL item so
+            # MailPstWriter._collect_graph_item can inline their bytes.
+            # Other item types are unaffected.
+            print(
+                f"[pst_export.flush_group] item_type={item_type} "
+                f"attachment_index_size={len(self.attachment_index)} "
+                f"items_to_write={len(items_to_write)}",
+                flush=True,
+            )
+            if item_type == "EMAIL" and self.attachment_index:
+                for it in items_to_write:
+                    matched = self.attachment_index.get(it.external_id, [])
+                    it._email_attachment_items = matched
+                    print(
+                        f"[pst_export.flush_group] stamp ext_id={it.external_id[:40]}... "
+                        f"matched_atts={len(matched)}",
+                        flush=True,
+                    )
 
             group = PstGroup(
                 key=group_key,
@@ -948,6 +982,20 @@ class PstExportOrchestrator:
 
         # Step 1: Plan
         await self._safe_progress(5)
+        # If the caller didn't pre-fetch the attachment index, build one from
+        # any EMAIL_ATTACHMENT items that arrived inline in self.items. The
+        # planner filters them out below, so without this they'd be lost.
+        if not self.attachment_index:
+            local_index: dict = {}
+            for _it in self.items:
+                if getattr(_it, "item_type", None) != "EMAIL_ATTACHMENT":
+                    continue
+                _ed = getattr(_it, "extra_data", None) or {}
+                _parent = _ed.get("parent_item_id")
+                if _parent:
+                    local_index.setdefault(_parent, []).append(_it)
+            if local_index:
+                self.attachment_index = local_index
         planner = PstGroupPlanner()
         groups = planner.plan(self.items, self.granularity, self.include_types)
 
@@ -1040,6 +1088,14 @@ class PstExportOrchestrator:
                     "[pst_export] group %d/%d start type=%s items=%d filename=%s",
                     idx + 1, total_groups, group.item_type, len(group.items), group.pst_filename,
                 )
+
+                # Stamp pre-fetched attachment siblings onto each EMAIL item;
+                # see _run_streaming._flush_group for the matching call site.
+                if group.item_type == "EMAIL" and self.attachment_index:
+                    for _it in group.items:
+                        _it._email_attachment_items = self.attachment_index.get(
+                            _it.external_id, []
+                        )
 
                 # Per-group exception isolation: a failed group must not poison
                 # the whole job. We log, skip, and continue. The job result

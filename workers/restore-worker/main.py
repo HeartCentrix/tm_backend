@@ -1682,6 +1682,35 @@ class RestoreWorker:
         job_id = str((message or {}).get("jobId") or (message or {}).get("job_id") or "unknown")
         tenant_id = str(getattr(items[0], "tenant_id", "") or "") if items else ""
 
+        # Stream-mode (the production path) passes items=[] and feeds the
+        # orchestrator via item_stream_factory. In that case tenant_id is
+        # empty here, but we still need a real container — fall back to
+        # resolving via the snapshot's resource → tenant. Without this,
+        # source_container=="mailbox" (literal), which breaks both the
+        # mail body fetch AND the EMAIL_ATTACHMENT bytes download because
+        # neither Azure container nor SeaweedFS bucket is named "mailbox".
+        if not tenant_id:
+            try:
+                from sqlalchemy import select as _select
+                snap_uuids_for_tenant = (message or {}).get("snapshotIds") or _spec.get("snapshot_ids") or []
+                if snap_uuids_for_tenant:
+                    import uuid as _uuid_t
+                    async with async_session_factory() as _s_t:
+                        row = (await _s_t.execute(
+                            _select(Resource.tenant_id)
+                            .join(Snapshot, Snapshot.resource_id == Resource.id)
+                            .where(Snapshot.id == _uuid_t.UUID(str(snap_uuids_for_tenant[0])))
+                            .limit(1)
+                        )).first()
+                        if row and row[0]:
+                            tenant_id = str(row[0])
+            except Exception as _t_exc:
+                print(
+                    f"[{self.worker_id}] tenant_id fallback resolution failed "
+                    f"(continuing with empty): {type(_t_exc).__name__}: {_t_exc}",
+                    flush=True,
+                )
+
         source_container = (
             azure_storage_manager.get_container_name(tenant_id, "email")
             if tenant_id else "mailbox"
@@ -1909,6 +1938,47 @@ class RestoreWorker:
             except Exception:
                 return False
 
+        # Pre-fetch the EMAIL_ATTACHMENT index keyed by parent EMAIL.external_id.
+        # The PST writer streams items in (item_type, external_id) lex order, so
+        # an email may flush before its attachment siblings arrive — building
+        # the index on the fly would silently drop those attachments. One
+        # pre-fetch query bounds memory at ~250 bytes × #attachments
+        # (~25 MB even at 100 k attachments) and is bulletproof against the
+        # ordering issue. We reuse stream_snapshot_items_by_group with
+        # item_types={"EMAIL_ATTACHMENT"} so sibling-snapshot resolution and
+        # DISTINCT ON external_id newest-wins behave identically to the main
+        # stream.
+        attachment_index: Dict[str, List[SnapshotItem]] = {}
+        if snapshot_ids_stream:
+            try:
+                async for _batch in self.stream_snapshot_items_by_group(
+                    async_session_factory,
+                    snapshot_ids=[str(s) for s in snapshot_ids_stream],
+                    item_ids=[],            # always pull all attachments for the picked snapshots
+                    folder_paths=None,      # parent emails handle folder filtering
+                    excluded_item_ids=None,
+                    item_types={"EMAIL_ATTACHMENT"},
+                    batch_size=_batch_size,
+                ):
+                    for _att in _batch:
+                        _ed = getattr(_att, "extra_data", None) or {}
+                        _parent = _ed.get("parent_item_id")
+                        if _parent:
+                            attachment_index.setdefault(_parent, []).append(_att)
+                print(
+                    f"[{self.worker_id}] pre-fetched attachment index: "
+                    f"{sum(len(v) for v in attachment_index.values())} attachments "
+                    f"across {len(attachment_index)} messages",
+                    flush=True,
+                )
+            except Exception as _att_exc:
+                print(
+                    f"[{self.worker_id}] attachment-index pre-fetch FAILED "
+                    f"(continuing without inlined attachments): "
+                    f"{type(_att_exc).__name__}: {_att_exc}",
+                    flush=True,
+                )
+
         orch = PstExportOrchestrator(
             job_id=job_id,
             items=items,                     # may be empty list (PST stream mode)
@@ -1921,6 +1991,7 @@ class RestoreWorker:
             checkpoint_loader=_checkpoint_load,
             checkpoint_saver=_checkpoint_save,
             item_stream_factory=_make_stream,
+            attachment_index=attachment_index,
         )
         orch.resource_label_by_snapshot = resource_label_by_snapshot
         orch.snapshot_to_resource = snapshot_to_resource
