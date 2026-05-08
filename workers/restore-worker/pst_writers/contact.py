@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 class ContactPstWriter(PstWriterBase):
     item_type = "USER_CONTACT"
     cli_kind = "contacts"
+    # Each contact = 1 PC, no Recipient TC, no body subnode.
+    _PER_ITEM_BASE_BLOCKS = 1
     standard_folder_type = "Contacts"   # informational; matches old API
 
     async def _collect_graph_item(self, item, shard, source_container: str) -> Optional[dict]:

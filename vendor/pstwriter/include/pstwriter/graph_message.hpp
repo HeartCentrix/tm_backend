@@ -166,6 +166,14 @@ struct GraphMessage {
 
     // Folder containment
     std::string parentFolderId;  // Graph folder id (mailFolders/<id>)
+
+    // Human-readable folder path supplied by the exporter (e.g.
+    // "/Inbox", "/Sent Items/Project X"). When present, pst_convert
+    // groups messages by this string to rebuild the folder hierarchy.
+    // Falls back to a single "Inbox" folder when empty so legacy
+    // snapshots without folder_path still produce a valid PST.
+    // Wire format: under-key ``_folderPath`` on the message JSON.
+    std::string folderPath;
 };
 
 // ============================================================================

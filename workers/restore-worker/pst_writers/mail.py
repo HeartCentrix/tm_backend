@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 class MailPstWriter(PstWriterBase):
     item_type = "EMAIL"
     cli_kind = "mail"
+    # Block budget defaults from the base class (3 blocks/msg for PC +
+    # Recipient TC + body subnode; attachment data adds blocks based on
+    # per-item byte size). No item-count cap — the chunker bin-packs by
+    # estimated block consumption against ``_MAX_BLOCKS_PER_CHUNK``.
     # Retained so callers / tests that introspect ``standard_folder_type``
     # (the Aspose-era field) keep working. pstwriter's CLI hard-codes the
     # folder name to "Inbox" for mail; this string is informational only.
@@ -60,6 +64,26 @@ class MailPstWriter(PstWriterBase):
         # extra_data dict in the inline path, and we don't want to mutate
         # caller-visible state by appending attachments to it.
         msg_json = dict(msg_json)
+
+        # Stamp the SnapshotItem's folder_path onto the message JSON so
+        # pst_convert can group messages by source folder ("/Inbox",
+        # "/Sent Items/Project X", etc.) and rebuild the folder
+        # hierarchy in the PST. Without this every message lands in a
+        # single hard-coded "Inbox" and Outlook's import wizard sees
+        # only one folder. We also fall back to the raw Graph
+        # parentFolderName so older snapshots without folder_path stay
+        # functional. The pstwriter side reads ``_folderPath`` (under
+        # this leading-underscore name to make it obvious the value was
+        # injected by the exporter rather than coming from Graph itself).
+        item_folder_path = getattr(item, "folder_path", None) or ""
+        if not item_folder_path:
+            item_folder_path = (
+                msg_json.get("parentFolderName")
+                or msg_json.get("_full_folder_path")
+                or ""
+            )
+        if item_folder_path:
+            msg_json["_folderPath"] = str(item_folder_path)
 
         # Sibling EMAIL_ATTACHMENT items are pre-fetched by the orchestrator
         # and stamped on each EMAIL item as ``_email_attachment_items``. They

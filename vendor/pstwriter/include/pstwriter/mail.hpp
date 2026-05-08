@@ -220,6 +220,16 @@ struct M7Folder {
     Nid          parentNid;          // typically IPM Subtree (0x8022) or another M7Folder
     std::string  containerClass {"IPF.Note"};
 
+    // Optional folder identity for nesting. When ``path`` is non-empty
+    // and ``parentPath`` references another M7Folder's ``path`` in the
+    // same config, the writer resolves the parent's allocated NID and
+    // overrides ``parentNid`` accordingly. Use these when you want
+    // Outlook to render the source mailbox's folder tree (e.g.
+    // "/Inbox", "/Inbox/Project X") instead of a flat list under IPM
+    // Subtree. Empty values fall back to the legacy parentNid wiring.
+    std::string  path;
+    std::string  parentPath;
+
     // Messages contained in this folder, in the order they should appear
     // in the Contents TC.
     std::vector<const graph::GraphMessage*> messages;

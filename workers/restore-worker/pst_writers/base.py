@@ -66,6 +66,25 @@ class PstWriterBase:
     # node IDs, padding) but ``split_gb * 0.95`` already builds in slack.
     _DEFAULT_PER_ITEM_BYTES = 8 * 1024
 
+    # Per-PST block budget. The vendored writer's BBT supports at most
+    # 400 data blocks (kBbtMaxEntriesPerLeaf × kBtMaxEntriesPerPage =
+    # 20 × 20). Reserve ~20 blocks for the folder tree + IPM Subtree +
+    # store-level nodes, leaving ~380 for message data. We chunk by
+    # *estimated blocks per item* rather than item count so light
+    # attachment-free mail packs hundreds of messages into one PST while
+    # attachment-heavy mail naturally splits across several. This is the
+    # "one PST when feasible, multi-PST only when truly needed" target.
+    _MAX_BLOCKS_PER_CHUNK = 380
+
+    # Per-item PST data-block estimate.
+    #   * Each message PC + Recipient TC ~= 2 structural blocks
+    #   * Each (body+attachments) byte above _SUBNODE_INLINE_LIMIT is
+    #     subnode-promoted and split into _BLOCK_PAYLOAD_BYTES chunks.
+    # Subclasses (calendar, contacts) override the per-item base.
+    _PER_ITEM_BASE_BLOCKS = 2
+    _BLOCK_PAYLOAD_BYTES  = 7000
+    _SUBNODE_INLINE_LIMIT = 3580
+
     async def write(
         self,
         group,                 # PstGroup from pst_export.py
@@ -108,9 +127,7 @@ class PstWriterBase:
                 result.failed_count += 1
                 continue
             collected.append(graph_obj)
-            per_item_bytes.append(
-                getattr(item, "content_size", 0) or self._DEFAULT_PER_ITEM_BYTES
-            )
+            per_item_bytes.append(self._estimate_item_size(item, graph_obj))
 
         if not collected:
             logger.warning(
@@ -126,16 +143,29 @@ class PstWriterBase:
         chunks = self._chunk_by_bytes(collected, per_item_bytes, split_bytes)
         stem = group.pst_filename[:-4] if group.pst_filename.endswith(".pst") \
             else group.pst_filename
-        # Reuse the planner's chosen filename for chunk #1 (back-compat with
-        # callers that index by group.pst_filename); subsequent chunks get
-        # the -NNN.pst suffix.
-        for idx, chunk in enumerate(chunks, start=1):
-            if idx == 1 and len(chunks) == 1:
+
+        # FIFO of chunks pending write. On failure we bisect a chunk and
+        # reinsert both halves, so the chunker's pre-flight estimate
+        # doesn't have to be perfect — actual writer overflow gets
+        # rescued by progressively smaller chunks. Single-item chunks
+        # that still fail get counted against ``failed_count`` so the
+        # caller knows data was dropped.
+        pending: list[list] = [list(c) for c in chunks]
+        emitted = 0  # number of PSTs successfully written so far
+        # planned_pst_count is just for the human-readable filename when
+        # only a single chunk was planned (back-compat with callers that
+        # index by group.pst_filename verbatim).
+        single_planned = (len(chunks) == 1)
+
+        while pending:
+            chunk = pending.pop(0)
+            next_idx = emitted + 1
+            if single_planned and next_idx == 1 and not pending:
                 pst_path = workdir / group.pst_filename
-            elif idx == 1:
+            elif next_idx == 1:
                 pst_path = workdir / f"{stem}-001.pst"
             else:
-                pst_path = workdir / f"{stem}-{idx:03d}.pst"
+                pst_path = workdir / f"{stem}-{next_idx:03d}.pst"
             if pst_path.exists():
                 pst_path.unlink()
 
@@ -143,27 +173,40 @@ class PstWriterBase:
                 written = await convert_to_pst(
                     self.cli_kind, chunk, pst_path, workdir=workdir,
                 )
+                emitted += 1
                 result.item_count += written
                 result.pst_paths.append(pst_path)
                 logger.info(
-                    "[pst_writer] wrote chunk %d/%d type=%s items=%d path=%s",
-                    idx, len(chunks), self.item_type, written, pst_path.name,
+                    "[pst_writer] wrote PST %d type=%s items=%d path=%s",
+                    emitted, self.item_type, written, pst_path.name,
                 )
             except (PstWriterCliError, asyncio.TimeoutError) as exc:
-                # Whole-chunk failure — pstwriter doesn't expose
-                # per-item insert. Bump failed_count by chunk size and
-                # keep going so other chunks still ship.
-                logger.error(
-                    "[pst_writer] chunk %d/%d FAILED type=%s items=%d: %s",
-                    idx, len(chunks), self.item_type, len(chunk), exc,
-                )
-                result.failed_count += len(chunk)
                 # Defensive cleanup — pst_convert may have left a
                 # half-written file behind.
                 try:
                     pst_path.unlink(missing_ok=True)
                 except Exception:
                     pass
+                if len(chunk) > 1:
+                    # Bisect and retry both halves. New halves go to the
+                    # front of the queue so we surface the failure early
+                    # if a single message still can't write.
+                    half = len(chunk) // 2
+                    logger.warning(
+                        "[pst_writer] chunk type=%s items=%d FAILED, "
+                        "bisecting into %d + %d and retrying: %s",
+                        self.item_type, len(chunk), half, len(chunk) - half, exc,
+                    )
+                    pending.insert(0, chunk[half:])
+                    pending.insert(0, chunk[:half])
+                else:
+                    # Single item that still doesn't fit — drop it but
+                    # log loudly so the user sees what was lost.
+                    logger.error(
+                        "[pst_writer] dropping unwriteable item type=%s: %s",
+                        self.item_type, exc,
+                    )
+                    result.failed_count += 1
 
         return result
 
@@ -171,29 +214,100 @@ class PstWriterBase:
     # Helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
+    def _estimate_item_size(self, item, graph_obj) -> int:
+        """Total bytes the writer will materialise for this item, including
+        attachments inlined into the Graph dict. Used for chunk planning.
+        Subclasses can override to tighten the estimate."""
+        base = getattr(item, "content_size", 0) or self._DEFAULT_PER_ITEM_BYTES
+        if isinstance(graph_obj, dict):
+            atts = graph_obj.get("attachments")
+            if isinstance(atts, list):
+                for a in atts:
+                    if isinstance(a, dict):
+                        try:
+                            base += int(a.get("size") or 0)
+                        except (TypeError, ValueError):
+                            pass
+        return int(base)
+
+    @classmethod
+    def _estimate_item_blocks(cls, item_bytes: int) -> int:
+        """Rough estimate of how many PST data blocks one item consumes.
+
+        Block 0 covers the PC + Recipient TC + small body inline. Bytes
+        above ``_SUBNODE_INLINE_LIMIT`` are subnode-promoted and split
+        into ``_BLOCK_PAYLOAD_BYTES`` chunks.
+        """
+        promoted = max(0, int(item_bytes) - cls._SUBNODE_INLINE_LIMIT)
+        promoted_blocks = (promoted + cls._BLOCK_PAYLOAD_BYTES - 1) \
+                          // cls._BLOCK_PAYLOAD_BYTES
+        return cls._PER_ITEM_BASE_BLOCKS + promoted_blocks
+
+    @classmethod
     def _chunk_by_bytes(
+        cls,
         items: list,
         per_item_bytes: list[int],
         split_bytes: int,
     ) -> list[list]:
-        """Greedy bin-pack items into chunks bounded by ``split_bytes``.
+        """Greedy bin-pack items into chunks bounded by both ``split_bytes``
+        AND ``cls._MAX_BLOCKS_PER_CHUNK``.
 
-        Always returns at least one chunk. Items larger than ``split_bytes``
-        on their own get their own chunk (we never split a single item).
+        The block cap reflects the vendored pstwriter's 400-block BBT
+        ceiling — once a chunk's estimated block consumption would
+        exceed it, we start a new chunk. This lets:
+          * light attachment-free mail pack hundreds of messages into one PST
+          * attachment-heavy mail naturally split across several PSTs
+          * a single PST always span multiple folders when they fit
+
+        Sort by ``_folderPath`` first so each chunk keeps related folders
+        together. Falls back to original order for non-mail items.
         """
-        if split_bytes <= 0 or not items:
-            return [items] if items else []
+        if not items:
+            return []
+        # Optional env override for live tuning without rebuild.
+        max_blocks = cls._MAX_BLOCKS_PER_CHUNK
+        try:
+            env_cap = int(os.environ.get("PST_MAX_BLOCKS_PER_CHUNK", "0") or 0)
+            if env_cap > 0:
+                max_blocks = env_cap
+        except ValueError:
+            pass
+
+        # Stable-sort by Graph "_folderPath" so each chunk keeps siblings
+        # together. Items without the field (calendar/contacts) keep
+        # their original order via empty-string sort key.
+        order = list(range(len(items)))
+        order.sort(key=lambda i: (
+            str(items[i].get("_folderPath", "") or "") if isinstance(items[i], dict) else ""
+        ))
+        ordered_items = [items[i] for i in order]
+        ordered_bytes = [per_item_bytes[i] for i in order]
+
         chunks: list[list] = []
         current: list = []
         current_bytes = 0
-        for item, sz in zip(items, per_item_bytes):
-            if current and current_bytes + sz > split_bytes:
+        current_blocks = 0
+        for item, sz in zip(ordered_items, ordered_bytes):
+            est_blocks = cls._estimate_item_blocks(sz)
+            byte_overflow = (
+                split_bytes > 0
+                and current
+                and current_bytes + sz > split_bytes
+            )
+            block_overflow = (
+                max_blocks > 0
+                and current
+                and current_blocks + est_blocks > max_blocks
+            )
+            if byte_overflow or block_overflow:
                 chunks.append(current)
                 current = []
                 current_bytes = 0
+                current_blocks = 0
             current.append(item)
             current_bytes += sz
+            current_blocks += est_blocks
         if current:
             chunks.append(current)
         return chunks

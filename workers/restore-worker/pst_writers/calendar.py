@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 class CalendarPstWriter(PstWriterBase):
     item_type = "CALENDAR_EVENT"
     cli_kind = "calendar"
+    # Events carry attendee/recurrence data but no recipient TC; the
+    # PC + per-event tables fit in 2 structural blocks before any
+    # subnode-promoted body or attachment is added.
+    # _PER_ITEM_BASE_BLOCKS inherited from PstWriterBase (2).
     standard_folder_type = "Calendar"   # informational; matches old API
 
     async def _collect_graph_item(self, item, shard, source_container: str) -> Optional[dict]:

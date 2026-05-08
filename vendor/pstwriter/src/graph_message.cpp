@@ -520,6 +520,10 @@ GraphMessage extractMessage(const JsonValue& obj)
     extractAttachments(obj, m.attachments);
 
     m.parentFolderId = getStr(obj, "parentFolderId");
+    // Exporter-injected path; underscore-prefixed because it doesn't
+    // come from Graph (the restore-worker stamps it from
+    // SnapshotItem.folder_path before serialising the message).
+    m.folderPath     = getStr(obj, "_folderPath");
 
     return m;
 }

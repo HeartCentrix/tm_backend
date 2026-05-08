@@ -20,6 +20,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1152,6 +1153,13 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
         vector<FolderRecord> folderRecs;
         folderRecs.reserve(config.folders.size());
 
+        // path → assigned NID. Used to resolve M7Folder.parentPath
+        // back to the parent folder's allocated NID after this loop.
+        // When the caller wires parent/child relationships via path
+        // strings (instead of pre-known NIDs), this map is the only
+        // way to recover the parent's NID since allocation happens
+        // here, not at the call site.
+        std::unordered_map<std::string, Nid> pathToFolderNid;
         for (const auto& f : config.folders) {
             FolderRecord rec;
             rec.src         = &f;
@@ -1165,6 +1173,9 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
             alloc.registerExternal(rec.contentsNid);
             alloc.registerExternal(rec.faiNid);
             folderRecs.push_back(rec);
+            if (!f.path.empty()) {
+                pathToFolderNid[f.path] = rec.folderNid;
+            }
         }
 
         // ============================================================
@@ -1203,9 +1214,47 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
             schema.containerClassUtf16le = ccBuf.data();
             schema.containerClassSize    = ccBuf.size();
 
-            auto pc = buildMailFolderPc(schema, kDummySub);
-            scheduleNode(rec.folderNid, rec.src->parentNid, std::move(pc.hnBytes));
+            // Resolve the effective parent NID. If the caller supplied
+            // a parentPath, look it up against the path→NID map built
+            // during the alloc loop above. Falls back to the explicit
+            // parentNid for legacy callers that didn't fill in path
+            // identities (or when parentPath is empty, i.e. a top-level
+            // folder under IPM Subtree). This is what lets the writer
+            // emit nested user folders ("/Inbox/Project X" under
+            // "Inbox") instead of a flat fan-out.
+            Nid effectiveParentNid = rec.src->parentNid;
+            if (!rec.src->parentPath.empty()) {
+                auto it = pathToFolderNid.find(rec.src->parentPath);
+                if (it != pathToFolderNid.end()) {
+                    effectiveParentNid = it->second;
+                }
+            }
 
+            // hasSubfolders flag must reflect reality so Outlook's
+            // tree control draws the expand-arrow. Walk siblings once
+            // per folder; cheap given typical folder count is < 100.
+            bool anyChild = false;
+            if (!rec.src->path.empty()) {
+                for (const auto& g : config.folders) {
+                    if (&g == rec.src) continue;
+                    if (g.parentPath == rec.src->path) {
+                        anyChild = true; break;
+                    }
+                }
+            }
+            schema.hasSubfolders = anyChild;
+
+            auto pc = buildMailFolderPc(schema, kDummySub);
+            scheduleNode(rec.folderNid, effectiveParentNid, std::move(pc.hnBytes));
+
+            // Per-folder Hierarchy TC: list rows for any child user
+            // folders (those whose parentPath references this folder's
+            // path). Empty TC otherwise — Outlook's tree control then
+            // shows the folder as a leaf. Without this, Outlook walks
+            // the hierarchy and finds an empty contents-table for the
+            // user folder; "Include subfolders" at the import wizard
+            // root sees no children to recurse into and skips them.
+            //
             // Round F++: Sibling tables (HIER/CONTENTS/FAI) NBTENTRYs
             // carry nidParent = the owning folder NID. The earlier
             // comment said "nidParent=0 per spec §3.12" but byte
@@ -1213,8 +1262,34 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
             // suggest scanpst's "row doesn't match sub-object" check
             // resolves the row's owning folder via this field. The
             // user-folder block (0x8002) is the natural owner.
+            std::vector<std::vector<uint8_t>> childNameBuffers;
+            std::vector<HierarchyTcRow> childRows;
+            if (!rec.src->path.empty()) {
+                childNameBuffers.reserve(folderRecs.size());
+                childRows.reserve(folderRecs.size());
+                for (const auto& other : folderRecs) {
+                    if (other.src == rec.src) continue;
+                    if (other.src->parentPath != rec.src->path) continue;
+                    childNameBuffers.push_back(u16le(other.src->displayName));
+                    childNameBuffers.push_back(u16le(other.src->containerClass));
+                    HierarchyTcRow row;
+                    row.rowId                 = other.folderNid;
+                    row.displayNameUtf16le    = childNameBuffers[childNameBuffers.size() - 2].data();
+                    row.displayNameSize       = childNameBuffers[childNameBuffers.size() - 2].size();
+                    const auto& cc = childNameBuffers.back();
+                    row.containerClassUtf16le = cc.empty() ? nullptr : cc.data();
+                    row.containerClassSize    = cc.size();
+                    row.contentCount          = other.contentCount;
+                    row.contentUnreadCount    = other.contentUnreadCount;
+                    row.hasSubfolders         = false;  // grandchildren omitted; one-level claim is enough for the wizard
+                    childRows.push_back(row);
+                }
+            }
+            const HierarchyTcRow* childRowsPtr =
+                childRows.empty() ? nullptr : childRows.data();
             scheduleNode(rec.hierarchyNid, rec.folderNid,
-                         buildFolderHierarchyTc(nullptr, 0).hnBytes);
+                         buildFolderHierarchyTc(childRowsPtr,
+                                                childRows.size()).hnBytes);
 
             // Contents TC — populated rows below.
             // (Defer to message-building loop; we'll patch the slot.)
@@ -1458,6 +1533,14 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
             }
 
             for (size_t i = 0; i < folderRecs.size(); ++i) {
+                // Skip nested folders — they appear in their parent's
+                // own Hierarchy TC, not in IPM Subtree's. Listing them
+                // here would make Outlook show every folder as a
+                // direct child of "Top of Personal Folders", losing
+                // the hierarchy the caller asked for via path strings.
+                // Empty parentPath = legacy caller (always top-level)
+                // OR explicit top-level folder under IPM Subtree.
+                if (!folderRecs[i].src->parentPath.empty()) continue;
                 HierarchyTcRow row;
                 row.rowId = folderRecs[i].folderNid;
                 // folderNameStore stores [name, containerClass, name,
@@ -1474,13 +1557,36 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
                 row.containerClassSize    = ccBuf.size();
                 row.contentCount       = folderRecs[i].contentCount;
                 row.contentUnreadCount = folderRecs[i].contentUnreadCount;
-                row.hasSubfolders      = false;
+                // hasSubfolders here mirrors what we set on the folder
+                // PC earlier — true when at least one M7Folder claims
+                // this folder as parentPath.
+                bool anyChild = false;
+                if (!folderRecs[i].src->path.empty()) {
+                    for (const auto& g : folderRecs) {
+                        if (g.src == folderRecs[i].src) continue;
+                        if (g.src->parentPath == folderRecs[i].src->path) {
+                            anyChild = true; break;
+                        }
+                    }
+                }
+                row.hasSubfolders = anyChild;
                 ipmHierRows.push_back(row);
             }
             const HierarchyTcRow* rowsPtr =
                 ipmHierRows.empty() ? nullptr : ipmHierRows.data();
             auto tc = buildFolderHierarchyTc(rowsPtr, ipmHierRows.size());
             scheduleNode(Nid{0x0000802Du}, Nid{0u}, std::move(tc.hnBytes));
+            // IPM Subtree's CONTENTS / FAI tables. The mail writer
+            // historically only emitted 0x802D and let scanpst tolerate
+            // the missing siblings; Outlook's import wizard recursion,
+            // when "Include subfolders" is checked at the store root,
+            // walks the IPM Subtree's bidSub looking for all three —
+            // missing tables make it return 0 imported items even when
+            // the user folders below are otherwise valid.
+            scheduleNode(Nid{0x0000802Eu}, Nid{0u},
+                         buildFolderContentsTc().hnBytes);
+            scheduleNode(Nid{0x0000802Fu}, Nid{0u},
+                         buildFolderFaiContentsTc().hnBytes);
         }
 
         // ============================================================
@@ -1670,6 +1776,67 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
             node.bidData   = msgPcBid;
             node.bidSub    = bidSub;
             nodes.push_back(node);
+        }
+
+        // ============================================================
+        // 5g. Folder bidSub wiring.
+        // ============================================================
+        // For each user folder, build a per-folder SLBLOCK containing
+        // SLENTRYs for the folder's HIERARCHY / CONTENTS / FAI tables
+        // and patch the folder PC node's bidSub to point at it.
+        //
+        // The same tables also exist as top-level NBT entries (their
+        // NIDs are kept registered with the M5Allocator) so legacy
+        // lookups still work, but Outlook's import wizard's recursion
+        // walks each folder's bidSub when "Include subfolders" is
+        // checked at the import root. With bidSub=0, "Include
+        // subfolders" returns 0 imported items even though the folders
+        // and their messages exist in the file — the wizard can't see
+        // any tables under the folder. Fixing the bidSub link is what
+        // turns root-level "Include subfolders" into the same one-click
+        // import that real Outlook PSTs (e.g. scanpst output) support.
+        {
+            std::unordered_map<uint32_t, Bid> nidToBid;
+            nidToBid.reserve(nodes.size());
+            for (const auto& n : nodes) {
+                nidToBid[n.nid.value] = n.bidData;
+            }
+            for (auto& fnode : nodes) {
+                if (fnode.nid.type() != NidType::NormalFolder) continue;
+                // Root Folder (0x122) historically has bidSub=0 in
+                // real Outlook output, so leave it alone. IPM Subtree
+                // and the baseline Search Root / Deleted Items DO get
+                // their bidSub wired below — the import wizard walks
+                // those when "Include subfolders" is set at the
+                // store-display root and needs them to recurse into
+                // user folders.
+                if (fnode.nid.value == 0x00000122u) continue;
+                const uint32_t idx = fnode.nid.index();
+                const Nid hierNid{(idx << 5) | static_cast<uint32_t>(NidType::HierarchyTable)};
+                const Nid contNid{(idx << 5) | static_cast<uint32_t>(NidType::ContentsTable)};
+                const Nid faiNid {(idx << 5) | static_cast<uint32_t>(NidType::AssocContentsTable)};
+                vector<SlEntry> entries;
+                entries.reserve(3);
+                if (auto it = nidToBid.find(hierNid.value); it != nidToBid.end()) {
+                    entries.emplace_back(hierNid, it->second, Bid{0u});
+                }
+                if (auto it = nidToBid.find(contNid.value); it != nidToBid.end()) {
+                    entries.emplace_back(contNid, it->second, Bid{0u});
+                }
+                if (auto it = nidToBid.find(faiNid.value); it != nidToBid.end()) {
+                    entries.emplace_back(faiNid, it->second, Bid{0u});
+                }
+                if (entries.empty()) continue;
+                std::sort(entries.begin(), entries.end(),
+                          [](const SlEntry& a, const SlEntry& b) {
+                              return a.nid.value < b.nid.value;
+                          });
+                M7SlBlock fslb;
+                fslb.bid     = allocInternalBid();
+                fslb.entries = std::move(entries);
+                fnode.bidSub = fslb.bid;
+                slBlocks.push_back(std::move(fslb));
+            }
         }
 
         // ============================================================
