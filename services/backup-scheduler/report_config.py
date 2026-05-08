@@ -7,13 +7,14 @@ These endpoints are added to the backup-scheduler service (port 8008).
 import uuid
 from typing import List, Optional
 from datetime import datetime
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.database import async_session_factory
-from shared.models import ReportConfig, ReportHistory, Organization
+from shared.models import ReportConfig, ReportHistory
+from shared.security import get_current_user_from_token
 
 router = APIRouter(prefix="/api/v1/reports", tags=["reports"])
 
@@ -90,24 +91,20 @@ class ReportHistoryResponse(BaseModel):
 
 # ==================== Helper Functions ====================
 
-async def get_org_id_from_token(token: str) -> Optional[str]:
-    """Extract org_id from JWT token (simplified - use proper auth in production)"""
-    # TODO: Implement proper JWT token parsing with org_id extraction
-    # For now, get the first org_id from the database
-    async with async_session_factory() as session:
-        result = await session.execute(select(Organization.id).limit(1))
-        org = result.scalar_one_or_none()
-        return str(org) if org else None
+
+def _require_org_id(current_user: dict) -> str:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(status_code=403, detail="User is not bound to an organization")
+    return org_id
 
 
 # ==================== Report Configuration Endpoints ====================
 
 @router.get("/config", response_model=ReportConfigResponse)
-async def get_report_config(token: str = None):
+async def get_report_config(current_user: dict = Depends(get_current_user_from_token)):
     """Get the current report configuration for the organization"""
-    org_id = await get_org_id_from_token(token or "")
-    if not org_id:
-        raise HTTPException(status_code=404, detail="Organization not found")
+    org_id = _require_org_id(current_user)
 
     async with async_session_factory() as session:
         result = await session.execute(
@@ -139,11 +136,12 @@ async def get_report_config(token: str = None):
 
 
 @router.post("/config", response_model=ReportConfigResponse)
-async def create_report_config(config_data: ReportConfigCreate, token: str = None):
+async def create_report_config(
+    config_data: ReportConfigCreate,
+    current_user: dict = Depends(get_current_user_from_token),
+):
     """Create a new report configuration"""
-    org_id = await get_org_id_from_token(token or "")
-    if not org_id:
-        raise HTTPException(status_code=404, detail="Organization not found")
+    org_id = _require_org_id(current_user)
 
     async with async_session_factory() as session:
         # Check if config already exists
@@ -187,11 +185,12 @@ async def create_report_config(config_data: ReportConfigCreate, token: str = Non
 
 
 @router.put("/config", response_model=ReportConfigResponse)
-async def update_report_config(config_data: ReportConfigUpdate, token: str = None):
+async def update_report_config(
+    config_data: ReportConfigUpdate,
+    current_user: dict = Depends(get_current_user_from_token),
+):
     """Update the report configuration"""
-    org_id = await get_org_id_from_token(token or "")
-    if not org_id:
-        raise HTTPException(status_code=404, detail="Organization not found")
+    org_id = _require_org_id(current_user)
 
     async with async_session_factory() as session:
         result = await session.execute(
@@ -246,12 +245,10 @@ async def get_report_history(
     limit: int = 50,
     offset: int = 0,
     report_type: Optional[str] = None,
-    token: str = None
+    current_user: dict = Depends(get_current_user_from_token),
 ):
     """Get report sending history"""
-    org_id = await get_org_id_from_token(token or "")
-    if not org_id:
-        raise HTTPException(status_code=404, detail="Organization not found")
+    org_id = _require_org_id(current_user)
 
     async with async_session_factory() as session:
         query = select(ReportHistory).where(ReportHistory.org_id == org_id)
@@ -288,11 +285,12 @@ async def get_report_history(
 
 
 @router.get("/history/{report_id}", response_model=ReportHistoryResponse)
-async def get_report_history_detail(report_id: str, token: str = None):
+async def get_report_history_detail(
+    report_id: str,
+    current_user: dict = Depends(get_current_user_from_token),
+):
     """Get detailed information about a specific report"""
-    org_id = await get_org_id_from_token(token or "")
-    if not org_id:
-        raise HTTPException(status_code=404, detail="Organization not found")
+    org_id = _require_org_id(current_user)
 
     async with async_session_factory() as session:
         result = await session.execute(
