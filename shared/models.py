@@ -312,12 +312,39 @@ class SlaPolicy(Base):
     archived_retention_mode = Column(String, default="SAME", nullable=False)
     archived_retention_days = Column(Integer, nullable=True)
 
-    # Per-policy overrides (fall back to tenant/org defaults when NULL)
-    storage_region = Column(String, nullable=True)
+    # storage_region was a phantom column with zero readers across the
+    # codebase (Phase 1 verified). Dropped via the migration in
+    # shared/database.py — TMvault routes by single global active backend
+    # via StorageRouter, not per-policy region.
     encryption_mode = Column(String, default="VAULT_MANAGED", nullable=False)  # VAULT_MANAGED | CUSTOMER_KEY
     key_vault_uri = Column(String, nullable=True)  # for BYOK
     key_name = Column(String, nullable=True)
     key_version = Column(String, nullable=True)
+    # Reconciler-set status: "" (not applicable / VAULT_MANAGED), "OK",
+    # "KEY_VAULT_ACCESS_DENIED" (managed identity missing role assignment),
+    # or "ERROR". Surfaced in the SLA list UI as a red dot when not OK.
+    encryption_status = Column(String, default="", nullable=False)
+    # When the operator changes any reconciler-driven setting (retention
+    # tiers, immutability, legal hold, encryption mode/key) we set
+    # lifecycle_dirty=true in the same transaction as the policy write.
+    # The 5-minute sweeper picks up dirty policies and re-applies — this
+    # is the durable fallback if the on-save HTTP nudge to the scheduler
+    # drops on the floor (network blip, scheduler restart, etc.).
+    lifecycle_dirty = Column(Boolean, default=False, nullable=False, index=True)
+    last_reconciled_at = Column(DateTime, nullable=True)
+    reconcile_attempts = Column(Integer, default=0, nullable=False)
+    # CMK key version actually applied. Distinct from `key_version` which
+    # is the operator-stated intent ("latest" or a pinned version). On
+    # drift detection / rotation, the reconciler resolves "latest" against
+    # Key Vault and stamps the resolved version here.
+    key_version_resolved = Column(String, nullable=True)
+    # Last time the cap-reached alert was emitted for this policy. The
+    # 5-minute sweeper would otherwise refire `SLA_RECONCILE_ATTEMPT_CAP_REACHED`
+    # every tick (288×/day) for every stuck policy — drowning the audit
+    # channel and any downstream PagerDuty rule. We dedupe to one alert
+    # per 24h until reconcile_attempts is reset (a successful run zeroes
+    # both attempts and last_cap_alert_at).
+    last_cap_alert_at = Column(DateTime, nullable=True)
 
     # Auto-apply hook — when true, the discovery-worker will assign this policy to
     # any newly-discovered resource that matches one of its resource-group rules.

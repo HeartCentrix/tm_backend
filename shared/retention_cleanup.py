@@ -27,7 +27,49 @@ import uuid
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.models import SlaPolicy, Snapshot, Resource, SnapshotItem, Tenant
+from shared.models import SlaPolicy, Snapshot, Resource, ResourceStatus, SnapshotItem, Tenant
+
+
+def _is_archived(resource: Resource) -> bool:
+    """A resource is 'archived' once its source (mailbox/user/drive) has been
+    removed from M365. Discovery flips Resource.status to ARCHIVED — the
+    backups stick around so the operator can still restore them, but the
+    SLA policy's archived-resource branch (KEEP_LAST / KEEP_ALL / CUSTOM /
+    SAME) decides how aggressively we prune them going forward."""
+    s = resource.status
+    val = s.value if hasattr(s, "value") else str(s)
+    return val == ResourceStatus.ARCHIVED.value
+
+
+def _archived_keep_ids(snapshots: List[Snapshot], policy: SlaPolicy) -> Set[uuid.UUID]:
+    """Apply policy.archived_retention_mode for resources flagged ARCHIVED.
+
+    SAME      → fall back to the policy's normal retention (caller handles).
+    KEEP_ALL  → never prune; keep every snapshot.
+    KEEP_LAST → keep only the single most recent snapshot.
+    CUSTOM    → keep snapshots within `archived_retention_days` (None = unlimited).
+    """
+    if not snapshots:
+        return set()
+    mode = (policy.archived_retention_mode or "SAME").upper()
+    if mode == "KEEP_ALL":
+        return {s.id for s in snapshots}
+    if mode == "KEEP_LAST":
+        latest = max(snapshots, key=lambda s: s.started_at or s.created_at or datetime.min)
+        return {latest.id}
+    if mode == "CUSTOM":
+        days = policy.archived_retention_days
+        if days is None:
+            return {s.id for s in snapshots}  # unlimited
+        cutoff = datetime.utcnow() - timedelta(days=int(days))
+        kept = {s.id for s in snapshots
+                if (s.started_at or s.created_at or datetime.utcnow()) >= cutoff}
+        # Always keep the most recent so a resource never goes "empty" silently.
+        latest = max(snapshots, key=lambda s: s.started_at or s.created_at or datetime.min)
+        kept.add(latest.id)
+        return kept
+    # SAME (default) → caller handles via the normal FLAT/GFS path.
+    return None  # type: ignore[return-value]  # sentinel: caller branches
 
 
 def _is_on_hold(policy: SlaPolicy) -> bool:
@@ -144,21 +186,44 @@ async def _delete_snapshots(session: AsyncSession, snap_ids: Set[uuid.UUID]) -> 
 
 async def enforce_retention_for_tenant(session: AsyncSession, tenant_id: uuid.UUID) -> Dict[str, int]:
     """Walk all resources for a tenant, apply each resource's SLA policy,
-    delete snapshots outside retention. Returns per-mode stats."""
+    delete snapshots outside retention. Returns per-mode stats.
+
+    Streamed: a 5,000-user M365 tenant has 25,000 resources (5 workloads
+    each) and tens of millions of snapshots. Loading the full resource set
+    into memory used to balloon Python heap to multi-GB on every cron run
+    and stalled the scheduler. Server-side cursor + per-row commit keeps
+    peak memory bounded to ~one-resource-worth-of-snapshots at a time.
+    """
     stats = {"checked_resources": 0, "held": 0, "deleted_snapshots": 0, "kept_snapshots": 0}
 
-    resources = (await session.execute(
-        select(Resource).where(Resource.tenant_id == tenant_id)
-    )).scalars().all()
-
-    # Preload all policies for the tenant once
+    # Preload all policies for the tenant once — there are O(10) policies
+    # per tenant even at scale, so this is cheap and avoids re-querying
+    # for every resource.
     pol_rows = (await session.execute(
         select(SlaPolicy).where(SlaPolicy.tenant_id == tenant_id)
     )).scalars().all()
     policies_by_id = {p.id: p for p in pol_rows}
     default_policy = next((p for p in pol_rows if p.is_default), None)
 
-    for res in resources:
+    if not policies_by_id and default_policy is None:
+        # Tenant has no policies at all — nothing to enforce. Bail before
+        # the resource scan to save cursor work.
+        return stats
+
+    # Stream resources via server-side cursor to keep memory bounded.
+    res_stream = await session.stream(
+        select(Resource)
+        .where(Resource.tenant_id == tenant_id)
+        .execution_options(yield_per=500)
+    )
+
+    # Commit periodically so we don't hold an open transaction across
+    # the entire tenant — at 25k resources this would block VACUUM and
+    # any concurrent writers for the duration of the sweep.
+    COMMIT_EVERY = 100
+    since_commit = 0
+
+    async for res in res_stream.scalars():
         stats["checked_resources"] += 1
         policy = policies_by_id.get(res.sla_policy_id) or default_policy
         if policy is None:
@@ -167,22 +232,37 @@ async def enforce_retention_for_tenant(session: AsyncSession, tenant_id: uuid.UU
             stats["held"] += 1
             continue
 
+        # Snapshots per resource are bounded (a single resource's
+        # retention window) — load them in full, but only one resource
+        # at a time.
         snaps = (await session.execute(
             select(Snapshot).where(Snapshot.resource_id == res.id)
         )).scalars().all()
         if not snaps:
             continue
 
-        mode = (policy.retention_mode or "FLAT").upper()
-        if mode == "GFS":
-            keep = _gfs_keep_ids(snaps, policy)
-        else:
-            keep = _flat_keep_ids(snaps, policy)
+        # ARCHIVED resources get a separate branch — operators have an
+        # explicit dropdown for what to keep once the source is gone.
+        # SAME falls through to the normal FLAT/GFS rule.
+        keep = None
+        if _is_archived(res):
+            keep = _archived_keep_ids(snaps, policy)
+        if keep is None:
+            mode = (policy.retention_mode or "FLAT").upper()
+            if mode == "GFS":
+                keep = _gfs_keep_ids(snaps, policy)
+            else:
+                keep = _flat_keep_ids(snaps, policy)
 
         to_delete = {s.id for s in snaps} - keep
         deleted = await _delete_snapshots(session, to_delete)
         stats["deleted_snapshots"] += deleted
         stats["kept_snapshots"] += len(keep)
+
+        since_commit += 1
+        if since_commit >= COMMIT_EVERY:
+            await session.commit()
+            since_commit = 0
 
     await session.commit()
     return stats

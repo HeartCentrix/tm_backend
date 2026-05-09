@@ -646,15 +646,42 @@ async def _apply_auto_protect_groups(db, tenant_id: UUID) -> int:
       5. Commit
 
     Returns the count of resources auto-assigned."""
-    from shared.models import ResourceGroup, GroupPolicyAssignment, Resource as _Res
+    from shared.models import ResourceGroup, GroupPolicyAssignment, Resource as _Res, SlaPolicy
     from shared.resource_group_matcher import find_matching_groups
+    from sqlalchemy import or_
 
-    # 1. candidate groups (auto-protect + enabled + attached to ≥1 policy)
-    groups_stmt = select(ResourceGroup).where(
-        ResourceGroup.tenant_id == tenant_id,
-        ResourceGroup.enabled.is_(True),
-        ResourceGroup.auto_protect_new.is_(True),
-    ).order_by(ResourceGroup.priority.asc())
+    # 1. candidate groups — eligible when EITHER:
+    #    a) the group itself has auto_protect_new=true (group-level opt-in), OR
+    #    b) at least one policy attached to the group has
+    #       auto_apply_to_matching=true (policy-level opt-in from the SLA wizard).
+    # The wizard's checkbox sets (b); the resource-group admin sets (a).
+    # Both routes funnel through the same matching + assign logic below.
+    auto_apply_policy_ids_stmt = select(SlaPolicy.id).where(
+        SlaPolicy.tenant_id == tenant_id,
+        SlaPolicy.enabled.is_(True),
+        SlaPolicy.auto_apply_to_matching.is_(True),
+    )
+    auto_apply_policy_ids = [row[0] for row in (await db.execute(auto_apply_policy_ids_stmt)).all()]
+
+    if auto_apply_policy_ids:
+        groups_attached_to_auto_policies = select(GroupPolicyAssignment.group_id).where(
+            GroupPolicyAssignment.policy_id.in_(auto_apply_policy_ids)
+        )
+        groups_stmt = select(ResourceGroup).where(
+            ResourceGroup.tenant_id == tenant_id,
+            ResourceGroup.enabled.is_(True),
+            or_(
+                ResourceGroup.auto_protect_new.is_(True),
+                ResourceGroup.id.in_(groups_attached_to_auto_policies),
+            ),
+        ).order_by(ResourceGroup.priority.asc())
+    else:
+        groups_stmt = select(ResourceGroup).where(
+            ResourceGroup.tenant_id == tenant_id,
+            ResourceGroup.enabled.is_(True),
+            ResourceGroup.auto_protect_new.is_(True),
+        ).order_by(ResourceGroup.priority.asc())
+
     groups = (await db.execute(groups_stmt)).scalars().all()
     if not groups:
         return 0
@@ -671,30 +698,59 @@ async def _apply_auto_protect_groups(db, tenant_id: UUID) -> int:
     if not eligible_groups:
         return 0
 
-    # 2. resources in this tenant without a policy
-    resources_stmt = select(_Res).where(
-        _Res.tenant_id == tenant_id,
-        _Res.sla_policy_id.is_(None),
-    )
-    resources = (await db.execute(resources_stmt)).scalars().all()
-    if not resources:
-        return 0
+    # 2. Resources in this tenant without a policy. Stream + chunked
+    #    bulk UPDATE so a 25k-resource tenant doesn't materialize the
+    #    full unpolicied set into memory and doesn't hold a single huge
+    #    transaction across the whole sweep.
+    from sqlalchemy import update as sa_update
 
+    CHUNK = 1000
+    pending: Dict[UUID, List[UUID]] = {}  # policy_id -> list of resource ids
     assigned = 0
-    for resource in resources:
+
+    res_stream = await db.stream(
+        select(_Res)
+        .where(_Res.tenant_id == tenant_id)
+        .where(_Res.sla_policy_id.is_(None))
+        .execution_options(yield_per=CHUNK)
+    )
+
+    async def _flush() -> int:
+        nonlocal pending
+        n = 0
+        for pol_id, rids in pending.items():
+            if not rids:
+                continue
+            await db.execute(
+                sa_update(_Res)
+                .where(_Res.id.in_(rids))
+                .where(_Res.sla_policy_id.is_(None))  # don't clobber races
+                .values(sla_policy_id=pol_id)
+            )
+            n += len(rids)
+        pending = {}
+        if n:
+            await db.commit()
+        return n
+
+    async for resource in res_stream.scalars():
         matched = find_matching_groups(resource, eligible_groups)
         if not matched:
             continue
-        # Use the highest-priority matching group's first attached policy.
         top_group = matched[0]
         policies_for_group = group_to_policies.get(top_group.id) or []
         if not policies_for_group:
             continue
-        resource.sla_policy_id = policies_for_group[0]
-        assigned += 1
+        pol_id = policies_for_group[0]
+        pending.setdefault(pol_id, []).append(resource.id)
+        # Flush when any single bucket reaches CHUNK — keeps the bulk
+        # UPDATE statement's parameter count predictable.
+        if len(pending[pol_id]) >= CHUNK:
+            assigned += await _flush()
+
+    assigned += await _flush()
 
     if assigned:
-        await db.commit()
         logger.info("[auto-protect] Assigned policies to %d newly-discovered resource(s) for tenant %s",
                     assigned, tenant_id)
     return assigned
