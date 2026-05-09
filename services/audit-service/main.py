@@ -48,12 +48,35 @@ def _fmt_bytes(b: int) -> str:
 
 
 def _compute_details(job: Job) -> str:
-    """Compute details string using data_backed_up/total_data formula."""
+    """Compute the per-row details string.
+
+    Branches on terminal status first so a completed job never shows a
+    stale 'Progress: 95%' fallback: that fallback was firing when the
+    final progress bump (→100) lost a race with the status flip, or
+    when bytes counters were never populated for that workload.
+    """
     if job.error_message:
         return job.error_message
+
     cached = _running_job_cache.get(str(job.id), {})
     data_backed_up = cached.get("data_backed_up", job.bytes_processed or 0)
-    total_data = cached.get("total_data") or (job.result.get("total_bytes", 0) if job.result else 0)
+    total_data = cached.get("total_data") or (
+        job.result.get("total_bytes", 0) if job.result else 0
+    )
+
+    # Terminal states: never show "Progress: X%" — the job is finished.
+    if job.status == JobStatus.COMPLETED:
+        if total_data > 0:
+            return f"{_fmt_bytes(data_backed_up or total_data)} backed up"
+        if data_backed_up > 0:
+            return f"{_fmt_bytes(data_backed_up)} backed up"
+        return "Completed"
+    if job.status == JobStatus.FAILED:
+        return job.error_message or "Failed"
+    if job.status == JobStatus.CANCELLED:
+        return "Cancelled"
+
+    # RUNNING / PENDING — progress text is meaningful.
     if total_data > 0:
         pct = min(100, int((data_backed_up / total_data) * 100))
         return f"{pct}% ({_fmt_bytes(data_backed_up)} / {_fmt_bytes(total_data)})"
