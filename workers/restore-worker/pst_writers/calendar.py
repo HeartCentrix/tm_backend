@@ -33,18 +33,26 @@ class CalendarPstWriter(PstWriterBase):
     async def _collect_graph_item(self, item, shard, source_container: str) -> Optional[dict]:
         extra = getattr(item, "extra_data", None) or {}
         raw = extra.get("raw") if isinstance(extra, dict) else None
+        ext_id = getattr(item, "external_id", "?")
         if not raw:
-            logger.warning(
-                "calendar: missing extra_data['raw'] for item %s",
-                getattr(item, "external_id", "?"),
+            print(
+                f"[pst_writer] calendar SKIP missing extra_data['raw'] item={ext_id}",
+                flush=True,
             )
             return None
 
         if raw.get("seriesMasterId"):
-            logger.debug(
-                "calendar: skipping child occurrence %s (parent=%s)",
-                raw.get("id"),
-                raw.get("seriesMasterId"),
+            # Child occurrence — pstwriter consumes the master and
+            # expands the recurrence rule on read. The streamer
+            # (stream_snapshot_items_by_group) auto-expands selected
+            # children to include their masters; if a child still slips
+            # through here it is because the master is not backed up
+            # (parent mailbox not in scope, or master was hard-deleted
+            # before the snapshot ran).
+            print(
+                f"[pst_writer] calendar SKIP child-occurrence item={ext_id} "
+                f"parent={raw.get('seriesMasterId')}",
+                flush=True,
             )
             return None
 

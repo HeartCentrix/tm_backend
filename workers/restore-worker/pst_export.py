@@ -567,6 +567,26 @@ class PstExportOrchestrator:
                 item_counts[item_type] += write_result.item_count
                 failed_counts[item_type] += write_result.failed_count
 
+                # When a group produced zero PSTs, surface the skip
+                # reason so the caller (job-service download endpoint,
+                # UI) can show a useful error instead of "no file".
+                if (
+                    write_result.item_count == 0
+                    and not write_result.pst_paths
+                ):
+                    skipped_groups.append({
+                        "key": str(group_key),
+                        "item_type": item_type,
+                        "reason": "no_collectable_items",
+                        "items_attempted": len(items_to_write),
+                        "failed": write_result.failed_count,
+                        "error": (
+                            "All items skipped — usually means calendar "
+                            "occurrences whose series-master is not "
+                            "backed up, or items missing raw payload."
+                        ),
+                    })
+
                 # Upload each produced PST to blob immediately, then
                 # delete the local file. This bounds /tmp regardless of
                 # total mailbox size.

@@ -9,3 +9,15 @@ venv/
 .git/
 .gitignore
 *.md
+# CMake / native-build artefacts. The pstwriter build directory must
+# never enter the Docker context — it contains the host machine's
+# build output (Mach-O on macOS, sometimes wrong-arch Linux ELFs from
+# CI). If it leaks in, cmake inside the build stage reuses the stale
+# artefacts and ships a binary that crashes at runtime with
+# `[Errno 8] Exec format error`. Build fresh inside the container.
+vendor/pstwriter/build/
+vendor/pstwriter/**/CMakeFiles/
+vendor/pstwriter/**/CMakeCache.txt
+vendor/pstwriter/**/*.o
+vendor/pstwriter/**/*.a
+vendor/pstwriter/**/*.so

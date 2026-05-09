@@ -15,9 +15,24 @@ RUN apt-get update \
 WORKDIR /src
 COPY vendor/pstwriter /src
 
-RUN cmake -S /src -B /src/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+# Wipe any stray build/ that snuck through .dockerignore — without
+# this, cmake reuses host-built artefacts (Mach-O on macOS dev
+# machines) and the runtime stage ships a wrong-architecture binary
+# that errors with `Exec format error`. Belt + suspenders alongside
+# the .dockerignore entry.
+RUN rm -rf /src/build /src/CMakeCache.txt /src/CMakeFiles \
+ && cmake -S /src -B /src/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
  && cmake --build /src/build --target pst_convert \
  && /src/build/bin/pst_convert 2>/dev/null || true   # smoke: prints usage on argc!=4
+
+# Sanity-check the produced binary is an ELF for the build platform.
+# Magic bytes 7f 45 4c 46 ("ELF") — anything else (Mach-O cf fa ed fe,
+# PE 4d 5a) means a wrong-arch artefact slipped through and the build
+# should fail loudly here, not silently at runtime.
+RUN head -c 4 /src/build/bin/pst_convert | od -An -tx1 | grep -q "7f 45 4c 46" \
+ || (echo "FATAL: pst_convert is not an ELF binary. Build context likely contains a host-built artefact." \
+     && head -c 4 /src/build/bin/pst_convert | od -An -tx1 \
+     && exit 1)
 
 # --- Stage 2: Python runtime ----------------------------------------------
 FROM python:3.11-slim

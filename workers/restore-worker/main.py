@@ -735,13 +735,34 @@ class RestoreWorker:
                     result = await handler(session, items_to_restore, message, spec)
                     print(f"[{self.worker_id}] handler returned job={job_id}", flush=True)
 
-                    # Update job as completed
-                    await self.update_job_status(session, job_id, JobStatus.COMPLETED, result)
+                    # Decide terminal status from the handler's actual outcome.
+                    # Without this, exports that produced zero files (e.g. the
+                    # PST converter binary was missing or the wrong arch) were
+                    # marked COMPLETED and the UI offered a download for a
+                    # non-existent file. The download endpoint then returned
+                    # 500 when it couldn't find blob_path. Now:
+                    #   - exported>0, failed=0  → COMPLETED (full success)
+                    #   - exported>0, failed>0  → COMPLETED with status flag
+                    #     "done_with_errors" preserved in result; download
+                    #     endpoint serves the partial file as before.
+                    #   - exported=0 (any failed) → FAILED. UI hides Download.
+                    exported = int(result.get("exported_count", 0) or 0)
+                    failed = int(result.get("failed_count", 0) or 0)
+                    is_export_type = restore_type in {"EXPORT_ZIP", "EXPORT_PST", "DOWNLOAD"}
+                    if is_export_type and exported == 0:
+                        terminal_status = JobStatus.FAILED
+                        outcome = "FAILURE"
+                        action = "RESTORE_FAILED"
+                    else:
+                        terminal_status = JobStatus.COMPLETED
+                        outcome = "SUCCESS"
+                        action = "RESTORE_COMPLETED"
+
+                    await self.update_job_status(session, job_id, terminal_status, result)
                     await session.commit()
 
-                    # Log audit event
                     await self.log_audit_event(
-                        job_id, message, result, action="RESTORE_COMPLETED", outcome="SUCCESS",
+                        job_id, message, result, action=action, outcome=outcome,
                     )
 
                     print(f"[{self.worker_id}] Restore job {job_id} completed: {restore_type}")
@@ -1006,6 +1027,64 @@ class RestoreWorker:
             {uuid.UUID(iid) for iid in (excluded_item_ids or [])}
             if excluded_item_ids else set()
         )
+
+        # When the caller picks specific item_ids and any of them are
+        # calendar series-children, expand the filter to include the
+        # corresponding seriesMaster rows. The PST writer skips children
+        # (the master carries the recurrence rule and pstwriter expands
+        # it on read) — without this expansion, a UI that picks a single
+        # occurrence sends only the child id, the master never enters
+        # the stream, and the export produces 0 items.
+        if item_ids:
+            try:
+                async with session_factory() as session:
+                    child_rows = (await session.execute(
+                        select(SnapshotItem.id, SnapshotItem.extra_data)
+                        .where(SnapshotItem.id.in_([uuid.UUID(i) for i in item_ids]))
+                        .where(SnapshotItem.item_type == "CALENDAR_EVENT")
+                    )).all()
+                    master_ext_ids: set = set()
+                    for _row_id, _ed in child_rows:
+                        if not isinstance(_ed, dict):
+                            continue
+                        _raw = _ed.get("raw") if isinstance(_ed, dict) else None
+                        if isinstance(_raw, dict) and _raw.get("seriesMasterId"):
+                            master_ext_ids.add(_raw["seriesMasterId"])
+                    if master_ext_ids:
+                        master_id_rows = (await session.execute(
+                            select(SnapshotItem.id)
+                            .where(SnapshotItem.snapshot_id.in_(sibling_ids))
+                            .where(SnapshotItem.item_type == "CALENDAR_EVENT")
+                            .where(SnapshotItem.external_id.in_(master_ext_ids))
+                        )).scalars().all()
+                        added = [str(mid) for mid in master_id_rows if str(mid) not in set(item_ids)]
+                        if added:
+                            item_ids = list(item_ids) + added
+                            print(
+                                f"[{self.worker_id}] expanded calendar item_ids: "
+                                f"{len(added)} series-master row(s) added "
+                                f"({len(master_ext_ids)} requested)",
+                                flush=True,
+                            )
+                        missing = master_ext_ids - {
+                            str(ext) for ext in (await session.execute(
+                                select(SnapshotItem.external_id)
+                                .where(SnapshotItem.snapshot_id.in_(sibling_ids))
+                                .where(SnapshotItem.external_id.in_(master_ext_ids))
+                            )).scalars().all()
+                        }
+                        if missing:
+                            print(
+                                f"[{self.worker_id}] WARN: {len(missing)} series-master "
+                                f"event(s) referenced by selected occurrences are not "
+                                f"backed up — those occurrences will be skipped",
+                                flush=True,
+                            )
+            except Exception as _exp_exc:
+                print(
+                    f"[{self.worker_id}] series-master expansion failed (non-fatal): {_exp_exc}",
+                    flush=True,
+                )
 
         # Keyset pagination on (external_id, snapshot_id) — DISTINCT ON
         # external_id with newest-wins means we always get one row per

@@ -1464,7 +1464,24 @@ async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
 
     blob_path = result.get("blob_path") or result.get("blobPath")
     if not blob_path:
-        raise HTTPException(status_code=500, detail="Job completed but no blob_path recorded")
+        # COMPLETED but no file produced — usually means the export ran
+        # but every group failed (e.g. PST converter unavailable). Surface
+        # the real failure reason from result.skipped_groups so the
+        # frontend can render a meaningful message instead of a generic
+        # 500. Client-friendly status is 422 — the job state is consistent
+        # but there's nothing to download.
+        skipped = result.get("skipped_groups") or []
+        first_err = (skipped[0].get("error") if skipped and isinstance(skipped[0], dict) else None) or ""
+        exported = result.get("exported_count", 0)
+        failed = result.get("failed_count", 0)
+        # Truncate long stack traces to keep the response readable.
+        if len(first_err) > 240:
+            first_err = first_err[:240] + "…"
+        detail = (
+            f"Export produced no file (exported={exported}, failed={failed})"
+            + (f". First error: {first_err}" if first_err else "")
+        )
+        raise HTTPException(status_code=422, detail=detail)
 
     # Reuse the same shard the workers use so credentials line up.
     # Container naming mirrors backup-worker / restore-worker:
