@@ -1034,6 +1034,15 @@ async def apply_lifecycle_policy(container_name: str, hot_days: int = 7,
             _lifecycle_logger.error("[LifecyclePolicy] No storage shard available — cannot apply policy")
             return {"success": False, "error": "No storage shard available"}
 
+    # Lifecycle rules: Hot → Cool → Delete.
+    #
+    # We deliberately DO NOT use the Azure Archive tier. Archive blobs require
+    # 1–15 hours of rehydration before they can be read, which violates the
+    # product requirement that archived backups stay accessible within minutes
+    # for restore/browse operations. Data lives in Cool storage for the full
+    # `cool_days + archive_days` window — Cool reads return in seconds while
+    # storage cost is ~50% lower than Hot. After the cumulative window, the
+    # blob is deleted by the lifecycle rule below.
     rules = [
         {
             "enabled": True,
@@ -1043,16 +1052,6 @@ async def apply_lifecycle_policy(container_name: str, hot_days: int = 7,
                             "prefixMatch": [f"{container_name}/"]},
                 "actions": {"baseBlob": {
                     "tierToCool": {"daysAfterModificationGreaterThan": hot_days}}}
-            }
-        },
-        {
-            "enabled": True,
-            "name": f"{container_name}_cool_to_archive",
-            "definition": {
-                "filters": {"blobTypes": ["blockBlob"],
-                            "prefixMatch": [f"{container_name}/"]},
-                "actions": {"baseBlob": {
-                    "tierToArchive": {"daysAfterModificationGreaterThan": hot_days + cool_days}}}
             }
         },
     ]
@@ -1137,6 +1136,482 @@ async def apply_lifecycle_policy(container_name: str, hot_days: int = 7,
             container_name, outer_exc, traceback.format_exc(),
         )
         return {"success": False, "error": str(outer_exc)}
+
+
+async def read_encryption_scope_state(
+    container_name: str,
+    shard: AzureStorageShard = None,
+) -> Dict:
+    """Read the live encryption-scope binding for a container from ARM.
+
+    Returns:
+      {"scope": "...", "key_uri": "...", "state": "Enabled|Disabled"} or
+      {"scope": None} if no scope is currently bound to the container, or
+      {"error": "..."} on failure.
+
+    Used by the reconciler to detect drift — if Azure-side state differs
+    from what the SLA policy says it should be, we re-apply.
+    """
+    if shard is None:
+        shard = azure_storage_manager.get_default_shard()
+        if not shard:
+            return {"error": "No storage shard available"}
+    try:
+        from azure.mgmt.storage.aio import StorageManagementClient
+        from azure.identity.aio import ClientSecretCredential
+        from shared.config import settings
+    except Exception as imp_exc:
+        return {"error": f"azure-mgmt-storage unavailable: {imp_exc}"}
+
+    client_id = settings.EFFECTIVE_ARM_CLIENT_ID or settings.MICROSOFT_CLIENT_ID
+    client_secret = settings.EFFECTIVE_ARM_CLIENT_SECRET or settings.MICROSOFT_CLIENT_SECRET
+    tenant_id = settings.EFFECTIVE_ARM_TENANT_ID or settings.MICROSOFT_TENANT_ID
+    if not client_id or not client_secret:
+        return {"error": "ARM credentials not configured"}
+    rg_name = settings.AZURE_BACKUP_RESOURCE_GROUP or "tmvault-storage"
+    credential = ClientSecretCredential(client_id=client_id, client_secret=client_secret, tenant_id=tenant_id)
+    scope_name = f"tmv-cmk-{container_name}".replace("_", "-")[:63]
+
+    try:
+        async with StorageManagementClient(credential) as mgmt:
+            # Read the container to learn its current default scope.
+            try:
+                container = await mgmt.blob_containers.get(
+                    resource_group_name=rg_name,
+                    account_name=shard.account_name,
+                    container_name=container_name,
+                )
+                bound_scope = getattr(container, "default_encryption_scope", None)
+            except Exception as e:
+                return {"error": f"container get failed: {e}"}
+            if not bound_scope or bound_scope == "$account-encryption-key":
+                return {"scope": None, "key_uri": None, "state": None}
+
+            try:
+                scope = await mgmt.encryption_scopes.get(
+                    resource_group_name=rg_name,
+                    account_name=shard.account_name,
+                    encryption_scope_name=scope_name,
+                )
+                kvp = getattr(scope, "key_vault_properties", None)
+                key_uri = getattr(kvp, "key_uri", None) if kvp else None
+                state = getattr(scope, "state", None)
+                return {"scope": bound_scope, "key_uri": key_uri, "state": str(state) if state else None}
+            except Exception as e:
+                return {"scope": bound_scope, "error": f"scope get failed: {e}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def resolve_key_vault_latest_version(
+    key_vault_uri: str,
+    key_name: str,
+) -> Optional[str]:
+    """Query Key Vault for the current version of a key. Returns the
+    version string, or None on failure (e.g. permission denied).
+
+    Used when the SLA policy pins to "latest" so the reconciler can
+    detect when the customer rotated the key in Key Vault and re-apply
+    the encryption scope with the new version. Storage account managed
+    identity needs `Get` permission on the key for this to succeed.
+    """
+    if not key_vault_uri or not key_name:
+        return None
+    try:
+        from azure.keyvault.keys.aio import KeyClient
+        from azure.identity.aio import ClientSecretCredential
+        from shared.config import settings
+    except Exception:
+        return None
+
+    client_id = settings.EFFECTIVE_ARM_CLIENT_ID or settings.MICROSOFT_CLIENT_ID
+    client_secret = settings.EFFECTIVE_ARM_CLIENT_SECRET or settings.MICROSOFT_CLIENT_SECRET
+    tenant_id = settings.EFFECTIVE_ARM_TENANT_ID or settings.MICROSOFT_TENANT_ID
+    if not client_id or not client_secret:
+        return None
+
+    credential = ClientSecretCredential(client_id=client_id, client_secret=client_secret, tenant_id=tenant_id)
+    try:
+        async with KeyClient(vault_url=key_vault_uri, credential=credential) as client:
+            key = await client.get_key(key_name)  # latest by default
+            # `key.id` is `https://vault/keys/<name>/<version>`
+            kid = getattr(key, "id", None) or ""
+            if "/" in kid:
+                return kid.rsplit("/", 1)[-1]
+            return None
+    except Exception:
+        return None
+
+
+async def apply_encryption_scope(
+    container_name: str,
+    key_vault_uri: str,
+    key_name: str,
+    key_version: Optional[str] = None,
+    shard: AzureStorageShard = None,
+) -> Dict:
+    """
+    Configure container-level customer-managed-key (CMK / BYOK) encryption
+    via Azure ARM. Creates an EncryptionScope on the storage account that
+    references the customer's Key Vault key, then patches the container so
+    `default_encryption_scope` points at it. New blobs in this container
+    are encrypted with the customer key; existing blobs remain encrypted
+    with whatever scope was active when they were written.
+
+    Returns:
+      success → {"success": True, "container": ..., "scope": ..., "status": "OK"}
+      access denied → {"success": False, "status": "KEY_VAULT_ACCESS_DENIED", ...}
+      generic error → {"success": False, "status": "ERROR", "error": ...}
+
+    The status string is persisted on the SLA policy so the wizard can
+    surface a red-dot warning when the storage account managed identity
+    lacks Get/WrapKey/UnwrapKey on the customer's vault.
+    """
+    _lifecycle_logger.info(
+        "[EncryptionScope] START — container=%s, vault=%s, key=%s, version=%s",
+        container_name, key_vault_uri, key_name, key_version or "(latest)",
+    )
+
+    if shard is None:
+        shard = azure_storage_manager.get_default_shard()
+        if not shard:
+            return {"success": False, "container": container_name,
+                    "status": "NO_SHARD", "error": "No storage shard available"}
+
+    if not (key_vault_uri and key_name):
+        return {"success": False, "container": container_name,
+                "status": "INVALID_KEY", "error": "key_vault_uri and key_name are required"}
+
+    try:
+        from azure.mgmt.storage.aio import StorageManagementClient
+        from azure.identity.aio import ClientSecretCredential
+        from shared.config import settings
+    except Exception as imp_exc:
+        return {"success": False, "container": container_name,
+                "status": "AZURE_SDK_MISSING",
+                "error": f"azure-mgmt-storage unavailable: {imp_exc}"}
+
+    client_id = settings.EFFECTIVE_ARM_CLIENT_ID or settings.MICROSOFT_CLIENT_ID
+    client_secret = settings.EFFECTIVE_ARM_CLIENT_SECRET or settings.MICROSOFT_CLIENT_SECRET
+    tenant_id = settings.EFFECTIVE_ARM_TENANT_ID or settings.MICROSOFT_TENANT_ID
+    if not client_id or not client_secret:
+        return {"success": False, "container": container_name,
+                "status": "NO_ARM_CREDS",
+                "error": "ARM credentials not configured"}
+
+    rg_name = settings.AZURE_BACKUP_RESOURCE_GROUP or "tmvault-storage"
+
+    # Encryption-scope name is a per-policy identifier. Container names are
+    # already tenant+workload-scoped, so deriving from the container keeps
+    # the scope unique without needing the policy id at this layer.
+    scope_name = f"tmv-cmk-{container_name}".replace("_", "-")[:63]
+
+    credential = ClientSecretCredential(
+        client_id=client_id, client_secret=client_secret, tenant_id=tenant_id,
+    )
+    try:
+        async with StorageManagementClient(credential) as mgmt:
+            key_uri_full = (
+                f"{key_vault_uri.rstrip('/')}/keys/{key_name}/{key_version}"
+                if key_version else
+                f"{key_vault_uri.rstrip('/')}/keys/{key_name}"
+            )
+            try:
+                await mgmt.encryption_scopes.put(
+                    resource_group_name=rg_name,
+                    account_name=shard.account_name,
+                    encryption_scope_name=scope_name,
+                    encryption_scope={
+                        "properties": {
+                            "source": "Microsoft.KeyVault",
+                            "state": "Enabled",
+                            "keyVaultProperties": {"keyUri": key_uri_full},
+                            "requireInfrastructureEncryption": False,
+                        }
+                    },
+                )
+            except Exception as scope_exc:
+                msg = str(scope_exc)
+                # Storage account managed identity lacks key permissions —
+                # surface a specific status so the UI can prompt for
+                # `az role assignment create --role "Key Vault Crypto User"`.
+                if any(s in msg for s in ("Forbidden", "AccessDenied",
+                                          "AuthorizationFailed",
+                                          "KeyVaultAccessForbidden")):
+                    _lifecycle_logger.error(
+                        "[EncryptionScope] KEY_VAULT_ACCESS_DENIED — %s", msg)
+                    return {"success": False, "container": container_name,
+                            "status": "KEY_VAULT_ACCESS_DENIED",
+                            "error": msg, "scope": scope_name}
+                raise
+
+            # Point the container at the new scope.
+            await mgmt.blob_containers.update(
+                resource_group_name=rg_name,
+                account_name=shard.account_name,
+                container_name=container_name,
+                blob_container={
+                    "default_encryption_scope": scope_name,
+                    "deny_encryption_scope_override": True,
+                },
+            )
+            return {"success": True, "container": container_name,
+                    "scope": scope_name, "status": "OK"}
+    except Exception as e:
+        _lifecycle_logger.error(
+            "[EncryptionScope] FAILED — container=%s: %s\n%s",
+            container_name, e, traceback.format_exc(),
+        )
+        return {"success": False, "container": container_name,
+                "status": "ERROR", "error": str(e)}
+
+
+async def read_container_immutability_state(
+    container_name: str,
+    shard: AzureStorageShard = None,
+) -> Dict:
+    """Read the live immutability-policy state for a container from ARM.
+    Returns {"mode": "None|Unlocked|Locked", "days": int|None}.
+
+    Used by the reconciler to refuse loosening transitions that Azure
+    can't honor — e.g. a Locked container whose policy row was edited to
+    Unlocked. Without this guard, the reconciler silently fails (Azure
+    rejects the change) and the operator thinks the policy was loosened
+    when in fact it's still WORM-locked.
+    """
+    if shard is None:
+        shard = azure_storage_manager.get_default_shard()
+        if not shard:
+            return {"error": "No storage shard available"}
+    try:
+        from azure.mgmt.storage.aio import StorageManagementClient
+        from azure.identity.aio import ClientSecretCredential
+        from shared.config import settings
+    except Exception as imp_exc:
+        return {"error": f"azure-mgmt-storage unavailable: {imp_exc}"}
+
+    client_id = settings.EFFECTIVE_ARM_CLIENT_ID or settings.MICROSOFT_CLIENT_ID
+    client_secret = settings.EFFECTIVE_ARM_CLIENT_SECRET or settings.MICROSOFT_CLIENT_SECRET
+    tenant_id = settings.EFFECTIVE_ARM_TENANT_ID or settings.MICROSOFT_TENANT_ID
+    if not client_id or not client_secret:
+        return {"error": "ARM credentials not configured"}
+    rg_name = settings.AZURE_BACKUP_RESOURCE_GROUP or "tmvault-storage"
+    credential = ClientSecretCredential(client_id=client_id, client_secret=client_secret, tenant_id=tenant_id)
+    try:
+        async with StorageManagementClient(credential) as mgmt:
+            try:
+                pol = await mgmt.blob_containers.get_immutability_policy(
+                    resource_group_name=rg_name,
+                    account_name=shard.account_name,
+                    container_name=container_name,
+                )
+                state = getattr(pol, "state", None)
+                days = getattr(pol, "immutability_period_since_creation_in_days", None)
+                # Azure exposes "Locked" or "Unlocked"; absence == None.
+                mode_str = str(state) if state else "None"
+                # Some SDK versions wrap state in an enum; normalize.
+                mode = "Locked" if "Locked" in mode_str else ("Unlocked" if "Unlocked" in mode_str else "None")
+                return {"mode": mode, "days": days}
+            except Exception as e:
+                msg = str(e)
+                if "ImmutabilityPolicyNotFound" in msg or "404" in msg:
+                    return {"mode": "None", "days": None}
+                return {"error": msg}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def apply_container_immutability(
+    container_name: str,
+    immutability_period_days: int,
+    mode: str = "Unlocked",
+    shard: AzureStorageShard = None,
+) -> Dict:
+    """
+    Set a CONTAINER-level immutability policy via the Azure ARM management
+    API. Applies WORM protection to every blob in the container — paired
+    with `reconcile_lifecycle_policies` so a policy change immediately
+    enforces the SLA's `immutability_mode` across the whole tenant.
+
+    mode = 'None'     → DELETE the policy (clears WORM).
+    mode = 'Unlocked' → editable; can be extended/tightened later.
+    mode = 'Locked'   → permanent; cannot be loosened or removed.
+
+    Returns: {"success": bool, "container": str, "mode": str, "error"?: str}
+    """
+    _lifecycle_logger.info(
+        "[ContainerImmutability] START — container=%s, days=%s, mode=%s",
+        container_name, immutability_period_days, mode,
+    )
+
+    if shard is None:
+        shard = azure_storage_manager.get_default_shard()
+        if not shard:
+            return {"success": False, "container": container_name,
+                    "error": "No storage shard available"}
+
+    # Refuse transitions Azure can't honor. If the live container is
+    # already in "Locked" state, ARM rejects any loosening (None or
+    # Unlocked). Surface a specific error so the reconciler can mark the
+    # policy KEY_VAULT-style "drift" status instead of silently failing
+    # at scale.
+    if mode in ("None", "Unlocked"):
+        live = await read_container_immutability_state(container_name, shard)
+        if (live or {}).get("mode") == "Locked":
+            return {"success": False, "container": container_name,
+                    "status": "REFUSED_LOOSEN_LOCKED",
+                    "error": (
+                        "Container has a Locked WORM policy in Azure that "
+                        "cannot be loosened or removed — ignoring policy-row "
+                        "transition to '{}'.".format(mode)
+                    )}
+
+    try:
+        from azure.mgmt.storage.aio import StorageManagementClient
+        from azure.identity.aio import ClientSecretCredential
+        from shared.config import settings
+    except Exception as imp_exc:
+        return {"success": False, "container": container_name,
+                "error": f"azure-mgmt-storage unavailable: {imp_exc}"}
+
+    client_id = settings.EFFECTIVE_ARM_CLIENT_ID or settings.MICROSOFT_CLIENT_ID
+    client_secret = settings.EFFECTIVE_ARM_CLIENT_SECRET or settings.MICROSOFT_CLIENT_SECRET
+    tenant_id = settings.EFFECTIVE_ARM_TENANT_ID or settings.MICROSOFT_TENANT_ID
+    if not client_id or not client_secret:
+        return {"success": False, "container": container_name,
+                "error": "ARM credentials not configured"}
+
+    rg_name = settings.AZURE_BACKUP_RESOURCE_GROUP or "tmvault-storage"
+    credential = ClientSecretCredential(
+        client_id=client_id, client_secret=client_secret, tenant_id=tenant_id,
+    )
+    try:
+        async with StorageManagementClient(credential) as mgmt:
+            if mode == "None":
+                # Delete any existing policy. Locked policies cannot be
+                # deleted — Azure returns 409; surface that as a soft error.
+                try:
+                    existing = await mgmt.blob_containers.get_immutability_policy(
+                        resource_group_name=rg_name,
+                        account_name=shard.account_name,
+                        container_name=container_name,
+                    )
+                    if_match = existing.etag
+                    await mgmt.blob_containers.delete_immutability_policy(
+                        resource_group_name=rg_name,
+                        account_name=shard.account_name,
+                        container_name=container_name,
+                        if_match=if_match,
+                    )
+                except Exception as del_exc:
+                    msg = str(del_exc)
+                    if "ImmutabilityPolicyNotFound" in msg or "404" in msg:
+                        return {"success": True, "container": container_name, "mode": "None",
+                                "note": "no_policy_to_delete"}
+                    return {"success": False, "container": container_name, "mode": "None",
+                            "error": msg}
+                return {"success": True, "container": container_name, "mode": "None"}
+
+            await mgmt.blob_containers.create_or_update_immutability_policy(
+                resource_group_name=rg_name,
+                account_name=shard.account_name,
+                container_name=container_name,
+                parameters={
+                    "properties": {
+                        "immutabilityPeriodSinceCreationInDays": int(immutability_period_days),
+                        "allowProtectedAppendWrites": True,
+                    }
+                },
+            )
+
+            if mode == "Locked":
+                # Lock irreversibly. Get current etag first.
+                cur = await mgmt.blob_containers.get_immutability_policy(
+                    resource_group_name=rg_name,
+                    account_name=shard.account_name,
+                    container_name=container_name,
+                )
+                await mgmt.blob_containers.lock_immutability_policy(
+                    resource_group_name=rg_name,
+                    account_name=shard.account_name,
+                    container_name=container_name,
+                    if_match=cur.etag,
+                )
+
+            return {"success": True, "container": container_name, "mode": mode,
+                    "days": immutability_period_days}
+    except Exception as e:
+        msg = str(e)
+        if "ImmutabilityPolicyLocked" in msg:
+            # Already locked — Azure refuses changes. Treat as success
+            # (the policy is enforced; we just can't loosen it).
+            return {"success": True, "container": container_name, "mode": "Locked",
+                    "note": "already_locked"}
+        _lifecycle_logger.error(
+            "[ContainerImmutability] FAILED — container=%s: %s\n%s",
+            container_name, e, traceback.format_exc(),
+        )
+        return {"success": False, "container": container_name, "error": msg}
+
+
+async def apply_container_legal_hold(
+    container_name: str,
+    enabled: bool,
+    tag: str = "tmvault-legal-hold",
+    shard: AzureStorageShard = None,
+) -> Dict:
+    """
+    Set or clear a CONTAINER-level legal hold via ARM. Tag is preserved on
+    enable; clear removes it. Container legal-holds protect every blob in
+    the container regardless of immutability period.
+    """
+    _lifecycle_logger.info(
+        "[ContainerLegalHold] START — container=%s, enabled=%s, tag=%s",
+        container_name, enabled, tag,
+    )
+    if shard is None:
+        shard = azure_storage_manager.get_default_shard()
+        if not shard:
+            return {"success": False, "container": container_name,
+                    "error": "No storage shard available"}
+
+    try:
+        from azure.mgmt.storage.aio import StorageManagementClient
+        from azure.identity.aio import ClientSecretCredential
+        from shared.config import settings
+    except Exception as imp_exc:
+        return {"success": False, "container": container_name,
+                "error": f"azure-mgmt-storage unavailable: {imp_exc}"}
+
+    client_id = settings.EFFECTIVE_ARM_CLIENT_ID or settings.MICROSOFT_CLIENT_ID
+    client_secret = settings.EFFECTIVE_ARM_CLIENT_SECRET or settings.MICROSOFT_CLIENT_SECRET
+    tenant_id = settings.EFFECTIVE_ARM_TENANT_ID or settings.MICROSOFT_TENANT_ID
+    if not client_id or not client_secret:
+        return {"success": False, "container": container_name,
+                "error": "ARM credentials not configured"}
+
+    rg_name = settings.AZURE_BACKUP_RESOURCE_GROUP or "tmvault-storage"
+    credential = ClientSecretCredential(
+        client_id=client_id, client_secret=client_secret, tenant_id=tenant_id,
+    )
+    try:
+        async with StorageManagementClient(credential) as mgmt:
+            op = "set_legal_hold" if enabled else "clear_legal_hold"
+            method = getattr(mgmt.blob_containers, op)
+            await method(
+                resource_group_name=rg_name,
+                account_name=shard.account_name,
+                container_name=container_name,
+                legal_hold={"tags": [tag]},
+            )
+            return {"success": True, "container": container_name,
+                    "enabled": enabled, "tag": tag}
+    except Exception as e:
+        _lifecycle_logger.error(
+            "[ContainerLegalHold] FAILED — container=%s: %s\n%s",
+            container_name, e, traceback.format_exc(),
+        )
+        return {"success": False, "container": container_name, "error": str(e)}
 
 
 async def apply_blob_immutability(container_name: str, blob_path: str,

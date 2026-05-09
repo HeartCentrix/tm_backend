@@ -2266,6 +2266,59 @@ class BackupWorker:
                 # list. Cuts peak memory O(all-items) → O(one-chunk).
                 items_data = await _fetch_for(resource, snapshot)
 
+                # SLA exclusions — apply post-fetch but pre-persist for the
+                # five Tier-2 per-user shards (USER_MAIL, USER_ONEDRIVE,
+                # USER_CONTACTS, USER_CALENDAR, USER_CHATS). The Tier-1
+                # mailbox/onedrive/sharepoint paths already filter inline at
+                # their fetch sites (see _item_is_excluded calls earlier);
+                # this adds parity for the Tier-2 fan-out so a folder-path
+                # or filename-glob exclusion catches per-user shards too.
+                policy = await self.get_sla_policy(resource, message)
+                if policy and items_data:
+                    raw_excl = await self.get_policy_exclusions(policy.id)
+                    if raw_excl:
+                        compiled_excl = self._compile_exclusions(raw_excl)
+                        kind_to_workload = {
+                            "USER_MAIL":     "EMAIL",
+                            "USER_ONEDRIVE": "FILE",
+                            "USER_CONTACTS": "CONTACT",
+                            "USER_CALENDAR": "CALENDAR",
+                            "USER_CHATS":    "CHAT_MESSAGE",
+                        }
+                        wl = kind_to_workload.get(resource.type.value, "ALL")
+                        kept: List[tuple] = []
+                        skipped = 0
+                        for tup in items_data:
+                            # Materialize the matcher input from the tuple:
+                            # the matcher reads name / parentReference.path /
+                            # folderPath / file.mimeType / subject /
+                            # from.emailAddress / toRecipients on the dict it
+                            # gets. We synthesize all those from the tuple's
+                            # raw payload + folder_path so every exclusion
+                            # type evaluates correctly.
+                            if len(tup) == 5:
+                                _itype, name, _eid, extra, folder_path = tup
+                            else:
+                                _itype, name, _eid, extra = tup
+                                folder_path = None
+                            extra_dict = extra if isinstance(extra, dict) else {}
+                            raw = (extra_dict.get("raw") or {}) if isinstance(extra_dict.get("raw"), dict) else {}
+                            matcher_item = dict(raw)
+                            matcher_item.setdefault("name", name or raw.get("name") or "")
+                            if folder_path:
+                                matcher_item["folderPath"] = folder_path
+                            if self._item_is_excluded_compiled(wl, matcher_item, compiled_excl):
+                                skipped += 1
+                                continue
+                            kept.append(tup)
+                        if skipped:
+                            print(
+                                f"[{self.worker_id}] [{resource.type.value}] "
+                                f"exclusions skipped {skipped} of {len(items_data)} "
+                                f"items for {resource.display_name or resource.id}"
+                            )
+                        items_data = kept
+
                 bytes_total = 0
                 async with async_session_factory() as session:
                     # Build plain dicts for a multi-row pg_insert instead
@@ -7905,10 +7958,14 @@ class BackupWorker:
 
         print(f"[{self.worker_id}]   [EMAIL] Total {len(items)} messages to backup ({len(primary_items)} primary)")
 
-        # SLA exclusions — filter before upload so excluded items never touch storage
+        # SLA exclusions — filter before upload so excluded items never touch storage.
+        # Compile rules ONCE (pre-bucketed by type, regexes pre-compiled) and
+        # pass the compiled bundle into the hot loop. At ~10k mailbox items
+        # × ~50 rules this saves ~500K re.compile calls per backup.
         if exclusions:
+            compiled_excl = self._compile_exclusions(exclusions)
             before = len(items)
-            items = [m for m in items if not self._item_is_excluded("EMAIL", m, exclusions)]
+            items = [m for m in items if not self._item_is_excluded_compiled("EMAIL", m, compiled_excl)]
             excluded = before - len(items)
             if excluded:
                 print(f"[{self.worker_id}]   [EMAIL] Excluded {excluded}/{before} by SLA policy rules")
@@ -8136,12 +8193,13 @@ class BackupWorker:
         items = files.get("value", [])
         print(f"[{self.worker_id}]   [FILES] Found {len(items)} drive items")
 
-        # SLA exclusions — filter before upload
+        # SLA exclusions — filter before upload (compiled once, see EMAIL path)
         policy = await self.get_sla_policy(resource, message)
         exclusions = await self.get_policy_exclusions(policy.id) if policy else []
         if exclusions:
+            compiled_excl = self._compile_exclusions(exclusions)
             before = len(items)
-            items = [f for f in items if not self._item_is_excluded("FILE", f, exclusions)]
+            items = [f for f in items if not self._item_is_excluded_compiled("FILE", f, compiled_excl)]
             excluded = before - len(items)
             if excluded:
                 print(f"[{self.worker_id}]   [FILES] Excluded {excluded}/{before} by SLA policy rules")
@@ -8240,9 +8298,14 @@ class BackupWorker:
             logger.warning("Failed to enumerate SharePoint subsites for %s: %s", resource.display_name, exc)
 
         # SLA exclusions — applied in the producer so excluded items never
-        # reach the queue (saves memory + Graph/SP REST bandwidth).
+        # reach the queue (saves memory + Graph/SP REST bandwidth). Compile
+        # the rule bundle once for the entire stream — at SharePoint scale
+        # we may iterate 100k+ drive items per site.
         policy = await self.get_sla_policy(resource, message)
         exclusions = await self.get_policy_exclusions(policy.id) if policy else []
+        compiled_exclusions = (
+            self._compile_exclusions(exclusions) if exclusions else None
+        )
 
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         sp_container = azure_storage_manager.get_container_name(str(tenant.id), "sharepoint")
@@ -8289,7 +8352,7 @@ class BackupWorker:
                 ):
                     streamed += 1
                     item["_site_label"] = site_label
-                    if exclusions and self._item_is_excluded("FILE", item, exclusions):
+                    if compiled_exclusions and self._item_is_excluded_compiled("FILE", item, compiled_exclusions):
                         stats["drive_excluded"] += 1
                         continue
                     await drive_queue.put(item)
@@ -9203,77 +9266,136 @@ class BackupWorker:
             ]
 
     @staticmethod
-    def _item_is_excluded(item_workload: str, item: Dict[str, Any], exclusions: List[Dict[str, Any]]) -> bool:
-        """Evaluate whether a single item should be filtered from backup.
+    def _compile_exclusions(exclusions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Pre-process the rule list into a compiled, type-bucketed
+        structure that `_item_is_excluded_compiled` can evaluate without
+        per-item regex compilation or string lowering.
 
-        item_workload: EMAIL / FILE / CALENDAR / CONTACT / TEAMS_MESSAGE / CHAT_MESSAGE
-        item: the raw Graph object being considered (email dict, drive item dict, etc.)
-        exclusions: list from get_policy_exclusions()
+        At 5k-user / 25k-shard scale this matters: a backup with 100
+        rules × 10k items per shard is 1M `re.compile` calls (+200K
+        per shard) without compilation. Pre-compile once per job.
 
-        Rule semantics:
-          FOLDER_PATH     - matches if item's folder/parent path contains the pattern
-          FILE_EXTENSION  - matches if item's name ends with .{pattern} (case-insensitive)
-          SUBJECT_REGEX   - (email) pattern.search(item.subject)
-          MIME_TYPE       - (file) item.file.mimeType equals pattern
-          EMAIL_ADDRESS   - (email) pattern matches sender/recipient email
-          FILENAME_GLOB   - (file) fnmatch against item.name
+        Returns a dict keyed by rule type with already-lowercased
+        patterns (and pre-compiled regexes for SUBJECT_REGEX). Empty
+        when there are no rules.
         """
-        import fnmatch, re as _re
-        if not exclusions:
-            return False
-        for rule in exclusions:
-            wl = rule.get("workload")
-            if wl and wl != item_workload and wl != "ALL":
-                continue
+        import re as _re
+        compiled: Dict[str, List[Any]] = {
+            "FOLDER_PATH": [],
+            "FILE_EXTENSION": [],
+            "FILENAME_GLOB": [],
+            "MIME_TYPE": [],
+            "SUBJECT_REGEX": [],
+            "EMAIL_ADDRESS": [],
+        }
+        for rule in (exclusions or []):
             rtype = rule.get("type")
             pat = (rule.get("pattern") or "").strip()
-            if not pat:
+            if not pat or rtype not in compiled:
                 continue
-
-            if rtype == "FOLDER_PATH":
-                folder = (item.get("parentReference", {}) or {}).get("path", "") or item.get("folderPath", "")
-                if pat.lower() in str(folder).lower():
-                    return True
-
-            elif rtype == "FILE_EXTENSION":
-                name = item.get("name", "") or ""
-                ext = "." + pat.lstrip(".").lower()
-                if name.lower().endswith(ext):
-                    return True
-
-            elif rtype == "FILENAME_GLOB":
-                name = item.get("name", "") or ""
-                if fnmatch.fnmatch(name.lower(), pat.lower()):
-                    return True
-
-            elif rtype == "MIME_TYPE":
-                mime = (item.get("file", {}) or {}).get("mimeType") or item.get("mimeType")
-                if mime and mime.lower() == pat.lower():
-                    return True
-
-            elif rtype == "SUBJECT_REGEX":
-                subject = item.get("subject", "") or ""
+            wl = rule.get("workload") or "ALL"
+            if rtype == "SUBJECT_REGEX":
                 try:
-                    if _re.search(pat, subject, _re.IGNORECASE):
-                        return True
+                    compiled[rtype].append((wl, _re.compile(pat, _re.IGNORECASE)))
                 except _re.error:
-                    # malformed regex — skip rather than fail the whole backup
-                    pass
+                    # malformed regex — skip silently so one bad rule
+                    # doesn't fail the whole backup. Operator sees the
+                    # pattern unchanged in the wizard; we should also
+                    # surface this as an audit event in a future pass.
+                    continue
+            elif rtype == "FILE_EXTENSION":
+                # Normalize once: strip leading dots, lower, then prepend.
+                compiled[rtype].append((wl, "." + pat.lstrip(".").lower()))
+            else:
+                compiled[rtype].append((wl, pat.lower()))
+        return compiled
 
-            elif rtype == "EMAIL_ADDRESS":
-                addrs = []
-                _from = (item.get("from", {}) or {}).get("emailAddress", {})
-                if _from.get("address"):
-                    addrs.append(_from["address"])
-                for r in (item.get("toRecipients") or []):
-                    a = (r.get("emailAddress") or {}).get("address")
-                    if a:
-                        addrs.append(a)
-                pat_l = pat.lower()
-                if any(pat_l == a.lower() or pat_l in a.lower() for a in addrs):
+    @staticmethod
+    def _item_is_excluded_compiled(
+        item_workload: str,
+        item: Dict[str, Any],
+        compiled: Dict[str, Any],
+    ) -> bool:
+        """Hot path — evaluates `item` against the pre-compiled rule
+        bundle. O(rules) per item, but rules are bucketed by type so
+        we only check applicable types per item.
+        """
+        import fnmatch
+        if not compiled:
+            return False
+
+        def _wl_match(rule_wl: str) -> bool:
+            return not rule_wl or rule_wl == "ALL" or rule_wl == item_workload
+
+        # FOLDER_PATH: substring match on parent path.
+        rules = compiled.get("FOLDER_PATH") or []
+        if rules:
+            folder = ((item.get("parentReference") or {}).get("path") or
+                      item.get("folderPath") or "")
+            folder_l = str(folder).lower()
+            for wl, pat in rules:
+                if _wl_match(wl) and pat in folder_l:
                     return True
+
+        # FILE_EXTENSION + FILENAME_GLOB share `name`.
+        rules_ext = compiled.get("FILE_EXTENSION") or []
+        rules_glob = compiled.get("FILENAME_GLOB") or []
+        if rules_ext or rules_glob:
+            name_l = (item.get("name") or "").lower()
+            for wl, ext in rules_ext:
+                if _wl_match(wl) and name_l.endswith(ext):
+                    return True
+            for wl, pat in rules_glob:
+                if _wl_match(wl) and fnmatch.fnmatch(name_l, pat):
+                    return True
+
+        # MIME_TYPE
+        rules = compiled.get("MIME_TYPE") or []
+        if rules:
+            mime = ((item.get("file") or {}).get("mimeType") or item.get("mimeType") or "").lower()
+            if mime:
+                for wl, pat in rules:
+                    if _wl_match(wl) and mime == pat:
+                        return True
+
+        # SUBJECT_REGEX (already compiled)
+        rules = compiled.get("SUBJECT_REGEX") or []
+        if rules:
+            subject = item.get("subject") or ""
+            for wl, regex in rules:
+                if _wl_match(wl) and regex.search(subject):
+                    return True
+
+        # EMAIL_ADDRESS — substring match against from + recipients.
+        rules = compiled.get("EMAIL_ADDRESS") or []
+        if rules:
+            addrs: List[str] = []
+            _from = (item.get("from") or {}).get("emailAddress") or {}
+            a = _from.get("address")
+            if a:
+                addrs.append(a.lower())
+            for r in (item.get("toRecipients") or []):
+                a = ((r or {}).get("emailAddress") or {}).get("address")
+                if a:
+                    addrs.append(a.lower())
+            if addrs:
+                for wl, pat in rules:
+                    if not _wl_match(wl):
+                        continue
+                    for ad in addrs:
+                        if pat == ad or pat in ad:
+                            return True
 
         return False
+
+    @staticmethod
+    def _item_is_excluded(item_workload: str, item: Dict[str, Any], exclusions: List[Dict[str, Any]]) -> bool:
+        """Backwards-compatible per-item check. Compiles on each call —
+        only kept for callers that haven't been migrated to the compiled
+        path yet. New code should call _compile_exclusions once per job
+        and _item_is_excluded_compiled per item."""
+        compiled = BackupWorker._compile_exclusions(exclusions or [])
+        return BackupWorker._item_is_excluded_compiled(item_workload, item, compiled)
 
     async def get_sla_policy(self, resource: Resource, message: Optional[Dict[str, Any]] = None) -> Optional[SlaPolicy]:
         policy_id = None

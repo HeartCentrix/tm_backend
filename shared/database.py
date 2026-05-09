@@ -909,12 +909,37 @@ async def init_db() -> None:
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS item_retention_basis VARCHAR DEFAULT 'SNAPSHOT' NOT NULL;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS archived_retention_mode VARCHAR DEFAULT 'SAME' NOT NULL;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS archived_retention_days INTEGER;",
-        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS storage_region VARCHAR;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS encryption_mode VARCHAR DEFAULT 'VAULT_MANAGED' NOT NULL;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS key_vault_uri VARCHAR;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS key_name VARCHAR;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS key_version VARCHAR;",
         "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS auto_apply_to_matching BOOLEAN DEFAULT FALSE NOT NULL;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS encryption_status VARCHAR DEFAULT '' NOT NULL;",
+        # Durability columns — paired with the 5-minute sweeper in
+        # backup-scheduler. lifecycle_dirty is set transactionally when an
+        # operator saves the policy, the sweeper picks it up if the on-save
+        # HTTP nudge fails. Index so the sweeper's WHERE clause is cheap.
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS lifecycle_dirty BOOLEAN DEFAULT FALSE NOT NULL;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS last_reconciled_at TIMESTAMP;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS reconcile_attempts INTEGER DEFAULT 0 NOT NULL;",
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS key_version_resolved VARCHAR;",
+        # 24h cooldown timestamp for the cap-reached audit alert. Without
+        # this the 5-min sweeper refires the same alert 288×/day per stuck
+        # policy. Reset to NULL on the next successful reconcile.
+        "ALTER TABLE sla_policies ADD COLUMN IF NOT EXISTS last_cap_alert_at TIMESTAMP;",
+        "CREATE INDEX IF NOT EXISTS ix_sla_policies_lifecycle_dirty "
+        "ON sla_policies (lifecycle_dirty) WHERE lifecycle_dirty = TRUE;",
+        # storage_region was a phantom — never read by any consumer (Phase 1
+        # confirmed zero readers across tm_backend/). Dropping it here
+        # now that the wizard no longer writes it. The matching ADD COLUMN
+        # above is a no-op on fresh DBs; on existing DBs the DROP wins.
+        "ALTER TABLE sla_policies DROP COLUMN IF EXISTS storage_region;",
+        # Singleton default-policy per tenant. Paired with `_enforce_default_singleton`
+        # in resource-service/main.py which flips other rows on save. The partial
+        # unique index defends against concurrent writes that could otherwise
+        # leave two policies marked is_default=true for the same tenant.
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_sla_policies_one_default_per_tenant "
+        "ON sla_policies (tenant_id) WHERE is_default = TRUE;",
         # On-prem storage toggle plumbing (migrations 2026-04-21 / 2026-04-22).
         # Ship these via ADD COLUMN IF NOT EXISTS so a fresh DB boot ends up
         # with the full schema even when the raw .sql migrations are never

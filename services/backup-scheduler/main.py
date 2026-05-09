@@ -13,8 +13,8 @@ Responsibilities:
 import asyncio
 import os
 import uuid
-from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Optional, Tuple
 from fastapi import FastAPI, BackgroundTasks
 from sqlalchemy import select, and_, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,6 +56,15 @@ RESOURCE_TYPE_TO_SLA_FLAG: Dict[str, str] = {
     # per-user TEAMS_CHAT_EXPORT shard emitted by discovery.
     "TEAMS_CHAT": "backup_teams_chats",
     "TEAMS_CHAT_EXPORT": "backup_teams_chats",
+    # Tier 2 per-user shards emitted by discovery — one row per user per
+    # workload (see graph_client.discover_user_resources). Without these
+    # mappings the scheduler can't resolve them to an SLA flag and skips
+    # every shard, even when the matching workload toggle is on.
+    "USER_MAIL": "backup_exchange",
+    "USER_ONEDRIVE": "backup_onedrive",
+    "USER_CONTACTS": "contacts",
+    "USER_CALENDAR": "calendars",
+    "USER_CHATS": "backup_teams_chats",
     "ENTRA_USER": "backup_entra_id",
     "ENTRA_GROUP": "backup_entra_id",
     "ENTRA_APP": "backup_entra_id",
@@ -88,6 +97,11 @@ RESOURCE_TYPE_DISPLAY_NAMES: Dict[str, str] = {
     "TEAMS_CHANNEL": "Teams channel data",
     "TEAMS_CHAT": "Teams chats",
     "TEAMS_CHAT_EXPORT": "Teams chat exports",
+    "USER_MAIL": "User mailboxes",
+    "USER_ONEDRIVE": "User OneDrive",
+    "USER_CONTACTS": "User contacts",
+    "USER_CALENDAR": "User calendars",
+    "USER_CHATS": "User chats",
     "ENTRA_USER": "Entra user data",
     "ENTRA_GROUP": "Entra group data",
     "ENTRA_APP": "Entra app data",
@@ -270,6 +284,55 @@ def build_sla_skip_message(resource_type: str, policy: SlaPolicy) -> tuple[str, 
     return message, flag_name, flag_label
 
 
+try:
+    from shared import sla_metrics as _sla_metrics
+    _sla_metrics.init()
+except Exception:
+    _sla_metrics = None  # type: ignore
+
+
+async def _emit_policy_audit(
+    action: str,
+    tenant_id: str,
+    policy: "SlaPolicy",
+    details: Optional[Dict[str, Any]] = None,
+    outcome: str = "SUCCESS",
+) -> None:
+    """Publish an audit.events message for a policy-driven Azure mutation
+    (CMK status change, WORM lock, legal hold toggle, lifecycle reconcile
+    failure). Never raises — observability must not block reconciliation.
+
+    Subscribers: audit-service writes to `audit_events` for SOC 2 trail;
+    downstream alerting consumers (Slack, PagerDuty) can subscribe to the
+    same queue with their own routing key filters.
+    """
+    try:
+        msg = create_audit_event_message(
+            action=action,
+            tenant_id=tenant_id,
+            actor_type="SYSTEM",
+            resource_id=str(policy.id),
+            resource_type="SLA_POLICY",
+            resource_name=policy.name,
+            outcome=outcome,
+            details={
+                "policy_id": str(policy.id),
+                "policy_name": policy.name,
+                "source": "backup_scheduler",
+                **(details or {}),
+            },
+        )
+        await message_bus.publish("audit.events", msg, priority=4)
+    except Exception as exc:
+        # Audit must not crash reconcile. Log and move on.
+        print(f"[AUDIT] policy-audit publish failed action={action} policy={policy.id}: {exc}")
+        try:
+            if _sla_metrics is not None:
+                _sla_metrics.inc_audit_publish_failed()
+        except Exception:
+            pass
+
+
 async def publish_sla_skip_audit_events(policy: SlaPolicy, skipped_resources: List[Resource]):
     """Emit warning audit events for resources skipped by SLA coverage filters."""
     if not skipped_resources:
@@ -323,8 +386,12 @@ async def startup():
     # Schedule M365 audit log ingestion every hour
     scheduler.add_job(ingest_m365_audit_logs, "interval", hours=1)
 
-    # AZ-0: Schedule lifecycle policy reconciler (daily)
+    # AZ-0: Schedule lifecycle policy reconciler (daily) + durable 5-min
+    # sweeper that picks up policies marked lifecycle_dirty=True since the
+    # last pass. The 24h pass guards against drift / Azure manual edits;
+    # the 5-min pass is the durability backstop for the on-save HTTP nudge.
     scheduler.add_job(reconcile_lifecycle_policies, "interval", hours=24)
+    scheduler.add_job(sweep_dirty_lifecycle_policies, "interval", minutes=5)
 
     # AZ-4: Schedule DR setup reconciler (every 6 hours)
     scheduler.add_job(reconcile_dr_setup, "interval", hours=6)
@@ -594,6 +661,16 @@ async def reschedule_all_policies(background_tasks: BackgroundTasks):
     """Re-scan all SLA policies and rebuild the scheduler"""
     background_tasks.add_task(schedule_all_policies)
     return {"status": "rescheduling"}
+
+
+@app.post("/scheduler/reconcile-lifecycle")
+async def trigger_lifecycle_reconcile(background_tasks: BackgroundTasks):
+    """Trigger an immediate run of the lifecycle / immutability / legal-hold
+    reconciler. Called by resource-service after a policy save so the
+    operator's changes take effect right away — no waiting for the daily
+    cron tick. Skipped silently when the active backend is SeaweedFS."""
+    background_tasks.add_task(reconcile_lifecycle_policies)
+    return {"status": "reconciling"}
 
 
 @app.post("/scheduler/resource/{resource_id}")
@@ -1658,76 +1735,781 @@ async def reconcile_lifecycle_policies():
     print("[LIFECYCLE] === START: Daily lifecycle policy reconciliation ===")
 
     try:
-        from shared.azure_storage import apply_lifecycle_policy
+        from shared.azure_storage import (
+            apply_lifecycle_policy,
+            apply_container_immutability,
+            apply_container_legal_hold,
+            apply_encryption_scope,
+        )
     except ImportError:
         print("[LIFECYCLE] ERROR: azure_storage.apply_lifecycle_policy not available — skipping")
         return
+
+    # Lifecycle policies, container immutability, and container legal-hold
+    # are Azure-Blob-only ARM operations. On SeaweedFS deployments they
+    # have no analogue, and the SLA fields that drive them (immutability,
+    # legal hold) are honored at the Postgres prune layer instead — see
+    # shared/retention_cleanup.py:35-40. Skip the entire reconciler when
+    # SeaweedFS is the active backend rather than firing API calls that
+    # will all fail.
+    try:
+        from shared.storage.router import router as storage_router
+        active_kind = None
+        for be in storage_router.list_backends():
+            if str(be.backend_id) == str(storage_router.active_backend_id()):
+                active_kind = be.kind
+                break
+        if active_kind and active_kind != "azure_blob":
+            print(f"[LIFECYCLE] Active backend is '{active_kind}' — Azure-only reconciler is a no-op here.")
+            return
+    except Exception as router_exc:
+        # Router not loaded (e.g. very early startup) — fall through and
+        # let the per-call ARM credentials check gate any actual work.
+        print(f"[LIFECYCLE] Router check skipped: {router_exc}")
+
+    # Tunables. Concurrency is bounded by ARM's per-subscription rate-limit
+    # (~50 req/min) — gather=20 with the per-call latency we see (~150ms
+    # nominal) lands well inside the budget while still cutting wall-clock
+    # ~20× vs serial. Per-tenant timeout protects against a single hung
+    # ARM call (auth glitch, network partition) freezing the whole pass.
+    LIFECYCLE_PARALLELISM = int(os.getenv("LIFECYCLE_PARALLELISM", "20"))
+    # 600s default: at single-tenant 5k-user / 250 TiB scale a tenant has
+    # O(10) policies × 4 workloads × 4 ARM calls = ~160 ARM hops per pass.
+    # ARM 99p latency is ~600ms cold-cache; 600s gives ~3.5× headroom over
+    # the worst case while still bounding a hung call. The legacy 120s
+    # default tripped on cold-tenant first runs.
+    LIFECYCLE_TENANT_TIMEOUT_S = float(os.getenv("LIFECYCLE_TENANT_TIMEOUT_S", "600"))
+    # Parallelize the per-workload inner loop. Workloads (files / azure-vm
+    # / azure-sql / azure-postgres) target distinct containers — no shared
+    # state, no ordering needed. Cap at the workload count to avoid
+    # accidentally exceeding ARM's per-subscription rate-limit ceiling.
+    LIFECYCLE_WORKLOAD_PARALLELISM = int(os.getenv("LIFECYCLE_WORKLOAD_PARALLELISM", "4"))
+
+    async def _reconcile_one_tenant(
+        tenant: Tenant,
+        only_dirty_policies: bool,
+    ) -> Tuple[int, int, int]:
+        """Reconcile every enabled SLA policy for one tenant. Returns
+        (success_count, fail_count, skip_count). Self-contained session so
+        concurrent tenants never share a DB connection or pending state."""
+        success = fail = skip = 0
+        async with async_session_factory() as t_session:
+            stmt = select(SlaPolicy).where(
+                SlaPolicy.tenant_id == tenant.id,
+                SlaPolicy.enabled == True,  # noqa: E712
+            )
+            if only_dirty_policies:
+                stmt = stmt.where(SlaPolicy.lifecycle_dirty == True)  # noqa: E712
+            policies = (await t_session.execute(stmt)).scalars().all()
+            if not policies:
+                return (0, 0, 1)
+
+            for sla in policies:
+                try:
+                    hot = sla.retention_hot_days or 7
+                    cool = sla.retention_cool_days or 30
+                    archive = sla.retention_archive_days  # None = unlimited
+
+                    immut_mode = (sla.immutability_mode or "None").strip()
+                    if immut_mode not in ("None", "Unlocked", "Locked"):
+                        immut_mode = "None"
+                    immut_days = (hot or 0) + (cool or 0) + (archive or 0)
+                    if immut_days <= 0:
+                        immut_days = max(hot, 1)
+                    legal_hold_on = bool(sla.legal_hold_enabled)
+
+                    print(
+                        f"[LIFECYCLE] {tenant.display_name} / {sla.name}: "
+                        f"hot={hot}d cool={cool}d "
+                        f"archive={'unlimited' if archive is None else f'{archive}d'} "
+                        f"immutability={immut_mode} legal_hold={legal_hold_on} "
+                        f"encryption={sla.encryption_mode}"
+                    )
+
+                    workload_sem = asyncio.Semaphore(LIFECYCLE_WORKLOAD_PARALLELISM)
+
+                    async def _reconcile_workload(
+                        workload: str,
+                    ) -> Tuple[int, int, Optional[str], List[Dict[str, Any]]]:
+                        """Reconcile one (policy, workload) pair. Returns
+                        (success_inc, fail_inc, cmk_status_or_None, audit_intents).
+                        Audits are returned rather than emitted directly so the
+                        caller can serialize them after the gather (avoids
+                        interleaved audit-event publishes from concurrent tasks).
+                        """
+                        async with workload_sem:
+                            s = f = 0
+                            cmk_status: Optional[str] = None
+                            audits: List[Dict[str, Any]] = []
+                            shard = azure_storage_manager.get_default_shard()
+                            container = azure_storage_manager.get_container_name(
+                                str(tenant.id), workload,
+                            )
+
+                            try:
+                                result = await apply_lifecycle_policy(container, hot, cool, archive, shard)
+                                if result.get("success"):
+                                    s += 1
+                                else:
+                                    f += 1
+                                    print(f"[LIFECYCLE]   ✗ {container} lifecycle: {result.get('error')}")
+                            except Exception as e:
+                                f += 1
+                                print(f"[LIFECYCLE]   ✗ {container} lifecycle: {e}")
+
+                            try:
+                                im_res = await apply_container_immutability(
+                                    container, immut_days, immut_mode, shard,
+                                )
+                                if not im_res.get("success"):
+                                    print(f"[LIFECYCLE]   ✗ {container} immutability: {im_res.get('error')}")
+                                elif immut_mode == "Locked" and im_res.get("note") != "already_locked":
+                                    audits.append({
+                                        "action": "SLA_IMMUTABILITY_LOCKED",
+                                        "details": {"container": container, "days": immut_days},
+                                    })
+                            except Exception as im_exc:
+                                print(f"[LIFECYCLE]   ✗ {container} immutability: {im_exc}")
+
+                            try:
+                                lh_res = await apply_container_legal_hold(
+                                    container, legal_hold_on, shard=shard,
+                                )
+                                if not lh_res.get("success"):
+                                    print(f"[LIFECYCLE]   ✗ {container} legal_hold: {lh_res.get('error')}")
+                            except Exception as lh_exc:
+                                print(f"[LIFECYCLE]   ✗ {container} legal_hold: {lh_exc}")
+
+                            if (sla.encryption_mode or "").upper() == "CUSTOMER_KEY":
+                                try:
+                                    enc_res = await apply_encryption_scope(
+                                        container,
+                                        sla.key_vault_uri or "",
+                                        sla.key_name or "",
+                                        sla.key_version,
+                                        shard,
+                                    )
+                                    cmk_status = enc_res.get("status", "UNKNOWN")
+                                    if not enc_res.get("success"):
+                                        print(f"[LIFECYCLE]   ✗ {container} CMK: {cmk_status} — {enc_res.get('error')}")
+                                except Exception as enc_exc:
+                                    cmk_status = "ERROR"
+                                    print(f"[LIFECYCLE]   ✗ {container} CMK: {enc_exc}")
+                            return (s, f, cmk_status, audits)
+
+                    workload_results = await asyncio.gather(
+                        *(
+                            _reconcile_workload(wl)
+                            for wl in ("files", "azure-vm", "azure-sql", "azure-postgres")
+                        ),
+                        return_exceptions=False,
+                    )
+                    cmk_statuses: List[str] = []
+                    pending_audits: List[Dict[str, Any]] = []
+                    for s, f, cmk, audits in workload_results:
+                        success += s
+                        fail += f
+                        if cmk is not None:
+                            cmk_statuses.append(cmk)
+                        pending_audits.extend(audits)
+                    # Emit collected audits sequentially so concurrent tasks
+                    # don't race on the audit message bus.
+                    for evt in pending_audits:
+                        await _emit_policy_audit(
+                            action=evt["action"],
+                            tenant_id=str(tenant.id),
+                            policy=sla,
+                            details=evt["details"],
+                        )
+
+                    # Aggregate CMK status onto the policy.
+                    if cmk_statuses:
+                        if all(s == "OK" for s in cmk_statuses):
+                            new_status = "OK"
+                        elif "KEY_VAULT_ACCESS_DENIED" in cmk_statuses:
+                            new_status = "KEY_VAULT_ACCESS_DENIED"
+                        else:
+                            new_status = "ERROR"
+                    else:
+                        new_status = ""
+
+                    prior_status = sla.encryption_status or ""
+                    status_changed = prior_status != new_status
+
+                    if status_changed:
+                        if _sla_metrics is not None:
+                            _sla_metrics.inc_encryption_transition(prior_status, new_status)
+                        sla.encryption_status = new_status
+                        # Notify on transition into a non-OK state. OK→non-OK
+                        # is a real alert; non-OK→OK is a recovery.
+                        if new_status and new_status != "OK":
+                            await _emit_policy_audit(
+                                action="SLA_ENCRYPTION_STATUS_DEGRADED",
+                                tenant_id=str(tenant.id),
+                                policy=sla,
+                                details={"from": prior_status, "to": new_status},
+                                outcome="FAILED",
+                            )
+                        elif prior_status and prior_status != "OK" and new_status == "OK":
+                            await _emit_policy_audit(
+                                action="SLA_ENCRYPTION_STATUS_RECOVERED",
+                                tenant_id=str(tenant.id),
+                                policy=sla,
+                                details={"from": prior_status, "to": new_status},
+                            )
+
+                    # Clear the dirty flag on success — partial failures keep
+                    # it dirty so the next 5-min sweep retries. Also clear
+                    # last_cap_alert_at so the next failure cycle starts a
+                    # fresh 24h cooldown rather than inheriting an old one.
+                    if fail == 0:
+                        sla.lifecycle_dirty = False
+                        sla.last_reconciled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                        sla.reconcile_attempts = 0
+                        sla.last_cap_alert_at = None
+                    else:
+                        sla.reconcile_attempts = (sla.reconcile_attempts or 0) + 1
+
+                    await t_session.commit()
+
+                except Exception as policy_exc:
+                    fail += 1
+                    print(f"[LIFECYCLE] policy {sla.id} error: {policy_exc}")
+                    try:
+                        sla.reconcile_attempts = (sla.reconcile_attempts or 0) + 1
+                        await t_session.commit()
+                    except Exception:
+                        await t_session.rollback()
+        return (success, fail, skip)
 
     try:
         async with async_session_factory() as session:
             tenants_result = await session.execute(select(Tenant))
             tenants = tenants_result.scalars().all()
 
-            if not tenants:
-                print("[LIFECYCLE] No tenants found — nothing to reconcile")
-                return
+        if not tenants:
+            print("[LIFECYCLE] No tenants found — nothing to reconcile")
+            return
 
-            print(f"[LIFECYCLE] Found {len(tenants)} tenant(s) to reconcile")
+        print(
+            f"[LIFECYCLE] Found {len(tenants)} tenant(s) to reconcile "
+            f"(parallelism={LIFECYCLE_PARALLELISM}, timeout={LIFECYCLE_TENANT_TIMEOUT_S}s)"
+        )
 
-            success_count = 0
-            fail_count = 0
-            skip_count = 0
+        sem = asyncio.Semaphore(LIFECYCLE_PARALLELISM)
 
-            for tenant in tenants:
+        async def _bounded(t: Tenant) -> Tuple[int, int, int]:
+            async with sem:
                 try:
-                    # Get tenant's default SLA policy
-                    sla_result = await session.execute(
-                        select(SlaPolicy).where(
-                            SlaPolicy.tenant_id == tenant.id,
-                            SlaPolicy.enabled == True
-                        ).limit(1)
+                    return await asyncio.wait_for(
+                        _reconcile_one_tenant(t, only_dirty_policies=False),
+                        timeout=LIFECYCLE_TENANT_TIMEOUT_S,
                     )
-                    sla = sla_result.scalar_one_or_none()
-                    if not sla:
-                        skip_count += 1
-                        print(f"[LIFECYCLE] Tenant {tenant.id} ({tenant.display_name}): No active SLA — skipping")
-                        continue
+                except asyncio.TimeoutError:
+                    print(f"[LIFECYCLE] tenant {t.id} timed out after {LIFECYCLE_TENANT_TIMEOUT_S}s")
+                    return (0, 1, 0)
+                except Exception as exc:
+                    print(f"[LIFECYCLE] tenant {t.id} fatal: {exc}")
+                    return (0, 1, 0)
 
-                    hot = sla.retention_hot_days or 7
-                    cool = sla.retention_cool_days or 30
-                    archive = sla.retention_archive_days  # None = unlimited
+        results = await asyncio.gather(*(_bounded(t) for t in tenants))
+        success_count = sum(r[0] for r in results)
+        fail_count = sum(r[1] for r in results)
+        skip_count = sum(r[2] for r in results)
 
-                    print(
-                        f"[LIFECYCLE] Tenant {tenant.id} ({tenant.display_name}): hot={hot}d, cool={cool}d, "
-                        f"archive={'unlimited' if archive is None else f'{archive}d'}, "
-                        f"immutability={sla.immutability_mode}, legal_hold={sla.legal_hold_enabled}"
-                    )
-
-                    for workload in ["files", "azure-vm", "azure-sql", "azure-postgres"]:
-                        shard = azure_storage_manager.get_default_shard()
-                        container = azure_storage_manager.get_container_name(str(tenant.id), workload)
-                        try:
-                            result = await apply_lifecycle_policy(container, hot, cool, archive, shard)
-                            if result.get("success"):
-                                print(f"[LIFECYCLE]   ✓ {container}: {result.get('rules_count', 0)} rules applied")
-                                success_count += 1
-                            else:
-                                print(f"[LIFECYCLE]   ✗ {container}: {result.get('error', 'unknown error')}")
-                                fail_count += 1
-                        except Exception as e:
-                            print(f"[LIFECYCLE]   ✗ {container}: {e}")
-                            fail_count += 1
-
-                except Exception as tenant_exc:
-                    print(f"[LIFECYCLE] Tenant {tenant.id} reconciliation error: {tenant_exc}")
-                    fail_count += 1
-
-            print(
-                f"[LIFECYCLE] === COMPLETE: success={success_count}, failed={fail_count}, skipped={skip_count} ==="
-            )
+        print(
+            f"[LIFECYCLE] === COMPLETE: success={success_count}, "
+            f"failed={fail_count}, skipped={skip_count} ==="
+        )
 
     except Exception as e:
         print(f"[LIFECYCLE] FATAL ERROR: {e}\n{_tb.format_exc()}")
+
+
+# Stable 64-bit advisory-lock keys. Postgres pg_try_advisory_lock takes
+# a single bigint or two ints; we pick a fixed namespace (high bits) so
+# these don't collide with other application advisory locks.
+_LOCK_KEY_LIFECYCLE_SWEEP = 0x534C415F4C434753  # ASCII "SLA_LCGS"
+
+# Errors we treat as transient — don't increment reconcile_attempts.
+# Operator-recoverable / permanent errors (4xx auth, malformed config)
+# still count toward the cap. At 5k-user / 260 TiB scale this matters
+# because a regional ARM blip shouldn't burn the cap during normal flake.
+_TRANSIENT_ARM_ERROR_TOKENS = (
+    "429",                # rate limit
+    "throttl", "Throttl",
+    "503", "ServiceUnavailable",
+    "504", "GatewayTimeout",
+    "500", "InternalServerError",
+    "TimeoutError", "asyncio.TimeoutError",
+    "Connection",
+    "TemporaryFailure", "RetryableError",
+)
+
+
+def _is_transient_arm_error(message: str) -> bool:
+    if not message:
+        return False
+    return any(tok in message for tok in _TRANSIENT_ARM_ERROR_TOKENS)
+
+
+async def sweep_dirty_lifecycle_policies():
+    """5-minute durable sweeper for `lifecycle_dirty=True` policies.
+
+    Why this exists: when an operator saves a policy, resource-service
+    marks `lifecycle_dirty=True` in the same DB transaction AND fires a
+    best-effort HTTP nudge (`/scheduler/reconcile-lifecycle`). The HTTP
+    is the fast path (sub-second). This sweeper is the durable backstop
+    — if the HTTP dropped (network blip, scheduler restart mid-request,
+    transient 502), the dirty flag is still in Postgres and we'll pick
+    it up on the next 5-min tick. The flag is cleared only after a
+    successful reconcile, so retries are automatic.
+
+    Capped at 25 attempts per policy to prevent a permanently-broken
+    policy (e.g. wrong Key Vault URI) from burning ARM quota forever —
+    after that we surface an audit event and stop retrying. Operator
+    must edit the policy to reset attempts.
+    """
+    import traceback as _tb
+    SWEEP_ATTEMPT_CAP = int(os.getenv("LIFECYCLE_SWEEP_ATTEMPT_CAP", "25"))
+    SWEEP_PARALLELISM = int(os.getenv("LIFECYCLE_SWEEP_PARALLELISM", "10"))
+    SWEEP_TIMEOUT_S = float(os.getenv("LIFECYCLE_SWEEP_TIMEOUT_S", "60"))
+
+    # Leader election. With multiple scheduler pods (HA), every 5min tick
+    # would otherwise have all pods racing on the same dirty rows —
+    # double the ARM rate, double the audit volume, lost
+    # reconcile_attempts increments. pg_try_advisory_lock returns
+    # immediately; non-leaders log and exit. Lock is session-scoped, so
+    # we keep a dedicated connection open for the duration of this run
+    # and release explicitly at the end.
+    lock_acquired = False
+    lock_session = None
+    try:
+        lock_session = async_session_factory()
+        await lock_session.__aenter__()
+        got = (await lock_session.execute(
+            text("SELECT pg_try_advisory_lock(:k)"),
+            {"k": _LOCK_KEY_LIFECYCLE_SWEEP},
+        )).scalar()
+        lock_acquired = bool(got)
+        if not lock_acquired:
+            print("[LIFECYCLE-SWEEP] another pod holds the sweeper lock — skipping this tick")
+            await lock_session.__aexit__(None, None, None)
+            lock_session = None
+            return
+    except Exception as e:
+        print(f"[LIFECYCLE-SWEEP] advisory-lock acquire failed, skipping tick: {e}")
+        if lock_session is not None:
+            try:
+                await lock_session.__aexit__(None, None, None)
+            except Exception:
+                pass
+        return
+
+    # SeaweedFS short-circuit (same logic as the daily reconciler).
+    # IMPORTANT: do NOT clear `lifecycle_dirty` on SeaweedFS. If we did,
+    # any policy edits made while SeaweedFS was active would be lost
+    # forever — when the operator flips back to Azure, those changes
+    # would never replay (no other path sets dirty=true retroactively).
+    # Instead, leave the flag set and exit. The flag is bounded by the
+    # number of policies (small) so the queue stays trivial; the next
+    # sweep tick after the Azure flip will pick them all up.
+    try:
+        from shared.storage.router import router as storage_router
+        active_kind = None
+        for be in storage_router.list_backends():
+            if str(be.backend_id) == str(storage_router.active_backend_id()):
+                active_kind = be.kind
+                break
+        if active_kind and active_kind != "azure_blob":
+            print(f"[LIFECYCLE-SWEEP] active backend is '{active_kind}' — "
+                  f"skipping (dirty flags preserved for Azure-flip replay)")
+            return
+    except Exception:
+        pass  # router not loaded yet — let the per-call ARM check gate it
+
+    try:
+        from shared.azure_storage import (
+            apply_lifecycle_policy,
+            apply_container_immutability,
+            apply_container_legal_hold,
+            apply_encryption_scope,
+        )
+    except ImportError:
+        return
+
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(SlaPolicy)
+            .where(SlaPolicy.lifecycle_dirty == True)  # noqa: E712
+            .where(SlaPolicy.enabled == True)  # noqa: E712
+            .where(SlaPolicy.reconcile_attempts < SWEEP_ATTEMPT_CAP)
+        )
+        dirty_policies = result.scalars().all()
+
+    if _sla_metrics is not None:
+        _sla_metrics.set_dirty_count(len(dirty_policies))
+
+    if not dirty_policies:
+        return
+
+    print(f"[LIFECYCLE-SWEEP] {len(dirty_policies)} dirty policy(ies) to reconcile")
+
+    # Group by tenant so we can reuse the same per-tenant reconcile shape
+    # used by the daily pass — but we filter to lifecycle_dirty=True so a
+    # one-policy edit doesn't scan every other policy in the tenant.
+    by_tenant: Dict[Any, List[SlaPolicy]] = {}
+    for p in dirty_policies:
+        by_tenant.setdefault(p.tenant_id, []).append(p)
+
+    # Load tenant rows (single query) so we have display names for logs.
+    async with async_session_factory() as session:
+        tenant_ids = list(by_tenant.keys())
+        if not tenant_ids:
+            return
+        t_rows = (await session.execute(
+            select(Tenant).where(Tenant.id.in_(tenant_ids))
+        )).scalars().all()
+    tenants_by_id = {t.id: t for t in t_rows}
+
+    sem = asyncio.Semaphore(SWEEP_PARALLELISM)
+
+    async def _sweep_one_tenant_dirty(tenant_id, policies):
+        tenant = tenants_by_id.get(tenant_id)
+        if tenant is None:
+            return
+        async with sem:
+            try:
+                await asyncio.wait_for(
+                    _reconcile_policies_for_tenant(tenant, policies),
+                    timeout=SWEEP_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                print(f"[LIFECYCLE-SWEEP] tenant {tenant_id} sweep timed out")
+            except Exception as exc:
+                print(f"[LIFECYCLE-SWEEP] tenant {tenant_id} error: {exc}\n{_tb.format_exc()}")
+
+    await asyncio.gather(*(
+        _sweep_one_tenant_dirty(tid, ps) for tid, ps in by_tenant.items()
+    ))
+
+    # Surface policies that hit the attempt cap so the operator can fix
+    # the underlying config (wrong vault URI, missing role assignment).
+    # Cooldown: dedupe to one alert per policy per 24h. The sweeper runs
+    # every 5 minutes; without the cooldown a single stuck policy fires
+    # 288 alerts/day into the audit channel and any downstream PagerDuty
+    # rule. The cooldown is cleared (column set NULL) on the next
+    # successful reconcile, so the next failure restarts the alert cycle.
+    CAP_ALERT_COOLDOWN_HOURS = 24
+    try:
+        async with async_session_factory() as session:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=CAP_ALERT_COOLDOWN_HOURS)
+            capped = (await session.execute(
+                select(SlaPolicy).where(
+                    SlaPolicy.lifecycle_dirty == True,  # noqa: E712
+                    SlaPolicy.reconcile_attempts >= SWEEP_ATTEMPT_CAP,
+                )
+            )).scalars().all()
+            now = datetime.now(timezone.utc)
+            for p in capped:
+                # Always increment the metric — it's a counter on the
+                # current rate, not a notification. The cooldown only
+                # gates the audit/Slack-style emission.
+                if _sla_metrics is not None:
+                    _sla_metrics.inc_attempt_cap()
+                last = p.last_cap_alert_at
+                if last is not None and last.tzinfo is None:
+                    # legacy rows may have naive timestamps
+                    last = last.replace(tzinfo=timezone.utc)
+                if last is not None and last > cutoff:
+                    continue  # within cooldown — skip the audit emit
+                await _emit_policy_audit(
+                    action="SLA_RECONCILE_ATTEMPT_CAP_REACHED",
+                    tenant_id=str(p.tenant_id),
+                    policy=p,
+                    details={"attempts": p.reconcile_attempts, "cap": SWEEP_ATTEMPT_CAP},
+                    outcome="FAILED",
+                )
+                p.last_cap_alert_at = now
+            await session.commit()
+    finally:
+        # Release the advisory lock no matter what — non-leaders never
+        # acquired so this is a no-op for them; the leader frees the lock
+        # so the next 5-min tick can elect again.
+        if lock_acquired and lock_session is not None:
+            try:
+                await lock_session.execute(
+                    text("SELECT pg_advisory_unlock(:k)"),
+                    {"k": _LOCK_KEY_LIFECYCLE_SWEEP},
+                )
+                await lock_session.commit()
+            except Exception as e:
+                print(f"[LIFECYCLE-SWEEP] advisory_unlock failed: {e}")
+            try:
+                await lock_session.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+
+async def _reconcile_policies_for_tenant(tenant, policies):
+    """Shared per-tenant body used by the daily full reconcile and the
+    5-minute dirty sweep. Caller is responsible for the timeout wrapper
+    and the semaphore guard."""
+    from shared.azure_storage import (
+        apply_lifecycle_policy,
+        apply_container_immutability,
+        apply_container_legal_hold,
+        apply_encryption_scope,
+        read_encryption_scope_state,
+        resolve_key_vault_latest_version,
+    )
+
+    async with async_session_factory() as t_session:
+        # Re-fetch policies inside this session so we have managed instances
+        # we can mutate + commit.
+        ids = [p.id for p in policies]
+        rows = (await t_session.execute(
+            select(SlaPolicy).where(SlaPolicy.id.in_(ids))
+        )).scalars().all()
+
+        for sla in rows:
+            had_failure = False
+            had_transient_only = True  # flips false on any non-transient failure
+            try:
+                hot = sla.retention_hot_days or 7
+                cool = sla.retention_cool_days or 30
+                archive = sla.retention_archive_days
+
+                immut_mode = (sla.immutability_mode or "None").strip()
+                if immut_mode not in ("None", "Unlocked", "Locked"):
+                    immut_mode = "None"
+                immut_days = (hot or 0) + (cool or 0) + (archive or 0)
+                if immut_days <= 0:
+                    immut_days = max(hot, 1)
+                legal_hold_on = bool(sla.legal_hold_enabled)
+
+                cmk_statuses: List[str] = []
+                for workload in ["files", "azure-vm", "azure-sql", "azure-postgres"]:
+                    shard = azure_storage_manager.get_default_shard()
+                    container = azure_storage_manager.get_container_name(str(tenant.id), workload)
+
+                    try:
+                        lc_res = await apply_lifecycle_policy(container, hot, cool, archive, shard)
+                        if not lc_res.get("success"):
+                            had_failure = True
+                            if not _is_transient_arm_error(str(lc_res.get("error", ""))):
+                                had_transient_only = False
+                    except Exception as e:
+                        had_failure = True
+                        if not _is_transient_arm_error(str(e)):
+                            had_transient_only = False
+                        print(f"[LIFECYCLE-SWEEP] {container} lifecycle: {e}")
+
+                    try:
+                        im_res = await apply_container_immutability(
+                            container, immut_days, immut_mode, shard,
+                        )
+                        if not im_res.get("success"):
+                            had_failure = True
+                            err = str(im_res.get("error", ""))
+                            status = im_res.get("status", "")
+                            # REFUSED_LOOSEN_LOCKED is a permanent operator
+                            # error (not transient) — emit audit so it
+                            # surfaces immediately, not after cap.
+                            if status == "REFUSED_LOOSEN_LOCKED":
+                                had_transient_only = False
+                                if _sla_metrics is not None:
+                                    _sla_metrics.inc_worm_loosen_refused()
+                                await _emit_policy_audit(
+                                    action="SLA_IMMUTABILITY_LOOSEN_REFUSED",
+                                    tenant_id=str(tenant.id),
+                                    policy=sla,
+                                    details={"container": container,
+                                             "policy_mode": immut_mode,
+                                             "live_mode": "Locked"},
+                                    outcome="FAILED",
+                                )
+                            elif not _is_transient_arm_error(err):
+                                had_transient_only = False
+                        elif immut_mode == "Locked" and im_res.get("note") != "already_locked":
+                            if _sla_metrics is not None:
+                                _sla_metrics.inc_worm("Locked")
+                            await _emit_policy_audit(
+                                action="SLA_IMMUTABILITY_LOCKED",
+                                tenant_id=str(tenant.id),
+                                policy=sla,
+                                details={"container": container, "days": immut_days},
+                            )
+                    except Exception as e:
+                        had_failure = True
+                        if not _is_transient_arm_error(str(e)):
+                            had_transient_only = False
+                        print(f"[LIFECYCLE-SWEEP] {container} immutability: {e}")
+
+                    try:
+                        lh_res = await apply_container_legal_hold(
+                            container, legal_hold_on, shard=shard,
+                        )
+                        if not lh_res.get("success"):
+                            had_failure = True
+                            if not _is_transient_arm_error(str(lh_res.get("error", ""))):
+                                had_transient_only = False
+                    except Exception as e:
+                        had_failure = True
+                        if not _is_transient_arm_error(str(e)):
+                            had_transient_only = False
+                        print(f"[LIFECYCLE-SWEEP] {container} legal_hold: {e}")
+
+                    if (sla.encryption_mode or "").upper() == "CUSTOMER_KEY":
+                        # Resolve the target key version. When the operator
+                        # left it blank ("latest"), query Key Vault directly
+                        # so rotation in the vault gets reflected here on
+                        # the next reconcile pass.
+                        target_version = sla.key_version
+                        if not target_version:
+                            target_version = await resolve_key_vault_latest_version(
+                                sla.key_vault_uri or "",
+                                sla.key_name or "",
+                            )
+                        # Build the expected keyUri so we can compare against
+                        # the live ARM state and skip unchanged scopes.
+                        expected_uri = None
+                        if sla.key_vault_uri and sla.key_name:
+                            base = (sla.key_vault_uri or "").rstrip("/")
+                            expected_uri = (
+                                f"{base}/keys/{sla.key_name}/{target_version}"
+                                if target_version else
+                                f"{base}/keys/{sla.key_name}"
+                            )
+                        try:
+                            live = await read_encryption_scope_state(container, shard)
+                            live_uri = (live or {}).get("key_uri")
+                            in_sync = (
+                                expected_uri is not None
+                                and live_uri is not None
+                                and (live_uri.rstrip("/") == expected_uri.rstrip("/")
+                                     or (target_version is None and live_uri.startswith(expected_uri.rstrip("/"))))
+                            )
+                        except Exception:
+                            in_sync = False
+                            live_uri = None
+
+                        if in_sync:
+                            cmk_statuses.append("OK")
+                            # Stamp the resolved version so the UI / audit
+                            # trail can show what's actually applied.
+                            if target_version and sla.key_version_resolved != target_version:
+                                sla.key_version_resolved = target_version
+                        else:
+                            try:
+                                enc_res = await apply_encryption_scope(
+                                    container,
+                                    sla.key_vault_uri or "",
+                                    sla.key_name or "",
+                                    target_version,
+                                    shard,
+                                )
+                                cmk_statuses.append(enc_res.get("status", "UNKNOWN"))
+                                if enc_res.get("success"):
+                                    if target_version:
+                                        sla.key_version_resolved = target_version
+                                    # Drift / rotation event audit (one per
+                                    # container so the operator can see
+                                    # exactly what flipped).
+                                    if _sla_metrics is not None:
+                                        if live_uri:
+                                            _sla_metrics.inc_cmk_rotated()
+                                        else:
+                                            _sla_metrics.inc_cmk_drift()
+                                    await _emit_policy_audit(
+                                        action=("SLA_CMK_KEY_ROTATED"
+                                                if live_uri else "SLA_CMK_SCOPE_APPLIED"),
+                                        tenant_id=str(tenant.id),
+                                        policy=sla,
+                                        details={
+                                            "container": container,
+                                            "from": live_uri,
+                                            "to": expected_uri,
+                                        },
+                                    )
+                                else:
+                                    had_failure = True
+                                    err = str(enc_res.get("error", ""))
+                                    if enc_res.get("status") == "KEY_VAULT_ACCESS_DENIED":
+                                        # Permanent until operator grants
+                                        # the role assignment — count toward
+                                        # the cap so we stop hammering KV.
+                                        had_transient_only = False
+                                    elif not _is_transient_arm_error(err):
+                                        had_transient_only = False
+                            except Exception as e:
+                                had_failure = True
+                                if not _is_transient_arm_error(str(e)):
+                                    had_transient_only = False
+                                cmk_statuses.append("ERROR")
+                                print(f"[LIFECYCLE-SWEEP] {container} CMK: {e}")
+
+                # Aggregate CMK status
+                if cmk_statuses:
+                    if all(s == "OK" for s in cmk_statuses):
+                        new_status = "OK"
+                    elif "KEY_VAULT_ACCESS_DENIED" in cmk_statuses:
+                        new_status = "KEY_VAULT_ACCESS_DENIED"
+                    else:
+                        new_status = "ERROR"
+                else:
+                    new_status = ""
+
+                prior_status = sla.encryption_status or ""
+                if prior_status != new_status:
+                    sla.encryption_status = new_status
+                    if new_status and new_status != "OK":
+                        await _emit_policy_audit(
+                            action="SLA_ENCRYPTION_STATUS_DEGRADED",
+                            tenant_id=str(tenant.id),
+                            policy=sla,
+                            details={"from": prior_status, "to": new_status},
+                            outcome="FAILED",
+                        )
+                    elif prior_status and prior_status != "OK" and new_status == "OK":
+                        await _emit_policy_audit(
+                            action="SLA_ENCRYPTION_STATUS_RECOVERED",
+                            tenant_id=str(tenant.id),
+                            policy=sla,
+                            details={"from": prior_status, "to": new_status},
+                        )
+
+                if had_failure:
+                    # Transient-only failures (429/503/timeout) leave the
+                    # dirty flag set for the next 5-min sweep but do NOT
+                    # bump the attempt counter — a regional ARM blip must
+                    # not consume the cap during normal flake.
+                    if not had_transient_only:
+                        sla.reconcile_attempts = (sla.reconcile_attempts or 0) + 1
+                        if _sla_metrics is not None:
+                            _sla_metrics.inc_reconcile("failure")
+                    else:
+                        if _sla_metrics is not None:
+                            _sla_metrics.inc_reconcile("transient")
+                else:
+                    sla.lifecycle_dirty = False
+                    sla.reconcile_attempts = 0
+                    sla.last_reconciled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    if _sla_metrics is not None:
+                        _sla_metrics.inc_reconcile("success")
+                    print(f"[LIFECYCLE-SWEEP] ✓ {tenant.display_name} / {sla.name}: clean")
+
+                await t_session.commit()
+
+            except Exception as policy_exc:
+                print(f"[LIFECYCLE-SWEEP] policy {sla.id} unexpected error: {policy_exc}")
+                # Unknown exception path — count toward cap (don't loop
+                # forever on a deterministic crash).
+                try:
+                    sla.reconcile_attempts = (sla.reconcile_attempts or 0) + 1
+                    await t_session.commit()
+                except Exception:
+                    await t_session.rollback()
 
 
 # ── AZ-4: DR Setup Reconciler ──

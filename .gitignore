@@ -5,6 +5,9 @@ __pycache__/
 *.so
 *.egg
 *.egg-info/
+.code-review-graph/
+.pytest_cache/
+.claude/
 dist/
 build/
 *.whl

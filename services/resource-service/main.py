@@ -1,12 +1,14 @@
 """Resource Service - Manages resources and SLA policies"""
 from contextlib import asynccontextmanager
-from typing import Optional, Iterable, List, Dict, Any
+from typing import Optional, Iterable, List, Dict, Any, Tuple
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 from datetime import timedelta
 import httpx
 
-from fastapi import FastAPI, Depends, HTTPException, Query
+import time
+from fastapi import FastAPI, Depends, HTTPException, Query, Header
+from fastapi.responses import JSONResponse
 from sqlalchemy import select, func, or_, text
 
 from shared.config import settings
@@ -23,6 +25,10 @@ from shared.schemas import (
     SlaExclusionRequest, SlaExclusionResponse,
     ResourceGroupRequest, ResourceGroupResponse,
     GroupPolicyAssignmentRequest,
+)
+from shared.sla_validation import (
+    gate_immutability_lock as _gate_immutability_lock,
+    validate_policy_payload as _validate_policy_payload,
 )
 
 
@@ -71,6 +77,242 @@ async def notify_scheduler_reschedule():
             await client.post("http://backup-scheduler:8008/scheduler/reschedule-all")
     except Exception as e:
         print(f"[resource-service] Failed to notify scheduler: {e}")
+
+
+async def notify_lifecycle_reconcile():
+    """Trigger an immediate lifecycle / immutability / legal-hold reconciliation
+    on the scheduler, so policy changes apply right away instead of waiting
+    for the daily 24h cron tick. Best-effort — failure logged, not raised.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post("http://backup-scheduler:8008/scheduler/reconcile-lifecycle")
+    except Exception as e:
+        print(f"[resource-service] Lifecycle reconcile notification failed: {e}")
+
+
+# In-process idempotency cache for POST /api/v1/policies. Maps the
+# Idempotency-Key header → (created_at_unix, response_body_dict). 24-hour
+# TTL. In-memory is acceptable here because the cache is purely a
+# duplicate-suppression hint — losing it on restart just means a retried
+# POST may create a fresh policy, which the client/UI can detect and
+# reconcile (e.g. by listing). For multi-pod coverage move to Redis.
+_IDEMPOTENCY_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_IDEMPOTENCY_TTL_S = 24 * 3600
+
+
+def _idempotency_get(key: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not key:
+        return None
+    entry = _IDEMPOTENCY_CACHE.get(key)
+    if not entry:
+        return None
+    ts, body = entry
+    if (time.time() - ts) > _IDEMPOTENCY_TTL_S:
+        _IDEMPOTENCY_CACHE.pop(key, None)
+        return None
+    return body
+
+
+def _idempotency_put(key: Optional[str], body: Dict[str, Any]) -> None:
+    if not key:
+        return
+    # Cap the cache so a malicious client can't OOM us.
+    if len(_IDEMPOTENCY_CACHE) > 5000:
+        # Drop the oldest 1000.
+        oldest = sorted(_IDEMPOTENCY_CACHE.items(), key=lambda kv: kv[1][0])[:1000]
+        for k, _ in oldest:
+            _IDEMPOTENCY_CACHE.pop(k, None)
+    _IDEMPOTENCY_CACHE[key] = (time.time(), body)
+
+
+async def _enforce_default_singleton(db: AsyncSession, tenant_id: UUID, keep_id: UUID) -> None:
+    """If a policy is being saved with is_default=True, flip every other
+    policy in the same tenant to is_default=False. Paired with the partial
+    unique index `ix_sla_policies_one_default_per_tenant` on (tenant_id)
+    WHERE is_default=TRUE. Caller is responsible for the surrounding
+    transaction commit."""
+    from sqlalchemy import update
+    await db.execute(
+        update(SlaPolicy)
+        .where(SlaPolicy.tenant_id == tenant_id)
+        .where(SlaPolicy.id != keep_id)
+        .where(SlaPolicy.is_default == True)  # noqa: E712 — SQLA needs literal
+        .values(is_default=False)
+    )
+
+
+async def _guard_zero_default(
+    db: AsyncSession, tenant_id: UUID, this_policy_id: UUID,
+    request_is_default: Optional[bool],
+    prior_is_default: bool,
+) -> None:
+    """Refuse a save that would leave the tenant with zero default policies.
+
+    The retention-cleanup fallback selects the tenant's default policy
+    when a resource has no explicit assignment (`retention_cleanup.py:159`).
+    A tenant with zero defaults silently picks the "first enabled policy"
+    which is non-deterministic across deploys and migrations.
+
+    Allowed:
+      - Setting is_default=true on a policy (singleton sweep handles others).
+      - Leaving is_default unchanged.
+      - Clearing is_default if some OTHER enabled policy is also default.
+      - Clearing is_default if there's exactly one policy in the tenant
+        (operator deleting the last default explicitly is fine — they
+        have nothing to back up to default-against anyway).
+    Refused:
+      - Clearing is_default if it would leave 0 defaults AND there are
+        other enabled policies present (operator must designate one).
+    """
+    if request_is_default is None or request_is_default is True:
+        return
+    if not prior_is_default:
+        return  # already non-default; no-op clear
+
+    # Count remaining defaults excluding this policy + the count of
+    # enabled policies in the tenant.
+    remaining_defaults = (await db.execute(
+        select(func.count(SlaPolicy.id)).where(
+            SlaPolicy.tenant_id == tenant_id,
+            SlaPolicy.id != this_policy_id,
+            SlaPolicy.is_default == True,  # noqa: E712
+        )
+    )).scalar() or 0
+    if remaining_defaults > 0:
+        return
+
+    # Are there other enabled policies that COULD be made default?
+    other_enabled = (await db.execute(
+        select(func.count(SlaPolicy.id)).where(
+            SlaPolicy.tenant_id == tenant_id,
+            SlaPolicy.id != this_policy_id,
+            SlaPolicy.enabled == True,  # noqa: E712
+        )
+    )).scalar() or 0
+    if other_enabled == 0:
+        # Last policy in the tenant; clearing default is fine — there's
+        # nothing for retention_cleanup to fall back to anyway.
+        return
+
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Cannot clear isDefault on the only default policy while other "
+            "enabled policies exist. Designate another policy as default "
+            "first, then revisit this one."
+        ),
+    )
+
+
+async def _apply_policy_to_matching(db: AsyncSession, policy: "SlaPolicy") -> int:
+    """Retroactive auto-apply for a single policy.
+
+    Scale strategy (25k+ resources, single tenant):
+      1. Stream resources via server-side cursor (yield_per) so peak
+         memory stays at chunk size, never the whole resource set.
+      2. Match in-memory chunk-by-chunk against the policy's attached
+         groups. Static groups are skipped (explicit lists handled
+         elsewhere).
+      3. Buffer matched ids in chunks of 1000, fire bulk UPDATE per
+         chunk — keeps a single statement's parameter count under
+         the SQL driver's safe limit and lets the DB reuse the index
+         lookup plan instead of one big WHERE id IN (25k uuids).
+
+    No-op when auto_apply_to_matching=False or no enabled groups attached.
+    """
+    if not policy.auto_apply_to_matching:
+        return 0
+    from shared.resource_group_matcher import resource_matches_group
+    from sqlalchemy import update as sa_update
+
+    rows = (await db.execute(
+        select(ResourceGroup)
+        .join(GroupPolicyAssignment, GroupPolicyAssignment.group_id == ResourceGroup.id)
+        .where(GroupPolicyAssignment.policy_id == policy.id)
+        .where(ResourceGroup.tenant_id == policy.tenant_id)
+        .where(ResourceGroup.enabled == True)  # noqa: E712
+    )).scalars().all()
+    # Skip static groups up-front — they have no rules to evaluate.
+    dynamic_groups = [g for g in rows if (g.group_type or "DYNAMIC").upper() != "STATIC"]
+    if not dynamic_groups:
+        return 0
+
+    CHUNK = 1000
+    matched_buffer: List[UUID] = []
+    total_bound = 0
+
+    # SQLAlchemy 2.x async-streaming pattern: execution_options(yield_per=N)
+    # keeps the driver in chunked-fetch mode so we don't load all rows.
+    stream = await db.stream(
+        select(Resource)
+        .where(Resource.tenant_id == policy.tenant_id)
+        .execution_options(yield_per=CHUNK)
+    )
+    async for res in stream.scalars():
+        for g in dynamic_groups:
+            if resource_matches_group(res, g.rules or [], g.combinator or "AND"):
+                matched_buffer.append(res.id)
+                break
+        if len(matched_buffer) >= CHUNK:
+            await db.execute(
+                sa_update(Resource)
+                .where(Resource.id.in_(matched_buffer))
+                .values(sla_policy_id=policy.id)
+            )
+            total_bound += len(matched_buffer)
+            matched_buffer.clear()
+
+    if matched_buffer:
+        await db.execute(
+            sa_update(Resource)
+            .where(Resource.id.in_(matched_buffer))
+            .values(sla_policy_id=policy.id)
+        )
+        total_bound += len(matched_buffer)
+
+    return total_bound
+
+
+async def _auto_bind_new_resource(db: AsyncSession, resource: "Resource") -> Optional[UUID]:
+    """Future auto-bind: called by discovery (or any caller that creates a
+    Resource) before commit. Looks up every auto_apply_to_matching policy
+    in the tenant whose attached resource groups match this resource;
+    binds to the highest-priority match. Returns the bound policy id or
+    None if no policy matched. Caller commits."""
+    from shared.resource_group_matcher import find_matching_groups
+
+    # All auto-apply policies for this tenant + their attached groups in
+    # one query, indexed by policy id.
+    rows = (await db.execute(
+        select(SlaPolicy, ResourceGroup)
+        .join(GroupPolicyAssignment, GroupPolicyAssignment.policy_id == SlaPolicy.id)
+        .join(ResourceGroup, ResourceGroup.id == GroupPolicyAssignment.group_id)
+        .where(SlaPolicy.tenant_id == resource.tenant_id)
+        .where(SlaPolicy.auto_apply_to_matching == True)  # noqa: E712
+        .where(SlaPolicy.enabled == True)  # noqa: E712
+        .where(ResourceGroup.enabled == True)  # noqa: E712
+    )).all()
+    if not rows:
+        return None
+    policies_to_groups: Dict[UUID, List[ResourceGroup]] = {}
+    for pol, grp in rows:
+        policies_to_groups.setdefault(pol.id, []).append(grp)
+
+    # Pick highest-priority matching group and use its policy.
+    best_policy: Optional[UUID] = None
+    best_priority: int = 10**9
+    for pid, groups in policies_to_groups.items():
+        matched = find_matching_groups(resource, groups)
+        if matched:
+            prio = getattr(matched[0], "priority", 100)
+            if prio < best_priority:
+                best_priority = prio
+                best_policy = pid
+    if best_policy is None:
+        return None
+    resource.sla_policy_id = best_policy
+    return best_policy
 
 
 app = FastAPI(title="Resource Service", version="1.0.0", lifespan=lifespan)
@@ -1059,17 +1301,42 @@ def policy_to_dict(p):
 async def list_policies(
     tenantId: Optional[str] = Query(None),
     serviceType: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(SlaPolicy).order_by(SlaPolicy.created_at.desc())
+    """List SLA policies. Paginated to keep list-page response sizes
+    bounded — at 5k-user / single-tenant scale operators may have
+    hundreds of policies; an unpaginated dump can be MB-sized JSON.
+
+    Response shape:
+      {"items": [...], "total": N, "limit": L, "offset": O}
+
+    Back-compat: callers that pass no pagination params still get the
+    first 100 rows. Wizard page should drive pagination via the items
+    list and the `total` for "X of Y policies" footers.
+    """
+    base_filter = []
     if tenantId:
-        stmt = stmt.where(SlaPolicy.tenant_id == UUID(tenantId))
+        base_filter.append(SlaPolicy.tenant_id == UUID(tenantId))
     normalized_service_type = normalize_policy_service_type(serviceType)
     if normalized_service_type:
-        stmt = stmt.where(SlaPolicy.service_type == normalized_service_type)
-    result = await db.execute(stmt)
-    policies = result.scalars().all()
-    return [policy_to_dict(p) for p in policies]
+        base_filter.append(SlaPolicy.service_type == normalized_service_type)
+
+    # Total — single COUNT(*) so pagination doesn't pay the full row cost.
+    count_stmt = select(func.count(SlaPolicy.id))
+    for f in base_filter:
+        count_stmt = count_stmt.where(f)
+    total = (await db.execute(count_stmt)).scalar() or 0
+
+    page_stmt = select(SlaPolicy).order_by(SlaPolicy.created_at.desc())
+    for f in base_filter:
+        page_stmt = page_stmt.where(f)
+    page_stmt = page_stmt.offset(offset).limit(limit)
+
+    rows = (await db.execute(page_stmt)).scalars().all()
+    items = [policy_to_dict(p) for p in rows]
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
 @app.get("/api/v1/policies/{policy_id}", response_model=SlaPolicyResponse)
@@ -1083,7 +1350,20 @@ async def get_policy(policy_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @app.post("/api/v1/policies")
-async def create_policy(request: dict, db: AsyncSession = Depends(get_db)):
+async def create_policy(
+    request: dict,
+    db: AsyncSession = Depends(get_db),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    # Idempotent retries (operator double-clicks Save, network flake) MUST
+    # NOT create duplicate policies. The client supplies an opaque
+    # Idempotency-Key on the first POST; subsequent POSTs with the same
+    # key inside the 24h window return the cached response without ever
+    # touching the DB. RFC standard pattern (Stripe / GitHub / AWS).
+    cached = _idempotency_get(idempotency_key)
+    if cached is not None:
+        return cached
+
     # Helper to get value by camelCase or snake_case
     def get_val(camel: str, snake: str, default=None):
         return request.get(camel, request.get(snake, default))
@@ -1093,6 +1373,17 @@ async def create_policy(request: dict, db: AsyncSession = Depends(get_db)):
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
     service_type = normalize_policy_service_type(get_val("serviceType", "service_type")) or tenant_policy_service_type(tenant)
+
+    # Validate-then-gate. Validation comes first because the WORM gate
+    # references the typed name, which we want resolved against a clean
+    # payload (e.g. trimmed whitespace).
+    _validate_policy_payload(request)
+    # On create, the policy name is the typed name (there's no prior name).
+    _gate_immutability_lock(
+        request,
+        prior_mode=None,
+        current_name=(get_val("name", "name") or "").strip(),
+    )
 
     policy = SlaPolicy(
         id=uuid4(),
@@ -1138,7 +1429,6 @@ async def create_policy(request: dict, db: AsyncSession = Depends(get_db)):
         legal_hold_enabled=get_val("legalHoldEnabled", "legal_hold_enabled", False),
         legal_hold_until=get_val("legalHoldUntil", "legal_hold_until"),
         immutability_mode=get_val("immutabilityMode", "immutability_mode", "None"),
-        storage_region=get_val("storageRegion", "storage_region"),
         encryption_mode=get_val("encryptionMode", "encryption_mode", "VAULT_MANAGED"),
         key_vault_uri=get_val("keyVaultUri", "key_vault_uri"),
         key_name=get_val("keyName", "key_name"),
@@ -1147,23 +1437,117 @@ async def create_policy(request: dict, db: AsyncSession = Depends(get_db)):
         enabled=get_val("enabled", "enabled", True),
         is_default=get_val("isDefault", "is_default", False),
     )
+    # Mark dirty in the SAME transaction as the insert. The 5-min sweeper
+    # in backup-scheduler picks this up if the HTTP nudge below drops on
+    # the floor — durable end-to-end with no message-bus dependency.
+    policy.lifecycle_dirty = True
+
+    # Flip existing default BEFORE the INSERT — the partial unique index
+    # `ix_sla_policies_one_default_per_tenant` fires at INSERT time, not at
+    # commit, so the prior holder must already be is_default=False or the
+    # INSERT raises UniqueViolation. Both UPDATE and INSERT live in the
+    # same transaction so a concurrent reader never observes "two defaults"
+    # or "zero defaults" mid-flip.
+    if policy.is_default:
+        from sqlalchemy import update as sa_update
+        await db.execute(
+            sa_update(SlaPolicy)
+            .where(SlaPolicy.tenant_id == tenant_id)
+            .where(SlaPolicy.is_default == True)  # noqa: E712
+            .values(is_default=False)
+        )
+        await db.flush()
+
     db.add(policy)
+    await db.flush()  # need policy.id for auto-apply downstream
+
+    bound_count = 0
+    if policy.auto_apply_to_matching:
+        bound_count = await _apply_policy_to_matching(db, policy)
+
     await db.commit()
+    if bound_count:
+        print(f"[POLICY] auto_apply: {bound_count} resources bound to policy {policy.id}")
 
-    # Notify scheduler to reschedule jobs with updated policy
+    # Notify scheduler — reschedule cron jobs and reconcile lifecycle / WORM /
+    # legal-hold so policy changes take effect immediately instead of after
+    # the 24h cron tick. Failure is non-fatal: lifecycle_dirty=True (set
+    # transactionally above) ensures the 5-min sweeper picks it up.
     await notify_scheduler_reschedule()
+    await notify_lifecycle_reconcile()
 
-    return policy_to_dict(policy)
+    response = policy_to_dict(policy)
+    _idempotency_put(idempotency_key, response)
+    return response
 
 
 @app.put("/api/v1/policies/{policy_id}", response_model=SlaPolicyResponse)
-async def update_policy(policy_id: str, request: dict, db: AsyncSession = Depends(get_db)):
-    stmt = select(SlaPolicy).where(SlaPolicy.id == UUID(policy_id))
+async def update_policy(
+    policy_id: str,
+    request: dict,
+    db: AsyncSession = Depends(get_db),
+    if_match: Optional[str] = Header(default=None, alias="If-Match"),
+):
+    # Lock the row for the duration of this transaction so two concurrent
+    # PUTs serialize cleanly — the loser's If-Match check then fails
+    # cleanly with 412 instead of silently overwriting.
+    stmt = (
+        select(SlaPolicy)
+        .where(SlaPolicy.id == UUID(policy_id))
+        .with_for_update()
+    )
     result = await db.execute(stmt)
     policy = result.scalar_one_or_none()
     if not policy:
         raise HTTPException(status_code=404, detail="Policy not found")
-    
+
+    # Optimistic concurrency: client sends If-Match: <updated_at-iso> from
+    # the GET response; server rejects with 412 if the row has moved on.
+    # We accept a missing header for back-compat (Wizard sends it; older
+    # callers don't), but log a warning so we can spot hot edit paths.
+    if if_match:
+        current_etag = (
+            policy.updated_at.isoformat() if policy.updated_at else
+            (policy.created_at.isoformat() if policy.created_at else "")
+        )
+        if if_match.strip().strip('"') != current_etag:
+            raise HTTPException(
+                status_code=412,
+                detail=(
+                    "Policy has been modified by another writer since you "
+                    "loaded it. Reload and re-apply your changes."
+                ),
+            )
+
+    # Validate the proposed payload, then gate WORM transitions. The gate
+    # passes the *prospective* new name (from the request, falling back
+    # to the existing name if the request doesn't change it) so the typed-
+    # name confirmation is checked against what the policy will be called
+    # AFTER this save — which is what the operator typed in the modal.
+    _validate_policy_payload(request)
+    new_name = (request.get("name") or request.get("name") or policy.name or "").strip()
+    _gate_immutability_lock(
+        request,
+        prior_mode=policy.immutability_mode,
+        current_name=new_name,
+    )
+    # Zero-default guard. Reads is_default from the request (camelCase or
+    # snake_case); compares against the prior value. Refuses 409 if the
+    # change would leave the tenant with zero default policies while
+    # other enabled policies are around.
+    requested_is_default = None
+    if "isDefault" in request:
+        requested_is_default = bool(request["isDefault"])
+    elif "is_default" in request:
+        requested_is_default = bool(request["is_default"])
+    await _guard_zero_default(
+        db,
+        tenant_id=policy.tenant_id,
+        this_policy_id=policy.id,
+        request_is_default=requested_is_default,
+        prior_is_default=bool(policy.is_default),
+    )
+
     # Helper to get value by camelCase or snake_case
     def get_val(camel: str, snake: str, default=None):
         return request.get(camel, request.get(snake, default))
@@ -1208,7 +1592,6 @@ async def update_policy(policy_id: str, request: dict, db: AsyncSession = Depend
         'legalHoldEnabled': 'legal_hold_enabled',
         'legalHoldUntil': 'legal_hold_until',
         'immutabilityMode': 'immutability_mode',
-        'storageRegion': 'storage_region',
         'encryptionMode': 'encryption_mode',
         'keyVaultUri': 'key_vault_uri',
         'keyName': 'key_name',
@@ -1217,16 +1600,60 @@ async def update_policy(policy_id: str, request: dict, db: AsyncSession = Depend
         'enabled': 'enabled', 'isDefault': 'is_default',
     }
     
+    # Special handling for is_default: flip OTHER policies' default to false
+    # BEFORE letting the ORM apply the field_map (and thus before autoflush
+    # writes this row's is_default=True). The partial unique index fires at
+    # statement time, not commit time — if we let setattr happen first, the
+    # next implicit flush UPDATEs this row to True while the prior holder
+    # is still True, raising UniqueViolation.
+    incoming_is_default = get_val('isDefault', 'is_default')
+    if incoming_is_default is True and not policy.is_default:
+        from sqlalchemy import update as sa_update
+        await db.execute(
+            sa_update(SlaPolicy)
+            .where(SlaPolicy.tenant_id == policy.tenant_id)
+            .where(SlaPolicy.id != policy.id)
+            .where(SlaPolicy.is_default == True)  # noqa: E712
+            .values(is_default=False)
+        )
+        await db.flush()
+
     for camel_key, snake_key in field_map.items():
         val = get_val(camel_key, snake_key)
         if val is not None:
             setattr(policy, snake_key, val)
-    
-    policy.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    await db.commit()
 
-    # Notify scheduler to reschedule jobs with updated policy
+    policy.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    # Mark dirty so the 5-min sweeper picks this change up if the HTTP
+    # nudge to the scheduler fails. Reset attempts so a previously-capped
+    # policy gets one more shot whenever the operator edits it.
+    policy.lifecycle_dirty = True
+    policy.reconcile_attempts = 0
+
+    bound_count = 0
+    if policy.auto_apply_to_matching:
+        # Only re-bind when something that affects matching has changed.
+        # Trivial saves (rename, frequency change, retention day tweak)
+        # don't need a re-bind sweep — the existing assignments still
+        # match. At 25k resources / single tenant this skip saves a
+        # full table scan + 25k UPDATE statements per noisy save.
+        rebind_relevant_keys = {
+            "autoApplyToMatching", "auto_apply_to_matching",
+        }
+        rebind = bool(rebind_relevant_keys.intersection(request.keys()))
+        if rebind:
+            bound_count = await _apply_policy_to_matching(db, policy)
+
+    await db.commit()
+    if bound_count:
+        print(f"[POLICY] auto_apply: {bound_count} resources rebound to policy {policy.id}")
+
+    # Notify scheduler — reschedule cron jobs and reconcile lifecycle / WORM /
+    # legal-hold so policy changes take effect immediately instead of after
+    # the 24h cron tick. Failure is non-fatal: lifecycle_dirty=True (set
+    # transactionally above) ensures the 5-min sweeper picks it up.
     await notify_scheduler_reschedule()
+    await notify_lifecycle_reconcile()
 
     return SlaPolicyResponse.model_validate(policy)
 
@@ -1256,6 +1683,46 @@ async def get_policy_resources(policy_id: str, db: AsyncSession = Depends(get_db
 @app.post("/api/v1/policies/{policy_id}/auto-assign", status_code=204)
 async def auto_assign_policy(policy_id: str, request: dict):
     pass
+
+
+@app.post("/api/v1/policies/{policy_id}/force-reconcile")
+async def force_reconcile_policy(policy_id: str, db: AsyncSession = Depends(get_db)):
+    """Operator-driven retry hook. Marks the policy lifecycle_dirty and
+    nudges the scheduler to run an immediate reconcile pass.
+
+    Why this exists: when a policy is stuck in `KEY_VAULT_ACCESS_DENIED`
+    or capped on `reconcile_attempts`, the operator's normal recovery
+    path is to fix the upstream config (Key Vault role, vault URI typo)
+    and wait up to 24h for the dirty sweeper to retry. That's too slow
+    when on-call is debugging a CMK outage. This endpoint clears the
+    attempt cap, sets dirty=true, and pings the scheduler so the next
+    reconcile happens within seconds rather than within the next sweep
+    window. Idempotent — safe to call repeatedly.
+
+    Returns: the post-flip policy state (encryption_status, attempts).
+    """
+    pol = await db.get(SlaPolicy, UUID(policy_id))
+    if not pol:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    pol.lifecycle_dirty = True
+    pol.reconcile_attempts = 0
+    pol.last_cap_alert_at = None
+    pol.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    await db.commit()
+    await db.refresh(pol)
+    # Best-effort nudge — durable retry via the 5-min sweeper if the
+    # scheduler call fails (e.g. scheduler restarting during the call).
+    try:
+        await notify_lifecycle_reconcile()
+    except Exception as exc:
+        print(f"[force-reconcile] scheduler nudge failed (sweeper will retry): {exc}")
+    return {
+        "id": str(pol.id),
+        "lifecycle_dirty": pol.lifecycle_dirty,
+        "reconcile_attempts": pol.reconcile_attempts,
+        "encryption_status": pol.encryption_status or "",
+        "last_cap_alert_at": pol.last_cap_alert_at.isoformat() if pol.last_cap_alert_at else None,
+    }
 
 
 # ==================== SLA Exclusions ====================
@@ -1373,7 +1840,6 @@ async def update_resource_group(group_id: str, body: dict, db: AsyncSession = De
     g = await db.get(ResourceGroup, UUID(group_id))
     if not g:
         raise HTTPException(status_code=404, detail="Resource group not found")
-    # camelCase or snake_case accepted
     field_map = {
         "name": "name", "description": "description",
         "groupType": "group_type", "group_type": "group_type",
@@ -1381,12 +1847,52 @@ async def update_resource_group(group_id: str, body: dict, db: AsyncSession = De
         "autoProtectNew": "auto_protect_new", "auto_protect_new": "auto_protect_new",
         "enabled": "enabled",
     }
+    # Capture the prior rules/combinator/enabled snapshot so we can detect
+    # whether matching semantics actually changed. Only a real change
+    # warrants a re-bind sweep — saving a description shouldn't kick off
+    # a 25k-resource scan.
+    prior_rules = g.rules
+    prior_combinator = g.combinator
+    prior_enabled = g.enabled
+    prior_priority = g.priority
+
     for key, column in field_map.items():
         if key in body:
             setattr(g, column, body[key])
     g.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.commit()
     await db.refresh(g)
+
+    # Re-bind hook: if the rule expression changed (or the group flipped
+    # enabled/disabled, or the priority changed in a way that may shift
+    # which policy wins on a contested resource), trigger a re-evaluation
+    # against any auto-apply policies attached to this group. Resources
+    # that previously matched but no longer do retain their assignment —
+    # we don't unbind here; that's a separate "purge" workflow operators
+    # have to opt into explicitly to avoid accidental data exposure.
+    rules_changed = (
+        prior_rules != g.rules
+        or prior_combinator != g.combinator
+        or prior_enabled != g.enabled
+        or prior_priority != g.priority
+    )
+    if rules_changed and (g.enabled is True):
+        try:
+            attached_policies = (await db.execute(
+                select(SlaPolicy)
+                .join(GroupPolicyAssignment, GroupPolicyAssignment.policy_id == SlaPolicy.id)
+                .where(GroupPolicyAssignment.group_id == g.id)
+                .where(SlaPolicy.tenant_id == g.tenant_id)
+                .where(SlaPolicy.enabled.is_(True))
+                .where(SlaPolicy.auto_apply_to_matching.is_(True))
+            )).scalars().all()
+            for pol in attached_policies:
+                await _apply_policy_to_matching(db, pol)
+        except Exception as exc:
+            # Re-bind is best-effort. The discovery-worker's auto-protect
+            # sweep is the durable fallback so a transient DB hiccup here
+            # doesn't strand resources on the wrong policy long-term.
+            print(f"[resource-group rebind] {g.id}: {exc}")
     return await _serialize_group(db, g)
 
 
