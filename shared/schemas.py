@@ -24,7 +24,10 @@ class LoginResponse(BaseModel):
 
 
 class RefreshTokenRequest(BaseModel):
-    refreshToken: str
+    # Optional: the SPA reads the refresh token from an HttpOnly cookie and
+    # sends an empty {} body. Non-browser callers (CLI, integration tests)
+    # may still pass the token explicitly.
+    refreshToken: Optional[str] = None
 
 
 class RefreshTokenResponse(BaseModel):
