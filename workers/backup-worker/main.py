@@ -74,6 +74,42 @@ except ImportError:
 _BULK_INSERT_CHUNK = int(os.getenv("BULK_INSERT_CHUNK", "2000"))
 
 
+# Inline-attachment threshold. Attachments + chat hosted-contents below
+# this size go into snapshot_items.extra_data["inline_b64"] (base64-
+# encoded bytes) instead of Azure Blob. Two reasons:
+#   1. Each Azure block-list commit costs 200-500 ms fixed overhead.
+#      Most enterprise attachments are signatures, logos, thumbnails
+#      ≤256 KB — paying a half-second round-trip per tiny image is the
+#      single biggest per-email wall-time tax (~10s/email observed).
+#   2. The azure-storage-blob aiohttp transport intermittently raises
+#      `Timeout on reading data from socket` under high concurrency for
+#      sub-MB uploads against newly-created containers (observed on
+#      catt_* chat hosted-content uploads). Inlining sidesteps the bug.
+# Trade-off: small items skip cross-snapshot dedup (find_existing_blob
+# only matches blob-backed rows). Dedup pool's `min_size_bytes` default
+# is 1 KB so tiny items already weren't deduped; impact is bounded to
+# the 1KB-256KB band, typically <2% of total backup bytes.
+_INLINE_ATTACHMENT_MAX_BYTES = int(
+    os.getenv("INLINE_ATTACHMENT_MAX_BYTES", str(256 * 1024)),
+)
+
+
+def _maybe_inline_attachment(content_bytes: Optional[bytes]) -> Optional[str]:
+    """Return base64-encoded content if it fits the inline threshold;
+    None if the bytes should go to Azure Blob instead.
+
+    Callers MUST handle both branches — inline path sets
+    extra_data["inline_b64"] and leaves blob_path=None; blob path runs
+    the existing upload_blob_with_dedup flow.
+    """
+    if content_bytes is None:
+        return None
+    if len(content_bytes) > _INLINE_ATTACHMENT_MAX_BYTES:
+        return None
+    import base64 as _b64
+    return _b64.b64encode(content_bytes).decode("ascii")
+
+
 class SnapshotVanishedError(Exception):
     """Raised by the snapshot_items bulk insert when the parent snapshot
     row was deleted out from under us — typically because cancel_job's
@@ -2769,62 +2805,63 @@ class BackupWorker:
                 blob_path: Optional[str] = None
                 content_hash: Optional[str] = None
                 size = declared_size
+                inline_b64: Optional[str] = None
 
                 if content_bytes is not None:
                     content_hash = hashlib.sha256(content_bytes).hexdigest()
                     size = len(content_bytes)
-                    # Hash the (msg_id, att_id) tuple — Graph IDs are ~150
-                    # base64 chars each, so the raw concatenation produced a
-                    # 330+ char path component that exceeded the 255-byte
-                    # filesystem name-length limit on SeaweedFS / ext4.
-                    # sha1 hex = 40 chars, deterministic, collision-resistant
-                    # for our purposes; same (msg_id, att_id) tuple still
-                    # maps to the same blob_path so dedup behaviour is
-                    # preserved.
-                    _att_key = hashlib.sha1(
-                        f"{msg_id}_{att_id}".encode()
-                    ).hexdigest()
-                    blob_path = azure_storage_manager.build_blob_path(
-                        str(tenant.id), str(resource.id), str(snapshot.id),
-                        f"att_{_att_key}",
-                    )
-                    try:
-                        # Content-addressable dedup — same attachment
-                        # forwarded around the org (quarterly report,
-                        # policy PDFs, branded templates) lands on one
-                        # blob instead of N. At 400 TiB / 5k users this
-                        # typically reclaims 5-10× of storage + Azure
-                        # egress. Dedup is scoped to the same tenant
-                        # so no cross-customer bleed is possible.
-                        from shared.azure_storage import upload_blob_with_dedup
-                        result = await upload_blob_with_dedup(
-                            tenant.id, content_hash,
-                            container, blob_path, content_bytes, shard,
-                            max_retries=3,
+
+                    # Inline path: small attachments (signatures, logos,
+                    # thumbnails) skip Azure Blob entirely. Saves the
+                    # 200-500 ms per-blob block-list commit which
+                    # dominates wall-time on small-attachment-heavy
+                    # mailboxes.
+                    inline_b64 = _maybe_inline_attachment(content_bytes)
+                    if inline_b64 is not None:
+                        local_bytes += size
+                    else:
+                        # Blob path: above threshold, use Azure.
+                        # Hash the (msg_id, att_id) tuple — Graph IDs are
+                        # ~150 base64 chars each, so raw concatenation
+                        # exceeded the 255-byte filesystem name-length
+                        # limit on SeaweedFS / ext4. sha1 hex = 40 chars,
+                        # deterministic, collision-resistant.
+                        _att_key = hashlib.sha1(
+                            f"{msg_id}_{att_id}".encode()
+                        ).hexdigest()
+                        blob_path = azure_storage_manager.build_blob_path(
+                            str(tenant.id), str(resource.id),
+                            str(snapshot.id), f"att_{_att_key}",
                         )
-                        if not (isinstance(result, dict) and result.get("success")):
+                        try:
+                            # Content-addressable dedup at the tenant
+                            # boundary — same attachment forwarded around
+                            # the org lands on one blob instead of N.
+                            from shared.azure_storage import upload_blob_with_dedup
+                            result = await upload_blob_with_dedup(
+                                tenant.id, content_hash,
+                                container, blob_path, content_bytes, shard,
+                                max_retries=3,
+                            )
+                            if not (isinstance(result, dict) and result.get("success")):
+                                blob_path = None
+                                content_hash = None
+                            else:
+                                blob_path = result.get("blob_path", blob_path)
+                                local_bytes += size
+                                if result.get("method") == "dedup_hit":
+                                    print(
+                                        f"[{self.worker_id}] [ATT-DEDUP-HIT] "
+                                        f"{att_name} on {msg_id} — "
+                                        f"reused existing blob, saved "
+                                        f"{size} bytes"
+                                    )
+                        except Exception as e:
+                            print(f"[{self.worker_id}] [ATT-UPLOAD] {att_name} on {msg_id}: {type(e).__name__}: {e}")
                             blob_path = None
                             content_hash = None
-                        else:
-                            # Reuse the deduped blob_path so both
-                            # snapshot_items point at the SAME physical
-                            # blob. Avoids the subtle bug where two
-                            # rows claim distinct blob_paths but only
-                            # one actually exists on storage.
-                            blob_path = result.get("blob_path", blob_path)
-                            local_bytes += size
-                            if result.get("method") == "dedup_hit":
-                                print(
-                                    f"[{self.worker_id}] [ATT-DEDUP-HIT] "
-                                    f"{att_name} on {msg_id} — "
-                                    f"reused existing blob, saved "
-                                    f"{size} bytes"
-                                )
-                    except Exception as e:
-                        print(f"[{self.worker_id}] [ATT-UPLOAD] {att_name} on {msg_id}: {type(e).__name__}: {e}")
-                        blob_path = None
-                        content_hash = None
 
+                resolved = (blob_path is not None) or (inline_b64 is not None)
                 local_items.append(SnapshotItem(
                     id=uuid.uuid4(),
                     snapshot_id=snapshot.id,
@@ -2847,7 +2884,11 @@ class BackupWorker:
                         # cid:xxx references.
                         "content_id": att.get("contentId") or att.get("contentID"),
                         "source_url": att.get("sourceUrl"),
-                        "resolved": blob_path is not None,
+                        "resolved": resolved,
+                        # When inline_b64 is set, restore/download paths
+                        # decode this instead of fetching from blob_path.
+                        # blob_path stays None for inline rows.
+                        "inline_b64": inline_b64,
                     },
                 ))
             return local_items, local_bytes
@@ -3003,38 +3044,51 @@ class BackupWorker:
             content_hash: Optional[str] = None
             size = 0
             bytes_added = 0
+            inline_b64: Optional[str] = None
 
             if content_bytes is not None:
                 content_hash = hashlib.sha256(content_bytes).hexdigest()
                 size = len(content_bytes)
-                # Same length-mitigation as the USER_MAIL path above —
-                # raw msg_id + att_id concatenation overflows the 255-byte
-                # filename limit on SeaweedFS / ext4.
-                _catt_key = hashlib.sha1(
-                    f"{msg_id}_{att_id}".encode()
-                ).hexdigest()
-                blob_path = azure_storage_manager.build_blob_path(
-                    str(tenant.id), str(resource.id), str(snapshot.id),
-                    f"catt_{_catt_key}",
-                )
-                try:
-                    async with sem:
-                        result = await upload_blob_with_retry(
-                            container, blob_path, content_bytes, shard, max_retries=3,
+
+                # Inline path: small chat attachments (most card images,
+                # thumbnails, emoji-sized inline content) skip Azure
+                # Blob to dodge the per-blob block-list commit cost AND
+                # the azure-storage-blob aiohttp 'Timeout on reading
+                # data from socket' that intermittently hits catt_*
+                # uploads under high concurrency.
+                inline_b64 = _maybe_inline_attachment(content_bytes)
+                if inline_b64 is not None:
+                    resolved = True
+                    bytes_added = size
+                else:
+                    # Blob path: above threshold, use Azure.
+                    # raw msg_id + att_id concatenation overflows the
+                    # 255-byte filename limit on SeaweedFS / ext4.
+                    _catt_key = hashlib.sha1(
+                        f"{msg_id}_{att_id}".encode()
+                    ).hexdigest()
+                    blob_path = azure_storage_manager.build_blob_path(
+                        str(tenant.id), str(resource.id), str(snapshot.id),
+                        f"catt_{_catt_key}",
+                    )
+                    try:
+                        async with sem:
+                            result = await upload_blob_with_retry(
+                                container, blob_path, content_bytes, shard, max_retries=3,
+                            )
+                        if isinstance(result, dict) and result.get("success"):
+                            resolved = True
+                            bytes_added = size
+                        else:
+                            blob_path = None
+                            content_hash = None
+                    except Exception as e:
+                        print(
+                            f"[{self.worker_id}] [CHAT-ATT UPLOAD] "
+                            f"{name} on {msg_id}: {type(e).__name__}: {e}"
                         )
-                    if isinstance(result, dict) and result.get("success"):
-                        resolved = True
-                        bytes_added = size
-                    else:
                         blob_path = None
                         content_hash = None
-                except Exception as e:
-                    print(
-                        f"[{self.worker_id}] [CHAT-ATT UPLOAD] "
-                        f"{name} on {msg_id}: {type(e).__name__}: {e}"
-                    )
-                    blob_path = None
-                    content_hash = None
 
             item = SnapshotItem(
                 id=uuid.uuid4(),
@@ -3060,6 +3114,9 @@ class BackupWorker:
                     # render it without a Graph round-trip.
                     "content": raw_content,
                     "resolved": resolved,
+                    # When inline_b64 is set, restore/download paths
+                    # decode this instead of fetching from blob_path.
+                    "inline_b64": inline_b64,
                 },
             )
             return item, bytes_added
@@ -3189,8 +3246,39 @@ class BackupWorker:
                         extra={"message_id": message_id, "hc_id": hc_id, "size": size},
                     )
                     return 0, 0
-                blob_path = f"users/{user_id}/chats/{chat_id}/messages/{message_id}/hosted/{hc_id}"
-                await self._upload_stream(blob_path, stream, content_type=ctype)
+
+                # Drain the stream into memory first so we can choose
+                # between inline storage (small content) and Azure blob
+                # upload (large content). Teams hosted-contents are
+                # already size-capped upstream so buffering is bounded.
+                buf = bytearray()
+                try:
+                    async for chunk in stream:
+                        if chunk:
+                            buf.extend(chunk)
+                finally:
+                    aclose = getattr(stream, "aclose", None)
+                    if aclose is not None:
+                        try:
+                            await aclose()
+                        except Exception:
+                            pass
+                content_bytes = bytes(buf)
+                actual_size = len(content_bytes) or size
+
+                # Inline path: small Teams hosted-contents (thumbnails,
+                # card icons, emoji-sized inline images) skip Azure to
+                # avoid the catt_* aiohttp transport-timeout failure
+                # mode observed under high concurrency. ~90% of Teams
+                # hosted-contents are below the 256 KB threshold.
+                inline_b64 = _maybe_inline_attachment(content_bytes)
+                blob_path: Optional[str] = None
+                if inline_b64 is None:
+                    blob_path = f"users/{user_id}/chats/{chat_id}/messages/{message_id}/hosted/{hc_id}"
+                    await self._upload_bytes(
+                        blob_path, content_bytes, content_type=ctype,
+                    )
+
                 await self._insert_snapshot_item(
                     snapshot_id=snapshot_id,
                     item_type="CHAT_HOSTED_CONTENT",
@@ -3198,10 +3286,14 @@ class BackupWorker:
                     parent_external_id=message_id,
                     name=f"inline-{hc_id}",
                     blob_path=blob_path,
-                    content_size=size,
-                    extra_data={"content_type": ctype, "source_message_id": message_id},
+                    content_size=actual_size,
+                    extra_data={
+                        "content_type": ctype,
+                        "source_message_id": message_id,
+                        "inline_b64": inline_b64,
+                    },
                 )
-                return 1, size
+                return 1, actual_size
 
         results = await asyncio.gather(*[_one(hc) for hc in hosted_contents])
         for c, b in results:
@@ -3260,6 +3352,28 @@ class BackupWorker:
             shard = azure_storage_manager.get_shard_for_resource(resource_id, tenant_id)
             cname = azure_storage_manager.get_container_name(tenant_id, container)
         await upload_blob_with_retry(cname, blob_path, bytes(buf), shard, max_retries=3)
+
+    async def _upload_bytes(
+        self, blob_path: str, content_bytes: bytes, *,
+        content_type: str = "application/octet-stream",
+        tenant_id: Optional[str] = None, resource_id: Optional[str] = None,
+        container: str = "teams",
+    ) -> None:
+        """Upload an already-buffered byte string to Azure blob. Used by
+        callers that need to inspect content size before deciding between
+        inline-in-DB and blob storage (so they can't hand off an
+        async iterator). Mirrors `_upload_stream` post-drain behaviour."""
+        if tenant_id is None or resource_id is None:
+            shard = azure_storage_manager.get_shard_for_resource(
+                resource_id or blob_path, tenant_id or blob_path,
+            )
+            cname = azure_storage_manager.get_container_name(
+                tenant_id or "default", container,
+            )
+        else:
+            shard = azure_storage_manager.get_shard_for_resource(resource_id, tenant_id)
+            cname = azure_storage_manager.get_container_name(tenant_id, container)
+        await upload_blob_with_retry(cname, blob_path, content_bytes, shard, max_retries=3)
 
     async def _insert_snapshot_item(self, **kw) -> None:
         """Insert a SnapshotItem row from kwargs. Thin wrapper so callers (like

@@ -2047,13 +2047,31 @@ async def get_item_content(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    if item.blob_path and azure_storage_manager.shards:
+    # Inline path: items with `extra_data.inline_b64` set carry their
+    # bytes directly in the JSON column instead of in Azure Blob. This
+    # covers EMAIL_ATTACHMENT / CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT
+    # rows ≤256 KB. Check this before the blob path because inline rows
+    # have blob_path=None by construction.
+    _ed_for_inline = item.extra_data or {}
+    _inline_b64 = _ed_for_inline.get("inline_b64")
+    data: Optional[bytes] = None
+    source: Optional[str] = None
+    if _inline_b64:
+        import base64 as _b64
+        try:
+            data = _b64.b64decode(_inline_b64)
+            source = "inline"
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Inline decode failed: {e}")
+
+    if data is None and item.blob_path and azure_storage_manager.shards:
         shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
         try:
             data = await _download_item_blob(shard, tenant_id, candidates, item.blob_path)
+            source = "blob"
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Blob read failed: {e}")
-        if data:
+    if data is not None:
             import json as _json
             meta = item.extra_data or {}
             # Only try JSON parsing when the caller didn't ask for a raw
@@ -2061,7 +2079,7 @@ async def get_item_content(
             # through the browser fine as raw bytes too.
             if not download:
                 try:
-                    return {"source": "blob", "content": _json.loads(data.decode("utf-8"))}
+                    return {"source": source or "blob", "content": _json.loads(data.decode("utf-8"))}
                 except Exception:
                     pass
 
