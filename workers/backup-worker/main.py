@@ -1206,7 +1206,12 @@ class BackupWorker:
                                 f"{graph_client.GRAPH_URL}/users/{user_id}"
                                 f"/mailFolders/{fid}/messages/delta"
                             )
-                            params = {"$top": "50", "$select": mail_select}
+                            # $top=999 is Graph's maximum for messages.
+                            # No-op at sub-1k mailboxes (every folder fits
+                            # in one page either way), but at 10k+ folders
+                            # the page count drops ~20× and saves minutes
+                            # of round-trip time on first sync.
+                            params = {"$top": "999", "$select": mail_select}
                         else:
                             # Folder enumeration failed — do a best-effort
                             # non-delta scan of all messages (no incremental).
@@ -1214,7 +1219,7 @@ class BackupWorker:
                                 f"{graph_client.GRAPH_URL}/users/{user_id}"
                                 f"/messages"
                             )
-                            params = {"$top": "50", "$select": mail_select}
+                            params = {"$top": "999", "$select": mail_select}
 
                         local_out: List = []
                         delta_out: Optional[str] = None
