@@ -1297,6 +1297,7 @@ class BackupWorker:
                         # raw dicts off the tuples we just built, hand
                         # them to _stream_persist_folder_items, then
                         # bump the snapshot row's live counters.
+                        _folder_persisted_ok = False
                         if _mail_streaming_enabled and local_out:
                             folder_path_val = (
                                 folder_tree.get(fid) if fid else ""
@@ -1314,6 +1315,7 @@ class BackupWorker:
                                 nonlocal _mail_persisted_total, _mail_persisted_bytes
                                 _mail_persisted_total += n
                                 _mail_persisted_bytes += b
+                                _folder_persisted_ok = True
                                 try:
                                     async with async_session_factory() as _s2:
                                         snap = await _s2.get(
@@ -1351,6 +1353,54 @@ class BackupWorker:
                                     f"streaming persist failed: "
                                     f"{type(persist_err).__name__}: "
                                     f"{persist_err}"
+                                )
+                        elif not _mail_streaming_enabled and local_out:
+                            # Legacy path returns items to caller for
+                            # later persist — cursor save deferred to
+                            # end-of-mailbox (existing behavior).
+                            _folder_persisted_ok = False
+                        elif _mail_streaming_enabled and not local_out:
+                            # Folder had zero new messages (incremental
+                            # delta returned empty) — cursor is still
+                            # advanced and we want to checkpoint it.
+                            _folder_persisted_ok = True
+
+                        # Resume checkpoint: persist THIS folder's
+                        # deltaLink to the resource right now (only
+                        # when the items are safely in DB). If the
+                        # worker dies, the next session reads
+                        # mail_delta_tokens_by_folder[fid] and
+                        # resumes the deltaLink — so this folder
+                        # skips straight to "what's new since last
+                        # cursor" instead of re-pulling everything.
+                        # Folders whose persist failed get a full
+                        # re-drain, idempotent via the UNIQUE
+                        # (snapshot_id, external_id, item_type)
+                        # constraint on EMAIL rows.
+                        if delta_out and _folder_persisted_ok:
+                            try:
+                                async with async_session_factory() as _ck:
+                                    _r = await _ck.get(Resource, resource.id)
+                                    if _r is not None:
+                                        _ed = dict(_r.extra_data or {})
+                                        _toks = dict(
+                                            _ed.get("mail_delta_tokens_by_folder") or {}
+                                        )
+                                        _toks[fid or "__all__"] = delta_out
+                                        _ed["mail_delta_tokens_by_folder"] = _toks
+                                        # If we had a legacy whole-mailbox
+                                        # token from a prior version, retire
+                                        # it once any per-folder cursor
+                                        # exists — it's now superseded.
+                                        _ed.pop("mail_delta_token", None)
+                                        _r.extra_data = _ed
+                                        await _ck.commit()
+                            except Exception as _ck_err:
+                                print(
+                                    f"[{self.worker_id}] [USER_MAIL] "
+                                    f"folder {fid[:8] if fid else '__all__'} "
+                                    f"per-folder cursor checkpoint "
+                                    f"failed: {_ck_err}"
                                 )
 
                         mail_progress["folders_done"] += 1
@@ -2078,6 +2128,43 @@ class BackupWorker:
                                     f"failed: {type(persist_err).__name__}: "
                                     f"{persist_err}"
                                 )
+
+                            # Resume checkpoint: persist THIS chat's
+                            # delta cursor (max lastModifiedDateTime)
+                            # to the resource right now, before draining
+                            # the next chat. If the worker dies, the
+                            # next session reads chat_delta_tokens[cid]
+                            # and queries Graph with
+                            # `lastModifiedDateTime gt <stamp>` — so
+                            # this chat skips straight to "what's new"
+                            # instead of re-pulling everything. Chats
+                            # that haven't checkpointed yet (or whose
+                            # persist failed above) get a full re-drain,
+                            # which is idempotent thanks to the UNIQUE
+                            # (snapshot_id, external_id, item_type)
+                            # constraint on TEAMS_CHAT_MESSAGE rows.
+                            if max_stamp:
+                                try:
+                                    async with async_session_factory() as _ck:
+                                        _r = await _ck.get(Resource, resource.id)
+                                        if _r is not None:
+                                            _ed = dict(_r.extra_data or {})
+                                            _toks = dict(_ed.get("chat_delta_tokens") or {})
+                                            _toks[cid] = max_stamp
+                                            _ed["chat_delta_tokens"] = _toks
+                                            _r.extra_data = _ed
+                                            await _ck.commit()
+                                except Exception as _ck_err:
+                                    # Advisory checkpoint — a DB hiccup
+                                    # here must not abort the drain.
+                                    # The end-of-drain merge below will
+                                    # catch up if this single write
+                                    # missed.
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"chat {cid[:8]} per-chat token "
+                                        f"checkpoint failed: {_ck_err}"
+                                    )
 
                         # Fire hostedContent fetch for this chat's msgs
                         # as a background task — runs in parallel with
