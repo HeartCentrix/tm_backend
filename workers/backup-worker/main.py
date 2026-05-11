@@ -4387,40 +4387,105 @@ class BackupWorker:
           * HTTP 5xx / transient network errors are retried at the
             HTTP client level via httpx's built-in retry; the outer
             per-file timeout is the ultimate safety net.
-          * On stream failure the facade aborts the multipart so we
-            don't leak parts into the bucket.
+          * On a mid-stream `RemoteProtocolError` / `ReadError` /
+            `ReadTimeout` (Graph/SharePoint CDN dropping the TCP
+            connection before the body completes — observed on
+            10–100 MB .mov/.mp4 files), the byte iterator reissues
+            the GET with `Range: bytes=N-` and continues feeding
+            the SAME multipart upload from the next byte offset.
+            Bytes already buffered into the backend stay; only the
+            missing tail is re-fetched. Capped at
+            ONEDRIVE_STREAM_MAX_RESUMES (default 4) attempts per
+            file to bound the worst case.
+          * On stream failure that survives all resumes, the facade
+            aborts the multipart so we don't leak parts into the
+            bucket.
           * Returns the same result dict shape as upload_blob_stream
             so callers treat success/failure uniformly.
         """
         import httpx as _httpx
         timeout = _httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=15.0)
         limits = _httpx.Limits(max_keepalive_connections=4, max_connections=8)
+        max_resumes = int(os.getenv("ONEDRIVE_STREAM_MAX_RESUMES", "4"))
 
         async def _byte_iter():
             transferred = 0
             last_heartbeat = 0
+            resume_attempt = 0
             async with _httpx.AsyncClient(
                 timeout=timeout, limits=limits,
                 follow_redirects=True, http2=False,
             ) as client:
-                async with client.stream("GET", download_url) as resp:
-                    if resp.status_code not in (200, 206):
-                        body = await resp.aread()
-                        raise RuntimeError(
-                            f"Graph download HTTP {resp.status_code} "
-                            f"for {file_name}: {body[:200]!r}"
+                while True:
+                    headers: Dict[str, str] = {}
+                    if transferred > 0:
+                        headers["Range"] = f"bytes={transferred}-"
+                    try:
+                        async with client.stream(
+                            "GET", download_url, headers=headers,
+                        ) as resp:
+                            # First request must be 200/206. Resume
+                            # requests MUST be 206 — a 200 here means
+                            # the CDN ignored Range and would replay
+                            # bytes we've already pushed to the
+                            # multipart, corrupting the upload.
+                            if transferred == 0:
+                                if resp.status_code not in (200, 206):
+                                    body = await resp.aread()
+                                    raise RuntimeError(
+                                        f"Graph download HTTP "
+                                        f"{resp.status_code} for "
+                                        f"{file_name}: {body[:200]!r}"
+                                    )
+                            else:
+                                if resp.status_code != 206:
+                                    body = await resp.aread()
+                                    raise RuntimeError(
+                                        f"Range resume rejected "
+                                        f"(HTTP {resp.status_code}) "
+                                        f"for {file_name} at offset "
+                                        f"{transferred}: "
+                                        f"{body[:200]!r}"
+                                    )
+                            async for chunk in resp.aiter_bytes(chunk_size):
+                                if chunk:
+                                    transferred += len(chunk)
+                                    if transferred - last_heartbeat >= 256 * 1024 * 1024:
+                                        print(
+                                            f"[{self.worker_id}] [USER_ONEDRIVE] "
+                                            f"{file_name}: {transferred/(1024**2):.0f} MB "
+                                            f"streamed"
+                                        )
+                                        last_heartbeat = transferred
+                                    yield chunk
+                        # Stream completed normally — done.
+                        return
+                    except (
+                        _httpx.RemoteProtocolError,
+                        _httpx.ReadError,
+                        _httpx.ReadTimeout,
+                    ) as exc:
+                        # Connection dropped mid-stream. If size is
+                        # known and we got everything, treat as
+                        # success (some CDNs close the connection
+                        # right after the last byte without proper
+                        # framing). Otherwise resume from offset.
+                        if expected_size > 0 and transferred >= expected_size:
+                            return
+                        if resume_attempt >= max_resumes:
+                            raise
+                        resume_attempt += 1
+                        backoff = min(8.0, 1.0 * (2 ** (resume_attempt - 1)))
+                        print(
+                            f"[{self.worker_id}] [USER_ONEDRIVE] "
+                            f"{file_name}: stream dropped at "
+                            f"{transferred}/{expected_size or '?'} "
+                            f"bytes ({type(exc).__name__}); "
+                            f"resume {resume_attempt}/{max_resumes} "
+                            f"after {backoff:.1f}s"
                         )
-                    async for chunk in resp.aiter_bytes(chunk_size):
-                        if chunk:
-                            transferred += len(chunk)
-                            if transferred - last_heartbeat >= 256 * 1024 * 1024:
-                                print(
-                                    f"[{self.worker_id}] [USER_ONEDRIVE] "
-                                    f"{file_name}: {transferred/(1024**2):.0f} MB "
-                                    f"streamed"
-                                )
-                                last_heartbeat = transferred
-                            yield chunk
+                        await asyncio.sleep(backoff)
+                        # Loop reissues GET with Range: bytes=N-
 
         return await shard.upload_blob_stream(
             container, blob_path, _byte_iter(), expected_size,
