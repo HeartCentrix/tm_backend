@@ -422,7 +422,16 @@ class AzureStorageShard:
         block_ids: list,
         metadata: dict = None,
     ) -> None:
-        """Commit previously-staged blocks in the given order."""
+        """Commit previously-staged blocks in the given order.
+
+        Metadata is funneled through _sanitize_metadata because Azure rejects
+        non-ASCII/symbol characters in metadata values with 400 InvalidMetadata.
+        Stream-upload callers (OneDrive files with spaces / accented names like
+        'DALL·E …') land here without going through the other upload helpers
+        that already sanitize — keep this in sync if a new metadata-bearing
+        path is added. Restore is unaffected: filenames are reconstructed from
+        snapshot_items.name in the DB, not from blob metadata.
+        """
         import base64
         from azure.storage.blob import BlobBlock
         async_client = self.get_async_client()
@@ -431,7 +440,7 @@ class AzureStorageShard:
             BlobBlock(block_id=base64.b64encode(bid.encode("ascii").ljust(16, b"=")).decode("ascii"))
             for bid in block_ids
         ]
-        await blob_client.commit_block_list(blocks, metadata=metadata)
+        await blob_client.commit_block_list(blocks, metadata=_sanitize_metadata(metadata))
 
     async def put_block_from_url(
         self,
