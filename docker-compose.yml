@@ -769,6 +769,28 @@ services:
     deploy:
       replicas: ${DR_WORKER_REPLICAS:-1}
 
+  storage-toggle-worker:
+    build:
+      context: .
+      dockerfile: services/storage_toggle_worker/Dockerfile
+    container_name: tm_vault_storage_toggle
+    env_file: .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: postgres
+      RABBITMQ_HOST: rabbitmq
+      AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME}
+      AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tm-network
+
   # ---------------------------------------------------------------------------
   # Observability — Prometheus + Grafana (gated by 'observability' profile)
   # Bring up with: docker compose --profile observability up -d
