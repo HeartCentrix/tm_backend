@@ -1,6 +1,7 @@
 """Microsoft Graph API client for resource discovery"""
 import asyncio
 import logging
+import os
 import httpx
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -3262,11 +3263,76 @@ class GraphClient:
         download_url = drive_item.get("@microsoft.graph.downloadUrl")
         if not download_url:
             return None
+        expected_size = int(drive_item.get("size") or 0)
+        max_resumes = int(os.getenv("SHARED_URL_STREAM_MAX_RESUMES", "6"))
+        # Short read timeout so a stalled connection trips fast and
+        # resumes from offset instead of dangling for the full 300s.
+        timeout = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=15.0)
+        buf = bytearray()
+        resume_attempt = 0
         try:
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                resp = await client.get(download_url)
-                resp.raise_for_status()
-                return resp.content
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                while True:
+                    headers: Dict[str, str] = {}
+                    if buf:
+                        headers["Range"] = f"bytes={len(buf)}-"
+                    try:
+                        async with client.stream("GET", download_url, headers=headers) as resp:
+                            if not buf:
+                                if resp.status_code not in (200, 206):
+                                    body = await resp.aread()
+                                    print(
+                                        f"[GraphClient] shared URL download HTTP "
+                                        f"{resp.status_code} ({source_url[:60]}…): "
+                                        f"{body[:160]!r}"
+                                    )
+                                    return None
+                            else:
+                                if resp.status_code != 206:
+                                    # CDN ignored Range — restart from zero to
+                                    # avoid concatenating duplicate bytes.
+                                    print(
+                                        f"[GraphClient] shared URL range "
+                                        f"rejected (HTTP {resp.status_code}); "
+                                        f"restarting from offset 0 "
+                                        f"({source_url[:60]}…)"
+                                    )
+                                    buf = bytearray()
+                                    continue
+                            async for chunk in resp.aiter_bytes(1 << 20):
+                                if chunk:
+                                    buf.extend(chunk)
+                        return bytes(buf)
+                    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as exc:
+                        # Connection dropped mid-stream. If size is known and
+                        # we already received everything, accept what we have
+                        # (some CDNs close without proper framing on the last
+                        # byte). Otherwise resume from current offset.
+                        if expected_size > 0 and len(buf) >= expected_size:
+                            return bytes(buf)
+                        if resume_attempt >= max_resumes:
+                            print(
+                                f"[GraphClient] shared URL download exhausted "
+                                f"{max_resumes} resumes at "
+                                f"{len(buf)}/{expected_size or '?'} bytes "
+                                f"({source_url[:60]}…): {type(exc).__name__}"
+                            )
+                            return None
+                        resume_attempt += 1
+                        backoff = min(8.0, 1.0 * (2 ** (resume_attempt - 1)))
+                        print(
+                            f"[GraphClient] shared URL stream dropped at "
+                            f"{len(buf)}/{expected_size or '?'} bytes "
+                            f"({type(exc).__name__}); resume "
+                            f"{resume_attempt}/{max_resumes} after "
+                            f"{backoff:.1f}s ({source_url[:60]}…)"
+                        )
+                        await asyncio.sleep(backoff)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (400, 401, 403, 404, 410, 423):
+                return None
+            print(f"[GraphClient] shared URL download failed ({source_url[:60]}…): HTTP {e.response.status_code}")
+            return None
         except Exception as e:
             print(f"[GraphClient] shared URL download failed ({source_url[:60]}…): {type(e).__name__}: {e}")
             return None

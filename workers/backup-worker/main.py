@@ -2475,6 +2475,22 @@ class BackupWorker:
                         # self.graph) picks up the per-backup token + shard.
                         self.graph = graph_client
 
+                        # Cap parallel hostedContent fan-out at the
+                        # message level. Without this, every message with
+                        # hostedContents fires _userchats_backup_hosted_contents
+                        # simultaneously and each one creates its own per-call
+                        # semaphore — so the *effective* concurrency is
+                        # msgs × per-msg-concurrency, easily hitting the
+                        # thousands on a chatty user. SharePoint CDN reacts
+                        # by dropping connections mid-stream, which then
+                        # triggers slow Range-resume retries on each.
+                        # Bounding the outer gather keeps the network in
+                        # a healthy zone.
+                        _msg_concurrency = max(
+                            1, int(os.getenv("CHAT_HC_MSG_CONCURRENCY", "16"))
+                        )
+                        _msg_sem = asyncio.Semaphore(_msg_concurrency)
+
                         async def _one_msg(message: Dict[str, Any]) -> Tuple[int, int]:
                             m_chat_id = (
                                 message.get("chatId")
@@ -2482,13 +2498,14 @@ class BackupWorker:
                             )
                             if not m_chat_id or not message.get("id"):
                                 return 0, 0
-                            return await bw_self._userchats_backup_hosted_contents(
-                                snapshot_id=snap_id_local,
-                                user_id=user_id_local,
-                                chat_id=m_chat_id,
-                                message_id=message["id"],
-                                hosted_contents=message["hostedContents"],
-                            )
+                            async with _msg_sem:
+                                return await bw_self._userchats_backup_hosted_contents(
+                                    snapshot_id=snap_id_local,
+                                    user_id=user_id_local,
+                                    chat_id=m_chat_id,
+                                    message_id=message["id"],
+                                    hosted_contents=message["hostedContents"],
+                                )
 
                         hc_results = await asyncio.gather(
                             *[_one_msg(m) for m in msgs_with_hc], return_exceptions=True,
