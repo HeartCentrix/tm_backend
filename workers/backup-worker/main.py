@@ -2969,8 +2969,87 @@ class BackupWorker:
             os.getenv("USER_MAIL_ATT_CONCURRENCY", "8"),
         )
         sem = asyncio.Semaphore(max(1, sem_concurrency))
+        # Separate upload pool so blob PUTs aren't bottlenecked by
+        # the Graph-bound `sem`. Same shape as chat-att.
+        upload_sem = asyncio.Semaphore(max(
+            1, int(os.getenv("USER_MAIL_UPLOAD_CONCURRENCY", "32"))
+        ))
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "email")
+
+        # In-phase content-hash dedup. The same attachment forwarded
+        # to N recipients (legal notices, MoM templates, signature
+        # images on every reply in a thread) used to upload N times
+        # to N per-attachment blob_paths. With hash-keyed blob naming
+        # + this task map, each unique hash uploads at most once per
+        # phase and all N SnapshotItem rows share the same blob_path.
+        # The cross-resource DB dedup check inside upload_blob_with_
+        # dedup still catches duplicates that already exist from prior
+        # runs or other resources.
+        dedup_min_size = int(os.getenv("BLOB_DEDUP_MIN_SIZE_BYTES", "1024"))
+        hash_upload_tasks: Dict[str, asyncio.Future] = {}
+        hash_upload_lock = asyncio.Lock()
+        hash_stats = {"in_phase_hits": 0, "db_hits": 0, "uploads": 0}
+
+        async def _upload_once_per_hash(
+            content_hash: str,
+            content_bytes: bytes,
+        ) -> Optional[str]:
+            """First caller for a hash uploads (with DB dedup check);
+            later callers join the same future and reuse the blob_path.
+            Sub-threshold bytes skip the dedup map and upload directly.
+            """
+            from shared.azure_storage import upload_blob_with_dedup
+            size = len(content_bytes)
+            blob_path = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id),
+                f"att_{content_hash[:40]}",
+            )
+            if size < dedup_min_size:
+                async with upload_sem:
+                    result = await upload_blob_with_retry(
+                        container, blob_path, content_bytes,
+                        shard, max_retries=3,
+                    )
+                if isinstance(result, dict) and result.get("success"):
+                    return blob_path
+                return None
+            async with hash_upload_lock:
+                fut = hash_upload_tasks.get(content_hash)
+                if fut is None:
+                    fut = asyncio.get_event_loop().create_future()
+                    hash_upload_tasks[content_hash] = fut
+                    creator = True
+                else:
+                    creator = False
+            if not creator:
+                hash_stats["in_phase_hits"] += 1
+                try:
+                    return await fut
+                except Exception:
+                    return None
+            try:
+                async with upload_sem:
+                    result = await upload_blob_with_dedup(
+                        tenant.id, content_hash,
+                        container, blob_path, content_bytes,
+                        shard, max_retries=3,
+                        min_size_bytes=dedup_min_size,
+                    )
+                if isinstance(result, dict) and result.get("success"):
+                    final_path = result.get("blob_path", blob_path)
+                    if result.get("method") == "dedup_hit":
+                        hash_stats["db_hits"] += 1
+                    else:
+                        hash_stats["uploads"] += 1
+                    fut.set_result(final_path)
+                    return final_path
+                fut.set_result(None)
+                return None
+            except Exception as e:
+                if not fut.done():
+                    fut.set_exception(e)
+                raise
 
         # Batch-fetch attachment lists for all messages in ≤20-msg
         # bundles via /v1.0/$batch. For messages whose attachment list
@@ -3091,42 +3170,21 @@ class BackupWorker:
                     if inline_b64 is not None:
                         local_bytes += size
                     else:
-                        # Blob path: above threshold, use Azure.
-                        # Hash the (msg_id, att_id) tuple — Graph IDs are
-                        # ~150 base64 chars each, so raw concatenation
-                        # exceeded the 255-byte filesystem name-length
-                        # limit on SeaweedFS / ext4. sha1 hex = 40 chars,
-                        # deterministic, collision-resistant.
-                        _att_key = hashlib.sha1(
-                            f"{msg_id}_{att_id}".encode()
-                        ).hexdigest()
-                        blob_path = azure_storage_manager.build_blob_path(
-                            str(tenant.id), str(resource.id),
-                            str(snapshot.id), f"att_{_att_key}",
-                        )
+                        # Blob path: above threshold. Route through
+                        # `_upload_once_per_hash` — identical content
+                        # forwarded across mailboxes / replies collapses
+                        # to one upload and all SnapshotItem rows share
+                        # the same hash-derived blob_path.
                         try:
-                            # Content-addressable dedup at the tenant
-                            # boundary — same attachment forwarded around
-                            # the org lands on one blob instead of N.
-                            from shared.azure_storage import upload_blob_with_dedup
-                            result = await upload_blob_with_dedup(
-                                tenant.id, content_hash,
-                                container, blob_path, content_bytes, shard,
-                                max_retries=3,
+                            resolved_path = await _upload_once_per_hash(
+                                content_hash, content_bytes,
                             )
-                            if not (isinstance(result, dict) and result.get("success")):
+                            if resolved_path:
+                                blob_path = resolved_path
+                                local_bytes += size
+                            else:
                                 blob_path = None
                                 content_hash = None
-                            else:
-                                blob_path = result.get("blob_path", blob_path)
-                                local_bytes += size
-                                if result.get("method") == "dedup_hit":
-                                    print(
-                                        f"[{self.worker_id}] [ATT-DEDUP-HIT] "
-                                        f"{att_name} on {msg_id} — "
-                                        f"reused existing blob, saved "
-                                        f"{size} bytes"
-                                    )
                         except Exception as e:
                             print(f"[{self.worker_id}] [ATT-UPLOAD] {att_name} on {msg_id}: {type(e).__name__}: {e}")
                             blob_path = None
@@ -3232,17 +3290,24 @@ class BackupWorker:
         Result on Amit's tenant: attachment phase drops from ~10 min
         to ~30 s."""
         att_concurrency = int(os.getenv("USER_CHATS_ATTACHMENT_CONCURRENCY", "16"))
-        # Split semaphores: share-resolve is Graph-rate-limited (per-app
-        # 10 RPS budget shared with everything else); byte-download is
-        # against SharePoint CDN which has a different (much higher)
-        # rate ceiling. Previously one semaphore gated BOTH phases — so
-        # the slower phase set the cap for both, and resolve+download
-        # couldn't overlap. With two semaphores, while phase 1 (resolve)
-        # is blocked on Graph throttle, phase 2 (download) can keep
-        # streaming bytes for already-resolved items.
+        # Split semaphores so each I/O class has its own capacity pool:
+        #   * resolve_sem  — Graph /shares/{id}/driveItem calls
+        #                    (Graph-rate-limited, shared budget with
+        #                     everything else hitting Graph)
+        #   * download_sem — SharePoint CDN byte-streaming
+        #                    (different/higher rate ceiling than Graph)
+        #   * upload_sem   — blob storage PUT (Azure Blob / SeaweedFS)
+        #                    (limited by NIC + storage write cap)
+        # Previously upload shared `download_sem`, which forced uploads
+        # to queue behind fresh CDN downloads even when the only thing
+        # holding them up was storage-write capacity. Splitting them
+        # lets the three I/O classes saturate independently.
         resolve_sem = asyncio.Semaphore(max(1, att_concurrency))
         download_sem = asyncio.Semaphore(max(
             1, int(os.getenv("CHAT_HC_DOWNLOAD_CONCURRENCY", "32"))
+        ))
+        upload_sem = asyncio.Semaphore(max(
+            1, int(os.getenv("CHAT_HC_UPLOAD_CONCURRENCY", "32"))
         ))
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
@@ -3259,6 +3324,98 @@ class BackupWorker:
         # — that one survives across phases and across resources.
         url_cache: Dict[str, Optional[bytes]] = {}
         url_tasks: Dict[str, asyncio.Task] = {}
+
+        # CONTENT-hash dedup. URL-level dedup collapses 4,430
+        # attachments down to ~741 unique downloads, but each of
+        # those 741 was previously uploaded to its own per-attachment
+        # blob_path (catt_{sha1(msg_id+att_id)}). Result: identical
+        # bytes shipped to storage up to 6× — wasted upload time and
+        # storage. Hash-keyed blob naming + this in-phase task map
+        # means each unique content_hash uploads exactly once per
+        # phase; all SnapshotItem rows sharing that hash point at
+        # the same blob_path. At 5K-user scale where forwarded
+        # screenshots / MoM templates / policy PDFs dominate, this
+        # is the single largest egress + storage savings.
+        # `dedup_min_size` matches blob_dedup's default — below this
+        # the DB round-trip cost outweighs dedup savings.
+        dedup_min_size = int(os.getenv("BLOB_DEDUP_MIN_SIZE_BYTES", "1024"))
+        hash_upload_tasks: Dict[str, asyncio.Future] = {}
+        hash_upload_lock = asyncio.Lock()
+        hash_stats = {"in_phase_hits": 0, "db_hits": 0, "uploads": 0}
+
+        async def _upload_once_per_hash(
+            content_hash: str,
+            content_bytes: bytes,
+        ) -> Optional[str]:
+            """Upload these bytes at most once per phase per hash.
+
+            First caller for a given hash performs the upload (with
+            an inline cross-resource DB dedup check); subsequent
+            callers with the same hash await the same future and get
+            the same blob_path. Returns None on upload failure.
+            """
+            size = len(content_bytes)
+            blob_path = azure_storage_manager.build_blob_path(
+                str(tenant.id), str(resource.id), str(snapshot.id),
+                f"catt_{content_hash[:40]}",
+            )
+            # Sub-threshold content skips the dedup map entirely —
+            # the round-trip costs more than the saved bytes. Tiny
+            # blobs go through a plain upload.
+            if size < dedup_min_size:
+                async with upload_sem:
+                    result = await upload_blob_with_retry(
+                        container, blob_path, content_bytes,
+                        shard, max_retries=3,
+                    )
+                if isinstance(result, dict) and result.get("success"):
+                    return blob_path
+                return None
+
+            # Per-hash future: claim or join.
+            async with hash_upload_lock:
+                fut = hash_upload_tasks.get(content_hash)
+                if fut is None:
+                    fut = asyncio.get_event_loop().create_future()
+                    hash_upload_tasks[content_hash] = fut
+                    creator = True
+                else:
+                    creator = False
+            if not creator:
+                hash_stats["in_phase_hits"] += 1
+                try:
+                    return await fut
+                except Exception:
+                    return None
+
+            # Creator path: do the actual upload (with DB dedup) and
+            # publish the result on the future. Any exception is
+            # set on the future so joiners see it too.
+            try:
+                from shared.azure_storage import upload_blob_with_dedup
+                async with upload_sem:
+                    result = await upload_blob_with_dedup(
+                        tenant.id, content_hash,
+                        container, blob_path, content_bytes,
+                        shard, max_retries=3,
+                        min_size_bytes=dedup_min_size,
+                    )
+                if isinstance(result, dict) and result.get("success"):
+                    final_path = result.get("blob_path", blob_path)
+                    if result.get("method") == "dedup_hit":
+                        hash_stats["db_hits"] += 1
+                    else:
+                        hash_stats["uploads"] += 1
+                    fut.set_result(final_path)
+                    return final_path
+                fut.set_result(None)
+                return None
+            except Exception as e:
+                # Propagate to joiners so they don't hang waiting on
+                # a future that will never resolve.
+                if not fut.done():
+                    fut.set_exception(e)
+                raise
 
         async def _fetch_url_deduped(url: str, context_label: str) -> Optional[bytes]:
             """Fetch a share URL with separated resolve + download
@@ -3362,22 +3519,18 @@ class BackupWorker:
                     resolved = True
                     bytes_added = size
                 else:
-                    # Blob path: above threshold, use Azure.
-                    # raw msg_id + att_id concatenation overflows the
-                    # 255-byte filename limit on SeaweedFS / ext4.
-                    _catt_key = hashlib.sha1(
-                        f"{msg_id}_{att_id}".encode()
-                    ).hexdigest()
-                    blob_path = azure_storage_manager.build_blob_path(
-                        str(tenant.id), str(resource.id), str(snapshot.id),
-                        f"catt_{_catt_key}",
-                    )
+                    # Blob path: above inline threshold. Route through
+                    # `_upload_once_per_hash` so identical bytes shared
+                    # across N attachments upload exactly once and all
+                    # SnapshotItem rows reference the same blob_path.
+                    # blob_path is hash-derived (not (msg_id, att_id)-
+                    # derived) so duplicates collapse onto one blob.
                     try:
-                        async with sem:
-                            result = await upload_blob_with_retry(
-                                container, blob_path, content_bytes, shard, max_retries=3,
-                            )
-                        if isinstance(result, dict) and result.get("success"):
+                        resolved_path = await _upload_once_per_hash(
+                            content_hash, content_bytes,
+                        )
+                        if resolved_path:
+                            blob_path = resolved_path
                             resolved = True
                             bytes_added = size
                         else:
@@ -3496,13 +3649,18 @@ class BackupWorker:
         # Phase-end telemetry.
         if url_cache:
             resolved_count = sum(1 for v in url_cache.values() if v is not None)
+            unique_hashes = len(hash_upload_tasks)
             print(
                 f"[{self.worker_id}] [CHAT-ATT] phase complete: "
                 f"{len(all_items)} items across "
                 f"{len(messages_with_attachments)} msgs, "
                 f"{len(url_cache)} unique URLs "
                 f"({resolved_count} resolved, "
-                f"{len(url_cache) - resolved_count} unreachable)"
+                f"{len(url_cache) - resolved_count} unreachable), "
+                f"{unique_hashes} unique content_hashes "
+                f"[uploads={hash_stats['uploads']}, "
+                f"db_dedup={hash_stats['db_hits']}, "
+                f"in_phase_dedup={hash_stats['in_phase_hits']}]"
                 + (f" [deduped {dup_count} in-memory collision(s)]"
                    if dup_count else "")
             )
