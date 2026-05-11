@@ -539,6 +539,81 @@ async def startup():
         _reconcile_stuck_queued_jobs, "interval", minutes=3,
     )
 
+    # Stuck-RUNNING job reaper — fixes the "all snapshots COMPLETED
+    # but job stays RUNNING forever" failure mode.
+    #
+    # The worker's `_process_mass_backup` flow is: kick off per-group
+    # tasks → asyncio.gather → update_job_status(COMPLETED). If the
+    # worker dies between "all snapshots got written to DB" and "job
+    # row flips to COMPLETED", the job stays at RUNNING / partial-pct
+    # forever. RabbitMQ may redeliver the message, but the existing
+    # handler unconditionally sets status=RUNNING + progress_pct=5
+    # and starts the whole job over — wasting all the work the
+    # snapshots already capture.
+    #
+    # Triggers when (1) job has been RUNNING with no updates for
+    # >5 min AND (2) every resource in batch_resource_ids has a
+    # terminal-status snapshot for THIS job. Idempotent: the WHERE
+    # clause filters out already-COMPLETED jobs, so re-runs are
+    # safe.
+    async def _reap_stuck_running_jobs():
+        try:
+            async with async_session_factory() as session:
+                result = await session.execute(text("""
+                    WITH terminal_per_job AS (
+                        SELECT j.id AS job_id,
+                               cardinality(j.batch_resource_ids) AS n_resources,
+                               (SELECT count(*) FROM snapshots s
+                                WHERE s.job_id = j.id
+                                  AND s.status IN ('COMPLETED','FAILED','PARTIAL')) AS n_terminal,
+                               (SELECT count(*) FROM snapshots s
+                                WHERE s.job_id = j.id
+                                  AND s.status = 'COMPLETED') AS n_completed,
+                               (SELECT COALESCE(SUM(s.item_count), 0) FROM snapshots s
+                                WHERE s.job_id = j.id) AS items_total,
+                               (SELECT COALESCE(SUM(s.bytes_total), 0) FROM snapshots s
+                                WHERE s.job_id = j.id) AS bytes_total
+                        FROM jobs j
+                        WHERE j.status = 'RUNNING'
+                          AND j.type = 'BACKUP'
+                          AND j.updated_at < NOW() - INTERVAL '5 minutes'
+                          AND cardinality(j.batch_resource_ids) > 0
+                    )
+                    UPDATE jobs j SET
+                        status = 'COMPLETED'::jobstatus,
+                        progress_pct = 100,
+                        completed_at = NOW(),
+                        updated_at = NOW(),
+                        result = COALESCE(j.result::jsonb, '{}'::jsonb)
+                                 || jsonb_build_object(
+                                    'reaped_by', 'stuck_running_reaper',
+                                    'total', t.n_resources,
+                                    'completed', t.n_completed,
+                                    'failed', t.n_resources - t.n_completed,
+                                    'item_count', t.items_total,
+                                    'bytes_added', t.bytes_total
+                                 )
+                    FROM terminal_per_job t
+                    WHERE j.id = t.job_id
+                      AND t.n_terminal >= t.n_resources
+                    RETURNING j.id
+                """))
+                rows = result.fetchall()
+                await session.commit()
+                if rows:
+                    print(
+                        f"[backup-scheduler] stuck_running_reaper: "
+                        f"finalized {len(rows)} jobs whose snapshots "
+                        f"all completed but worker died before the "
+                        f"job-level update"
+                    )
+        except Exception as exc:
+            print(f"[backup-scheduler] stuck_running_reaper failed: {exc}")
+
+    scheduler.add_job(
+        _reap_stuck_running_jobs, "interval", minutes=2,
+    )
+
     # Task 26: Delete orphaned export ZIPs older than 1 day (3am UTC daily).
     # Primary mechanism is Azure lifecycle rule (ops/azure-lifecycle-exports.json);
     # this is a fallback for envs without lifecycle API access (local Azurite, restricted tenants).
