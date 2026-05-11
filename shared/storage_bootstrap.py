@@ -137,6 +137,12 @@ async def ensure_storage_bootstrap(engine: AsyncEngine) -> None:
                 )
 
         azure_id = str(uuid.uuid4())
+        # Upsert on re-seed so operator-driven .env changes (e.g.
+        # AZURE_STORAGE_ACCOUNT_NAME swap to a new account) actually
+        # land in the DB. Previously this used DO NOTHING, which froze
+        # the endpoint at whatever .env held the first time bootstrap
+        # ran — toggles to "azure-primary" then preflighted against a
+        # stale account and timed out.
         await conn.execute(
             text(
                 "INSERT INTO storage_backends "
@@ -145,7 +151,11 @@ async def ensure_storage_bootstrap(engine: AsyncEngine) -> None:
                 "VALUES (:id, 'azure_blob', 'azure-primary', :endpoint, "
                 " 'env://AZURE_STORAGE_ACCOUNT_KEY', CAST(:config AS JSONB), "
                 " true, NOW(), NOW()) "
-                "ON CONFLICT (name) DO NOTHING"
+                "ON CONFLICT (name) DO UPDATE SET "
+                "  endpoint = EXCLUDED.endpoint, "
+                "  secret_ref = EXCLUDED.secret_ref, "
+                "  config = EXCLUDED.config, "
+                "  updated_at = NOW()"
             ),
             {
                 "id": azure_id,
