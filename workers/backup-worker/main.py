@@ -3325,6 +3325,21 @@ class BackupWorker:
         url_cache: Dict[str, Optional[bytes]] = {}
         url_tasks: Dict[str, asyncio.Task] = {}
 
+        # driveItem.id-keyed download dedup. A forwarded SharePoint /
+        # OneDrive file generates a NEW sharing URL each time it's
+        # shared, so the same underlying file can produce many
+        # distinct `contentUrl`s — all of which resolve (via
+        # /shares/{id}/driveItem) to the same `driveItem.id`. Without
+        # this layer we'd download the bytes N times even though
+        # URL-cache already dedups identical URLs and content-hash
+        # dedup collapses uploads. Keying downloads by driveItem.id
+        # cuts CDN traffic on heavily-forwarded files (the dominant
+        # cost when content includes 20+ MB videos / screenshots).
+        # Telemetry: di_dedup_hits below.
+        driveitem_tasks: Dict[str, asyncio.Future] = {}
+        driveitem_lock = asyncio.Lock()
+        di_dedup_hits = {"n": 0}
+
         # CONTENT-hash dedup. URL-level dedup collapses 4,430
         # attachments down to ~741 unique downloads, but each of
         # those 741 was previously uploaded to its own per-attachment
@@ -3441,10 +3456,46 @@ class BackupWorker:
                         return None
                     if not drive_item.get("@microsoft.graph.downloadUrl"):
                         return None
-                    # Phase 2: download bytes under SEPARATE CDN
-                    # semaphore. Releasing resolve_sem here lets other
-                    # callers' Phase 1 (resolve) interleave with this
-                    # caller's Phase 2 (download).
+                    # Phase 2: download bytes — but first check the
+                    # driveItem.id dedup map. If another caller is
+                    # already downloading the same underlying file
+                    # (different sharing URL, same driveItem), join
+                    # their future instead of re-downloading.
+                    di_id = drive_item.get("id")
+                    if di_id:
+                        async with driveitem_lock:
+                            fut = driveitem_tasks.get(di_id)
+                            if fut is None:
+                                fut = asyncio.get_event_loop().create_future()
+                                driveitem_tasks[di_id] = fut
+                                creator = True
+                            else:
+                                creator = False
+                        if not creator:
+                            di_dedup_hits["n"] += 1
+                            try:
+                                return await fut
+                            except Exception:
+                                return None
+                        # Creator path: do the actual download, publish.
+                        try:
+                            async with download_sem:
+                                bytes_result = await graph_client.download_drive_item_bytes(
+                                    drive_item, source_url_for_cache=u,
+                                )
+                            fut.set_result(bytes_result)
+                            return bytes_result
+                        except Exception as e:
+                            if not fut.done():
+                                fut.set_exception(e)
+                            print(
+                                f"[{self.worker_id}] [CHAT-ATT] "
+                                f"download fail {ctx}: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            return None
+                    # No driveItem.id (unexpected — Graph always
+                    # returns one) — fall through to plain download.
                     try:
                         async with download_sem:
                             return await graph_client.download_drive_item_bytes(
@@ -3650,13 +3701,16 @@ class BackupWorker:
         if url_cache:
             resolved_count = sum(1 for v in url_cache.values() if v is not None)
             unique_hashes = len(hash_upload_tasks)
+            unique_driveitems = len(driveitem_tasks)
             print(
                 f"[{self.worker_id}] [CHAT-ATT] phase complete: "
                 f"{len(all_items)} items across "
                 f"{len(messages_with_attachments)} msgs, "
                 f"{len(url_cache)} unique URLs "
                 f"({resolved_count} resolved, "
-                f"{len(url_cache) - resolved_count} unreachable), "
+                f"{len(url_cache) - resolved_count} unreachable) → "
+                f"{unique_driveitems} unique driveItems "
+                f"(saved {di_dedup_hits['n']} redundant downloads) → "
                 f"{unique_hashes} unique content_hashes "
                 f"[uploads={hash_stats['uploads']}, "
                 f"db_dedup={hash_stats['db_hits']}, "
