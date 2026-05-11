@@ -249,7 +249,7 @@ async def _update_job_pct(job_id, pct: int) -> None:
 import aio_pika
 from aio_pika import IncomingMessage
 import httpx
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -566,11 +566,71 @@ class BackupWorker:
 
         tasks = []
         for queue_name, prefetch in queues:
-            task = asyncio.create_task(self.consume_queue(queue_name, prefetch))
+            task = asyncio.create_task(self._supervised_consume(queue_name, prefetch))
             tasks.append(task)
 
-        print(f"[{self.worker_id}] Started consuming from {len(queues)} queues")
+        print(f"[{self.worker_id}] Started consuming from {len(queues)} queues (supervised)")
         await asyncio.gather(*tasks)
+
+    async def _supervised_consume(self, queue_name: str, prefetch_count: int):
+        """Restart-on-crash wrapper around consume_queue.
+
+        Root cause this addresses: under the Azure SDK aiohttp transport
+        cascade (`SSL shutdown timed out` / `Timeout on reading data
+        from socket`), the underlying queue.iterator() can raise an
+        unhandled aio-pika ChannelClosed or transport error after the
+        loop's exception handler has already demoted it. That bubbles
+        out of consume_queue → asyncio.gather → start() → main() and
+        the worker process exits cleanly (ExitCode=0). RabbitMQ then
+        redelivers the in-flight job and the new session restarts the
+        whole snapshot from zero — the single biggest source of
+        mid-run wasted progress documented in
+        benchmarks/comparison-2026-05-11.md.
+
+        Supervisor: catches any non-Cancelled exception, prints with
+        backoff, re-enters consume_queue. Cancellation is honored so
+        SIGTERM still shuts the worker down cleanly.
+        """
+        attempt = 0
+        while True:
+            try:
+                await self.consume_queue(queue_name, prefetch_count)
+                # consume_queue returning normally = channel closed
+                # cleanly (e.g. during shutdown). Don't restart unless
+                # there's still a usable channel.
+                if not message_bus.channel or message_bus.channel.is_closed:
+                    print(f"[{self.worker_id}] {queue_name} consumer exited; channel closed — stopping supervisor")
+                    return
+                print(f"[{self.worker_id}] {queue_name} consumer returned without error; restarting")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                attempt += 1
+                # Exponential backoff capped at 30s so a persistently
+                # broken broker doesn't spin-loop CPU, but a transient
+                # transport blip recovers within seconds.
+                delay = min(30, 2 ** min(attempt, 5))
+                print(
+                    f"[{self.worker_id}] {queue_name} consumer crashed "
+                    f"(attempt {attempt}, restarting in {delay}s): "
+                    f"{exc.__class__.__name__}: {exc}"
+                )
+                import traceback
+                traceback.print_exc()
+                await asyncio.sleep(delay)
+                # Re-establish the broker connection if it's dropped
+                # before re-entering consume_queue.
+                try:
+                    if not message_bus.connection or message_bus.connection.is_closed:
+                        print(f"[{self.worker_id}] reconnecting message bus before {queue_name} restart")
+                        await message_bus.connect()
+                except Exception as reconnect_exc:
+                    print(f"[{self.worker_id}] reconnect failed: {reconnect_exc} — will retry on next loop")
+                    continue
+            else:
+                # Successful return path: brief pause before re-listening
+                # to avoid hot-spin if the channel keeps closing.
+                await asyncio.sleep(1)
 
     async def consume_queue(self, queue_name: str, prefetch_count: int):
         if not message_bus.channel:
@@ -1259,11 +1319,23 @@ class BackupWorker:
 
                         local_out: List = []
                         delta_out: Optional[str] = None
+                        # Pipelined persist: fire a background task per
+                        # page so DB writes overlap with the next page
+                        # fetch. For a 5-page folder where each page
+                        # fetch is 1s and each persist is 0.3s, total
+                        # wall drops from ~6.5s to ~5.1s (~20% save).
+                        # Bounded implicitly — most folders have <10
+                        # pages so we don't need an explicit cap.
+                        folder_path_val = (
+                            folder_tree.get(fid) if fid else ""
+                        ) or ""
+                        persist_tasks: List[asyncio.Task] = []
                         try:
                             async with mail_sem:
                                 async for page in graph_client._iter_pages(
                                     url, params=params,
                                 ):
+                                    page_raw_msgs: List[Dict[str, Any]] = []
                                     for m in page.get("value", []) or []:
                                         path = (
                                             folder_tree.get(
@@ -1279,8 +1351,24 @@ class BackupWorker:
                                             {"raw": m},
                                             path,
                                         ))
+                                        if isinstance(m, dict):
+                                            page_raw_msgs.append(m)
                                     if "@odata.deltaLink" in page:
                                         delta_out = page["@odata.deltaLink"]
+                                    # Fire persist for this page while
+                                    # we continue paging. Done outside
+                                    # the inner for-loop so each page's
+                                    # rows hit the DB as a single
+                                    # bulk-upsert.
+                                    if _mail_streaming_enabled and page_raw_msgs:
+                                        persist_tasks.append(
+                                            asyncio.create_task(
+                                                _stream_persist_folder_items(
+                                                    page_raw_msgs,
+                                                    folder_path_val,
+                                                )
+                                            )
+                                        )
                         except Exception as e:
                             fid_disp = fid[:8] if fid else "__all__"
                             print(
@@ -1292,78 +1380,81 @@ class BackupWorker:
                         if delta_out:
                             mail_new_tokens[fid or "__all__"] = delta_out
 
-                        # Streaming persist — if snapshot is in scope,
-                        # bulk-insert THIS folder's msgs now. Gather
-                        # raw dicts off the tuples we just built, hand
-                        # them to _stream_persist_folder_items, then
-                        # bump the snapshot row's live counters.
+                        # Drain the pipelined persist tasks. Only mark
+                        # the folder fully-persisted if EVERY page's
+                        # persist succeeded — otherwise the cursor save
+                        # below stays inhibited so a partial folder
+                        # gets a clean re-drain on next run (idempotent
+                        # via the UNIQUE (snapshot_id, external_id,
+                        # item_type) constraint).
                         _folder_persisted_ok = False
-                        if _mail_streaming_enabled and local_out:
-                            folder_path_val = (
-                                folder_tree.get(fid) if fid else ""
-                            ) or ""
-                            raw_msgs = [
-                                extra.get("raw")
-                                for (_t, _n, _e, extra, *_rest) in local_out
-                                if isinstance(extra, dict)
-                                and isinstance(extra.get("raw"), dict)
-                            ]
-                            try:
-                                n, b = await _stream_persist_folder_items(
-                                    raw_msgs, folder_path_val,
-                                )
-                                nonlocal _mail_persisted_total, _mail_persisted_bytes
-                                _mail_persisted_total += n
-                                _mail_persisted_bytes += b
-                                _folder_persisted_ok = True
-                                try:
-                                    async with async_session_factory() as _s2:
-                                        snap = await _s2.get(
-                                            Snapshot, snapshot.id,
-                                        )
-                                        if snap is not None:
-                                            snap.item_count = _mail_persisted_total
-                                            snap.new_item_count = _mail_persisted_total
-                                            snap.bytes_total = _mail_persisted_bytes
-                                            snap.bytes_added = _mail_persisted_bytes
-                                            await _s2.commit()
-                                except Exception as _bump_err:
+                        folder_persisted_n = 0
+                        folder_persisted_b = 0
+                        any_persist_failed = False
+                        if persist_tasks:
+                            results = await asyncio.gather(
+                                *persist_tasks, return_exceptions=True,
+                            )
+                            for r in results:
+                                if isinstance(r, SnapshotVanishedError):
+                                    # Same race as USER_CHATS — abort
+                                    # the whole handler instead of
+                                    # plowing through every remaining
+                                    # folder with the same FK
+                                    # violation.
                                     print(
                                         f"[{self.worker_id}] [USER_MAIL] "
-                                        f"live item_count bump failed: "
-                                        f"{_bump_err}"
+                                        f"{user_label_mail}: {r} — "
+                                        f"aborting handler"
                                     )
-                            except SnapshotVanishedError as snap_gone:
-                                # Same race as USER_CHATS — abort the
-                                # whole handler instead of plowing
-                                # through every remaining folder with
-                                # the same FK violation. Re-raise so
-                                # the outer per-resource try/except
-                                # closes the resource cleanly.
-                                print(
-                                    f"[{self.worker_id}] [USER_MAIL] "
-                                    f"{user_label_mail}: {snap_gone} — "
-                                    f"aborting handler"
-                                )
-                                raise
-                            except Exception as persist_err:
-                                print(
-                                    f"[{self.worker_id}] [USER_MAIL] "
-                                    f"folder {fid[:8] if fid else '__all__'} "
-                                    f"streaming persist failed: "
-                                    f"{type(persist_err).__name__}: "
-                                    f"{persist_err}"
-                                )
-                        elif not _mail_streaming_enabled and local_out:
-                            # Legacy path returns items to caller for
-                            # later persist — cursor save deferred to
-                            # end-of-mailbox (existing behavior).
-                            _folder_persisted_ok = False
+                                    raise r
+                                if isinstance(r, Exception):
+                                    any_persist_failed = True
+                                    print(
+                                        f"[{self.worker_id}] [USER_MAIL] "
+                                        f"folder {fid[:8] if fid else '__all__'} "
+                                        f"page-persist failed: "
+                                        f"{type(r).__name__}: {r}"
+                                    )
+                                    continue
+                                if isinstance(r, tuple) and len(r) == 2:
+                                    folder_persisted_n += r[0]
+                                    folder_persisted_b += r[1]
+                            if not any_persist_failed:
+                                _folder_persisted_ok = True
                         elif _mail_streaming_enabled and not local_out:
                             # Folder had zero new messages (incremental
                             # delta returned empty) — cursor is still
                             # advanced and we want to checkpoint it.
                             _folder_persisted_ok = True
+
+                        # Bump the snapshot's live counters once with
+                        # this folder's cumulative total. Same
+                        # granularity as the pre-pipeline path (one
+                        # update per folder), just deferred to after
+                        # all pages persisted instead of called from
+                        # inside the page loop.
+                        if _folder_persisted_ok and folder_persisted_n > 0:
+                            nonlocal _mail_persisted_total, _mail_persisted_bytes
+                            _mail_persisted_total += folder_persisted_n
+                            _mail_persisted_bytes += folder_persisted_b
+                            try:
+                                async with async_session_factory() as _s2:
+                                    snap = await _s2.get(
+                                        Snapshot, snapshot.id,
+                                    )
+                                    if snap is not None:
+                                        snap.item_count = _mail_persisted_total
+                                        snap.new_item_count = _mail_persisted_total
+                                        snap.bytes_total = _mail_persisted_bytes
+                                        snap.bytes_added = _mail_persisted_bytes
+                                        await _s2.commit()
+                            except Exception as _bump_err:
+                                print(
+                                    f"[{self.worker_id}] [USER_MAIL] "
+                                    f"live item_count bump failed: "
+                                    f"{_bump_err}"
+                                )
 
                         # Resume checkpoint: persist THIS folder's
                         # deltaLink to the resource right now (only
@@ -2049,25 +2140,101 @@ class BackupWorker:
 
                         msgs_local: List[Dict[str, Any]] = []
                         max_stamp: Optional[str] = None
-                        try:
-                            async with per_chat_sem:
-                                async for page in graph_client._iter_pages(
-                                    url, params=params,
+                        # Resume-on-5xx state. When Graph returns 502/503/504
+                        # mid-pagination, the prior behavior was to log
+                        # "(kept N)" and abandon the rest of the chat — which
+                        # silently dropped every message past the failure
+                        # point. At Taylor scale this is unacceptable
+                        # durability. The retry loop here re-enters
+                        # _iter_pages from the LAST successfully-consumed
+                        # @odata.nextLink (which encodes the $skiptoken),
+                        # so retries resume from page N+1 rather than
+                        # restarting from page 1. After retries exhausted
+                        # we fall through to the same graceful exit, but
+                        # with fewer false negatives.
+                        last_next_url: Optional[str] = url
+                        last_params = params
+                        chat_retries_left = int(
+                            os.getenv("CHAT_DRAIN_RETRIES", "4")
+                        )
+                        chat_backoff_s = 2.0
+                        while True:
+                            try:
+                                async with per_chat_sem:
+                                    async for page in graph_client._iter_pages(
+                                        last_next_url, params=last_params,
+                                    ):
+                                        for m in (page.get("value", []) or []):
+                                            msgs_local.append(m)
+                                            stamp = m.get("lastModifiedDateTime")
+                                            if stamp and (
+                                                max_stamp is None
+                                                or stamp > max_stamp
+                                            ):
+                                                max_stamp = stamp
+                                        # Track the nextLink AFTER consuming
+                                        # this page so a retry resumes from
+                                        # the very next un-fetched page —
+                                        # not from the start, not from a
+                                        # page we already have.
+                                        nlink = page.get("@odata.nextLink")
+                                        if nlink:
+                                            last_next_url = nlink
+                                            # nextLink encodes its own
+                                            # params (incl. $skiptoken),
+                                            # so we drop the explicit
+                                            # params dict.
+                                            last_params = None
+                                        else:
+                                            last_next_url = None
+                                # Drain completed cleanly. Exit retry loop.
+                                break
+                            except httpx.HTTPStatusError as he:
+                                status = (
+                                    he.response.status_code
+                                    if he.response is not None else 0
+                                )
+                                if (
+                                    status in (502, 503, 504)
+                                    and chat_retries_left > 0
+                                    and last_next_url
                                 ):
-                                    for m in (page.get("value", []) or []):
-                                        msgs_local.append(m)
-                                        stamp = m.get("lastModifiedDateTime")
-                                        if stamp and (
-                                            max_stamp is None
-                                            or stamp > max_stamp
-                                        ):
-                                            max_stamp = stamp
-                        except Exception as e:
-                            print(
-                                f"[{self.worker_id}] [USER_CHATS] chat {cid[:8]} "
-                                f"drain failed: {type(e).__name__}: {e} "
-                                f"(kept {len(msgs_local)})"
-                            )
+                                    chat_retries_left -= 1
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"chat {cid[:8]} {status} mid-page "
+                                        f"(kept {len(msgs_local)} so far); "
+                                        f"retrying in {chat_backoff_s:.0f}s "
+                                        f"from last nextLink "
+                                        f"({chat_retries_left} retries left)"
+                                    )
+                                    await asyncio.sleep(chat_backoff_s)
+                                    chat_backoff_s = min(
+                                        30.0, chat_backoff_s * 2,
+                                    )
+                                    continue
+                                # Non-retryable HTTP error (403/404/etc),
+                                # or retries exhausted — bail with what we
+                                # have, same as the pre-retry path.
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] chat "
+                                    f"{cid[:8]} drain failed: "
+                                    f"{type(he).__name__}: {he} "
+                                    f"(kept {len(msgs_local)})"
+                                )
+                                break
+                            except Exception as e:
+                                # Network / SDK errors — keep prior behavior.
+                                # _iter_pages itself has timeout retries, so
+                                # what reaches here is the post-retry-cap
+                                # failure. Don't double-retry.
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] chat "
+                                    f"{cid[:8]} drain failed: "
+                                    f"{type(e).__name__}: {e} "
+                                    f"(kept {len(msgs_local)})"
+                                )
+                                break
                         # Streaming persist — if a snapshot is in scope,
                         # persist this chat's items RIGHT NOW instead of
                         # accumulating into all_msgs + one mega-commit
@@ -3065,7 +3232,18 @@ class BackupWorker:
         Result on Amit's tenant: attachment phase drops from ~10 min
         to ~30 s."""
         att_concurrency = int(os.getenv("USER_CHATS_ATTACHMENT_CONCURRENCY", "16"))
-        sem = asyncio.Semaphore(max(1, att_concurrency))
+        # Split semaphores: share-resolve is Graph-rate-limited (per-app
+        # 10 RPS budget shared with everything else); byte-download is
+        # against SharePoint CDN which has a different (much higher)
+        # rate ceiling. Previously one semaphore gated BOTH phases — so
+        # the slower phase set the cap for both, and resolve+download
+        # couldn't overlap. With two semaphores, while phase 1 (resolve)
+        # is blocked on Graph throttle, phase 2 (download) can keep
+        # streaming bytes for already-resolved items.
+        resolve_sem = asyncio.Semaphore(max(1, att_concurrency))
+        download_sem = asyncio.Semaphore(max(
+            1, int(os.getenv("CHAT_HC_DOWNLOAD_CONCURRENCY", "32"))
+        ))
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
 
@@ -3076,33 +3254,52 @@ class BackupWorker:
         # repeat references to a broken URL short-circuit. Stores
         # resolved bytes so repeat references to a valid URL reuse
         # the download. Scoped to this phase only — cleared at end.
+        # Note: the GraphClient also keeps a worker-lifetime cache of
+        # URLs that resolved to permanent 4xx (see _unreachable_urls)
+        # — that one survives across phases and across resources.
         url_cache: Dict[str, Optional[bytes]] = {}
         url_tasks: Dict[str, asyncio.Task] = {}
 
         async def _fetch_url_deduped(url: str, context_label: str) -> Optional[bytes]:
-            """Fetch a share URL, deduping across concurrent callers.
-            First caller creates the task; subsequent callers await the
-            same task. Result (bytes or None) cached for the rest of
-            the phase."""
+            """Fetch a share URL with separated resolve + download
+            phases. First caller creates the task; subsequent callers
+            await the same task. Result cached for the rest of the
+            phase."""
             if url in url_cache:
                 return url_cache[url]
             if url not in url_tasks:
                 async def _go(u: str, ctx: str) -> Optional[bytes]:
-                    async with sem:
-                        try:
-                            return await graph_client.fetch_shared_url_content(u)
-                        except Exception as e:
-                            # fetch_shared_url_content already swallows
-                            # 400/401/403/404/410/423 → None. Anything
-                            # reaching here is unexpected; log + treat
-                            # as None so the message still gets an
-                            # unresolved SnapshotItem.
-                            print(
-                                f"[{self.worker_id}] [CHAT-ATT] "
-                                f"resolve fail {ctx}: "
-                                f"{type(e).__name__}: {e}"
+                    # Phase 1: resolve under Graph-resolve semaphore
+                    try:
+                        async with resolve_sem:
+                            drive_item = await graph_client.resolve_share_to_drive_item(u)
+                    except Exception as e:
+                        print(
+                            f"[{self.worker_id}] [CHAT-ATT] "
+                            f"resolve fail {ctx}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        return None
+                    if drive_item is None:
+                        return None
+                    if not drive_item.get("@microsoft.graph.downloadUrl"):
+                        return None
+                    # Phase 2: download bytes under SEPARATE CDN
+                    # semaphore. Releasing resolve_sem here lets other
+                    # callers' Phase 1 (resolve) interleave with this
+                    # caller's Phase 2 (download).
+                    try:
+                        async with download_sem:
+                            return await graph_client.download_drive_item_bytes(
+                                drive_item, source_url_for_cache=u,
                             )
-                            return None
+                    except Exception as e:
+                        print(
+                            f"[{self.worker_id}] [CHAT-ATT] "
+                            f"download fail {ctx}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        return None
                 url_tasks[url] = asyncio.create_task(_go(url, context_label))
             try:
                 result = await url_tasks[url]
@@ -3588,28 +3785,53 @@ class BackupWorker:
         try:
             ordered_ids = [f["id"] for f in ordered if f.get("id") and not checkpoint.is_done(f["id"])]
             BATCH_SIZE = 20
+            # Parallel fan-out: previously this loop awaited each batch
+            # call before issuing the next, so 540 URLs took ~10 min
+            # whenever the chats handler was co-running and hogging
+            # Graph budget (each batch sat in the rate-limiter queue
+            # behind every chat message). Firing batches concurrently
+            # under a bounded semaphore lets pre-fetch claim its fair
+            # share of the Graph budget and finish in ~30-60s even with
+            # chats running. Cap is env-tunable; default sized for the
+            # per-app 10 RPS ceiling (6 concurrent batches × ~1s wire
+            # = headroom for other resources).
+            prefetch_concurrency = int(os.getenv(
+                "ONEDRIVE_PREFETCH_CONCURRENCY", "6"
+            ))
+            sem = asyncio.Semaphore(prefetch_concurrency)
             _prefetch_t0 = time.monotonic()
-            for i in range(0, len(ordered_ids), BATCH_SIZE):
-                sub = ordered_ids[i:i + BATCH_SIZE]
-                partial = await graph_client.get_download_urls_batch(
-                    drive_id, sub,
-                )
-                batch_url_map.update(partial)
-                # Progress log every 200 URLs so huge drives (10k+
-                # files) don't look frozen during pre-fetch. Short-
-                # circuits cleanly when a batch returns empty on a
-                # throttle (empty map entries fall through per-file).
-                if (i // BATCH_SIZE) % 10 == 0 and i > 0:
-                    print(
-                        f"[{self.worker_id}] [USER_ONEDRIVE] "
-                        f"url pre-fetch: "
-                        f"{min(i + BATCH_SIZE, len(ordered_ids))}/"
-                        f"{len(ordered_ids)} URLs resolved",
+            total_batches = (len(ordered_ids) + BATCH_SIZE - 1) // BATCH_SIZE
+            done_batches = {"n": 0}
+            progress_lock = asyncio.Lock()
+
+            async def _one_batch(sub_ids: List[str], batch_idx: int):
+                async with sem:
+                    partial = await graph_client.get_download_urls_batch(
+                        drive_id, sub_ids,
                     )
+                async with progress_lock:
+                    batch_url_map.update(partial)
+                    done_batches["n"] += 1
+                    # Progress every 10 batches (~200 URLs) — keeps
+                    # large drives visible without log spam.
+                    if done_batches["n"] % 10 == 0 or done_batches["n"] == total_batches:
+                        print(
+                            f"[{self.worker_id}] [USER_ONEDRIVE] "
+                            f"url pre-fetch: "
+                            f"{min(done_batches['n'] * BATCH_SIZE, len(ordered_ids))}/"
+                            f"{len(ordered_ids)} URLs resolved",
+                        )
+
+            batch_tasks = [
+                _one_batch(ordered_ids[i:i + BATCH_SIZE], i // BATCH_SIZE)
+                for i in range(0, len(ordered_ids), BATCH_SIZE)
+            ]
+            await asyncio.gather(*batch_tasks, return_exceptions=True)
             print(
                 f"[{self.worker_id}] [USER_ONEDRIVE] url pre-fetch "
                 f"done ({len(batch_url_map)}/{len(ordered_ids)} "
-                f"urls in {time.monotonic() - _prefetch_t0:.1f}s)",
+                f"urls in {time.monotonic() - _prefetch_t0:.1f}s, "
+                f"concurrency={prefetch_concurrency})",
             )
         except Exception as exc:
             # Non-fatal — per-file path re-fetches as needed.

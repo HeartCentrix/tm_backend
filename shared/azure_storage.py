@@ -1729,6 +1729,54 @@ async def apply_legal_hold(container_name: str, blob_path: str,
             return {"success": False, "error": error_msg}
 
 
+# Error substrings that indicate the Azure SDK aiohttp transport has
+# poisoned its underlying connector — retrying on the same client will
+# usually hit the same failure or worse, surface an orphan-future
+# cascade that kills the event loop. When detected we close + rebuild
+# the shard's async client before the next attempt.
+_TRANSPORT_RESET_ERROR_PATTERNS = (
+    "SSL shutdown timed out",
+    "Timeout on reading data from socket",
+    "Cannot write to closing transport",
+    "ClientConnectionError",
+    "ServerDisconnectedError",
+    "Connection lost",
+)
+
+
+def _is_transport_reset_error(error_msg: str) -> bool:
+    if not error_msg:
+        return False
+    return any(p in error_msg for p in _TRANSPORT_RESET_ERROR_PATTERNS)
+
+
+async def _reset_shard_transport(shard) -> None:
+    """Used to call shard._store.close() to dispose the shared aiohttp
+    ClientSession after a transport-reset, on the theory that the
+    poisoned connector pool would otherwise reuse the dead socket.
+
+    That theory was wrong. AzureStorageShard._async_client is a
+    SINGLETON shared by every concurrent upload from this worker (chats
+    fans out 16 hostedContent uploads in parallel, OneDrive fires up to
+    AZURE_UPLOAD_CONCURRENCY=5 block PUTs per file, etc). Closing the
+    shared client mid-flight on a single timeout makes every other
+    in-flight request crash with:
+
+        File "aiohttp/client.py", line 740, in _connect_and_send_request
+            assert self._connector is not None
+        AssertionError
+
+    aiohttp's connector pool drops bad sockets automatically when an
+    error fires on them, and grabs a fresh socket for the retry. The
+    exponential backoff in upload_blob_with_retry gives any genuinely
+    poisoned socket enough wall time to age out of the keep-alive
+    window. So the recycle is now a no-op — we keep the log line so
+    the rate of transport-resets remains observable, but we don't
+    nuke the shared client. Re-enable per-retry one-shot clients
+    if a future Azure SDK bug actually requires it."""
+    return
+
+
 async def upload_blob_with_retry_from_file(container_name: str, blob_path: str, file_path: str,
                                            shard: AzureStorageShard, file_size: int = 0,
                                            max_retries: int = 3, metadata: Optional[Dict] = None) -> Dict:
@@ -1755,6 +1803,11 @@ async def upload_blob_with_retry_from_file(container_name: str, blob_path: str, 
         last_error = result.get("error", "Unknown error")
         if "Authorization" in last_error or "Authentication" in last_error:
             return result
+
+        if _is_transport_reset_error(last_error):
+            print(f"[AzureStorage] Transport-reset detected on {container_name}/{blob_path} "
+                  f"(attempt {attempt+1}/{max_retries}); recycling SDK client. err={last_error}")
+            await _reset_shard_transport(shard)
 
         delay = settings.RETRY_DELAY_MS * (settings.RETRY_BACKOFF_MULTIPLIER ** attempt) / 1000
         await asyncio.sleep(delay)
@@ -1783,6 +1836,13 @@ async def upload_blob_with_retry(container_name: str, blob_path: str, content: b
         # Don't retry on auth/permission errors
         if "Authorization" in last_error or "Authentication" in last_error:
             return result
+
+        # Transport-reset cascade — close the poisoned aiohttp connector
+        # before next attempt so we don't reuse a half-dead session.
+        if _is_transport_reset_error(last_error):
+            print(f"[AzureStorage] Transport-reset detected on {container_name}/{blob_path} "
+                  f"(attempt {attempt+1}/{max_retries}); recycling SDK client. err={last_error}")
+            await _reset_shard_transport(shard)
 
         # Exponential backoff
         delay = settings.RETRY_DELAY_MS * (settings.RETRY_BACKOFF_MULTIPLIER ** attempt) / 1000
