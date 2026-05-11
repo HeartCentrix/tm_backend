@@ -132,6 +132,13 @@ services:
     environment:
       DB_HOST: postgres
       JWT_SECRET: ${JWT_SECRET}
+      # Required for at-rest encryption of OAuth access/refresh tokens
+      # (Power BI, M365 datasource consents). Must be a base64 Fernet key
+      # distinct from JWT_SECRET. Provisioned in .env.
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      # Short access-token TTL; SPA auto-refresh hides the boundary.
+      JWT_EXPIRATION_HOURS: ${JWT_EXPIRATION_HOURS:-1}
+      JWT_REFRESH_EXPIRATION_DAYS: ${JWT_REFRESH_EXPIRATION_DAYS:-7}
     depends_on:
       postgres:
         condition: service_healthy

@@ -106,7 +106,17 @@ def _set_auth_cookies(response: Response, access_token: str, refresh_token: str)
     HttpOnly = JS can't read them, so XSS can't exfiltrate. SameSite + Secure
     block the obvious CSRF / network-leak paths. The browser auto-attaches
     them to fetch() calls when `credentials: 'include'` is set.
+
+    A third, non-HttpOnly companion cookie ``access_token_expires_at`` carries
+    the access-token's expiry as an epoch-ms integer. JS reads it to schedule
+    a proactive /refresh ~60s before expiry — saves the user from the 401 +
+    retry round-trip on the first request after a long idle. The breadcrumb
+    is just a timestamp; it leaks nothing useful to XSS that wasn't already
+    visible in the network tab.
     """
+    access_max_age = settings.JWT_EXPIRATION_HOURS * 3600
+    refresh_max_age = settings.JWT_REFRESH_EXPIRATION_DAYS * 86400
+
     common = {
         "httponly": True,
         "secure": settings.COOKIE_SECURE,
@@ -114,17 +124,22 @@ def _set_auth_cookies(response: Response, access_token: str, refresh_token: str)
         "domain": settings.COOKIE_DOMAIN,
         "path": "/",
     }
-    response.set_cookie(
-        "access_token",
-        access_token,
-        max_age=settings.JWT_EXPIRATION_HOURS * 3600,
-        **common,
+    response.set_cookie("access_token", access_token, max_age=access_max_age, **common)
+    response.set_cookie("refresh_token", refresh_token, max_age=refresh_max_age, **common)
+
+    # Non-HttpOnly breadcrumb so the SPA can schedule proactive refresh.
+    expires_at_ms = int(
+        (datetime.now(timezone.utc) + timedelta(seconds=access_max_age)).timestamp() * 1000
     )
     response.set_cookie(
-        "refresh_token",
-        refresh_token,
-        max_age=settings.JWT_REFRESH_EXPIRATION_DAYS * 86400,
-        **common,
+        "access_token_expires_at",
+        str(expires_at_ms),
+        max_age=access_max_age,
+        httponly=False,                       # JS-readable on purpose
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        domain=settings.COOKIE_DOMAIN,
+        path="/",
     )
 
 
@@ -138,6 +153,15 @@ def _clear_auth_cookies(response: Response) -> None:
     }
     response.delete_cookie("access_token", **common)
     response.delete_cookie("refresh_token", **common)
+    # Breadcrumb is non-HttpOnly; clear with a matching attribute set.
+    response.delete_cookie(
+        "access_token_expires_at",
+        domain=settings.COOKIE_DOMAIN,
+        path="/",
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        httponly=False,
+    )
 
 
 @app.get("/api/v1/auth/microsoft/url", response_model=MicrosoftAuthUrlResponse)

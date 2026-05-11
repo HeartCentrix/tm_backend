@@ -31,8 +31,13 @@ class Settings:
         self.DB_POOL_USE_LIFO = os.getenv("DB_POOL_USE_LIFO", "true").lower() in ("true", "1", "yes")
         self.JWT_SECRET = os.getenv("JWT_SECRET", "")
         self.JWT_ALGORITHM = "HS256"
-        self.JWT_EXPIRATION_HOURS = 8
-        self.JWT_REFRESH_EXPIRATION_DAYS = 7
+        # Access TTL is short on purpose: a stolen access cookie is useful
+        # for at most this long. The SPA's auto-refresh hides the boundary
+        # from the user, so 1h has zero UX cost. Override via env in dev for
+        # faster iteration. Refresh TTL stays at 7d — that one is bounded by
+        # rotation + revocation, not by clock.
+        self.JWT_EXPIRATION_HOURS = int(os.getenv("JWT_EXPIRATION_HOURS", "1"))
+        self.JWT_REFRESH_EXPIRATION_DAYS = int(os.getenv("JWT_REFRESH_EXPIRATION_DAYS", "7"))
         # Distinct per-class secrets prevent access<->refresh token swaps. Fall
         # back to JWT_SECRET so existing single-secret deployments keep booting;
         # the type-claim check in decode_token is the primary defense.
