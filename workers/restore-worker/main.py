@@ -2920,6 +2920,21 @@ class RestoreWorker:
 
         attachments_with_bytes: List[tuple] = []
         for att in att_items:
+            # Inline path: small attachments (signatures, logos,
+            # thumbnails) live in extra_data.inline_b64 instead of
+            # Azure blob. Check that first since it avoids the network
+            # round-trip and works even if the storage backend is
+            # offline. blob_path stays None for inline rows.
+            ed = att.extra_data or {}
+            inline_b64 = ed.get("inline_b64")
+            if inline_b64:
+                try:
+                    import base64 as _b64
+                    blob_bytes = _b64.b64decode(inline_b64)
+                    attachments_with_bytes.append((att, blob_bytes))
+                except Exception as e:
+                    print(f"[{self.worker_id}] inline_b64 decode failed for {att.external_id}: {type(e).__name__}: {e}")
+                continue
             if not getattr(att, "blob_path", None):
                 continue
             try:

@@ -1,6 +1,7 @@
 """Microsoft Graph API client for resource discovery"""
 import asyncio
 import logging
+import os
 import httpx
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -93,6 +94,89 @@ class GraphClient:
         self.power_bi_refresh_token = power_bi_refresh_token
         self._access_token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
+        # Persistent shared httpx.AsyncClient. Previously every Graph
+        # call did `async with httpx.AsyncClient(...)` which forced a
+        # fresh TCP + TLS handshake per request (~80-150ms on WAN to
+        # graph.microsoft.com). For a 5K-user first-sync that's ~100M
+        # handshakes worth of overhead. Persistent client with a 50-
+        # keepalive pool collapses that to ~50 handshakes for the
+        # lifetime of the worker. Lazy-created on first use so we
+        # don't need a running event loop at construction time.
+        self._http: Optional[httpx.AsyncClient] = None
+        self._http_lock = asyncio.Lock()
+
+    async def _get_shared_http(self) -> httpx.AsyncClient:
+        """Return (lazy-create) the persistent httpx.AsyncClient.
+
+        Locked so concurrent first-callers don't both build a client.
+        Re-creates if the previous client was closed (defensive, in
+        case some path called aclose() prematurely)."""
+        if self._http is not None and not self._http.is_closed:
+            return self._http
+        async with self._http_lock:
+            if self._http is not None and not self._http.is_closed:
+                return self._http
+            # Generous default timeout — individual call sites can
+            # tighten via per-call `timeout=` kwarg on .get/.post.
+            # connect=30 covers TLS handshake under WAN jitter.
+            # read=600 covers large-attachment downloads (mail/chat).
+            # max_keepalive_connections=50 sized so a worker with 10
+            # parallel folder drains × 2-4 in-flight pages each fits
+            # without recycling sockets.
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    connect=30.0, read=600.0, write=300.0, pool=30.0,
+                ),
+                limits=httpx.Limits(
+                    max_connections=100,
+                    max_keepalive_connections=50,
+                    keepalive_expiry=300.0,
+                ),
+                # Several SharePoint/CDN download sites need 3xx
+                # redirect following (referenceAttachment shared URLs,
+                # chat hosted content). Graph proper rarely returns
+                # 3xx; safe default.
+                follow_redirects=True,
+            )
+            return self._http
+
+    def _http_session(self, timeout=None):
+        """Drop-in replacement for `async with httpx.AsyncClient(timeout=X)`.
+
+        Returns an async context manager that yields the SHARED
+        persistent client without closing it on exit. The `timeout=`
+        arg is honored at the persistent client's session-default level
+        on first creation; per-call sites should pass `timeout=` to
+        their .get/.post if they need a tighter cap than the generous
+        client-wide default (read=600s) — this preserves behavior of
+        the pre-pool sites without forcing every call site to be
+        rewritten."""
+        client_provider = self._get_shared_http
+
+        class _SharedClientCM:
+            async def __aenter__(self_inner):
+                return await client_provider()
+
+            async def __aexit__(self_inner, *exc):
+                # Crucial: do NOT close the shared client here. It
+                # outlives this `async with` block by design.
+                return False
+
+        return _SharedClientCM()
+
+    async def aclose(self) -> None:
+        """Dispose the persistent client on worker shutdown.
+
+        Idempotent. Safe to call multiple times. After aclose() the
+        next Graph call lazy-creates a fresh client — useful when
+        the loop is being recycled."""
+        client = self._http
+        self._http = None
+        if client is not None and not client.is_closed:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
     def _effective_priority(self) -> int:
         """Return the priority for the current asyncio task.
@@ -122,7 +206,7 @@ class GraphClient:
         last_exc = None
         for attempt in range(1, 4):  # 3 attempts
             try:
-                async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT) as client:
+                async with self._http_session() as client:
                     resp = await client.post(
                         self.TOKEN_URL.format(tenant_id=self.tenant_id),
                         data={
@@ -192,7 +276,7 @@ class GraphClient:
 
         while next_url:
             try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
+                async with self._http_session() as client:
                     # ConsistencyLevel: eventual is only valid with $count queries
                     if params and params.get("$count") == "true":
                         headers = {"Authorization": f"Bearer {token}", "ConsistencyLevel": "eventual"}
@@ -212,6 +296,15 @@ class GraphClient:
                         resp.raise_for_status()
 
                     resp.raise_for_status()
+                    # Adaptive circuit-breaker feedback: tell the
+                    # multi-app manager this app served a clean 2xx so
+                    # it can exit probation + recover its rate cap.
+                    try:
+                        from shared.multi_app_manager import multi_app_manager
+                        _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
+                        multi_app_manager.mark_success(self.client_id, _lat_ms)
+                    except Exception:
+                        pass
                     data = resp.json()
                     last_data = data
                     retry_count = 0  # Reset on success
@@ -267,7 +360,7 @@ class GraphClient:
         delta_link: Optional[str] = None
         last_data: Dict[str, Any] = {}
 
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+        async with self._http_session() as client:
             while next_url:
                 prio = self._effective_priority()
                 await policy.stream_bucket.acquire(priority=prio)
@@ -320,6 +413,12 @@ class GraphClient:
 
                 resp.raise_for_status()
                 policy.reset_on_success()
+                # Adaptive circuit-breaker feedback for the hardened path.
+                try:
+                    _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
+                    multi_app_manager.mark_success(self.client_id, _lat_ms)
+                except Exception:
+                    pass
                 data = resp.json() or {}
                 last_data = data
 
@@ -379,7 +478,7 @@ class GraphClient:
         while next_url:
             token = await self._get_token()
             try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
+                async with self._http_session() as client:
                     if params and params.get("$count") == "true":
                         headers = {"Authorization": f"Bearer {token}", "ConsistencyLevel": "eventual"}
                     else:
@@ -403,6 +502,13 @@ class GraphClient:
                         resp.raise_for_status()
 
                     resp.raise_for_status()
+                    # Adaptive circuit-breaker feedback (legacy stream path).
+                    try:
+                        from shared.multi_app_manager import multi_app_manager as _mam
+                        _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
+                        _mam.mark_success(self.client_id, _lat_ms)
+                    except Exception:
+                        pass
                     data = resp.json()
                     retry_count = 0
                     yield data
@@ -451,7 +557,7 @@ class GraphClient:
         token = await self._get_token()
         self._last_delta_link: Optional[str] = None
 
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+        async with self._http_session() as client:
             while next_url:
                 prio = self._effective_priority()
                 await policy.stream_bucket.acquire(priority=prio)
@@ -512,6 +618,14 @@ class GraphClient:
 
                 resp.raise_for_status()
                 policy.reset_on_success()
+                # Adaptive circuit-breaker feedback (hardened stream path).
+                try:
+                    _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
+                    # Mark on the CURRENT app (post-failover) not self.client_id,
+                    # since hardened iter migrates apps mid-stream.
+                    multi_app_manager.mark_success(current_app, _lat_ms)
+                except Exception:
+                    pass
                 data = resp.json() or {}
                 yield data
 
@@ -547,7 +661,7 @@ class GraphClient:
     async def _post(self, url: str, payload: Dict[str, Any], headers: Optional[Dict] = None) -> Dict[str, Any]:
         """Make authenticated POST request"""
         token = await self._get_token()
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+        async with self._http_session() as client:
             req_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
             if headers:
                 req_headers.update(headers)
@@ -558,7 +672,7 @@ class GraphClient:
     async def _put(self, url: str, content: Any, headers: Optional[Dict] = None) -> Dict[str, Any]:
         """Make authenticated PUT request (for file uploads)"""
         token = await self._get_token()
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+        async with self._http_session() as client:
             req_headers = {"Authorization": f"Bearer {token}"}
             if headers:
                 req_headers.update(headers)
@@ -575,7 +689,7 @@ class GraphClient:
     async def _patch(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Make authenticated PATCH request"""
         token = await self._get_token()
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+        async with self._http_session() as client:
             req_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
             resp = await client.patch(url, headers=req_headers, json=payload)
             resp.raise_for_status()
@@ -584,7 +698,7 @@ class GraphClient:
     async def _delete(self, url: str) -> None:
         """Make authenticated DELETE request"""
         token = await self._get_token()
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+        async with self._http_session() as client:
             headers = {"Authorization": f"Bearer {token}"}
             resp = await client.delete(url, headers=headers)
             resp.raise_for_status()
@@ -975,7 +1089,7 @@ class GraphClient:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json;odata=nometadata",
         }
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with self._http_session() as client:
             while next_url:
                 resp = await client.get(next_url, headers=headers)
                 if resp.status_code in (401, 403):
@@ -2145,7 +2259,7 @@ class GraphClient:
             payload["request"]["Owner"] = owner_email
 
         url = f"https://{admin_host}/_api/SPSiteManager/create"
-        async with httpx.AsyncClient(timeout=180.0) as client:
+        async with self._http_session() as client:
             # Wait up to ~5 min for provisioning — communication sites are
             # usually ready in <60s, but a cold tenant can lag.
             deadline = time.monotonic() + 300
@@ -2320,7 +2434,7 @@ class GraphClient:
                 "scope": scope,
             }
 
-        async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT) as client:
+        async with self._http_session() as client:
             resp = await client.post(token_url, data=data)
             if resp.status_code >= 400:
                 # Surface AAD's error text — it's the only way to tell
@@ -2453,7 +2567,7 @@ class GraphClient:
             "$select": "Id,Title,Description,DefaultViewUrl,Created,LastItemModifiedDate,BaseTemplate,Hidden,IsCatalog,IsSystemList",
         }
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with self._http_session() as client:
             resp = await client.get(url, headers=headers, params=params)
             if resp.status_code == 403 or resp.status_code == 401:
                 print(f"[GraphClient] SP REST denied for {site_web_url} (status={resp.status_code}); is AllSites.Read granted on THIS app registration?")
@@ -2567,7 +2681,7 @@ class GraphClient:
             }
         next_url: Optional[str] = url
         backoff = 1.0  # seconds; doubled per consecutive transient failure
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with self._http_session() as client:
             while next_url:
                 try:
                     resp = await client.get(
@@ -2613,7 +2727,7 @@ class GraphClient:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json;odata=nometadata",
         }
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with self._http_session() as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code >= 400:
                 return None
@@ -2633,7 +2747,7 @@ class GraphClient:
         token = await self._get_sharepoint_token(hostname)
         safe_path = server_relative_url.replace("'", "''")
         url = f"{site_web_url.rstrip('/')}/_api/web/GetFileByServerRelativeUrl('{safe_path}')/$value"
-        async with httpx.AsyncClient(timeout=180.0, follow_redirects=True) as client:
+        async with self._http_session() as client:
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
             return resp.content
@@ -2660,7 +2774,7 @@ class GraphClient:
         while True:
             attempt += 1
             try:
-                async with httpx.AsyncClient(timeout=600.0, follow_redirects=True) as client:
+                async with self._http_session() as client:
                     async with client.stream("GET", url, headers=headers) as resp:
                         if resp.status_code in (429, 503):
                             retry_after = _parse_retry_after(resp)
@@ -2710,7 +2824,7 @@ class GraphClient:
         """
         token = await self._get_token()
         url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/content"
-        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        async with self._http_session() as client:
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
             return resp.content
@@ -3164,7 +3278,7 @@ class GraphClient:
         """Download a fileAttachment's binary content via /$value."""
         url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}/attachments/{attachment_id}/$value"
         token = await self._get_token()
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        async with self._http_session() as client:
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
             return resp.content
@@ -3218,8 +3332,98 @@ class GraphClient:
 
         return _iter(), ctype, size
 
+    # Worker-lifetime cache of source URLs that resolved to a permanent
+    # 4xx (400/401/403/404/410/423). Backed by a plain dict so subsequent
+    # references to the same URL — same chat, different chat, different
+    # user, different resource type — short-circuit at O(1) instead of
+    # burning a Graph round-trip + a Retry-After to "discover" it's
+    # still unreachable. Bounded so the dict can't grow unbounded on a
+    # tenant with thousands of broken references; evicts oldest on
+    # insert past _UNREACHABLE_URL_CACHE_MAX. Set at the CLASS level
+    # rather than self.* so it spans every GraphClient instance the
+    # worker creates (one per tenant).
+    _unreachable_urls: Dict[str, float] = {}
+    _UNREACHABLE_URL_CACHE_MAX = 50_000
+
+    @classmethod
+    def _mark_url_unreachable(cls, url: str) -> None:
+        if not url:
+            return
+        # Eviction: when cache is full, drop the oldest 5% in one pass.
+        if len(cls._unreachable_urls) >= cls._UNREACHABLE_URL_CACHE_MAX:
+            cutoff = sorted(cls._unreachable_urls.values())[
+                len(cls._unreachable_urls) // 20
+            ]
+            cls._unreachable_urls = {
+                u: t for u, t in cls._unreachable_urls.items() if t > cutoff
+            }
+        cls._unreachable_urls[url] = time.time()
+
+    @classmethod
+    def _is_url_unreachable(cls, url: str) -> bool:
+        return bool(url) and url in cls._unreachable_urls
+
+    async def resolve_share_to_drive_item(self, source_url: str) -> Optional[Dict[str, Any]]:
+        """Convert a OneDrive / SharePoint share URL into a driveItem dict.
+
+        Split out from fetch_shared_url_content so callers can put the
+        share-resolve (Graph-rate-limited) and the byte-download
+        (SharePoint-CDN, different rate limits) under SEPARATE
+        semaphores — letting the two phases overlap instead of
+        sharing one bottleneck.
+
+        Returns the driveItem dict on success, None on permanent 4xx.
+        Marks the URL as unreachable on permanent 4xx so subsequent
+        references short-circuit without burning a Graph round-trip."""
+        if not source_url:
+            return None
+        if self._is_url_unreachable(source_url):
+            return None
+        import base64 as _b64
+        try:
+            share_id = "u!" + _b64.urlsafe_b64encode(source_url.encode("utf-8")).decode("ascii").rstrip("=")
+        except Exception:
+            return None
+        try:
+            return await self._get(
+                f"{self.GRAPH_URL}/shares/{share_id}/driveItem",
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (400, 401, 403, 404, 410, 423):
+                self._mark_url_unreachable(source_url)
+                return None
+            raise
+        except Exception:
+            return None
+
+    async def download_drive_item_bytes(
+        self,
+        drive_item: Dict[str, Any],
+        source_url_for_cache: Optional[str] = None,
+    ) -> Optional[bytes]:
+        """Stream the bytes of a resolved driveItem via its
+        @microsoft.graph.downloadUrl. Range-resumes on transport drops.
+
+        Pass `source_url_for_cache` if you'd like a permanent-4xx
+        result to be added to the worker-lifetime unreachable cache
+        (so a subsequent reference to the same source URL fails fast).
+        """
+        download_url = drive_item.get("@microsoft.graph.downloadUrl")
+        if not download_url:
+            return None
+        expected_size = int(drive_item.get("size") or 0)
+        return await self._stream_download_url(
+            download_url, expected_size,
+            source_url_for_cache=source_url_for_cache,
+        )
+
     async def fetch_shared_url_content(self, source_url: str) -> Optional[bytes]:
         """Resolve a OneDrive / SharePoint share URL to its actual file bytes.
+
+        Back-compat wrapper around resolve_share_to_drive_item +
+        download_drive_item_bytes. New callers should prefer the two
+        split methods so they can isolate Graph-resolve concurrency
+        from SharePoint-CDN download concurrency.
 
         Used for referenceAttachments on mail (and later chat) messages — the
         attachment payload only has a `sourceUrl`, not content. Graph's
@@ -3235,40 +3439,102 @@ class GraphClient:
         degrade to metadata-only storage in that case."""
         if not source_url:
             return None
-        import base64 as _b64
-        try:
-            share_id = "u!" + _b64.urlsafe_b64encode(source_url.encode("utf-8")).decode("ascii").rstrip("=")
-        except Exception:
+        drive_item = await self.resolve_share_to_drive_item(source_url)
+        if drive_item is None:
             return None
+        return await self.download_drive_item_bytes(
+            drive_item, source_url_for_cache=source_url,
+        )
 
+    async def _stream_download_url(
+        self,
+        download_url: str,
+        expected_size: int = 0,
+        source_url_for_cache: Optional[str] = None,
+    ) -> Optional[bytes]:
+        """Internal: stream a (resolved) download URL with Range-resume.
+        Caches permanent 4xx into the unreachable-URL cache when
+        source_url_for_cache is provided."""
+        max_resumes = int(os.getenv("SHARED_URL_STREAM_MAX_RESUMES", "6"))
+        label = (source_url_for_cache or download_url)[:60]
+        buf = bytearray()
+        resume_attempt = 0
         try:
-            drive_item = await self._get(
-                f"{self.GRAPH_URL}/shares/{share_id}/driveItem",
-            )
+            async with self._http_session() as client:
+                while True:
+                    headers: Dict[str, str] = {}
+                    if buf:
+                        headers["Range"] = f"bytes={len(buf)}-"
+                    try:
+                        async with client.stream("GET", download_url, headers=headers) as resp:
+                            if not buf:
+                                if resp.status_code not in (200, 206):
+                                    body = await resp.aread()
+                                    print(
+                                        f"[GraphClient] shared URL download HTTP "
+                                        f"{resp.status_code} ({label}…): "
+                                        f"{body[:160]!r}"
+                                    )
+                                    # Permanent 4xx — record in worker-
+                                    # lifetime unreachable cache so the
+                                    # next reference to this URL fails
+                                    # fast without burning Graph budget.
+                                    if (
+                                        source_url_for_cache
+                                        and resp.status_code in (400, 401, 403, 404, 410, 423)
+                                    ):
+                                        self._mark_url_unreachable(source_url_for_cache)
+                                    return None
+                            else:
+                                if resp.status_code != 206:
+                                    # CDN ignored Range — restart from zero to
+                                    # avoid concatenating duplicate bytes.
+                                    print(
+                                        f"[GraphClient] shared URL range "
+                                        f"rejected (HTTP {resp.status_code}); "
+                                        f"restarting from offset 0 "
+                                        f"({label}…)"
+                                    )
+                                    buf = bytearray()
+                                    continue
+                            async for chunk in resp.aiter_bytes(1 << 20):
+                                if chunk:
+                                    buf.extend(chunk)
+                        return bytes(buf)
+                    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as exc:
+                        # Connection dropped mid-stream. If size is known and
+                        # we already received everything, accept what we have
+                        # (some CDNs close without proper framing on the last
+                        # byte). Otherwise resume from current offset.
+                        if expected_size > 0 and len(buf) >= expected_size:
+                            return bytes(buf)
+                        if resume_attempt >= max_resumes:
+                            print(
+                                f"[GraphClient] shared URL download exhausted "
+                                f"{max_resumes} resumes at "
+                                f"{len(buf)}/{expected_size or '?'} bytes "
+                                f"({label}…): {type(exc).__name__}"
+                            )
+                            return None
+                        resume_attempt += 1
+                        backoff = min(8.0, 1.0 * (2 ** (resume_attempt - 1)))
+                        print(
+                            f"[GraphClient] shared URL stream dropped at "
+                            f"{len(buf)}/{expected_size or '?'} bytes "
+                            f"({type(exc).__name__}); resume "
+                            f"{resume_attempt}/{max_resumes} after "
+                            f"{backoff:.1f}s ({label}…)"
+                        )
+                        await asyncio.sleep(backoff)
         except httpx.HTTPStatusError as e:
-            # Fast-fail on permanent failures. 423 = resource locked by
-            # owner (typical for cross-user OneDrive Personal file refs
-            # in Teams chats — app can't access other users' drives
-            # without per-user delegation). 410 = tombstoned/deleted.
-            # 401 = auth scope missing. All non-retryable — return None
-            # so the caller records the item as metadata-only without
-            # burning rate-limit budget on retries that will never work.
             if e.response.status_code in (400, 401, 403, 404, 410, 423):
+                if source_url_for_cache:
+                    self._mark_url_unreachable(source_url_for_cache)
                 return None
-            raise
-        except Exception:
+            print(f"[GraphClient] shared URL download failed ({label}…): HTTP {e.response.status_code}")
             return None
-
-        download_url = drive_item.get("@microsoft.graph.downloadUrl")
-        if not download_url:
-            return None
-        try:
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                resp = await client.get(download_url)
-                resp.raise_for_status()
-                return resp.content
         except Exception as e:
-            print(f"[GraphClient] shared URL download failed ({source_url[:60]}…): {type(e).__name__}: {e}")
+            print(f"[GraphClient] shared URL download failed ({label}…): {type(e).__name__}: {e}")
             return None
 
     async def list_event_attachments(self, user_id: str, event_id: str) -> List[Dict[str, Any]]:
@@ -3292,7 +3558,7 @@ class GraphClient:
         """Download a calendar event fileAttachment's binary content via /$value."""
         url = f"{self.GRAPH_URL}/users/{user_id}/events/{event_id}/attachments/{attachment_id}/$value"
         token = await self._get_token()
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        async with self._http_session() as client:
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
             return resp.content
@@ -3325,7 +3591,7 @@ class GraphClient:
         """Download the binary content of a specific historical version."""
         url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/versions/{version_id}/content"
         token = await self._get_token()
-        async with httpx.AsyncClient(timeout=600.0, follow_redirects=True) as client:
+        async with self._http_session() as client:
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
             return resp.content
@@ -3816,7 +4082,7 @@ class GraphClient:
             "Content-Type": "text/plain",
         }
         body = _b64.b64encode(mime_bytes)
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+        async with self._http_session() as client:
             resp = await client.post(url, headers=headers, content=body)
             if resp.status_code == 429 or resp.status_code == 503:
                 await asyncio.sleep(_parse_retry_after(resp))
@@ -3875,7 +4141,7 @@ class GraphClient:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/octet-stream",
         }
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as c:
+        async with self._http_session() as c:
             resp = await c.put(url, headers=headers, content=body)
             if resp.status_code in (429, 503):
                 await asyncio.sleep(_parse_retry_after(resp))
@@ -3923,7 +4189,7 @@ class GraphClient:
                 "@microsoft.graph.conflictBehavior": conflict_behavior,
             }
         }
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as c:
+        async with self._http_session() as c:
             session_resp = await c.post(create_url, headers=create_headers, json=create_payload)
             if session_resp.status_code >= 400:
                 raise RuntimeError(
@@ -4019,7 +4285,7 @@ class GraphClient:
         CHUNK_ALIGN = 320 * 1024
         aligned = max(CHUNK_ALIGN, (chunk_size // CHUNK_ALIGN) * CHUNK_ALIGN)
 
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as c:
+        async with self._http_session() as c:
             session_resp = await c.post(
                 create_url, headers=create_headers, json=create_payload,
             )
@@ -4351,7 +4617,7 @@ class GraphClient:
 
         chunk_size = 4 * 1024 * 1024  # 4 MiB per Microsoft's guidance.
         total = len(content_bytes)
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with self._http_session() as client:
             start = 0
             while start < total:
                 end = min(start + chunk_size, total) - 1
@@ -4742,7 +5008,7 @@ class GraphClient:
         endpoints like OneNote page content (text/html) or resource $value (binary).
         Follows 302 redirects implicitly via httpx."""
         token = await self._get_token()
-        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        async with self._http_session() as client:
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
             return resp.content
