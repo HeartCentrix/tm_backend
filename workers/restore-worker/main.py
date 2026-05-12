@@ -2116,6 +2116,7 @@ class RestoreWorker:
                              + result.get("item_counts_by_type", {}).get("CALENDAR_EVENT", 0)
                              + result.get("item_counts_by_type", {}).get("USER_CONTACT", 0),
             "failed_count": sum(result.get("failed_counts_by_type", {}).values()),
+            "skipped_count": sum(result.get("skipped_counts_by_type", {}).values()),
             "export_type": "PST",
             "blob_path": result.get("blob_path"),
             "container": result.get("container"),
@@ -2126,6 +2127,7 @@ class RestoreWorker:
             "status": result.get("status"),
             "item_counts_by_type": result.get("item_counts_by_type", {}),
             "failed_counts_by_type": result.get("failed_counts_by_type", {}),
+            "skipped_counts_by_type": result.get("skipped_counts_by_type", {}),
             "skipped_groups": result.get("skipped_groups", []),
         }
 

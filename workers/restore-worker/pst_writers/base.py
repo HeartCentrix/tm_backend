@@ -46,11 +46,29 @@ if os.path.isdir(_SHARED) and os.path.dirname(_SHARED) not in sys.path:
 logger = logging.getLogger(__name__)
 
 
+class IntentionalSkip(Exception):
+    """Raised from :meth:`PstWriterBase._collect_graph_item` when an item
+    is being deliberately dropped from the export (e.g. a calendar series
+    occurrence whose master we already carry — pstwriter expands the
+    recurrence rule on read, so emitting the child would duplicate the
+    event). The base writer counts these against ``skipped_count``
+    instead of ``failed_count`` so the export manifest can distinguish
+    "we chose not to include this" from "we tried and the data was bad".
+
+    The exception message is logged at INFO; the caller does not need to
+    handle it themselves."""
+
+
 @dataclass
 class PstWriteResult:
     pst_paths: list = field(default_factory=list)   # list[Path]
     item_count: int = 0
     failed_count: int = 0
+    # Items dropped on purpose during collection (series occurrences
+    # whose master is in scope, dedup hits, etc.). Surfaced separately
+    # in the manifest so the UI / audit log doesn't read intentional
+    # skips as data-loss failures.
+    skipped_count: int = 0
 
 
 class PstWriterBase:
@@ -115,6 +133,16 @@ class PstWriterBase:
                 graph_obj = await self._collect_graph_item(
                     item, shard, source_container,
                 )
+            except IntentionalSkip as exc:
+                # Subclass deliberately dropped this item (e.g. calendar
+                # series occurrence whose master is in scope). Not a
+                # failure — keep the count separate from failed_count.
+                logger.info(
+                    "[pst_writer] collect SKIP item=%s type=%s: %s",
+                    ext_id, self.item_type, exc,
+                )
+                result.skipped_count += 1
+                continue
             except Exception as exc:
                 logger.error(
                     "[pst_writer] collect FAILED item=%s type=%s: %s",
@@ -132,7 +160,8 @@ class PstWriterBase:
         if not collected:
             logger.warning(
                 "[pst_writer] group %s produced 0 collectable items "
-                "(failed=%d)", group.key, result.failed_count,
+                "(failed=%d skipped=%d)",
+                group.key, result.failed_count, result.skipped_count,
             )
             return result
 
