@@ -4820,8 +4820,13 @@ class BackupWorker:
         # keep a 400 TiB-class enterprise worker from OOMing we cap the
         # parallel-range concurrency globally so the product stays
         # bounded regardless of what the operator sets individually.
+        # Default 4 GiB (up from 2). With segment_concurrency now at 8
+        # and 64 MB per segment, peak per-huge-file is 512 MB → 4 GiB
+        # budget admits 8 huge files in flight simultaneously, vs 4 at
+        # the prior 2 GiB / 4-concurrency config. Cap still bounded by
+        # ONEDRIVE_BACKUP_FILE_CONCURRENCY upstream.
         huge_file_budget_gib = int(os.getenv(
-            "ONEDRIVE_HUGE_FILE_RAM_BUDGET_GIB", "2",
+            "ONEDRIVE_HUGE_FILE_RAM_BUDGET_GIB", "4",
         ))
         max_huge_files_inflight = max(
             1,

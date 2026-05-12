@@ -303,8 +303,14 @@ class Settings:
             "ONEDRIVE_LARGE_FILE_SEGMENT_BYTES",
             str(64 * 1024 * 1024),
         ))
+        # Default bumped from 4 to 8 — single-TCP from Graph CDN caps
+        # around 50-100 MB/s, so 8 concurrent Range fetches per huge
+        # file scale to ~600 MB/s of effective bandwidth on enterprise
+        # links. Peak RAM per file = segment_concurrency * segment_size
+        # = 8 * 64 MB = 512 MB, still bounded by the global huge-file
+        # RAM budget below.
         self.ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY = int(os.getenv(
-            "ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY", "4",
+            "ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY", "8",
         ))
 
         # ── Heavy backup pool ──
