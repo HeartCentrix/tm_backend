@@ -515,6 +515,10 @@ class PstExportOrchestrator:
 
         item_counts: dict = defaultdict(int)
         failed_counts: dict = defaultdict(int)
+        # Items the writer deliberately dropped (series occurrences whose
+        # master is in scope, dedup hits) — distinct from failed_counts
+        # so the audit log doesn't flag intentional skips as data loss.
+        skipped_counts: dict = defaultdict(int)
         skipped_groups: list = []
         pst_blob_paths: list = list(prior_blobs)
         # Per-group accumulator. Memory bound = Σ(items per active group).
@@ -600,6 +604,7 @@ class PstExportOrchestrator:
                     )
                 item_counts[item_type] += write_result.item_count
                 failed_counts[item_type] += write_result.failed_count
+                skipped_counts[item_type] += write_result.skipped_count
 
                 # When a group produced zero PSTs, surface the skip
                 # reason so the caller (job-service download endpoint,
@@ -614,6 +619,7 @@ class PstExportOrchestrator:
                         "reason": "no_collectable_items",
                         "items_attempted": len(items_to_write),
                         "failed": write_result.failed_count,
+                        "skipped": write_result.skipped_count,
                         "error": (
                             "All items skipped — usually means calendar "
                             "occurrences whose series-master is not "
@@ -904,6 +910,7 @@ class PstExportOrchestrator:
             "raw_workloads_included": sorted(self.raw_file_types) if self.raw_file_types else [],
             "item_counts_by_type": dict(item_counts),
             "failed_counts_by_type": dict(failed_counts),
+            "skipped_counts_by_type": dict(skipped_counts),
             "skipped_groups": skipped_groups,
             "total_size_bytes": total_size,
         }
@@ -963,6 +970,7 @@ class PstExportOrchestrator:
                 "total_size_bytes": total_size,
                 "item_counts_by_type": dict(item_counts),
                 "failed_counts_by_type": dict(failed_counts),
+                "skipped_counts_by_type": dict(skipped_counts),
                 "skipped_groups": skipped_groups,
                 "granularity": self.granularity,
                 "items_processed": items_seen,
@@ -1063,6 +1071,7 @@ class PstExportOrchestrator:
                 "total_size_bytes": 0,
                 "item_counts_by_type": {},
                 "failed_counts_by_type": {},
+                "skipped_counts_by_type": {},
                 "skipped_groups": [],
                 "granularity": self.granularity,
                 "error": msg,
@@ -1081,6 +1090,7 @@ class PstExportOrchestrator:
         all_pst_paths: list = []
         item_counts: dict = {}
         failed_counts: dict = {}
+        skipped_counts: dict = {}
         total_groups = len(groups)
 
         skipped_groups: list = []
@@ -1148,11 +1158,15 @@ class PstExportOrchestrator:
                     failed_counts[group.item_type] = (
                         failed_counts.get(group.item_type, 0) + write_result.failed_count
                     )
+                    skipped_counts[group.item_type] = (
+                        skipped_counts.get(group.item_type, 0) + write_result.skipped_count
+                    )
                     elapsed = _time.monotonic() - t0
                     logger.info(
-                        "[pst_export] group %d/%d done type=%s wrote=%d failed=%d psts=%d in %.2fs",
+                        "[pst_export] group %d/%d done type=%s wrote=%d failed=%d skipped=%d psts=%d in %.2fs",
                         idx + 1, total_groups, group.item_type,
                         write_result.item_count, write_result.failed_count,
+                        write_result.skipped_count,
                         len(write_result.pst_paths), elapsed,
                     )
                     completed_keys.add(group.key)
@@ -1244,6 +1258,7 @@ class PstExportOrchestrator:
                 "total_size_bytes": total_size,
                 "item_counts_by_type": item_counts,
                 "failed_counts_by_type": failed_counts,
+                "skipped_counts_by_type": skipped_counts,
                 "skipped_groups": skipped_groups,
                 "granularity": self.granularity,
             }

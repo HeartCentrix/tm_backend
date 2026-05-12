@@ -20,7 +20,7 @@ _WORKER = os.path.abspath(os.path.join(_HERE, ".."))
 if _WORKER not in sys.path:
     sys.path.insert(0, _WORKER)
 
-from .base import PstWriterBase  # noqa: E402
+from .base import IntentionalSkip, PstWriterBase  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +52,13 @@ class CalendarPstWriter(PstWriterBase):
             # children to include their masters; if a child still slips
             # through here it is because the master is not backed up
             # (parent mailbox not in scope, or master was hard-deleted
-            # before the snapshot ran).
-            print(
-                f"[pst_writer] calendar SKIP child-occurrence item={ext_id} "
-                f"parent={raw.get('seriesMasterId')}",
-                flush=True,
+            # before the snapshot ran). Either way it's an intentional
+            # drop, not a failure — surface it as ``skipped_count`` so
+            # the manifest's ``failed_counts_by_type`` only reflects
+            # genuine errors.
+            raise IntentionalSkip(
+                f"series-occurrence parent={raw.get('seriesMasterId')}"
             )
-            return None
 
         # Stamp the SnapshotItem's folder_path onto the event JSON so
         # pst_convert can group events by source-calendar ("Calendar",
