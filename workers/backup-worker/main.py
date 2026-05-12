@@ -2540,7 +2540,14 @@ class BackupWorker:
                         asyncio.Semaphore(_att_chat_concurrency) if _interleave_att else None
                     )
                     _att_tasks: List[asyncio.Task] = []
-                    _att_items_total: List[SnapshotItem] = []
+                    # _att_items_total used to be a list collected for Phase-2
+                    # to flush via session.add_all. That pattern is broken
+                    # because Phase-2 lives in _backup_one (a sibling function)
+                    # and cannot reach this scope — `except NameError: pass`
+                    # silently swallowed every interleaved item. Now the kick
+                    # task persists items itself; this counter is just for
+                    # the barrier log.
+                    _att_items_total_count = 0
                     _att_bytes_total = 0
                     _att_interleaved_msg_ids: set = set()
                     # Signal key mutated on each successfully-fetched
@@ -2607,12 +2614,16 @@ class BackupWorker:
                         cid: str, msgs: List[Dict[str, Any]],
                     ) -> None:
                         """Fetch file attachments for a chat's messages in
-                        parallel with ongoing drains of other chats. Mirrors
-                        _kick_hosted_content_for_chat: successfully-processed
-                        messages get _att_interleaved=True so Phase-2's filter
-                        skips them. Failures stay unmarked so Phase-2 retries
-                        them from items_data."""
-                        nonlocal _att_bytes_total
+                        parallel with ongoing drains of other chats.
+
+                        Persists items INSIDE this task (not via the
+                        nonlocal _att_items_total list). The original
+                        nonlocal pattern was unreachable from Phase-2 in
+                        _backup_one (different function scope), so a
+                        silent `except NameError: pass` dropped every
+                        interleaved item. Mirror _userchats_backup_
+                        hosted_contents which also persists internally."""
+                        nonlocal _att_bytes_total, _att_items_total_count
                         msgs_with_att = [m for m in msgs if m.get("attachments")]
                         if not msgs_with_att:
                             return
@@ -2621,8 +2632,47 @@ class BackupWorker:
                                 items, b = await self._userchats_backup_attachments(
                                     graph_client, resource, snapshot, tenant, msgs_with_att,
                                 )
-                                _att_items_total.extend(items)
+                                if items:
+                                    try:
+                                        async with async_session_factory() as session:
+                                            session.add_all(items)
+                                            await session.commit()
+                                    except Exception as _att_commit_err:
+                                        # Same fallback as Phase-2's commit
+                                        # block: on UNIQUE violation, switch
+                                        # to per-row upsert so a single
+                                        # collision doesn't drop a whole
+                                        # chat's attachments.
+                                        print(
+                                            f"[{self.worker_id}] [CHAT-ATT-INTERLEAVE] "
+                                            f"session.add_all of {len(items)} items "
+                                            f"failed: {type(_att_commit_err).__name__}: "
+                                            f"{_att_commit_err}. Retrying per-row."
+                                        )
+                                        att_rows = [{
+                                            "id": it.id,
+                                            "snapshot_id": it.snapshot_id,
+                                            "tenant_id": it.tenant_id,
+                                            "external_id": it.external_id,
+                                            "item_type": it.item_type,
+                                            "name": it.name,
+                                            "folder_path": it.folder_path,
+                                            "content_hash": it.content_hash,
+                                            "content_size": it.content_size,
+                                            "content_checksum": it.content_checksum,
+                                            "extra_data": it.extra_data,
+                                        } for it in items]
+                                        try:
+                                            async with async_session_factory() as session:
+                                                await _bulk_upsert_snapshot_items(session, att_rows)
+                                        except Exception as _retry_err:
+                                            print(
+                                                f"[{self.worker_id}] [CHAT-ATT-INTERLEAVE] "
+                                                f"bulk-upsert fallback ALSO failed: "
+                                                f"{type(_retry_err).__name__}: {_retry_err}"
+                                            )
                                 _att_bytes_total += b
+                                _att_items_total_count += len(items)
                                 for m in msgs_with_att:
                                     m_id = m.get("id")
                                     if m_id:
@@ -3085,9 +3135,9 @@ class BackupWorker:
                         print(
                             f"[{self.worker_id}] [USER_CHATS] att interleave "
                             f"drained {len(_att_interleaved_msg_ids)} msgs "
-                            f"({len(_att_items_total)} items, "
+                            f"({_att_items_total_count} items, "
                             f"{_att_bytes_total} bytes) in {att_elapsed:.1f}s "
-                            f"(overlapped with drain phase)"
+                            f"(overlapped with drain phase, persisted in-task)"
                         )
 
                     elapsed = time.monotonic() - chats_start_mono
@@ -3516,15 +3566,13 @@ class BackupWorker:
                     user_id = (
                         (resource.extra_data or {}).get("user_id") or resource.external_id
                     )
-                    # Fold in attachments captured by the drain-time interleave.
-                    # Drain barrier (above) has already awaited all _att_tasks
-                    # so these nonlocals are stable when we read them here.
-                    try:
-                        if _att_items_total:
-                            att_items.extend(_att_items_total)
-                        att_bytes += _att_bytes_total
-                    except NameError:
-                        pass
+                    # Drain-time interleave already persisted its items + tagged
+                    # processed messages with _att_interleaved. Phase-2 only
+                    # handles the fall-through: messages whose interleave task
+                    # failed (rare). Bytes/counts from the interleave land in
+                    # the DB; the finalize block below derives totals from the
+                    # actual snapshot_items rows so cross-scope nonlocals aren't
+                    # needed.
                     chats_with_att = [
                         extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
                         if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
@@ -3707,14 +3755,25 @@ class BackupWorker:
                 # real EMAIL row count and the UI would show "37 items" for a
                 # 950-row snapshot.
                 async with async_session_factory() as _count_sess:
-                    persisted_count = (await _count_sess.execute(
-                        select(func.count(SnapshotItem.id)).where(
-                            SnapshotItem.snapshot_id == snapshot.id,
-                        )
-                    )).scalar() or 0
+                    _row = (await _count_sess.execute(
+                        select(
+                            func.count(SnapshotItem.id),
+                            func.coalesce(func.sum(SnapshotItem.content_size), 0),
+                        ).where(SnapshotItem.snapshot_id == snapshot.id)
+                    )).one()
+                    persisted_count = int(_row[0] or 0)
+                    persisted_bytes = int(_row[1] or 0)
                 fallback_total = len(items_data) + len(att_items) + total_hosted_items
                 total_items = max(persisted_count, fallback_total)
-                bytes_total += att_bytes
+                # Roll in attachment bytes from the Phase-2 fall-through and
+                # then take max against persisted_bytes (which is the authoritative
+                # SUM(content_size) over snapshot_items). This catches bytes
+                # contributed by drain-time interleaves (chat-attachment and
+                # hostedContent) whose accumulators live in scopes _backup_one
+                # cannot reach. Pre-2026-05-13 fix: bytes_total under-reported
+                # by the full size of interleaved chat attachments — observed
+                # 2 GB missing on Amit Mishra's snapshot.
+                bytes_total = max(bytes_total + att_bytes, persisted_bytes)
 
                 async with async_session_factory() as session:
                     snap = await session.get(Snapshot, snapshot.id)
