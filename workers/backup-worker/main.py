@@ -282,6 +282,34 @@ from shared.entra_fingerprint import fingerprint_object as _entra_fp
 logger = logging.getLogger(__name__)
 
 
+def _classify_chat_drain_error(status: Optional[int], exc: Exception) -> str:
+    """Map a chat-drain failure to a category that decides whether the next
+    backup retries this chat or skips it.
+
+      PERMISSION (403)  — Graph said "your app can't read this resource".
+                          Stable until an admin grants new scopes; record the
+                          app's current scope fingerprint and skip until it
+                          changes.
+      GONE (404)        — Resource no longer exists. Skip until it reappears
+                          in the chat list.
+      THROTTLE (429)    — Rate limited; retry next backup (Graph budget will
+                          have refilled by then). Never skip.
+      AUTH (401)        — Token expired / invalidated; same as transient at
+                          the chat layer — _iter_pages handles token refresh
+                          internally, so 401 reaching here is unusual.
+      TRANSIENT         — 5xx, network errors, anything else. Always retry.
+    """
+    if status == 403:
+        return "PERMISSION"
+    if status == 404:
+        return "GONE"
+    if status == 429:
+        return "THROTTLE"
+    if status == 401:
+        return "AUTH"
+    return "TRANSIENT"
+
+
 def _message_to_contact_shape(msg: dict) -> dict:
     """Best-effort: convert an IPM.Contact message (from Deleted Items or
     Recoverable Items folders) into a dict that looks like a Graph contact
@@ -2376,6 +2404,23 @@ class BackupWorker:
                         ) or {},
                     )
                     new_tokens: Dict[str, str] = {}
+                    # Per-chat drain-failure tracking — informational only.
+                    # Every backup retries every failed chat once; the
+                    # counter just lets the UI surface "this chat has
+                    # failed N runs in a row" without changing retry
+                    # behaviour. On success the entry auto-clears, so
+                    # granting permission (e.g. OnlineMeeting.Read.All
+                    # for meeting chats) self-recovers on the next
+                    # incremental — no operator intervention needed.
+                    existing_failures: Dict[str, Dict[str, Any]] = dict(
+                        (resource.extra_data or {}).get(
+                            "chat_drain_failures", {},
+                        ) or {},
+                    )
+                    # new_failures[cid] = None      → clear existing entry
+                    # new_failures[cid] = {...}     → set/update entry
+                    # absent from new_failures      → no change
+                    new_failures: Dict[str, Optional[Dict[str, Any]]] = {}
 
                     # Chat-level last-updated map for the drain-skip path
                     # below. Graph $filter=lastModifiedDateTime gt X on
@@ -2447,6 +2492,25 @@ class BackupWorker:
 
                     def _pick_chat_client(cid: str) -> GraphClient:
                         return _chat_shards[abs(hash(cid)) % len(_chat_shards)]
+
+                    # Pre-fetch each shard app's granted-scope fingerprint so
+                    # the smart-skip path in _drain_one_chat can decide
+                    # whether to retry a previously-403'd chat without
+                    # making an extra Graph call per chat. One query per
+                    # shard app per backup; result cached on the GraphClient.
+                    _shard_scope_fps: Dict[str, str] = {}
+                    for _sh in _chat_shards:
+                        try:
+                            _shard_scope_fps[_sh.client_id] = (
+                                await _sh.get_granted_scope_fingerprint()
+                            )
+                        except Exception as _fp_err:
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] scope "
+                                f"fingerprint fetch failed for app "
+                                f"{_sh.client_id[:8]}: {_fp_err}"
+                            )
+                            _shard_scope_fps[_sh.client_id] = ""
 
                     cancel_check_every = int(os.getenv(
                         "USER_CHATS_CANCEL_CHECK_EVERY_CHATS", "10",
@@ -2773,6 +2837,70 @@ class BackupWorker:
                             return cid, [], None
                         saved_cursor = existing_tokens.get(cid)
 
+                        # Per-chat failure record drives smart-skip. The naive
+                        # alternatives are both broken: "always retry" wastes
+                        # Graph budget on chats that will never succeed (e.g.
+                        # PERMISSION-denied meeting chats), and "retry N times
+                        # then skip forever" misses recovery after the operator
+                        # grants the missing scope. Smart-skip splits by error
+                        # class:
+                        #   PERMISSION (403) — skip while the SP's granted-scope
+                        #     fingerprint is unchanged from the failure point;
+                        #     the moment an admin grants a new appRole the
+                        #     fingerprint differs and we auto-retry.
+                        #   GONE (404)       — skip if the chat is no longer in
+                        #     the current chat list (cid pruned from
+                        #     chat_last_updated_map). If it reappears we retry.
+                        #   THROTTLE/AUTH/TRANSIENT — always retry; these are
+                        #     not deterministic, the next run may succeed.
+                        # The fingerprint + class are written into the failure
+                        # record so subsequent runs can make this decision
+                        # without any state outside Postgres.
+                        _prior_failure = existing_failures.get(cid) or {}
+                        _prior_count = int(_prior_failure.get("count", 0) or 0)
+                        _prior_class = _prior_failure.get("error_class")
+                        _prior_fp = _prior_failure.get(
+                            "granted_scopes_at_failure", "",
+                        )
+                        # Shard-assigned client for this chat. Each chat
+                        # talks to ONE app for the whole drain (deterministic
+                        # by hash(cid)) so retries land back on the same
+                        # bucket and the per-chat token cache stays warm.
+                        # Computed here (moved up from the drain loop) so the
+                        # smart-skip can read the shard's current scope
+                        # fingerprint before deciding whether to call Graph.
+                        _shard_client = _pick_chat_client(cid)
+                        _current_fp = _shard_scope_fps.get(
+                            _shard_client.client_id, "",
+                        )
+                        _should_skip_failed = False
+                        _skip_reason = ""
+                        if _prior_class == "PERMISSION":
+                            # Only skip if scopes are demonstrably the same.
+                            # Empty fp means the introspection call failed —
+                            # fail-open: attempt the drain rather than risk a
+                            # false skip (worst case wastes one 403).
+                            if _current_fp and _prior_fp and _current_fp == _prior_fp:
+                                _should_skip_failed = True
+                                _skip_reason = "permission unchanged"
+                        elif _prior_class == "GONE":
+                            if cid not in chat_last_updated_map:
+                                _should_skip_failed = True
+                                _skip_reason = "chat no longer in list"
+                        if _should_skip_failed:
+                            _progress["chats_done"] += 1
+                            if _progress["chats_done"] % cancel_check_every == 0:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"{user_label}: "
+                                    f"{_progress['chats_done']}/"
+                                    f"{len(chat_ids_to_drain)} chats, "
+                                    f"{_progress['msgs']} msgs so far "
+                                    f"(smart-skip chat {cid[:8]} — "
+                                    f"{_prior_class}: {_skip_reason})"
+                                )
+                            return cid, [], existing_tokens.get(cid)
+
                         # ── Chat-level drain skip (primary incremental win) ──
                         # Graph $filter=lastModifiedDateTime gt X on
                         # /chats/{id}/messages is unreliable — server-side
@@ -2820,6 +2948,20 @@ class BackupWorker:
 
                         msgs_local: List[Dict[str, Any]] = []
                         max_stamp: Optional[str] = None
+                        # Tracks whether the drain hit a non-retryable error.
+                        # Stays True only if every page came back cleanly. If
+                        # this ends up False we deliberately DO NOT advance
+                        # the per-chat cursor — the next backup re-runs the
+                        # query from the prior saved_cursor and recaptures
+                        # anything we missed (UNIQUE(snapshot_id, external_id,
+                        # item_type) makes the re-pull idempotent). Without
+                        # this guard, a transient 403/429/network error would
+                        # silently advance the cursor past messages we never
+                        # actually fetched, leaving them permanently missing
+                        # from subsequent incrementals. Observed 2026-05-13
+                        # on Amit Mishra's run where 5 chats / 4,660 msgs
+                        # were dropped this way.
+                        drain_succeeded = True
                         # Resume-on-5xx state. When Graph returns 502/503/504
                         # mid-pagination, the prior behavior was to log
                         # "(kept N)" and abandon the rest of the chat — which
@@ -2838,11 +2980,7 @@ class BackupWorker:
                             os.getenv("CHAT_DRAIN_RETRIES", "4")
                         )
                         chat_backoff_s = 2.0
-                        # Shard-assigned client for this chat. Each chat
-                        # talks to ONE app for the whole drain (deterministic
-                        # by hash(cid)) so retries land back on the same
-                        # bucket and the per-chat token cache stays warm.
-                        _shard_client = _pick_chat_client(cid)
+                        # _shard_client computed above (pre-skip) — reused here.
                         while True:
                             try:
                                 async with per_chat_sem:
@@ -2900,24 +3038,68 @@ class BackupWorker:
                                     continue
                                 # Non-retryable HTTP error (403/404/etc),
                                 # or retries exhausted — bail with what we
-                                # have, same as the pre-retry path.
+                                # have. Mark drain as failed so the cursor
+                                # checkpoint + return value below skip the
+                                # advancement; the next backup retries this
+                                # chat from the prior cursor.
+                                drain_succeeded = False
+                                _err_str = f"HTTP {status} {type(he).__name__}"
+                                _err_class = _classify_chat_drain_error(status, he)
+                                new_failures[cid] = {
+                                    "count": _prior_count + 1,
+                                    "last_error": _err_str,
+                                    "error_class": _err_class,
+                                    "granted_scopes_at_failure": _current_fp,
+                                    "shard_app_id": _shard_client.client_id,
+                                    "first_failed_at": _prior_failure.get(
+                                        "first_failed_at",
+                                        datetime.utcnow().isoformat() + "Z",
+                                    ),
+                                    "last_failed_at":
+                                        datetime.utcnow().isoformat() + "Z",
+                                }
                                 print(
                                     f"[{self.worker_id}] [USER_CHATS] chat "
                                     f"{cid[:8]} drain failed: "
                                     f"{type(he).__name__}: {he} "
-                                    f"(kept {len(msgs_local)})"
+                                    f"(kept {len(msgs_local)}, "
+                                    f"class={_err_class}, "
+                                    f"consecutive-failure #{_prior_count + 1}, "
+                                    f"cursor preserved — will retry next backup)"
                                 )
                                 break
                             except Exception as e:
-                                # Network / SDK errors — keep prior behavior.
-                                # _iter_pages itself has timeout retries, so
-                                # what reaches here is the post-retry-cap
-                                # failure. Don't double-retry.
+                                # Network / SDK errors — _iter_pages already
+                                # has its own retry budget; what reaches here
+                                # is the post-cap failure. Same cursor-
+                                # preservation contract as the HTTP branch
+                                # above.
+                                drain_succeeded = False
+                                _err_str = f"{type(e).__name__}: {str(e)[:80]}"
+                                # No HTTP status on network/SDK errors; classify
+                                # with None so we get TRANSIENT (always-retry).
+                                _err_class = _classify_chat_drain_error(None, e)
+                                new_failures[cid] = {
+                                    "count": _prior_count + 1,
+                                    "last_error": _err_str,
+                                    "error_class": _err_class,
+                                    "granted_scopes_at_failure": _current_fp,
+                                    "shard_app_id": _shard_client.client_id,
+                                    "first_failed_at": _prior_failure.get(
+                                        "first_failed_at",
+                                        datetime.utcnow().isoformat() + "Z",
+                                    ),
+                                    "last_failed_at":
+                                        datetime.utcnow().isoformat() + "Z",
+                                }
                                 print(
                                     f"[{self.worker_id}] [USER_CHATS] chat "
                                     f"{cid[:8]} drain failed: "
                                     f"{type(e).__name__}: {e} "
-                                    f"(kept {len(msgs_local)})"
+                                    f"(kept {len(msgs_local)}, "
+                                    f"class={_err_class}, "
+                                    f"consecutive-failure #{_prior_count + 1}, "
+                                    f"cursor preserved — will retry next backup)"
                                 )
                                 break
 
@@ -3013,7 +3195,12 @@ class BackupWorker:
                             # which is idempotent thanks to the UNIQUE
                             # (snapshot_id, external_id, item_type)
                             # constraint on TEAMS_CHAT_MESSAGE rows.
-                            if max_stamp:
+                            #
+                            # Skip the checkpoint entirely when drain
+                            # failed mid-flight — advancing the cursor
+                            # past a partial drain permanently drops
+                            # everything after the failure point.
+                            if max_stamp and drain_succeeded:
                                 try:
                                     async with async_session_factory() as _ck:
                                         _r = await _ck.get(Resource, resource.id)
@@ -3075,7 +3262,17 @@ class BackupWorker:
                                     f"{user_label}: job cancelled — "
                                     f"short-circuiting remaining drains"
                                 )
-                        return cid, msgs_local, max_stamp
+                        # Clear any prior failure record on a clean drain so
+                        # transient failures (1-2 misses) reset the counter
+                        # and don't accumulate toward the permanent-skip
+                        # threshold over months of incrementals.
+                        if drain_succeeded and cid in existing_failures:
+                            new_failures[cid] = None
+                        # Return None as the new cursor when the drain
+                        # failed so the end-of-drain merge does not write
+                        # new_tokens[cid]; existing saved_cursor stays
+                        # intact and the next backup retries from there.
+                        return cid, msgs_local, (max_stamp if drain_succeeded else None)
 
                     async def _drain_chats_parallel() -> None:
                         results = await asyncio.gather(
@@ -3239,6 +3436,22 @@ class BackupWorker:
                                     )
                                     merged.update(new_tokens)
                                     ed["chat_delta_tokens"] = merged
+                                # Merge per-chat drain-failure state. Successes
+                                # clear stale records (entry=None → pop), new
+                                # failures increment the counter. Chats that
+                                # hit MAX_DRAIN_FAILURES stay in this dict so
+                                # the next backup's skip-check fires before
+                                # any HTTP call.
+                                if new_failures:
+                                    _merged_fails = dict(
+                                        ed.get("chat_drain_failures") or {},
+                                    )
+                                    for _cid, _state in new_failures.items():
+                                        if _state is None:
+                                            _merged_fails.pop(_cid, None)
+                                        else:
+                                            _merged_fails[_cid] = _state
+                                    ed["chat_drain_failures"] = _merged_fails
                                 # Replace cache wholesale with what we saw
                                 # this run — drops entries for chats the
                                 # user has left.

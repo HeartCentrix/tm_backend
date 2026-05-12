@@ -198,6 +198,60 @@ class GraphClient:
         """Return the app client ID for tracking purposes"""
         return self.client_id
 
+    async def get_granted_scope_fingerprint(self) -> str:
+        """Returns a short hash that uniquely identifies THIS app's currently-
+        granted application permissions in the active tenant.
+
+        Used by the chat-drain "smart skip" path: when a chat fails with 403,
+        we record the fingerprint at failure-time. On subsequent backups we
+        compare the current fingerprint to the recorded one — same value
+        means "no permission change since failure, don't bother retrying";
+        different value means an admin granted/revoked a permission, retry.
+
+        Source of truth: GET /servicePrincipals(appId='<id>')/appRoleAssignments
+        which lists every application-permission grant for this app in this
+        tenant. Each grant has a stable `appRoleId` GUID (e.g. the GUID for
+        Chat.Read.All). Sort the GUIDs, hash, return a 16-char hex digest —
+        small enough to store cheaply on every chat failure record, stable
+        across runs, changes only when an admin adds/removes a permission.
+
+        Cached per-instance so repeated calls during one backup don't burn
+        Graph budget. ~1 query per shard app per backup."""
+        cached = getattr(self, "_granted_scope_fingerprint", None)
+        if cached is not None:
+            return cached
+        try:
+            token = await self._get_token()
+            url = (
+                f"{self.GRAPH_URL}/servicePrincipals(appId='{self.client_id}')"
+                "/appRoleAssignments?$select=appRoleId&$top=200"
+            )
+            http = await self._get_shared_http()
+            resp = await http.get(
+                url, headers={"Authorization": f"Bearer {token}"}, timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json() or {}
+            role_ids = sorted(
+                str(item.get("appRoleId") or "")
+                for item in (data.get("value") or [])
+                if item.get("appRoleId")
+            )
+            fp = hashlib.sha256(",".join(role_ids).encode()).hexdigest()[:16]
+            self._granted_scope_fingerprint = fp
+            return fp
+        except Exception as e:
+            # Fail-open: empty string compares != to any real fingerprint
+            # so callers will retry rather than skip. Better to waste one
+            # Graph call than to permanently skip a chat we could have
+            # backed up.
+            log = logging.getLogger("tmvault.graph_client")
+            log.warning(
+                "get_granted_scope_fingerprint failed for app %s: %s",
+                self.client_id, e,
+            )
+            return ""
+
     async def _get_token(self) -> str:
         """Get or refresh access token using client credentials with retry."""
         if self._access_token and self._token_expiry and datetime.utcnow() < self._token_expiry:
