@@ -4507,13 +4507,10 @@ class BackupWorker:
         upload_sem = asyncio.Semaphore(max(
             1, int(os.getenv("CHAT_HC_UPLOAD_CONCURRENCY", "32"))
         ))
-        # Snapshot dedup-state sizes at entry, so the phase-complete log
-        # reports THIS call's contribution rather than the cumulative
-        # cross-chat totals (which would print identical numbers from
-        # every per-chat kick once the cache fills up).
-        _pre_urls = len(url_cache)
-        _pre_di = len(driveitem_tasks)
-        _pre_hash = len(hash_upload_tasks)
+        # Snapshot dedup-counter values at entry. The phase-complete log
+        # prints (current - entry) so each per-chat kick reports its
+        # contribution to upload / db-dedup / in-phase-dedup activity
+        # instead of the cumulative snapshot-wide totals.
         _pre_uploads = hash_stats["uploads"]
         _pre_db_hits = hash_stats["db_hits"]
         _pre_phase_hits = hash_stats["in_phase_hits"]
@@ -4918,48 +4915,33 @@ class BackupWorker:
 
         # Phase-end telemetry.
         #
-        # Reports THIS call's contribution as deltas. With snapshot-wide
-        # dedup, the shared caches grow across every per-chat call —
-        # logging cumulative sizes would print misleadingly-large
-        # "unique URL" counts that don't correspond to this chat's
-        # work. Deltas show how many NEW unique URLs / driveItems /
-        # hashes this call added on top of what the prior kicks
-        # already resolved. Cumulative numbers are recovered by
-        # summing the deltas (the snapshot-level summary lives
-        # elsewhere, in the USER_CHATS finalize block).
-        new_urls = len(url_cache) - _pre_urls
-        new_di = len(driveitem_tasks) - _pre_di
-        new_hash = len(hash_upload_tasks) - _pre_hash
-        if new_urls or new_di or new_hash or all_items:
-            new_uploads = hash_stats["uploads"] - _pre_uploads
-            new_db_hits = hash_stats["db_hits"] - _pre_db_hits
-            new_phase_hits = hash_stats["in_phase_hits"] - _pre_phase_hits
-            new_di_hits = di_dedup_hits["n"] - _pre_di_hits
-            # `resolved_count` is over THIS call's new URLs only.
-            new_url_keys = list(url_cache.keys())[_pre_urls:]
-            resolved_count = sum(
-                1 for k in new_url_keys if url_cache.get(k) is not None
-            )
-            unreachable_count = len(new_url_keys) - resolved_count
+        # `len(all_items)` and `len(messages_with_attachments)` are
+        # accurate per-call (this call's own gathers). The shared-cache
+        # state, however, reflects the cumulative snapshot-wide totals
+        # because every concurrent per-chat kick reads/writes the same
+        # dicts. Reporting it as "shared-cache" makes that explicit.
+        # The dedup-saved counters in `hash_stats` / `di_dedup_hits`
+        # are atomic int updates — printing the deltas vs entry is
+        # roughly per-call but can include increments from concurrent
+        # kicks; treat them as advisory.
+        new_uploads = hash_stats["uploads"] - _pre_uploads
+        new_db_hits = hash_stats["db_hits"] - _pre_db_hits
+        new_phase_hits = hash_stats["in_phase_hits"] - _pre_phase_hits
+        new_di_hits = di_dedup_hits["n"] - _pre_di_hits
+        if all_items or new_uploads or new_db_hits or new_phase_hits:
             print(
                 f"[{self.worker_id}] [CHAT-ATT] phase complete: "
                 f"{len(all_items)} items across "
-                f"{len(messages_with_attachments)} msgs, "
-                f"+{new_urls} new URLs "
-                f"({resolved_count} resolved, "
-                f"{unreachable_count} unreachable) → "
-                f"+{new_di} new driveItems "
-                f"(saved {new_di_hits} redundant downloads) → "
-                f"+{new_hash} new content_hashes "
-                f"[uploads={new_uploads}, "
-                f"db_dedup={new_db_hits}, "
-                f"in_phase_dedup={new_phase_hits}]"
+                f"{len(messages_with_attachments)} msgs "
+                f"[uploads≈{new_uploads}, "
+                f"db_dedup≈{new_db_hits}, "
+                f"in_phase_dedup≈{new_phase_hits}, "
+                f"di_dedup≈{new_di_hits}] "
+                f"shared-cache: {len(url_cache)} urls, "
+                f"{len(driveitem_tasks)} driveItems, "
+                f"{len(hash_upload_tasks)} hashes"
                 + (f" [deduped {dup_count} in-memory collision(s)]"
                    if dup_count else "")
-                + (f" [shared-cache: {len(url_cache)} urls, "
-                   f"{len(driveitem_tasks)} driveItems, "
-                   f"{len(hash_upload_tasks)} hashes]"
-                   if (_pre_urls + _pre_di + _pre_hash) else "")
             )
         return all_items, total_bytes
 
