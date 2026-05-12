@@ -3754,16 +3754,39 @@ class BackupWorker:
                 # re-hash 10k bodies) — that filter would otherwise mask the
                 # real EMAIL row count and the UI would show "37 items" for a
                 # 950-row snapshot.
+                #
+                # item_count is the user-facing "X items" number. Exclude
+                # attachment / inline-content child rows so the UI shows
+                # real conversational/primary content only:
+                #   - CHAT_ATTACHMENT       — file in a chat (one row per attachment)
+                #   - EMAIL_ATTACHMENT      — file on an email (one row per attachment)
+                #   - CHAT_HOSTED_CONTENT   — inline image / sticker in a chat
+                # The rows still exist (and bytes still count), but they're
+                # child metadata of a parent message — they shouldn't pad
+                # the "messages" or "emails" count the user reads as scope.
+                CHILD_ITEM_TYPES = (
+                    "CHAT_ATTACHMENT",
+                    "EMAIL_ATTACHMENT",
+                    "CHAT_HOSTED_CONTENT",
+                )
                 async with async_session_factory() as _count_sess:
                     _row = (await _count_sess.execute(
                         select(
-                            func.count(SnapshotItem.id),
+                            func.count(SnapshotItem.id).filter(
+                                ~SnapshotItem.item_type.in_(CHILD_ITEM_TYPES)
+                            ),
                             func.coalesce(func.sum(SnapshotItem.content_size), 0),
                         ).where(SnapshotItem.snapshot_id == snapshot.id)
                     )).one()
                     persisted_count = int(_row[0] or 0)
                     persisted_bytes = int(_row[1] or 0)
-                fallback_total = len(items_data) + len(att_items) + total_hosted_items
+                # fallback_total still uses len(att_items) because Phase-2
+                # fall-through att_items represent real per-attachment rows
+                # — but they're the same CHAT_ATTACHMENT / EMAIL_ATTACHMENT
+                # rows we're filtering out above, so don't add them to the
+                # fallback either. items_data is the primary content
+                # collection; that's the only number we want here.
+                fallback_total = len(items_data)
                 total_items = max(persisted_count, fallback_total)
                 # Roll in attachment bytes from the Phase-2 fall-through and
                 # then take max against persisted_bytes (which is the authoritative
