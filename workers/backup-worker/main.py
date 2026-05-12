@@ -1208,11 +1208,42 @@ class BackupWorker:
                     # Mirrors what the legacy mailbox handler did so messages
                     # in nested folders show under their real path instead of
                     # all collapsing to "Inbox".
+                    #
+                    # with_stats=True asks Graph to include totalItemCount /
+                    # unreadItemCount / sizeInBytes in the SAME HTTP call,
+                    # so we can build a per-folder fingerprint for the
+                    # Layer C skip-by-fingerprint check below at zero extra
+                    # cost.
                     try:
-                        folder_tree = await graph_client.get_mail_folder_tree(user_id)
+                        folder_tree_full = (
+                            await graph_client.get_mail_folder_tree(
+                                user_id, with_stats=True,
+                            )
+                        )
                     except Exception as e:
                         print(f"[{self.worker_id}] [USER_MAIL] folder tree fetch failed for {user_id}: {e}")
-                        folder_tree = {}
+                        folder_tree_full = {}
+                    # Path-only view for downstream code that just needs
+                    # folder_tree[fid] → "/Inbox/Subfolder".
+                    folder_tree: Dict[str, str] = {
+                        fid: (
+                            (entry.get("path") if isinstance(entry, dict)
+                             else entry) or ""
+                        )
+                        for fid, entry in folder_tree_full.items()
+                    }
+                    # Fingerprint per folder. Identical values across two
+                    # runs ⇒ no message has been added, removed, or read/
+                    # unread-toggled in that folder — skip its delta call.
+                    folder_fingerprints_now: Dict[str, str] = {
+                        fid: (
+                            f"{int(entry.get('totalItemCount') or 0)}|"
+                            f"{int(entry.get('unreadItemCount') or 0)}|"
+                            f"{int(entry.get('sizeInBytes') or 0)}"
+                        )
+                        for fid, entry in folder_tree_full.items()
+                        if isinstance(entry, dict)
+                    }
 
                     # Per-folder parallel delta drain — replaces the legacy
                     # single serial /users/{uid}/messages chain. Mail folder
@@ -1249,7 +1280,73 @@ class BackupWorker:
                     )
                     mail_sem = asyncio.Semaphore(max(1, mail_fanout))
                     mail_progress = {"folders_done": 0, "msgs": 0}
-                    mail_folder_ids = list(folder_tree.keys()) or [None]
+
+                    # ─── Layer C: skip-by-fingerprint ──────────────────────
+                    # Skip a folder's per-delta call when its
+                    # totalItemCount/unreadItemCount/sizeInBytes triple
+                    # matches the fingerprint we stored at the end of the
+                    # previous successful USER_MAIL run. Graph guarantees
+                    # at least one of these changes when ANY message in
+                    # the folder is added, removed, or has its is_read
+                    # flag toggled, so identical fingerprints = no work.
+                    #
+                    # 3-day safety net via USER_MAIL_FULL_RESCAN_DAYS:
+                    # forces every folder to drain at least once per
+                    # window, catching any silent Graph counter drift.
+                    _ed_mail = dict(resource.extra_data or {})
+                    _mail_fps_prev: Dict[str, str] = (
+                        _ed_mail.get("mail_folder_fingerprints") or {}
+                    )
+                    _mail_baseline_iso = _ed_mail.get(
+                        "mail_folder_baseline_at",
+                    )
+                    _mail_baseline_dt: Optional[datetime] = None
+                    if _mail_baseline_iso:
+                        try:
+                            _mail_baseline_dt = datetime.fromisoformat(
+                                str(_mail_baseline_iso).replace("Z", "")
+                            )
+                        except Exception:
+                            _mail_baseline_dt = None
+                    _mail_rescan_days = int(
+                        os.getenv("USER_MAIL_FULL_RESCAN_DAYS", "3"),
+                    )
+                    _mail_force_full = (
+                        _mail_baseline_dt is None
+                        or (
+                            datetime.utcnow() - _mail_baseline_dt
+                        ).total_seconds() > _mail_rescan_days * 86400
+                    )
+
+                    _all_folder_ids = list(folder_tree.keys()) or [None]
+                    mail_folder_ids: List[Optional[str]] = []
+                    _mail_folders_skipped: List[str] = []
+                    for _fid in _all_folder_ids:
+                        if not _fid:
+                            mail_folder_ids.append(_fid)
+                            continue
+                        if _mail_force_full:
+                            mail_folder_ids.append(_fid)
+                            continue
+                        fp_now = folder_fingerprints_now.get(_fid)
+                        fp_prev = _mail_fps_prev.get(_fid)
+                        if fp_now and fp_prev and fp_now == fp_prev:
+                            _mail_folders_skipped.append(_fid)
+                        else:
+                            mail_folder_ids.append(_fid)
+                    _mail_skip_mode = (
+                        "full-rescan" if _mail_force_full
+                        else (
+                            f"baseline={_mail_baseline_dt.isoformat()}"
+                            if _mail_baseline_dt else "first-run"
+                        )
+                    )
+                    print(
+                        f"[{self.worker_id}] [USER_MAIL] skip-by-fp: "
+                        f"{len(_mail_folders_skipped)} folders unchanged, "
+                        f"{len([f for f in mail_folder_ids if f])} to drain "
+                        f"(mode={_mail_skip_mode})"
+                    )
 
                     # Streaming-persist bookkeeping (mirror of the USER_CHATS
                     # path). Each folder's msgs persist the instant that
@@ -1558,12 +1655,16 @@ class BackupWorker:
                     # only pull new messages per folder. Merge with
                     # existing so a failed folder doesn't wipe tokens
                     # we still hold for the rest.
-                    if mail_new_tokens:
-                        try:
-                            async with async_session_factory() as _s:
-                                r = await _s.get(Resource, resource.id)
-                                if r is not None:
-                                    ed = dict(r.extra_data or {})
+                    #
+                    # Also refresh mail_folder_fingerprints + advance
+                    # mail_folder_baseline_at so the next incremental can
+                    # skip unchanged folders via Layer C.
+                    try:
+                        async with async_session_factory() as _s:
+                            r = await _s.get(Resource, resource.id)
+                            if r is not None:
+                                ed = dict(r.extra_data or {})
+                                if mail_new_tokens:
                                     merged = dict(
                                         ed.get(
                                             "mail_delta_tokens_by_folder",
@@ -1571,13 +1672,28 @@ class BackupWorker:
                                     )
                                     merged.update(mail_new_tokens)
                                     ed["mail_delta_tokens_by_folder"] = merged
-                                    r.extra_data = ed
-                                    await _s.commit()
-                        except Exception as _e:
-                            print(
-                                f"[{self.worker_id}] [USER_MAIL] delta "
-                                f"persist failed: {_e}"
-                            )
+                                # Merge fingerprints: skipped folders keep
+                                # their prior value; drained folders pick up
+                                # the freshly observed value. Folders that
+                                # vanished (deleted by user) drop off.
+                                merged_fps = {
+                                    fid: folder_fingerprints_now.get(
+                                        fid,
+                                        _mail_fps_prev.get(fid),
+                                    )
+                                    for fid in folder_fingerprints_now.keys()
+                                }
+                                ed["mail_folder_fingerprints"] = merged_fps
+                                ed["mail_folder_baseline_at"] = (
+                                    datetime.utcnow().isoformat()
+                                )
+                                r.extra_data = ed
+                                await _s.commit()
+                    except Exception as _e:
+                        print(
+                            f"[{self.worker_id}] [USER_MAIL] delta/fp "
+                            f"persist failed: {_e}"
+                        )
 
                     # When streaming persist ran per-folder inline, reduce
                     # the returned list to attachment-candidates only so
@@ -1796,28 +1912,159 @@ class BackupWorker:
                     )
                     chats_start_mono = time.monotonic()
                     chat_meta: Dict[str, Dict[str, Any]] = {}
+                    # Layer D: ask Graph to inline each chat's member list
+                    # via $expand=members so we skip the per-chat /members
+                    # $batch entirely. On tenants where $expand returns
+                    # 400 (older Graph builds occasionally do), retry
+                    # without it and fall back to the $batch path.
+                    chat_members_inline: bool = False
                     try:
                         list_page = await graph_client._get(
                             f"{graph_client.GRAPH_URL}/users/{user_id}/chats",
-                            params={"$top": "200", "$select": "id,topic,chatType"},
+                            params={
+                                "$top": "200",
+                                "$select": "id,topic,chatType,lastUpdatedDateTime",
+                                "$expand": "members",
+                            },
                         )
                         chats_raw = (list_page or {}).get("value", []) or []
-                    except Exception as e:
-                        print(f"[{self.worker_id}] [USER_CHATS] chats list failed for {user_id}: {e}")
-                        chats_raw = []
+                        chat_members_inline = True
+                    except Exception as e_expand:
+                        # Retry without $expand. Distinguish a Graph 400
+                        # (unsupported) from a transient error — either
+                        # way we degrade to the legacy $batch path.
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] $expand=members "
+                            f"unsupported, falling back to $batch: "
+                            f"{type(e_expand).__name__}: {e_expand}"
+                        )
+                        try:
+                            list_page = await graph_client._get(
+                                f"{graph_client.GRAPH_URL}/users/{user_id}/chats",
+                                params={
+                                    "$top": "200",
+                                    "$select": (
+                                        "id,topic,chatType,"
+                                        "lastUpdatedDateTime"
+                                    ),
+                                },
+                            )
+                            chats_raw = (list_page or {}).get("value", []) or []
+                        except Exception as e:
+                            print(f"[{self.worker_id}] [USER_CHATS] chats list failed for {user_id}: {e}")
+                            chats_raw = []
 
-                    # Batch /chats/{id}/members via /v1.0/$batch — one HTTP
-                    # call per 20 chats instead of 200 individual _get's.
-                    # Cuts throttle cost ~20× vs the old 8-way gather.
+                    # ─── Incremental skip-by-activity (Layer A) ────────────
+                    # Skip member-batch + display-name rebuild for chats
+                    # whose lastUpdatedDateTime is at-or-before the baseline
+                    # we captured at the end of the previous successful
+                    # USER_CHATS run. Per-chat delta is still called for
+                    # every chat (token validation), so a stale Graph
+                    # timestamp would only delay metadata refresh — never
+                    # cause missing messages.
+                    #
+                    # 3-day safety net: if the baseline is older than that,
+                    # rebuild every chat's metadata from scratch (handles
+                    # any Graph timestamp drift / member-list churn we
+                    # missed).
+                    _now = datetime.utcnow()
+                    _ed_existing = dict(resource.extra_data or {})
+                    _baseline_iso = _ed_existing.get("chat_skip_baseline_at")
+                    _baseline_dt: Optional[datetime] = None
+                    if _baseline_iso:
+                        try:
+                            _baseline_dt = datetime.fromisoformat(
+                                str(_baseline_iso).replace("Z", "")
+                            )
+                        except Exception:
+                            _baseline_dt = None
+                    _rescan_window_days = int(
+                        os.getenv("USER_CHATS_FULL_RESCAN_DAYS", "3"),
+                    )
+                    _force_full_chat_rescan = (
+                        _baseline_dt is None
+                        or (_now - _baseline_dt).total_seconds()
+                        > _rescan_window_days * 86400
+                    )
+                    _cached_chat_meta: Dict[str, Dict[str, Any]] = (
+                        _ed_existing.get("chat_meta_cache") or {}
+                    )
+
+                    def _chat_changed(ch: Dict[str, Any]) -> bool:
+                        if _force_full_chat_rescan or _baseline_dt is None:
+                            return True
+                        ts = ch.get("lastUpdatedDateTime")
+                        if not ts:
+                            return True
+                        try:
+                            ch_dt = datetime.fromisoformat(
+                                str(ts).replace("Z", "")
+                            )
+                        except Exception:
+                            return True
+                        return ch_dt > _baseline_dt
+
+                    # Partition: chats needing a member fetch (new or
+                    # recently updated) vs those we can serve from cache.
+                    fresh_chats: List[Dict[str, Any]] = []
+                    reuse_chats: List[Dict[str, Any]] = []
+                    for ch in chats_raw:
+                        cid = ch.get("id")
+                        if not cid:
+                            continue
+                        cached = _cached_chat_meta.get(cid)
+                        if cached and not _chat_changed(ch):
+                            reuse_chats.append(ch)
+                        else:
+                            fresh_chats.append(ch)
+
+                    _skip_mode = (
+                        "full-rescan"
+                        if _force_full_chat_rescan
+                        else f"baseline={_baseline_dt.isoformat()}"
+                    )
+                    print(
+                        f"[{self.worker_id}] [USER_CHATS] skip-by-activity: "
+                        f"{len(reuse_chats)} reused from cache, "
+                        f"{len(fresh_chats)} need member fetch "
+                        f"(mode={_skip_mode})"
+                    )
+
+                    # Layer D first: harvest inline-expanded members when
+                    # Graph honoured $expand=members. Zero extra HTTP cost
+                    # because the data already rode on the chat-list page.
+                    member_lookup: Dict[str, Tuple[List[str], List[str]]] = {}
+                    if chat_members_inline:
+                        for c in chats_raw:
+                            cid = c.get("id")
+                            if not cid:
+                                continue
+                            inline = c.get("members") or []
+                            emails = [
+                                m.get("email") for m in inline
+                                if m.get("email")
+                            ]
+                            names = [
+                                m.get("displayName") for m in inline
+                                if m.get("displayName")
+                            ]
+                            member_lookup[cid] = (emails, names)
+
+                    # Fallback path: $batch /chats/{id}/members for any
+                    # fresh chat we don't yet have members for (legacy
+                    # tenants where $expand=members was unsupported).
+                    # One HTTP call per 20 chats instead of 200 individual
+                    # _get's. Cuts throttle cost ~20× vs the old 8-way
+                    # gather.
                     from shared.graph_batch import BatchRequest
                     batch_reqs = [
                         BatchRequest(
                             id=c["id"], method="GET",
                             url=f"/chats/{c['id']}/members",
                         )
-                        for c in chats_raw if c.get("id")
+                        for c in fresh_chats
+                        if c.get("id") and c["id"] not in member_lookup
                     ]
-                    member_lookup: Dict[str, Tuple[List[str], List[str]]] = {}
                     if batch_reqs:
                         try:
                             batch_result = await graph_client.batch(batch_reqs)
@@ -1836,7 +2083,17 @@ class BackupWorker:
                             else:
                                 member_lookup[cid] = ([], [])
 
-                    for ch in chats_raw:
+                    # Replay cached metadata for reused chats — no member
+                    # fetch needed, just rehydrate the existing entry into
+                    # chat_meta so the rest of the drain loop sees a uniform
+                    # map shape.
+                    for ch in reuse_chats:
+                        cid = ch.get("id")
+                        cached = _cached_chat_meta.get(cid)
+                        if cid and cached:
+                            chat_meta[cid] = dict(cached)
+
+                    for ch in fresh_chats:
                         cid = ch.get("id")
                         if not cid:
                             continue
@@ -1910,6 +2167,22 @@ class BackupWorker:
                         ) or {},
                     )
                     new_tokens: Dict[str, str] = {}
+
+                    # Chat-level last-updated map for the drain-skip path
+                    # below. Graph $filter=lastModifiedDateTime gt X on
+                    # /chats/{id}/messages doesn't actually filter
+                    # server-side — observed: 3 successive USER_CHATS runs
+                    # each pulled 19,331 messages despite valid per-chat
+                    # cursors in DB. The chat list's top-level
+                    # lastUpdatedDateTime IS reliable, so we use it to
+                    # short-circuit drain for chats that haven't been
+                    # touched since the last successful run.
+                    chat_last_updated_map: Dict[str, str] = {}
+                    for c in chats_raw:
+                        _cid = c.get("id")
+                        _lu = c.get("lastUpdatedDateTime")
+                        if _cid and _lu:
+                            chat_last_updated_map[_cid] = _lu
 
                     chat_ids_to_drain = [
                         cid for cid in chat_meta.keys() if cid
@@ -2135,6 +2408,37 @@ class BackupWorker:
                         if _chat_fanout_cancelled:
                             return cid, [], None
                         saved_cursor = existing_tokens.get(cid)
+
+                        # ── Chat-level drain skip (primary incremental win) ──
+                        # Graph $filter=lastModifiedDateTime gt X on
+                        # /chats/{id}/messages is unreliable — server-side
+                        # filtering is silently ignored on most chat types,
+                        # causing the per-message $filter path below to re-
+                        # pull every message on every incremental run.
+                        # However the chat list's top-level lastUpdatedDateTime
+                        # IS reliable: if it's at-or-before our saved cursor
+                        # for this chat, nothing has happened in this chat
+                        # since we last drained it. Skip the HTTP round-trip
+                        # entirely and re-emit the existing cursor so the
+                        # end-of-drain persist keeps it fresh.
+                        if (
+                            saved_cursor
+                            and not str(saved_cursor).startswith("http")
+                        ):
+                            chat_lu = chat_last_updated_map.get(cid)
+                            if chat_lu and chat_lu <= saved_cursor:
+                                _progress["chats_done"] += 1
+                                if _progress["chats_done"] % cancel_check_every == 0:
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"{user_label}: "
+                                        f"{_progress['chats_done']}/"
+                                        f"{len(chat_ids_to_drain)} chats, "
+                                        f"{_progress['msgs']} msgs so far "
+                                        f"(skipped chat {cid[:8]} — "
+                                        f"no activity since cursor)"
+                                    )
+                                return cid, [], saved_cursor
                         url = f"{graph_client.GRAPH_URL}/chats/{cid}/messages"
                         params: Dict[str, str] = {"$top": "50"}
                         # If saved_cursor looks like a full URL (legacy
@@ -2247,6 +2551,24 @@ class BackupWorker:
                                     f"(kept {len(msgs_local)})"
                                 )
                                 break
+
+                        # Advance cursor past chat.lastUpdatedDateTime
+                        # even when message timestamps lag behind. Graph
+                        # bumps chat.lastUpdatedDateTime on non-message
+                        # activity (reactions, system events) without
+                        # producing rows in /messages, so the per-chat
+                        # skip check sees chat_lu > saved_cursor on every
+                        # subsequent run and re-drains the same data.
+                        # Pinning the cursor to max(msg_max, chat_lu)
+                        # closes that loop: once we've drained for a
+                        # given chat_lu, we won't drain it again until
+                        # something actually moves chat_lu forward.
+                        chat_lu_local = chat_last_updated_map.get(cid)
+                        if chat_lu_local and (
+                            max_stamp is None or chat_lu_local > max_stamp
+                        ):
+                            max_stamp = chat_lu_local
+
                         # Streaming persist — if a snapshot is in scope,
                         # persist this chat's items RIGHT NOW instead of
                         # accumulating into all_msgs + one mega-commit
@@ -2437,21 +2759,36 @@ class BackupWorker:
                     # pull new messages per-chat. Merge with existing map
                     # so a failed chat doesn't wipe tokens we still hold
                     # for others.
-                    if new_tokens:
-                        try:
-                            async with async_session_factory() as _s:
-                                r = await _s.get(Resource, resource.id)
-                                if r is not None:
-                                    ed = dict(r.extra_data or {})
+                    #
+                    # Also persist chat_meta_cache + chat_skip_baseline_at
+                    # so the next incremental can reuse member/display-name
+                    # metadata for chats whose lastUpdatedDateTime is at-or-
+                    # before the baseline (see Layer A skip block above).
+                    try:
+                        async with async_session_factory() as _s:
+                            r = await _s.get(Resource, resource.id)
+                            if r is not None:
+                                ed = dict(r.extra_data or {})
+                                if new_tokens:
                                     merged = dict(
                                         ed.get("chat_delta_tokens") or {},
                                     )
                                     merged.update(new_tokens)
                                     ed["chat_delta_tokens"] = merged
-                                    r.extra_data = ed
-                                    await _s.commit()
-                        except Exception as _e:
-                            print(f"[{self.worker_id}] [USER_CHATS] delta persist failed: {_e}")
+                                # Replace cache wholesale with what we saw
+                                # this run — drops entries for chats the
+                                # user has left.
+                                ed["chat_meta_cache"] = {
+                                    cid: dict(meta)
+                                    for cid, meta in chat_meta.items()
+                                }
+                                ed["chat_skip_baseline_at"] = (
+                                    datetime.utcnow().isoformat()
+                                )
+                                r.extra_data = ed
+                                await _s.commit()
+                    except Exception as _e:
+                        print(f"[{self.worker_id}] [USER_CHATS] delta/meta persist failed: {_e}")
 
                     # When streaming persist ran inline per-chat, the
                     # heavy lift is already in the DB — item_count was

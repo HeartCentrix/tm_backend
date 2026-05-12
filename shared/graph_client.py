@@ -3773,18 +3773,34 @@ class GraphClient:
     # restore — without the full path we can only restore items to a flat root.
 
     async def get_mail_folder_tree(
-        self, user_id: str, well_known_root: Optional[str] = None,
-    ) -> Dict[str, str]:
+        self,
+        user_id: str,
+        well_known_root: Optional[str] = None,
+        with_stats: bool = False,
+    ):
         """Return a flat map: folder_id → full path like "/Inbox/Subfolder".
 
         If well_known_root is provided (e.g., 'archive', 'recoverableitemsroot'),
         starts the walk at that special folder instead of the primary mailbox.
         Returns empty dict if the root folder doesn't exist (no archive license,
-        no Exchange mailbox, etc.)."""
+        no Exchange mailbox, etc.).
+
+        When ``with_stats=True`` the returned shape switches to
+        ``Dict[fid, {"path": str, "totalItemCount": int,
+        "unreadItemCount": int, "sizeInBytes": int}]`` — same HTTP cost
+        (Graph returns these fields for free, we just add them to
+        ``$select``), but lets callers build a fingerprint per folder
+        for incremental skip decisions.
+        """
+        sel_base = "id,displayName,childFolderCount"
+        sel_stats = (
+            sel_base + ",totalItemCount,unreadItemCount,sizeInBytes"
+            if with_stats else sel_base
+        )
         if well_known_root:
             root_url = f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{well_known_root}"
             try:
-                root = await self._get(root_url, params={"$select": "id,displayName"})
+                root = await self._get(root_url, params={"$select": sel_stats})
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in (403, 404):
                     return {}
@@ -3794,7 +3810,7 @@ class GraphClient:
             try:
                 top = await self._get(
                     f"{self.GRAPH_URL}/users/{user_id}/mailFolders",
-                    params={"$top": "200", "$select": "id,displayName"},
+                    params={"$top": "200", "$select": sel_stats},
                 )
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in (403, 404):
@@ -3802,14 +3818,24 @@ class GraphClient:
                 raise
             roots = top.get("value", []) or []
 
-        tree: Dict[str, str] = {}
+        tree: Dict[str, Any] = {}
+
+        def _entry(folder: Dict[str, Any], path: str) -> Any:
+            if not with_stats:
+                return path
+            return {
+                "path": path,
+                "totalItemCount": int(folder.get("totalItemCount") or 0),
+                "unreadItemCount": int(folder.get("unreadItemCount") or 0),
+                "sizeInBytes": int(folder.get("sizeInBytes") or 0),
+            }
 
         async def walk(folder: Dict[str, Any], parent_path: str) -> None:
             fid = folder.get("id")
             name = folder.get("displayName") or "(unnamed)"
             path = f"{parent_path}/{name}"
             if fid:
-                tree[fid] = path
+                tree[fid] = _entry(folder, path)
             # Each folder has a childFolderCount field; only descend if > 0 to
             # avoid wasted requests on leaves.
             if folder.get("childFolderCount", 0) <= 0:
@@ -3819,7 +3845,7 @@ class GraphClient:
             try:
                 child_resp = await self._get(
                     f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{fid}/childFolders",
-                    params={"$top": "200", "$select": "id,displayName,childFolderCount"},
+                    params={"$top": "200", "$select": sel_stats},
                 )
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in (403, 404):
