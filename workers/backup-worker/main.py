@@ -857,12 +857,14 @@ class BackupWorker:
         # Connection released to pool here.
 
         # ── Step 2: network work without a pinned session ─────────────────
-        graph_client = await self.get_graph_client(tenant)
+        resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
+        # Per-resource-type handler_key gives each Tier 2 handler its own
+        # Graph app from the round-robin pool, so 6 concurrent handlers on
+        # the same tenant don't all queue behind one app's RPS budget.
+        graph_client = await self.get_graph_client(tenant, handler_key=resource_type)
         if not graph_client:
             print(f"[{self.worker_id}] Graph client not available for resource {resource_id}, skipping")
             return
-
-        resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
         print(f"[{self.worker_id}] Processing backup for {resource_id} (type={resource_type}, tenant={tenant.id})")
 
         # create_snapshot opens + closes its own short-lived session.
@@ -1136,11 +1138,10 @@ class BackupWorker:
         if not resources:
             return {"item_count": 0, "bytes_added": 0}
 
-        graph_client = await self.get_graph_client(tenant)
+        resource_type = resources[0].type.value
+        graph_client = await self.get_graph_client(tenant, handler_key=resource_type)
         if not graph_client:
             return {"item_count": 0, "bytes_added": 0, "error": "No Graph client"}
-
-        resource_type = resources[0].type.value
 
         # Dispatch to type-specific handler with parallelism
         if resource_type in ("ONEDRIVE", "SHAREPOINT_SITE"):
@@ -2102,8 +2103,23 @@ class BackupWorker:
                             return True
                         return ch_dt > _baseline_dt
 
+                    def _cached_name_is_fallback(c: Dict[str, Any]) -> bool:
+                        # A cached entry whose displayName is the synthetic
+                        # "(19:xxxxx)" placeholder is worse than no cache —
+                        # reusing it locks the bad name in for the whole
+                        # baseline window. Force a refetch so the four-step
+                        # resolution chain (members → /users → message
+                        # author) gets another shot at producing a real name.
+                        dn = (c or {}).get("displayName") or ""
+                        return (
+                            dn.startswith("1-on-1 Chat (19:")
+                            or dn.startswith("Group Chat (19:")
+                            or dn.startswith("Chat ")
+                        )
+
                     # Partition: chats needing a member fetch (new or
-                    # recently updated) vs those we can serve from cache.
+                    # recently updated, or with a poisoned cached name) vs
+                    # those we can serve from cache.
                     fresh_chats: List[Dict[str, Any]] = []
                     reuse_chats: List[Dict[str, Any]] = []
                     for ch in chats_raw:
@@ -2111,7 +2127,7 @@ class BackupWorker:
                         if not cid:
                             continue
                         cached = _cached_chat_meta.get(cid)
-                        if cached and not _chat_changed(ch):
+                        if cached and not _chat_changed(ch) and not _cached_name_is_fallback(cached):
                             reuse_chats.append(ch)
                         else:
                             fresh_chats.append(ch)
@@ -2389,6 +2405,49 @@ class BackupWorker:
                     per_chat_sem = asyncio.Semaphore(max(1, chat_fanout))
                     _progress = {"chats_done": 0, "msgs": 0}
 
+                    # Multi-app sharding: spread chat drains across all
+                    # healthy app registrations so 145 chats use 12 RPS
+                    # buckets instead of one. The per-handler GraphClient
+                    # pinning (see get_graph_client) gives CHATS its own
+                    # app, but inside USER_CHATS itself we further fan out
+                    # so the per-chat /messages calls don't all queue on
+                    # the same app bucket. Falls back to the per-handler
+                    # client when only one app is configured. Tunable via
+                    # USER_CHATS_APP_SHARDS env (0 = use all available).
+                    _max_shards = int(os.getenv("USER_CHATS_APP_SHARDS", "0"))
+                    _chat_shards: List[GraphClient] = []
+                    if chat_ids_to_drain:
+                        _healthy_apps = [
+                            a for a in multi_app_manager.apps
+                            if not a.is_throttled and a.client_id and a.client_secret
+                        ]
+                        if not _healthy_apps:
+                            _healthy_apps = [
+                                a for a in multi_app_manager.apps
+                                if a.client_id and a.client_secret
+                            ]
+                        if _max_shards > 0:
+                            _healthy_apps = _healthy_apps[:_max_shards]
+                        for _a in _healthy_apps:
+                            try:
+                                _chat_shards.append(GraphClient(
+                                    client_id=_a.client_id,
+                                    client_secret=_a.client_secret,
+                                    tenant_id=tenant.external_tenant_id,
+                                ))
+                            except Exception:
+                                continue
+                    if not _chat_shards:
+                        _chat_shards = [graph_client]
+                    print(
+                        f"[{self.worker_id}] [USER_CHATS] sharding "
+                        f"{len(chat_ids_to_drain)} chat(s) across "
+                        f"{len(_chat_shards)} app(s)"
+                    )
+
+                    def _pick_chat_client(cid: str) -> GraphClient:
+                        return _chat_shards[abs(hash(cid)) % len(_chat_shards)]
+
                     cancel_check_every = int(os.getenv(
                         "USER_CHATS_CANCEL_CHECK_EVERY_CHATS", "10",
                     ))
@@ -2441,8 +2500,14 @@ class BackupWorker:
                     #   USER_CHATS_INTERLEAVE_HOSTED_CONTENT=true
                     # Knob for concurrency stays the existing env:
                     #   CHAT_HOSTED_CONTENT_CONCURRENCY (default 8)
+                    # Interleave hostedContent / attachment fetch with chat
+                    # drain — each chat's attachment downloads kick as a
+                    # background task the moment that chat's drain finishes,
+                    # rather than a post-pass after every chat completes.
+                    # Validated on real tenants; on by default. Disable with
+                    # USER_CHATS_INTERLEAVE_HOSTED_CONTENT=false if needed.
                     _interleave_hc = os.getenv(
-                        "USER_CHATS_INTERLEAVE_HOSTED_CONTENT", "false",
+                        "USER_CHATS_INTERLEAVE_HOSTED_CONTENT", "true",
                     ).lower() in ("true", "1", "yes")
                     _hc_concurrency = int(os.getenv(
                         "CHAT_HOSTED_CONTENT_CONCURRENCY", "8",
@@ -2667,10 +2732,15 @@ class BackupWorker:
                             os.getenv("CHAT_DRAIN_RETRIES", "4")
                         )
                         chat_backoff_s = 2.0
+                        # Shard-assigned client for this chat. Each chat
+                        # talks to ONE app for the whole drain (deterministic
+                        # by hash(cid)) so retries land back on the same
+                        # bucket and the per-chat token cache stays warm.
+                        _shard_client = _pick_chat_client(cid)
                         while True:
                             try:
                                 async with per_chat_sem:
-                                    async for page in graph_client._iter_pages(
+                                    async for page in _shard_client._iter_pages(
                                         last_next_url, params=last_params,
                                     ):
                                         for m in (page.get("value", []) or []):
@@ -2948,6 +3018,76 @@ class BackupWorker:
                         f"({rate:.1f} msg/s)"
                     )
 
+                    # Last-resort displayName resolution: when the member
+                    # API and /users/{id} backfill both failed (deleted or
+                    # federated/external other-party, or membership rows
+                    # with no userId), derive the name from the FIRST
+                    # message's from.user.displayName. Graph preserves
+                    # this field on the message even after the user is
+                    # later deleted from AAD, so it's the most resilient
+                    # source. Runs only against chats whose chat_meta
+                    # currently holds a fallback "(19:xxxxx)" name.
+                    try:
+                        _msgs_by_chat: Dict[str, List[Dict[str, Any]]] = {}
+                        for _m in all_msgs:
+                            _cid_local = _m.get("chatId") or (
+                                _m.get("channelIdentity") or {}
+                            ).get("channelId")
+                            if _cid_local:
+                                _msgs_by_chat.setdefault(_cid_local, []).append(_m)
+                        _resolved_msg = 0
+                        for _cid_local, _info in chat_meta.items():
+                            _dn = (_info or {}).get("displayName") or ""
+                            if not (_dn.startswith("1-on-1 Chat (19:")
+                                    or _dn.startswith("Group Chat (19:")
+                                    or _dn.startswith("Chat ")):
+                                continue
+                            _chat_msgs = _msgs_by_chat.get(_cid_local, [])
+                            if not _chat_msgs:
+                                continue
+                            _names: List[str] = []
+                            _seen_uids: set = set()
+                            for _m in _chat_msgs:
+                                _sender = (_m.get("from") or {}).get("user") or {}
+                                _uid = _sender.get("id")
+                                _nm = _sender.get("displayName")
+                                if (_uid and _uid != user_id
+                                        and _uid not in _seen_uids and _nm):
+                                    _seen_uids.add(_uid)
+                                    _names.append(_nm)
+                                    if len(_names) >= 5:
+                                        break
+                            if not _names:
+                                continue
+                            _ctype = (_info or {}).get("chatType", "unknown")
+                            if _ctype == "oneOnOne":
+                                _new_dn = _names[0]
+                            else:
+                                _new_dn = f"Group: {', '.join(_names[:3])}"
+                                if len(_names) > 3:
+                                    _new_dn += f" +{len(_names) - 3} more"
+                            chat_meta[_cid_local] = {
+                                **_info,
+                                "displayName": _new_dn,
+                                "memberNames": list(dict.fromkeys(
+                                    (_info.get("memberNames") or []) + _names
+                                )),
+                                "memberCount": len(_names),
+                            }
+                            _resolved_msg += 1
+                        if _resolved_msg:
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] "
+                                f"resolved {_resolved_msg} chat name(s) "
+                                f"from message authors (fallback path)"
+                            )
+                    except Exception as _re:
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] "
+                            f"message-author name fallback failed: "
+                            f"{type(_re).__name__}: {_re}"
+                        )
+
                     # Persist per-chat delta tokens so subsequent runs only
                     # pull new messages per-chat. Merge with existing map
                     # so a failed chat doesn't wipe tokens we still hold
@@ -2982,6 +3122,56 @@ class BackupWorker:
                                 await _s.commit()
                     except Exception as _e:
                         print(f"[{self.worker_id}] [USER_CHATS] delta/meta persist failed: {_e}")
+
+                    # Folder-path normalization: rewrite stale folder_path /
+                    # chatTopic for any historical items whose chat's display
+                    # name has improved since they were written. Without this
+                    # step, items written when membership was unresolvable
+                    # remain stuck in "chats/Group Chat (19:xxxxx)" forever
+                    # — even after /users backfill resolves a real name.
+                    # Runs ~O(chats), idempotent (WHERE folder_path != target
+                    # makes already-good rows a no-op).
+                    try:
+                        cids: List[str] = []
+                        names: List[str] = []
+                        for cid, info in chat_meta.items():
+                            dn = (info or {}).get("displayName")
+                            # Skip fallback names — no point overwriting one
+                            # bad name with another, and skip empties.
+                            if not dn or dn.startswith("1-on-1 Chat (19:") \
+                                    or dn.startswith("Group Chat (19:") \
+                                    or dn.startswith("Chat "):
+                                continue
+                            cids.append(cid)
+                            names.append(dn)
+                        if cids:
+                            async with async_session_factory() as _s2:
+                                _res = await _s2.execute(
+                                    text("""
+                                        UPDATE snapshot_items si
+                                        SET folder_path = 'chats/' || nm.dn,
+                                            metadata = (si.metadata::jsonb
+                                                        || jsonb_build_object('chatTopic', nm.dn))::json
+                                        FROM (
+                                          SELECT unnest(CAST(:cids AS text[])) AS cid,
+                                                 unnest(CAST(:names AS text[])) AS dn
+                                        ) nm, snapshots s
+                                        WHERE s.id = si.snapshot_id
+                                          AND s.resource_id = :rid
+                                          AND (si.metadata::jsonb->>'chatId') = nm.cid
+                                          AND si.folder_path != 'chats/' || nm.dn
+                                    """),
+                                    {"cids": cids, "names": names, "rid": str(resource.id)},
+                                )
+                                await _s2.commit()
+                                rc = _res.rowcount or 0
+                                if rc:
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"normalized folder_path on {rc} stale row(s)"
+                                    )
+                    except Exception as _e:
+                        print(f"[{self.worker_id}] [USER_CHATS] folder_path normalize failed: {_e}")
 
                     # When streaming persist ran inline per-chat, the
                     # heavy lift is already in the DB — item_count was
@@ -10514,11 +10704,31 @@ class BackupWorker:
             if len(prior) < self.ANOMALY_MIN_PRIOR_SNAPSHOTS:
                 return  # not enough history to judge
 
+            current = snapshot.item_count or 0
+
+            # Healthy no-op incremental: when current=0 AND the resource has a
+            # saved cursor/deltaLink/skip-baseline, this snapshot represents
+            # "delta returned nothing changed" — not data loss. Without this
+            # guard the detector flags every quiet day as ransomware because
+            # `avg_prior` reflects earlier full-pull snapshots whose item
+            # counts are 1-4 orders of magnitude above a real delta.
+            if current == 0:
+                resource_for_guard = await session.get(Resource, snapshot.resource_id)
+                extra = (resource_for_guard.extra_data or {}) if resource_for_guard else {}
+                INCREMENTAL_CURSOR_KEYS = (
+                    "mail_delta_token",
+                    "delta_token",
+                    "chat_delta_tokens",
+                    "chat_skip_baseline_at",
+                    "onedrive_delta_link",
+                )
+                if any(extra.get(k) for k in INCREMENTAL_CURSOR_KEYS):
+                    return  # incremental no-op — not an anomaly
+
             avg = sum((p.item_count or 0) for p in prior) / len(prior)
             if avg < self.ANOMALY_MIN_AVG_ITEMS:
                 return  # resource too small to be meaningful
 
-            current = snapshot.item_count or 0
             ratio = current / avg if avg else 1.0
             if ratio >= self.ANOMALY_DROP_RATIO:
                 return  # within normal variance
@@ -10611,21 +10821,30 @@ class BackupWorker:
 
     # ==================== Helpers ====================
 
-    async def get_graph_client(self, tenant: Tenant) -> Optional[GraphClient]:
-        """Return a per-tenant cached GraphClient (creates on first miss).
+    async def get_graph_client(
+        self, tenant: Tenant, handler_key: str = "default",
+    ) -> Optional[GraphClient]:
+        """Return a per-(tenant, handler_key) cached GraphClient.
 
         Caching matters because concurrent batch backups (Tier 2 fans out
         5 USER_* type-groups in parallel) used to create a fresh client per
         call — each hitting Microsoft's /oauth2/v2.0/token endpoint at the
         same instant. AAD throttles those parallel token requests and
         returns 401 on the losers, dropping items silently. Sharing one
-        client per tenant lets _get_token's TTL cache absorb the burst.
+        client per handler lets _get_token's TTL cache absorb the burst.
 
-        We deliberately key by tenant only (not by app id) so the second,
-        third, … callers don't drift to a different `multi_app_manager`
-        slot just because round-robin advanced. The first request for a
-        tenant picks an app and pins it for that worker's lifetime."""
-        cache_key = str(tenant.external_tenant_id)
+        Per-handler keying (vs the older tenant-only keying) is what makes
+        the 12-app registration pool actually useful for a single tenant
+        on a single worker process. Previously the first call pinned APP_1
+        for the tenant and every concurrent handler (CHATS, MAIL, ONEDRIVE,
+        CONTACTS, …) shared APP_1's ~10 RPS bucket — so OneDrive's batch
+        URL pre-fetch could sit 10 minutes behind chat-message traffic
+        even though 11 other apps were idle. With per-handler keying each
+        handler grabs the next app from multi_app_manager's round-robin,
+        so 6 concurrent handlers can use 6 different apps in parallel.
+        Within a handler the client is still cached, so AAD doesn't see
+        a token storm."""
+        cache_key = f"{tenant.external_tenant_id}::{handler_key}"
         existing = self.graph_clients.get(cache_key)
         if existing:
             return existing
