@@ -60,4 +60,19 @@ class CalendarPstWriter(PstWriterBase):
             )
             return None
 
+        # Stamp the SnapshotItem's folder_path onto the event JSON so
+        # pst_convert can group events by source-calendar ("Calendar",
+        # "Calendar/United States holidays", ...) and rebuild the
+        # multi-calendar layout in Outlook. Without this, every event
+        # lands in a flat "Calendar" folder regardless of which Graph
+        # calendar resource it came from. Falls back to None if the
+        # backup didn't capture folder_path so older snapshots stay
+        # functional. The pstwriter side reads ``_folderPath`` under
+        # this leading-underscore name to make it obvious the value was
+        # injected by the exporter rather than coming from Graph itself.
+        item_folder_path = getattr(item, "folder_path", None) or ""
+        if item_folder_path:
+            raw = dict(raw)
+            raw["_folderPath"] = str(item_folder_path)
+
         return raw

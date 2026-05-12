@@ -559,58 +559,153 @@ TcResult buildFolderFaiContentsTc()
 }
 
 // ----------------------------------------------------------------------------
-// buildNameToIdMapPc — empty Name-to-ID Map per §2.4.7 + §2.7.1.
+// buildNameToIdMapPc — Name-to-Id Map per [MS-PST] §2.4.7.
 //
-// M11-K P5: scanpst flagged invalid HNIDs (0x60/0x80/0xA0) on the
-// three stream properties because we emitted them with 0-byte
-// allocations. Outlook's parser rejects zero-length HN allocations
-// referenced by a property HNID — the slot exists in rgibAlloc but
-// the parser expects at least 1 byte of content. Emit 4-byte stub
-// values (DWORD-aligned, single zero entry) so each HID resolves to
-// a non-empty allocation.
+// M10 (2026-05-11): real map registering PSETID_Appointment + 5 numeric
+// dispids. Pre-M10 this was a stub — Outlook's Calendar UI couldn't
+// resolve PidLidAppointmentStartWhole / EndWhole / Location / Duration
+// / SubType, so events landed in the PST but no calendar grid showed.
 //
-// Per [MS-PST] §2.4.7:
-//   * NameidBucketCount: 251 (SHOULD value for hash bucketing)
-//   * NameidStreamGuid:  16 B per GUID entry — empty map = 0 entries,
-//                        but we emit 16 zero bytes as a stub GUID so
-//                        the stream allocation is non-empty.
-//   * NameidStreamEntry: 8 B per name-id entry — empty map = 0 entries;
-//                        emit 8 zero bytes (1 stub entry that bucket-
-//                        count of 251 will never select).
-//   * NameidStreamString: variable; 4 zero bytes is enough to satisfy
-//                         scanpst's "non-empty" requirement.
+// Layout produced:
+//   * 0x0001 PidTagNameidBucketCount       PtypInteger32 = 251
+//   * 0x0002 PidTagNameidStreamGuid        PtypBinary
+//        16-byte PSETID_Appointment GUID. Referenced as GUID index 3
+//        (per §2.4.7: indices 0/1/2 reserved; stream starts at 3).
+//   * 0x0003 PidTagNameidStreamEntry       PtypBinary
+//        5×8-byte NAMEID entries — one per dispid in this order:
+//          dispid(4) | wGuid(2, = (3<<1)|0 = 6) | wPropIdx(2, 0..4)
+//        Local ID for entry i = 0x8000 + wPropIdx_i. Order pinned in
+//        kAppointmentNamedProps below.
+//   * 0x0004 PidTagNameidStreamString      PtypBinary
+//        4-byte zero stub (no string-named properties yet, but stream
+//        must be non-empty so the HNID has bytes to point at — same
+//        M11-K P5 constraint as the pre-M10 stub).
+//   * 0x10xx Hash buckets                  PtypBinary
+//        One property per non-empty bucket (bucket index = dispid % 251).
+//        Each value is the same 8-byte NAMEID shape as the entry stream;
+//        all 5 dispids hash to distinct buckets so each property holds
+//        exactly one entry. PidTag id = 0x1000 + bucket_index.
+//
+// All buffers are emitted via PropStorageHint::Auto so buildPropertyContext
+// picks inline vs. HN storage. Binary props >4 bytes always promote to HN
+// per [MS-PST] §2.3.3.3.
 // ----------------------------------------------------------------------------
+namespace {
+
+struct AppointmentNamedProp {
+    uint32_t dispid;
+    uint16_t localId;   // = 0x8000 + wPropIdx (assigned by order below)
+};
+
+// Order pins wPropIdx. DO NOT REORDER without also updating the kLid*
+// constants in messaging.hpp — local IDs leak into emitted PSTs.
+constexpr AppointmentNamedProp kAppointmentNamedProps[] = {
+    { 0x820Du, kLidAppointmentStartWhole },  // PidLidAppointmentStartWhole
+    { 0x820Eu, kLidAppointmentEndWhole   },  // PidLidAppointmentEndWhole
+    { 0x8208u, kLidLocation              },  // PidLidLocation
+    { 0x8213u, kLidAppointmentDuration   },  // PidLidAppointmentDuration
+    { 0x8215u, kLidAppointmentSubType    },  // PidLidAppointmentSubType
+};
+constexpr size_t kAppointmentNamedPropsCount =
+    sizeof(kAppointmentNamedProps) / sizeof(kAppointmentNamedProps[0]);
+
+constexpr uint32_t kNameidBucketCount = 251u;
+
+// PSETID_Appointment is the only GUID we register → 1 entry in the stream.
+// wGuid value for any property under this GUID = (3 << 1) | 0 = 6
+//   (GUID index 3 in the high 15 bits, kind=0 numeric in the low bit).
+constexpr uint16_t kPsetidAppointmentWGuid = (3u << 1) | 0u;  // = 6
+
+// Encode one 8-byte NAMEID entry into out.
+inline void encodeNameidEntry(uint8_t* out,
+                              uint32_t dispid,
+                              uint16_t wGuid,
+                              uint16_t wPropIdx) noexcept
+{
+    detail::writeU32(out, 0, dispid);
+    detail::writeU16(out, 4, wGuid);
+    detail::writeU16(out, 6, wPropIdx);
+}
+
+} // namespace
+
 PcResult buildNameToIdMapPc(Nid firstSubnodeNid)
 {
-    // PidTagNameidBucketCount: 251 (the "SHOULD" value per §2.4.7).
+    // ---- Stream buffers ----
     array<uint8_t, 4> bucketCountBytes{};
-    detail::writeU32(bucketCountBytes.data(), 0, 251u);
+    detail::writeU32(bucketCountBytes.data(), 0, kNameidBucketCount);
 
-    // M11-K P5: non-empty stub buffers so scanpst sees valid HNIDs.
-    // 16/8/4 byte allocations; content all zero (empty-map placeholder).
-    static constexpr array<uint8_t, 16> kStreamGuidStub{};
-    static constexpr array<uint8_t,  8> kStreamEntryStub{};
-    static constexpr array<uint8_t,  4> kStreamStringStub{};
+    // NameidStreamGuid: just PSETID_Appointment.
+    array<uint8_t, 16> streamGuid = kPsetidAppointment;
 
-    PcProperty props[4] = {
-        // 0x00010003 PidTagNameidBucketCount (inline, Int32)
-        { 0x0001u, PropType::Int32,
-          bucketCountBytes.data(), 4u, PropStorageHint::Auto },
-        // 0x00020102 PidTagNameidStreamGuid (HN-stored Binary, 16 B stub)
-        { 0x0002u, PropType::Binary,
-          kStreamGuidStub.data(), kStreamGuidStub.size(),
-          PropStorageHint::Auto },
-        // 0x00030102 PidTagNameidStreamEntry (HN-stored Binary, 8 B stub)
-        { 0x0003u, PropType::Binary,
-          kStreamEntryStub.data(), kStreamEntryStub.size(),
-          PropStorageHint::Auto },
-        // 0x00040102 PidTagNameidStreamString (HN-stored Binary, 4 B stub)
-        { 0x0004u, PropType::Binary,
-          kStreamStringStub.data(), kStreamStringStub.size(),
-          PropStorageHint::Auto },
+    // NameidStreamEntry: 5 × 8 bytes.
+    array<uint8_t, 8 * kAppointmentNamedPropsCount> streamEntry{};
+    for (size_t i = 0; i < kAppointmentNamedPropsCount; ++i) {
+        const uint16_t wPropIdx = static_cast<uint16_t>(
+            kAppointmentNamedProps[i].localId - 0x8000u);
+        encodeNameidEntry(streamEntry.data() + i * 8u,
+                          kAppointmentNamedProps[i].dispid,
+                          kPsetidAppointmentWGuid,
+                          wPropIdx);
+    }
+
+    // NameidStreamString: empty for numeric-only. Keep the 4-byte zero
+    // stub from the pre-M10 implementation so scanpst sees a non-empty
+    // HN allocation when our HNID resolves the slot (M11-K P5).
+    static constexpr array<uint8_t, 4> kStreamStringStub{};
+
+    // ---- Hash bucket payloads (one per non-empty bucket) ----
+    struct BucketBuf {
+        uint16_t                   tagId;   // 0x1000 + bucket_index
+        array<uint8_t, 8>          bytes;   // one NAMEID entry per bucket
     };
+    array<BucketBuf, kAppointmentNamedPropsCount> buckets{};
+    for (size_t i = 0; i < kAppointmentNamedPropsCount; ++i) {
+        const uint32_t bucketIdx =
+            kAppointmentNamedProps[i].dispid % kNameidBucketCount;
+        buckets[i].tagId = static_cast<uint16_t>(0x1000u + bucketIdx);
+        const uint16_t wPropIdx = static_cast<uint16_t>(
+            kAppointmentNamedProps[i].localId - 0x8000u);
+        encodeNameidEntry(buckets[i].bytes.data(),
+                          kAppointmentNamedProps[i].dispid,
+                          kPsetidAppointmentWGuid,
+                          wPropIdx);
+    }
+    // All 5 dispids hash to distinct buckets, but assert it to catch
+    // future regressions if someone adds a colliding dispid (a real
+    // collision would require packing 2 entries into one bucket payload).
+    for (size_t i = 0; i < kAppointmentNamedPropsCount; ++i) {
+        for (size_t j = i + 1; j < kAppointmentNamedPropsCount; ++j) {
+            if (buckets[i].tagId == buckets[j].tagId) {
+                throw std::logic_error(
+                    "buildNameToIdMapPc: appointment dispids hash to the "
+                    "same bucket; need multi-entry bucket support");
+            }
+        }
+    }
 
-    return buildPropertyContext(props, 4, firstSubnodeNid);
+    // ---- Property descriptor array (4 streams + 5 buckets = 9 props) ----
+    constexpr size_t kPropCount = 4 + kAppointmentNamedPropsCount;
+    array<PcProperty, kPropCount> props{};
+
+    props[0] = { 0x0001u, PropType::Int32,
+                 bucketCountBytes.data(), 4u, PropStorageHint::Auto };
+    props[1] = { 0x0002u, PropType::Binary,
+                 streamGuid.data(), streamGuid.size(),
+                 PropStorageHint::Auto };
+    props[2] = { 0x0003u, PropType::Binary,
+                 streamEntry.data(), streamEntry.size(),
+                 PropStorageHint::Auto };
+    props[3] = { 0x0004u, PropType::Binary,
+                 kStreamStringStub.data(), kStreamStringStub.size(),
+                 PropStorageHint::Auto };
+    for (size_t i = 0; i < kAppointmentNamedPropsCount; ++i) {
+        props[4 + i] = { buckets[i].tagId, PropType::Binary,
+                         buckets[i].bytes.data(), buckets[i].bytes.size(),
+                         PropStorageHint::Auto };
+    }
+
+    return buildPropertyContext(props.data(), props.size(), firstSubnodeNid);
 }
 
 // ----------------------------------------------------------------------------

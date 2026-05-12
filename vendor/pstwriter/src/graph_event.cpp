@@ -123,6 +123,7 @@ GraphEvent extractEvent(const JsonValue& obj)
     GraphEvent e;
     e.id                   = getStr(obj, "id");
     e.parentFolderId       = getStr(obj, "parentFolderId");
+    e.folderPath           = getStr(obj, "_folderPath");
     e.changeKey            = getStr(obj, "changeKey");
     e.iCalUId              = getStr(obj, "iCalUId");
     e.transactionId        = getStr(obj, "transactionId");

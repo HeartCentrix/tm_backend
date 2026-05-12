@@ -435,17 +435,94 @@ int runCalendar(const string& jsonPath, const string& pstPath)
 
     std::cout << "  parsed " << events.size() << " event(s)\n";
 
-    M9CalendarFolder folder;
-    folder.displayName = "Calendar";
-    folder.parentNid   = Nid{0x00008022u};
-    folder.events.reserve(events.size());
-    for (const auto& e : events) folder.events.push_back(&e);
+    // Folder synthesis (mirror runMail). The exporter stamps each
+    // event's source-calendar path onto e.folderPath
+    // ("Calendar/Default", "Calendar/United States holidays", ...).
+    // Group by full path and synthesise one M9CalendarFolder per node
+    // so Outlook renders the source mailbox's multi-calendar layout
+    // instead of a flat dump under one "Calendar" folder. Intermediate
+    // path levels (e.g. "Calendar" when only "Calendar/Default"
+    // appears) are inserted as empty container folders so the wizard's
+    // parent-resolver can find them.
+    std::vector<string> folderOrder;
+    std::unordered_map<string, size_t> pathToIdx;
+    std::vector<vector<const graph::GraphEvent*>> bucketByIdx;
+
+    auto ensureFolder = [&](const string& fullPath) -> size_t {
+        auto it = pathToIdx.find(fullPath);
+        if (it != pathToIdx.end()) return it->second;
+        const size_t idx = folderOrder.size();
+        folderOrder.push_back(fullPath);
+        pathToIdx.emplace(fullPath, idx);
+        bucketByIdx.emplace_back();
+        return idx;
+    };
+
+    for (const auto& e : events) {
+        const string norm = normalizeFolderPath(e.folderPath);
+        const auto parts = splitFolderPath(norm);
+        string accumulated;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            if (!accumulated.empty()) accumulated.push_back('/');
+            accumulated += parts[i];
+            ensureFolder(accumulated);
+        }
+        const size_t leafIdx = ensureFolder(norm);
+        bucketByIdx[leafIdx].push_back(&e);
+    }
+
+    // normalizeFolderPath returns "Inbox" for empty input — which is
+    // wrong for calendar. Override the legacy single-folder case by
+    // renaming the synthetic top-level path to "Calendar" when no
+    // event carries a real folderPath.
+    if (folderOrder.size() == 1 && folderOrder[0] == "Inbox" &&
+        !bucketByIdx[0].empty()) {
+        folderOrder[0] = "Calendar";
+        pathToIdx.clear();
+        pathToIdx.emplace("Calendar", 0);
+    }
+
+    std::vector<M9CalendarFolder> folders;
+    folders.reserve(folderOrder.size());
+    for (size_t i = 0; i < folderOrder.size(); ++i) {
+        const string& full = folderOrder[i];
+        const auto parts = splitFolderPath(full);
+        M9CalendarFolder f;
+        f.displayName = parts.empty() ? string("Calendar") : parts.back();
+        f.path        = full;
+        if (parts.size() > 1) {
+            f.parentPath.clear();
+            for (size_t j = 0; j + 1 < parts.size(); ++j) {
+                if (!f.parentPath.empty()) f.parentPath.push_back('/');
+                f.parentPath += parts[j];
+            }
+        }
+        f.parentNid      = Nid{0x00008022u};
+        f.containerClass = "IPF.Appointment";
+        f.events.reserve(bucketByIdx[i].size());
+        for (auto* ep : bucketByIdx[i]) f.events.push_back(ep);
+        folders.push_back(std::move(f));
+    }
+
+    if (folders.empty()) {
+        // Defensive: zero events → emit a placeholder Calendar so the
+        // writer still produces a valid PST instead of aborting.
+        M9CalendarFolder placeholder;
+        placeholder.displayName    = "Calendar";
+        placeholder.path           = "Calendar";
+        placeholder.parentNid      = Nid{0x00008022u};
+        placeholder.containerClass = "IPF.Appointment";
+        folders.push_back(std::move(placeholder));
+    }
+
+    std::cout << "  synthesised " << folders.size() << " folder(s) from "
+              << events.size() << " event(s)\n";
 
     M9PstConfig cfg;
     cfg.path           = pstPath;
     cfg.providerUid    = kDefaultProviderUid;
     cfg.pstDisplayName = "PST Conversion (calendar)";
-    cfg.folders        = { folder };
+    cfg.folders        = std::move(folders);
 
     const auto r = writeM9Pst(cfg);
     if (!r.ok) {

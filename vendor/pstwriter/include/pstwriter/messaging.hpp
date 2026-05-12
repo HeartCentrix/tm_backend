@@ -341,29 +341,73 @@ TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
 TcResult buildFolderFaiContentsTc();
 
 // ============================================================================
+// Named Property Registry — appointment props the calendar PC depends on.
+//
+// [MS-PST] §2.4.7 defines a Name-to-Id Map at NID 0x0061 (PC) that
+// translates (GUID, dispid|string) tuples to local property IDs in the
+// 0x8000+ range. Outlook reads canonical appointment properties from
+// PSETID_Appointment named props — without registering them in the
+// Name-to-Id Map and emitting them on the event PC, the Calendar UI
+// can't render start/end/location/duration columns.
+//
+// M10: ship 5 numeric named properties under PSETID_Appointment. The
+// local IDs below are assigned by wPropIdx ordinal — first entry gets
+// 0x8000, second 0x8001, etc. (per [MS-PST] §2.4.7.1: "local property
+// ID for a named property is 0x8000 + wPropIdx"). buildNameToIdMapPc
+// registers them in this order; buildEventPc emits PC properties using
+// these tag IDs.
+//
+// Adding new named properties: append to the registry, leave existing
+// local IDs unchanged (changing wPropIdx ordering rewrites local IDs
+// and silently invalidates existing PSTs).
+// ============================================================================
+
+// PSETID_Appointment {00062002-0000-0000-C000-000000000046} — see
+// [MS-OXOCAL] §1.3.1. Stored at GUID stream index 0 → wGuid value 3
+// (indices 0,1,2 are reserved per §2.4.7: 0=none, 1=PS_MAPI, 2=PS_PUBLIC_STRINGS).
+constexpr std::array<uint8_t, 16> kPsetidAppointment{
+    0x02, 0x20, 0x06, 0x00,  // Data1 (LE)
+    0x00, 0x00,              // Data2 (LE)
+    0x00, 0x00,              // Data3 (LE)
+    0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46  // Data4 (raw)
+};
+
+// Local property IDs for the 5 appointment named properties. Tag layout in
+// the event PC is `(localId << 16) | propType`. Order MUST match the
+// dispid array order in buildNameToIdMapPc.
+constexpr uint16_t kLidAppointmentStartWhole = 0x8000;  // dispid 0x820D — PtypTime
+constexpr uint16_t kLidAppointmentEndWhole   = 0x8001;  // dispid 0x820E — PtypTime
+constexpr uint16_t kLidLocation              = 0x8002;  // dispid 0x8208 — PtypString
+constexpr uint16_t kLidAppointmentDuration   = 0x8003;  // dispid 0x8213 — PtypInteger32
+constexpr uint16_t kLidAppointmentSubType    = 0x8004;  // dispid 0x8215 — PtypBoolean
+
+// ============================================================================
 // buildNameToIdMapPc — emit the §2.4.7 NID_NAME_TO_ID_MAP PC (NID 0x0061).
 //
-// Per [MS-PST] §2.4.7 (Named Property Lookup Map): "the Name-to-ID-Map is a
-// standard PC with some special properties. Specifically, the properties in
-// the PC do not refer to real property identifiers, but instead point to
-// specific data sections of the Name-to-ID-Map."
+// Per [MS-PST] §2.4.7: the Name-to-ID-Map is a PC whose property IDs do
+// not refer to real PidTags but to special slots of the map. Required
+// properties:
 //
-// §2.7.1 minimum state for NID 0x0061 = "Empty". M6 emits the 4 well-known
-// stream/count properties, each at zero-length:
+//   0x00010003 PidTagNameidBucketCount   PtypInteger32 = 251
+//   0x00020102 PidTagNameidStreamGuid    PtypBinary    — array of 16-B GUIDs,
+//                                                        indexed from 3
+//   0x00030102 PidTagNameidStreamEntry   PtypBinary    — array of 8-B NAMEID
+//                                                        entries (dispid/offset
+//                                                        + wGuid + wPropIdx)
+//   0x00040102 PidTagNameidStreamString  PtypBinary    — string-name data
+//                                                        (empty when all
+//                                                        named props are
+//                                                        numeric)
+//   0x1000+    Hash buckets              PtypBinary    — one property per
+//                                                        non-empty bucket;
+//                                                        bucket index =
+//                                                        dispid % 251
 //
-//   0x00010003 PidTagNameidBucketCount   PtypInteger32 = 251 (per §2.4.7
-//                                          Hash Table page; value SHOULD
-//                                          be 251 even when buckets unused)
-//   0x00020102 PidTagNameidStreamGuid    PtypBinary    (empty stream)
-//   0x00030102 PidTagNameidStreamEntry   PtypBinary    (empty stream)
-//   0x00040102 PidTagNameidStreamString  PtypBinary    (empty stream)
-//
-// **Open question (KNOWN_UNVERIFIED)**: §2.4.7 Hash Table page says hash
-// buckets are stored as PC properties at PidTag IDs 0x1000..0x10FA (251
-// total). For an empty Name-to-ID Map, are these 251 zero-length bucket
-// properties also required, or only the 4 stream/count properties? M6 ships
-// the conservative 4-property version; if Outlook rejects at the M6 gate,
-// expand to all 255 properties.
+// M10 registers PSETID_Appointment + the 5 appointment dispids
+// (0x820D StartWhole, 0x820E EndWhole, 0x8208 Location, 0x8213 Duration,
+// 0x8215 SubType) so Outlook's Calendar UI can resolve appointment
+// properties on event PCs. See kLid* constants above for the assigned
+// local IDs.
 // ============================================================================
 PcResult buildNameToIdMapPc(Nid firstSubnodeNid);
 
