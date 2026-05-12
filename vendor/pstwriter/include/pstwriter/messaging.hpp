@@ -305,6 +305,17 @@ struct ContentsTcRow {
     // "Contents Table for X, row doesn't match sub-object".
     const uint8_t*  searchKeyBytes              {nullptr};
     size_t          searchKeySize               {0};   // 0x300B (Binary)
+
+    // M12.3 — controls whether buildFolderContentsTc unconditionally
+    // sets CEB bits 2/10/13/14 (MessageStatus / MessageSize /
+    // MessageToMe / MessageCcMe). Mail keeps them on (default true)
+    // because buildMailPc emits the matching PC defaults. CONTACTS
+    // pass false: Outlook-exported contacts.pst byte-diff
+    // (2026-05-12) shows real-Outlook IPM.Contact PCs OMIT these
+    // tags; setting the row CEB bits while the PC lacks the tag is
+    // what triggers "row doesn't match sub-object" + "Failed to add
+    // row to the FLT" → contact silently dropped from People view.
+    bool            emitOptionalFixedCells      {true};
 };
 
 // ============================================================================
@@ -372,7 +383,17 @@ constexpr std::array<uint8_t, 16> kPsetidAppointment{
     0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46  // Data4 (raw)
 };
 
-// Local property IDs for the 5 appointment named properties. Tag layout in
+// PSETID_Address {00062004-0000-0000-C000-000000000046} — see
+// [MS-OXOCNTC] §1.3.2. Contact named properties live under this GUID.
+// Stored at GUID stream index 1 → wGuid value 4 (= (4 << 1) | 0).
+constexpr std::array<uint8_t, 16> kPsetidAddress{
+    0x04, 0x20, 0x06, 0x00,  // Data1 (LE) — 0x00062004
+    0x00, 0x00,              // Data2 (LE)
+    0x00, 0x00,              // Data3 (LE)
+    0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46  // Data4 (raw)
+};
+
+// Local property IDs for the appointment named properties. Tag layout in
 // the event PC is `(localId << 16) | propType`. Order MUST match the
 // dispid array order in buildNameToIdMapPc.
 constexpr uint16_t kLidAppointmentStartWhole = 0x8000;  // dispid 0x820D — PtypTime
@@ -380,6 +401,17 @@ constexpr uint16_t kLidAppointmentEndWhole   = 0x8001;  // dispid 0x820E — Pty
 constexpr uint16_t kLidLocation              = 0x8002;  // dispid 0x8208 — PtypString
 constexpr uint16_t kLidAppointmentDuration   = 0x8003;  // dispid 0x8213 — PtypInteger32
 constexpr uint16_t kLidAppointmentSubType    = 0x8004;  // dispid 0x8215 — PtypBoolean
+
+// Local property IDs for the contact named properties (PSETID_Address).
+// Outlook's People view filters contacts by PidLidFileUnder; without it,
+// the contact PC lands in the destination but isn't surfaced in the
+// default Contacts view. Email1* fields are needed so the contact's
+// primary email renders on the contact card.
+constexpr uint16_t kLidFileUnder              = 0x8005;  // dispid 0x8005 — PtypString
+constexpr uint16_t kLidEmail1DisplayName      = 0x8006;  // dispid 0x8080 — PtypString
+constexpr uint16_t kLidEmail1AddressType      = 0x8007;  // dispid 0x8082 — PtypString
+constexpr uint16_t kLidEmail1EmailAddress     = 0x8008;  // dispid 0x8083 — PtypString
+constexpr uint16_t kLidEmail1OriginalDisplayName = 0x8009;  // dispid 0x8084 — PtypString
 
 // ============================================================================
 // buildNameToIdMapPc — emit the §2.4.7 NID_NAME_TO_ID_MAP PC (NID 0x0061).

@@ -456,15 +456,16 @@ TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
         // buildMailPc emits the matching PC defaults (Sensitivity=0,
         // MessageStatus=0, MessageToMe=false, MessageCcMe=false).
 
-        // MessageStatus @ ibData=8, iBit=2 — always set (PC default 0).
+        // MessageStatus @ ibData=8, iBit=2 — only set when caller opts in
+        // (mail does, contacts don't — see ContentsTcRow.emitOptionalFixedCells).
         detail::writeU32(dst, 8, static_cast<uint32_t>(src.messageStatus));
-        setCebBit(ceb, 2);
+        if (src.emitOptionalFixedCells) setCebBit(ceb, 2);
 
-        // MessageFlags @ ibData=16, iBit=4 — buildMailPc always emits.
+        // MessageFlags @ ibData=16, iBit=4 — buildMailPc and buildContactPc both emit.
         detail::writeU32(dst, 16, static_cast<uint32_t>(src.messageFlags));
         setCebBit(ceb, 4);
 
-        // Importance @ ibData=20, iBit=5 — buildMailPc always emits.
+        // Importance @ ibData=20, iBit=5 — buildMailPc and buildContactPc both emit.
         detail::writeU32(dst, 20, static_cast<uint32_t>(src.importance));
         setCebBit(ceb, 5);
 
@@ -480,11 +481,11 @@ TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
             setCebBit(ceb, 9);
         }
 
-        // MessageSize @ ibData=48, iBit=10 — always.
+        // MessageSize @ ibData=48, iBit=10 — see emitOptionalFixedCells note above.
         detail::writeU32(dst, 48, static_cast<uint32_t>(src.messageSize));
-        setCebBit(ceb, 10);
+        if (src.emitOptionalFixedCells) setCebBit(ceb, 10);
 
-        // Sensitivity @ ibData=60, iBit=15 — always set (PC default 0).
+        // Sensitivity @ ibData=60, iBit=15 — both mail and contact PCs emit.
         detail::writeU32(dst, 60, static_cast<uint32_t>(src.sensitivity));
         setCebBit(ceb, 15);
 
@@ -495,12 +496,14 @@ TcResult buildFolderContentsTc(const ContentsTcRow* rows, size_t rowCount,
         }
 
         // MessageToMe @ ibData=124, iBit=13 / MessageCcMe @ 125, iBit=14
-        // — always set (PC defaults to false / 0). Round L: 120/121→124/125
-        // because PR_SEARCH_KEY (0x300B) HID slot occupies 120-123.
+        // — see emitOptionalFixedCells. Outlook-exported IPM.Contact PCs
+        // omit 0x0057/0x0058; setting the row CEB while the PC lacks
+        // the tag was the proximate cause of "row doesn't match
+        // sub-object" / "Failed to add row to the FLT" on contacts.
         dst[124] = src.messageToMe ? 1u : 0u;
-        setCebBit(ceb, 13);
+        if (src.emitOptionalFixedCells) setCebBit(ceb, 13);
         dst[125] = src.messageCcMe ? 1u : 0u;
-        setCebBit(ceb, 14);
+        if (src.emitOptionalFixedCells) setCebBit(ceb, 14);
 
         // ---- Varlen cells ----
         // The HID slot at each varlen column's ibData is left as zero;
@@ -592,29 +595,42 @@ TcResult buildFolderFaiContentsTc()
 // ----------------------------------------------------------------------------
 namespace {
 
-struct AppointmentNamedProp {
+struct NamedPropEntry {
     uint32_t dispid;
     uint16_t localId;   // = 0x8000 + wPropIdx (assigned by order below)
+    uint16_t wGuid;     // see kPsetid*WGuid below — encodes GUID idx + kind
 };
-
-// Order pins wPropIdx. DO NOT REORDER without also updating the kLid*
-// constants in messaging.hpp — local IDs leak into emitted PSTs.
-constexpr AppointmentNamedProp kAppointmentNamedProps[] = {
-    { 0x820Du, kLidAppointmentStartWhole },  // PidLidAppointmentStartWhole
-    { 0x820Eu, kLidAppointmentEndWhole   },  // PidLidAppointmentEndWhole
-    { 0x8208u, kLidLocation              },  // PidLidLocation
-    { 0x8213u, kLidAppointmentDuration   },  // PidLidAppointmentDuration
-    { 0x8215u, kLidAppointmentSubType    },  // PidLidAppointmentSubType
-};
-constexpr size_t kAppointmentNamedPropsCount =
-    sizeof(kAppointmentNamedProps) / sizeof(kAppointmentNamedProps[0]);
 
 constexpr uint32_t kNameidBucketCount = 251u;
 
-// PSETID_Appointment is the only GUID we register → 1 entry in the stream.
-// wGuid value for any property under this GUID = (3 << 1) | 0 = 6
-//   (GUID index 3 in the high 15 bits, kind=0 numeric in the low bit).
-constexpr uint16_t kPsetidAppointmentWGuid = (3u << 1) | 0u;  // = 6
+// wGuid encoding ([MS-PST] §2.4.7.1): low bit = name kind (0=numeric, 1=string);
+// high 15 bits = GUID index. GUID indices 0..2 are reserved (none / PS_MAPI /
+// PS_PUBLIC_STRINGS); stream entries start at index 3.
+constexpr uint16_t kPsetidAppointmentWGuid = (3u << 1) | 0u;  // = 6 — numeric
+constexpr uint16_t kPsetidAddressWGuid     = (4u << 1) | 0u;  // = 8 — numeric
+
+// Order pins wPropIdx. DO NOT REORDER without also updating the kLid*
+// constants in messaging.hpp — local IDs leak into emitted PSTs.
+//
+// PSETID_Appointment first (indices 0..4 → local 0x8000..0x8004),
+// then PSETID_Address (indices 5..9 → local 0x8005..0x8009). New
+// entries are append-only.
+constexpr NamedPropEntry kNamedProps[] = {
+    // ---- PSETID_Appointment (calendar) ----
+    { 0x820Du, kLidAppointmentStartWhole,        kPsetidAppointmentWGuid },
+    { 0x820Eu, kLidAppointmentEndWhole,          kPsetidAppointmentWGuid },
+    { 0x8208u, kLidLocation,                     kPsetidAppointmentWGuid },
+    { 0x8213u, kLidAppointmentDuration,          kPsetidAppointmentWGuid },
+    { 0x8215u, kLidAppointmentSubType,           kPsetidAppointmentWGuid },
+    // ---- PSETID_Address (contacts) ----
+    { 0x8005u, kLidFileUnder,                    kPsetidAddressWGuid     },
+    { 0x8080u, kLidEmail1DisplayName,            kPsetidAddressWGuid     },
+    { 0x8082u, kLidEmail1AddressType,            kPsetidAddressWGuid     },
+    { 0x8083u, kLidEmail1EmailAddress,           kPsetidAddressWGuid     },
+    { 0x8084u, kLidEmail1OriginalDisplayName,    kPsetidAddressWGuid     },
+};
+constexpr size_t kNamedPropsCount =
+    sizeof(kNamedProps) / sizeof(kNamedProps[0]);
 
 // Encode one 8-byte NAMEID entry into out.
 inline void encodeNameidEntry(uint8_t* out,
@@ -635,57 +651,65 @@ PcResult buildNameToIdMapPc(Nid firstSubnodeNid)
     array<uint8_t, 4> bucketCountBytes{};
     detail::writeU32(bucketCountBytes.data(), 0, kNameidBucketCount);
 
-    // NameidStreamGuid: just PSETID_Appointment.
-    array<uint8_t, 16> streamGuid = kPsetidAppointment;
+    // NameidStreamGuid: PSETID_Appointment at index 0 (→ GUID idx 3),
+    //                   PSETID_Address     at index 1 (→ GUID idx 4).
+    array<uint8_t, 32> streamGuid{};
+    std::memcpy(streamGuid.data(),      kPsetidAppointment.data(), 16);
+    std::memcpy(streamGuid.data() + 16, kPsetidAddress.data(),     16);
 
-    // NameidStreamEntry: 5 × 8 bytes.
-    array<uint8_t, 8 * kAppointmentNamedPropsCount> streamEntry{};
-    for (size_t i = 0; i < kAppointmentNamedPropsCount; ++i) {
+    // NameidStreamEntry: 8 bytes per registry row.
+    array<uint8_t, 8 * kNamedPropsCount> streamEntry{};
+    for (size_t i = 0; i < kNamedPropsCount; ++i) {
         const uint16_t wPropIdx = static_cast<uint16_t>(
-            kAppointmentNamedProps[i].localId - 0x8000u);
+            kNamedProps[i].localId - 0x8000u);
         encodeNameidEntry(streamEntry.data() + i * 8u,
-                          kAppointmentNamedProps[i].dispid,
-                          kPsetidAppointmentWGuid,
+                          kNamedProps[i].dispid,
+                          kNamedProps[i].wGuid,
                           wPropIdx);
     }
 
-    // NameidStreamString: empty for numeric-only. Keep the 4-byte zero
-    // stub from the pre-M10 implementation so scanpst sees a non-empty
-    // HN allocation when our HNID resolves the slot (M11-K P5).
+    // NameidStreamString: empty (all named props are numeric). 4-byte
+    // zero stub so scanpst sees a non-empty HN allocation when the HNID
+    // resolves the slot (M11-K P5 constraint).
     static constexpr array<uint8_t, 4> kStreamStringStub{};
 
     // ---- Hash bucket payloads (one per non-empty bucket) ----
+    //
+    // Numeric named-property bucket: `dispid % bucket_count`. Per
+    // [MS-PST] §2.4.7, buckets that contain entries are stored as
+    // PtypBinary properties at PidTag id (0x1000 + bucket_index). Each
+    // bucket entry has the same 8-byte NAMEID layout as the entry
+    // stream. We assume each bucket carries exactly one entry — if two
+    // dispids collide, throw so the caller adds multi-entry support
+    // (rather than silently emitting an ambiguous map).
     struct BucketBuf {
         uint16_t                   tagId;   // 0x1000 + bucket_index
-        array<uint8_t, 8>          bytes;   // one NAMEID entry per bucket
+        array<uint8_t, 8>          bytes;
     };
-    array<BucketBuf, kAppointmentNamedPropsCount> buckets{};
-    for (size_t i = 0; i < kAppointmentNamedPropsCount; ++i) {
+    array<BucketBuf, kNamedPropsCount> buckets{};
+    for (size_t i = 0; i < kNamedPropsCount; ++i) {
         const uint32_t bucketIdx =
-            kAppointmentNamedProps[i].dispid % kNameidBucketCount;
+            kNamedProps[i].dispid % kNameidBucketCount;
         buckets[i].tagId = static_cast<uint16_t>(0x1000u + bucketIdx);
         const uint16_t wPropIdx = static_cast<uint16_t>(
-            kAppointmentNamedProps[i].localId - 0x8000u);
+            kNamedProps[i].localId - 0x8000u);
         encodeNameidEntry(buckets[i].bytes.data(),
-                          kAppointmentNamedProps[i].dispid,
-                          kPsetidAppointmentWGuid,
+                          kNamedProps[i].dispid,
+                          kNamedProps[i].wGuid,
                           wPropIdx);
     }
-    // All 5 dispids hash to distinct buckets, but assert it to catch
-    // future regressions if someone adds a colliding dispid (a real
-    // collision would require packing 2 entries into one bucket payload).
-    for (size_t i = 0; i < kAppointmentNamedPropsCount; ++i) {
-        for (size_t j = i + 1; j < kAppointmentNamedPropsCount; ++j) {
+    for (size_t i = 0; i < kNamedPropsCount; ++i) {
+        for (size_t j = i + 1; j < kNamedPropsCount; ++j) {
             if (buckets[i].tagId == buckets[j].tagId) {
                 throw std::logic_error(
-                    "buildNameToIdMapPc: appointment dispids hash to the "
+                    "buildNameToIdMapPc: named-prop dispids hash to the "
                     "same bucket; need multi-entry bucket support");
             }
         }
     }
 
-    // ---- Property descriptor array (4 streams + 5 buckets = 9 props) ----
-    constexpr size_t kPropCount = 4 + kAppointmentNamedPropsCount;
+    // ---- Property descriptor array (4 streams + N buckets) ----
+    constexpr size_t kPropCount = 4 + kNamedPropsCount;
     array<PcProperty, kPropCount> props{};
 
     props[0] = { 0x0001u, PropType::Int32,
@@ -699,7 +723,7 @@ PcResult buildNameToIdMapPc(Nid firstSubnodeNid)
     props[3] = { 0x0004u, PropType::Binary,
                  kStreamStringStub.data(), kStreamStringStub.size(),
                  PropStorageHint::Auto };
-    for (size_t i = 0; i < kAppointmentNamedPropsCount; ++i) {
+    for (size_t i = 0; i < kNamedPropsCount; ++i) {
         props[4 + i] = { buckets[i].tagId, PropType::Binary,
                          buckets[i].bytes.data(), buckets[i].bytes.size(),
                          PropStorageHint::Auto };

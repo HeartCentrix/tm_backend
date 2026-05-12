@@ -264,13 +264,34 @@ MailPcResult buildEventPc(const graph::GraphEvent&  e,
         }
     }
 
-    // Server-time bookkeeping
-    if (!e.createdDateTime.empty())
+    // Server-time bookkeeping — always emit. scanpst rejects messages
+    // missing PR_CREATION_TIME / PR_LAST_MODIFICATION_TIME (see
+    // M11/M12 contact fix). Stub with FILETIME 0 when Graph didn't
+    // supply a value.
+    if (!e.createdDateTime.empty()) {
         pb.addSystemTime(pid_event::kCreationTime,
                          graph::isoToFiletimeTicks(e.createdDateTime));
-    if (!e.lastModifiedDateTime.empty())
+    } else {
+        pb.addSystemTime(pid_event::kCreationTime, 0ull);
+    }
+    if (!e.lastModifiedDateTime.empty()) {
         pb.addSystemTime(pid_event::kLastModificationTime,
                          graph::isoToFiletimeTicks(e.lastModifiedDateTime));
+    } else {
+        pb.addSystemTime(pid_event::kLastModificationTime, 0ull);
+    }
+
+    // PR_SEARCH_KEY — scanpst rejects "Missing PR_SEARCH_KEY" AND
+    // raises "row doesn't match sub-object" if the value differs from
+    // the Contents-TC-row's. Derive from the event identity so both
+    // sides produce the same bytes. iCalUId is the canonical event
+    // identity in Graph; falls back to subject + start.
+    {
+        std::string seed = e.iCalUId;
+        if (seed.empty()) seed = e.subject + "|" + e.start.dateTime;
+        const auto sk = graph::deriveMessageSearchKey(seed);
+        pb.addBinary(0x300Bu, vector<uint8_t>(sk.begin(), sk.end()));
+    }
 
     // Has-attachments
     pb.addBoolean(pid_event::kHasAttachments, e.hasAttachments);
@@ -592,10 +613,18 @@ WriteResult writeM9Pst(const M9PstConfig& config) noexcept
                 if (e.hasOrganizer && !e.organizer.name.empty()) {
                     b.sentRepresentingName = u16le(e.organizer.name);
                 }
-                // Stub PR_SEARCH_KEY + PR_CHANGE_KEY (16 / 22 zero bytes).
-                // Outlook needs the columns present even when the value
-                // is a stub; row schema requires them per the 29-col TC.
-                b.searchKey.assign(16, 0u);
+                // PR_SEARCH_KEY: derive deterministically from the
+                // same seed buildEventPc uses, so the row's value and
+                // the event PC's PR_SEARCH_KEY match byte-for-byte
+                // (scanpst flags "row doesn't match sub-object" when
+                // they diverge).
+                {
+                    std::string seed = e.iCalUId;
+                    if (seed.empty()) seed = e.subject + "|" + e.start.dateTime;
+                    const auto sk = graph::deriveMessageSearchKey(seed);
+                    b.searchKey.assign(sk.begin(), sk.end());
+                }
+                // PR_CHANGE_KEY: 22-byte XID stub (Outlook accepts).
                 b.changeKey.assign(22, 0u);
 
                 ContentsTcRow row{};
