@@ -20,6 +20,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -38,10 +39,18 @@ namespace {
 // ----------------------------------------------------------------------------
 namespace pid_contact {
 
+constexpr uint16_t kImportance              = 0x0017u;
 constexpr uint16_t kMessageClass            = 0x001Au;
+constexpr uint16_t kSensitivity             = 0x0036u;
 constexpr uint16_t kSubject                 = 0x0037u;   // Display-name fallback
+constexpr uint16_t kMessageFlags            = 0x0E07u;
+constexpr uint16_t kMessageSize             = 0x0E08u;
+constexpr uint16_t kHasAttachments          = 0x0E1Bu;
+constexpr uint16_t kIconIndex               = 0x1080u;   // 512 for default contact icon
 constexpr uint16_t kCreationTime            = 0x3007u;
 constexpr uint16_t kLastModificationTime    = 0x3008u;
+constexpr uint16_t kInternetCpid            = 0x3FDEu;   // 65001 = UTF-8
+constexpr uint16_t kMessageLocaleId         = 0x3FF1u;   // 1033 = en-US
 
 // Personal-info props
 constexpr uint16_t kDisplayName             = 0x3001u;
@@ -119,6 +128,20 @@ public:
         auto& slot = wide_.back();
         detail::writeU64(slot.data(), 0, ticks);
         addProp(tag, PropType::SystemTime, slot.data(), 8u);
+    }
+
+    // Emit a Unicode string from raw UTF-16LE bytes (no string-to-utf16
+    // conversion). Used for PR_SUBJECT where we need to prepend the
+    // 2-char `\x01\x01` normalized-subject-prefix marker per
+    // [MS-OXCMSG] §3.3.3.1 — addUnicodeString takes UTF-8 and can't
+    // express the prefix.
+    void addUnicodeRaw(uint16_t tag, vector<uint8_t> utf16leBytes)
+    {
+        if (utf16leBytes.empty()) return;
+        const uint8_t* ptr  = utf16leBytes.data();
+        const size_t   size = utf16leBytes.size();
+        bufs_.emplace_back(std::move(utf16leBytes));
+        addProp(tag, PropType::Unicode, ptr, size);
     }
 
     void addUnicodeString(uint16_t tag, const string& utf8)
@@ -236,7 +259,60 @@ MailPcResult buildContactPc(const graph::GraphContact& c,
             displayName = c.surname;
     }
     pb.addUnicodeString(pid_contact::kDisplayName, displayName);
-    pb.addUnicodeString(pid_contact::kSubject,     displayName);
+
+    // PR_SUBJECT for contacts uses the [MS-OXCMSG] §3.3.3.1 normalized-
+    // subject format: 2 UTF-16 code units `U+0001 U+0001` followed by
+    // the subject text. Outlook-exported contacts.pst byte-diff (this
+    // file's reference) shows exactly that layout (`\x01\x01Akshat
+    // Verma`). Without the prefix, Outlook treats the subject as
+    // malformed and may hide the contact from the People view even
+    // though the message lands in the destination Contacts folder.
+    {
+        auto subjectUtf16 = graph::utf8ToUtf16le(displayName);
+        std::vector<uint8_t> prefixed;
+        prefixed.reserve(4 + subjectUtf16.size());
+        prefixed.push_back(0x01); prefixed.push_back(0x00); // U+0001
+        prefixed.push_back(0x01); prefixed.push_back(0x00); // U+0001
+        prefixed.insert(prefixed.end(),
+                        subjectUtf16.begin(), subjectUtf16.end());
+        pb.addUnicodeRaw(pid_contact::kSubject, std::move(prefixed));
+    }
+
+    // M12.3 — message-envelope minimum aligned to real-Outlook
+    // contacts.pst byte-diff. REF has only 9 of these envelope props
+    // on the PC (Importance, Sensitivity, MessageClass, Subject,
+    // MessageFlags, MessageSize, DisplayName, plus 0x300B/0x3007/
+    // 0x3008/0x3FDE/0x3FF1). Dropped from our PC because REF omits
+    // them on IPM.Contact:
+    //   * 0x0057 PR_MESSAGE_TO_ME, 0x0058 PR_MESSAGE_CC_ME
+    //   * 0x0E17 PR_MESSAGE_STATUS, 0x0E08 PR_MESSAGE_SIZE
+    //   * 0x0E1B PR_HASATTACH (mail-style, not used by People view)
+    //   * 0x1080 PR_ICON_INDEX (Outlook computes from MessageClass)
+    //   * 0x3002 PR_ADDRTYPE, 0x3003 PR_EMAIL_ADDRESS (REF uses
+    //     PSETID_Address named props only)
+    //   * 0x3013 PR_CHANGE_KEY (REF omits)
+    // The Contents TC row paired with this PC sets
+    // emitOptionalFixedCells=false to skip CEB bits 2/10/13/14,
+    // matching this PC's "absent" state on those tags.
+    pb.addInt32  (pid_contact::kImportance,     1u);          // Normal
+    pb.addInt32  (pid_contact::kSensitivity,    0u);          // None
+    // PR_MESSAGE_FLAGS = 0x09 (mfRead | mfUnsent) per REF; IPM.Contact
+    // items are locally-created (never "sent") so mfUnsent applies.
+    pb.addInt32  (pid_contact::kMessageFlags,   0x00000009u); // mfRead | mfUnsent
+    // PR_INTERNET_CPID = 20127 (US-ASCII) per REF. We used to emit
+    // 65001 (UTF-8) for parity with mail; Outlook's contact items
+    // canonically carry the US-ASCII codepage.
+    pb.addInt32  (pid_contact::kInternetCpid,   20127u);
+    pb.addInt32  (pid_contact::kMessageLocaleId, 1033u);      // en-US
+
+    // M12.5 — REVERTED M12.4's "Outlook-canonical envelope" block.
+    // The PR_LTP_PARENT_NID=0 emission caused libpff (and presumably
+    // Outlook) to treat the contact as having no valid parent and
+    // route it to the orphan/recovered tree; pffexport on the M12.4
+    // PST showed the contact landing in /tmp/ours.recovered/ instead
+    // of under the Contacts folder. The other 11 additions
+    // (PR_CREATOR_NAME, PR_MESSAGE_CODEPAGE, etc.) didn't help with
+    // Import either, so reverting back to M12.3 minimum.
 
     // Personal-info props
     pb.addUnicodeString(pid_contact::kGivenName,         c.givenName);
@@ -267,6 +343,49 @@ MailPcResult buildContactPc(const graph::GraphContact& c,
         pb.addUnicodeString(pid_contact::kAddressType, "SMTP");
     }
 
+    // M11 named properties under PSETID_Address. The earlier attempt to
+    // emit these tripped Outlook's repair dialog, but the actual
+    // culprit (revealed by scanpst log) was missing PR_SEARCH_KEY /
+    // PR_CREATION_TIME / PR_LAST_MODIFICATION_TIME on the contact PC,
+    // not the named props. Re-enabled now that those are stub-emitted
+    // below. Outlook's People view reads these to render the contact
+    // card / sort order.
+    if (!displayName.empty()) {
+        pb.addUnicodeString(kLidFileUnder, displayName);
+    }
+    if (!c.emailAddresses.empty()) {
+        const auto& addr = c.emailAddresses.front().address;
+        const auto& nm   = c.emailAddresses.front().name;
+        const std::string& displayForEmail = nm.empty() ? displayName : nm;
+        if (!displayForEmail.empty()) {
+            pb.addUnicodeString(kLidEmail1DisplayName,         displayForEmail);
+            pb.addUnicodeString(kLidEmail1OriginalDisplayName, displayForEmail);
+        }
+        if (!addr.empty()) {
+            pb.addUnicodeString(kLidEmail1AddressType,  "SMTP");
+            pb.addUnicodeString(kLidEmail1EmailAddress, addr);
+        }
+    }
+
+    // PR_SEARCH_KEY (0x300B) — must match the value the parent
+    // folder's Contents TC row carries (scanpst flags "row doesn't
+    // match sub-object" otherwise). M12.3 — switched from
+    // deriveSearchKey (literal "SMTP:<UPPER(addr)>" truncated to 16B)
+    // to deriveMessageSearchKey (FNV-1a 16B hash) so the bytes match
+    // what real-Outlook contacts.pst stores (opaque hash, not literal
+    // text). Same function as mail/event PCs use; both contact PC and
+    // the matching TC row emit the same hash from the same seed.
+    {
+        std::string seed;
+        if (!c.emailAddresses.empty() && !c.emailAddresses.front().address.empty()) {
+            seed = c.emailAddresses.front().address;
+        } else {
+            seed = displayName;
+        }
+        const auto sk = graph::deriveMessageSearchKey(seed);
+        pb.addBinary(0x300Bu, vector<uint8_t>(sk.begin(), sk.end()));
+    }
+
     // Birthday / anniversary
     if (!c.birthday.empty())
         pb.addSystemTime(pid_contact::kBirthday, graph::isoToFiletimeTicks(c.birthday));
@@ -274,13 +393,21 @@ MailPcResult buildContactPc(const graph::GraphContact& c,
         pb.addSystemTime(pid_contact::kWeddingAnniversary,
                          graph::isoToFiletimeTicks(c.anniversary));
 
-    // Times
-    if (!c.createdDateTime.empty())
+    // Times — scanpst log: "Missing PR_CREATION_TIME" and "Missing
+    // PR_LAST_MODIFICATION_TIME" are hard errors. Always emit; if
+    // Graph didn't supply a value, stub with FILETIME 0 (1601-01-01).
+    if (!c.createdDateTime.empty()) {
         pb.addSystemTime(pid_contact::kCreationTime,
                          graph::isoToFiletimeTicks(c.createdDateTime));
-    if (!c.lastModifiedDateTime.empty())
+    } else {
+        pb.addSystemTime(pid_contact::kCreationTime, 0ull);
+    }
+    if (!c.lastModifiedDateTime.empty()) {
         pb.addSystemTime(pid_contact::kLastModificationTime,
                          graph::isoToFiletimeTicks(c.lastModifiedDateTime));
+    } else {
+        pb.addSystemTime(pid_contact::kLastModificationTime, 0ull);
+    }
 
     // Business address
     pb.addUnicodeString(pid_contact::kBusinessAddrStreet,     c.businessAddress.street);
@@ -333,12 +460,20 @@ struct M8DataBlock {
     vector<uint8_t> bodyBytes;
 };
 
+// A scheduled SLBLOCK (subnode index for one node) — same shape as the
+// M9 calendar writer. Folder bidSubs reference these so the import wizard
+// can recurse into Hierarchy/Contents/FAI tables.
+struct M8SlBlock {
+    Bid             bid;
+    vector<SlEntry> entries;
+};
+
 } // namespace
 
 WriteResult writeM8Pst(const M8PstConfig& config) noexcept
 {
     try {
-        uint64_t nextDataBidIdx = 1u;
+        uint64_t nextDataBidIdx     = 1u;
         auto allocDataBid = [&]() noexcept {
             return Bid::makeData(nextDataBidIdx++);
         };
@@ -353,6 +488,12 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
 
         vector<M8NodeBuild> nodes;
         vector<M8DataBlock> dataBlocks;
+        vector<M8SlBlock>   slBlocks;
+        // nid → bidData lookup; retained for future folder-bidSub work
+        // (the M11 minimal revert dropped the post-pass; see comments in
+        // the per-folder loop). scheduleNode keeps writing to it so we
+        // can re-enable wiring without rewiring the helper.
+        std::unordered_map<uint32_t, Bid> nidToBid;
 
         auto scheduleNode = [&](Nid nid, Nid parent,
                                 vector<uint8_t> body,
@@ -370,6 +511,7 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             n.bidSub    = bidSub;
             n.bodyBytes = std::move(body);
             nodes.push_back(std::move(n));
+            nidToBid[nid.value] = bidData;
         };
 
         // Round B: empty basic queue node — bidData=0, no block. See mail.cpp.
@@ -426,6 +568,29 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             folderRecs.push_back(rec);
         }
 
+        // Pre-allocate NIDs for every contact up front so each folder's
+        // Contents TC can carry one populated row per contact (with
+        // PidTagLtpRowId = contact NID). Outlook's Contacts view
+        // enumerates the Contents TC and renders rows from its display
+        // columns; an empty Contents TC produces a blank Contacts view
+        // even when the contact PCs exist in the NBT.
+        struct ContactRecord {
+            const graph::GraphContact* src;
+            FolderRecord*              folder;
+            Nid                        contactNid;
+        };
+        vector<ContactRecord> contactRecs;
+        for (auto& rec : folderRecs) {
+            for (const auto* c : rec.src->contacts) {
+                if (c == nullptr) continue;
+                ContactRecord cr;
+                cr.src        = c;
+                cr.folder     = &rec;
+                cr.contactNid = alloc.allocate(NidType::NormalMessage);
+                contactRecs.push_back(cr);
+            }
+        }
+
         // ============================================================
         // 4. Per folder: PC + sibling tables.
         // ============================================================
@@ -447,32 +612,189 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             auto pc = buildMailFolderPc(schema, kDummySub);
             scheduleNode(rec.folderNid, rec.src->parentNid, std::move(pc.hnBytes));
 
-            // Sibling tables (HIER/CONTENTS/FAI) NBTENTRYs carry
-            // nidParent = 0 per [MS-PST] §3.12, confirmed via Aspose
-            // oracle. See KNOWN_UNVERIFIED.md M11-D.
+            // Hierarchy TC: contacts folder has no children → 0 rows.
+            // Sibling-table NBTENTRYs carry nidParent = 0 per
+            // [MS-PST] §3.12 (Aspose oracle, see KNOWN_UNVERIFIED M11-D).
             scheduleNode(rec.hierarchyNid, Nid{0u},
                          buildFolderHierarchyTc(nullptr, 0).hnBytes);
+
+            // Per-folder Contents TC: one populated row per contact the
+            // folder owns. Outlook's Contacts view enumerates this TC
+            // and reads each row's display columns (Subject = display
+            // name, LastModificationTime) to render the contact list.
+            // An empty TC = "no contacts" even when the contact PCs
+            // exist below in the NBT.
+            //
+            // Storage outlives the schedule call so raw pointers in
+            // ContentsTcRow stay valid until buildFolderContentsTc has
+            // emitted the row payloads. Reserve upfront so push_back
+            // never reallocates and invalidates pointers we captured.
+            struct ContactRowBuffers {
+                vector<uint8_t> messageClass;
+                vector<uint8_t> subject;
+                vector<uint8_t> searchKey;
+                vector<uint8_t> changeKey;
+            };
+            size_t folderContactCount = 0;
+            for (const auto& cr : contactRecs) {
+                if (cr.folder == &rec) ++folderContactCount;
+            }
+            vector<ContactRowBuffers> ctcBufs;  ctcBufs.reserve(folderContactCount);
+            vector<ContentsTcRow>     ctcRows;  ctcRows.reserve(folderContactCount);
+            for (const auto& cr : contactRecs) {
+                if (cr.folder != &rec) continue;
+                const graph::GraphContact& c = *cr.src;
+
+                // Display name fallback chain matches buildContactPc.
+                string display = c.displayName;
+                if (display.empty()) {
+                    if (!c.givenName.empty() && !c.surname.empty())
+                        display = c.givenName + " " + c.surname;
+                    else if (!c.givenName.empty())
+                        display = c.givenName;
+                    else
+                        display = c.surname;
+                }
+
+                ctcBufs.push_back({});
+                auto& b = ctcBufs.back();
+                b.messageClass = u16le("IPM.Contact");
+                // Subject MUST match the contact PC's PR_SUBJECT value
+                // byte-for-byte (scanpst flags "row doesn't match
+                // sub-object" otherwise). buildContactPc emits PR_SUBJECT
+                // with the [MS-OXCMSG] §3.3.3.1 `\x01\x01` normalized-
+                // subject prefix; emit the same shape here.
+                if (!display.empty()) {
+                    auto subjectUtf16 = graph::utf8ToUtf16le(display);
+                    b.subject.reserve(4 + subjectUtf16.size());
+                    b.subject.push_back(0x01); b.subject.push_back(0x00);
+                    b.subject.push_back(0x01); b.subject.push_back(0x00);
+                    b.subject.insert(b.subject.end(),
+                                     subjectUtf16.begin(), subjectUtf16.end());
+                }
+                // PR_SEARCH_KEY must match the PC's 0x300B (see
+                // buildContactPc). M12.3 — switched to
+                // deriveMessageSearchKey to match REF's opaque-hash
+                // bytes. Both row and PC use the same seed/function.
+                {
+                    std::string seed;
+                    if (!c.emailAddresses.empty()
+                        && !c.emailAddresses.front().address.empty()) {
+                        seed = c.emailAddresses.front().address;
+                    } else {
+                        seed = display;
+                    }
+                    const auto sk = graph::deriveMessageSearchKey(seed);
+                    b.searchKey.assign(sk.begin(), sk.end());
+                }
+                // PR_CHANGE_KEY (0x3013) — M12.3 — DROP. Outlook-exported
+                // contacts.pst byte-diff (2026-05-12) shows real-Outlook
+                // IPM.Contact PCs DO NOT carry PR_CHANGE_KEY. Setting
+                // the row CEB bit 19 with a 22-byte stub while the PC
+                // omits the tag is precisely what triggered "row
+                // doesn't match sub-object". b.changeKey stays empty;
+                // row.changeKeyBytes = nullptr → CEB bit 19 cleared.
+
+                ContentsTcRow row{};
+                row.rowId         = cr.contactNid;
+                row.rowVer        = 0u;
+                row.importance    = 1;   // Normal
+                row.sensitivity   = 0;
+                row.messageStatus = 0;
+                row.messageFlags  = 0x00000009u;   // mfRead | mfUnsent (matches PC, see buildContactPc)
+                row.messageSize   = 0;
+                row.messageToMe   = false;
+                row.messageCcMe   = false;
+                // M12.3 — skip CEB bits 2/10/13/14 for MessageStatus /
+                // MessageSize / MessageToMe / MessageCcMe. The contact
+                // PC drops the matching tags so the row must too,
+                // otherwise scanpst flags "row doesn't match
+                // sub-object" + "Failed to add row to the FLT".
+                row.emitOptionalFixedCells = false;
+                if (!c.lastModifiedDateTime.empty()) {
+                    row.lastModificationTime =
+                        graph::isoToFiletimeTicks(c.lastModifiedDateTime);
+                }
+                row.messageClassUtf16le         = b.messageClass.data();
+                row.messageClassSize            = b.messageClass.size();
+                row.subjectUtf16le              = b.subject.empty() ? nullptr : b.subject.data();
+                row.subjectSize                 = b.subject.size();
+                row.searchKeyBytes              = b.searchKey.data();
+                row.searchKeySize               = b.searchKey.size();
+                row.changeKeyBytes              = b.changeKey.data();
+                row.changeKeySize               = b.changeKey.size();
+                ctcRows.push_back(row);
+            }
+            // Build Contents TC with row-matrix promotion DISABLED
+            // (firstSubnodeNid = 0). For contact volumes the row
+            // matrix + varlen HN allocations stay well under the 8176
+            // HN block cap (≈118 B/row + ≤200 B varlen), so promotion
+            // is unnecessary and the resulting Contents TC has no
+            // subnodes. Avoids the bidSub wiring that — in M11 testing
+            // — caused Outlook's import wizard to flag "errors
+            // detected" even though the same wiring works in M7 mail
+            // and M9 calendar (root cause TBD).
+            //
+            // If buildFolderContentsTc throws std::length_error for a
+            // large enough contact set, the caller (pst_export.py's
+            // bisect-retry loop) will split the chunk and retry.
+            auto ctcTc = buildFolderContentsTc(
+                ctcRows.empty() ? nullptr : ctcRows.data(),
+                ctcRows.size(),
+                Nid{0u});
             scheduleNode(rec.contentsNid, Nid{0u},
-                         buildFolderContentsTc().hnBytes);
+                         std::move(ctcTc.hnBytes));
+
             scheduleNode(rec.faiNid, Nid{0u},
                          buildFolderFaiContentsTc().hnBytes);
         }
 
         // ============================================================
         // 5. IPM Subtree Hierarchy TC.
+        //
+        // scanpst log: "Adding folder (nid=8062) back to the database"
+        // — Deleted Items (NID 0x8062) is emitted as a baseline folder
+        // PC parented to IPM Subtree (0x8022), but the Hierarchy TC at
+        // 0x802D listed only the user folders. scanpst then treats
+        // Deleted Items as orphaned. Inject a row for it. (M7 mail
+        // writer does the same; M11-N on mail.cpp.)
         // ============================================================
         {
+            static const auto kDeletedItemsName = u16le("Deleted Items");
             vector<HierarchyTcRow> ipmHier;
-            ipmHier.reserve(folderRecs.size());
+            ipmHier.reserve(folderRecs.size() + 1u);
+
+            // Deleted Items first (baseline-emitted folder).
+            {
+                HierarchyTcRow row{};
+                row.rowId                 = Nid{0x00008062u};
+                row.displayNameUtf16le    = kDeletedItemsName.data();
+                row.displayNameSize       = kDeletedItemsName.size();
+                row.containerClassUtf16le = nullptr;  // matches baseline PC
+                row.containerClassSize    = 0;
+                row.contentCount          = 0u;
+                row.contentUnreadCount    = 0u;
+                row.hasSubfolders         = false;
+                ipmHier.push_back(row);
+            }
+
+            // Contact folders. containerClass MUST match the folder PC
+            // (we emit "IPF.Contact" on the PC). scanpst log
+            // "Hierarchy Table for 8022, row doesn't match sub-object"
+            // was raised because the row had CEB-cleared containerClass
+            // while the PC carried "IPF.Contact" — mismatch.
             for (size_t i = 0; i < folderRecs.size(); ++i) {
-                HierarchyTcRow row;
-                row.rowId              = folderRecs[i].folderNid;
-                const auto& nameBuf    = folderBufStore[2 * i];
-                row.displayNameUtf16le = nameBuf.data();
-                row.displayNameSize    = nameBuf.size();
-                row.contentCount       = folderRecs[i].contentCount;
-                row.contentUnreadCount = 0u;
-                row.hasSubfolders      = false;
+                HierarchyTcRow row{};
+                row.rowId                 = folderRecs[i].folderNid;
+                const auto& nameBuf       = folderBufStore[2 * i];
+                const auto& ccBuf         = folderBufStore[2 * i + 1];
+                row.displayNameUtf16le    = nameBuf.data();
+                row.displayNameSize       = nameBuf.size();
+                row.containerClassUtf16le = ccBuf.empty() ? nullptr : ccBuf.data();
+                row.containerClassSize    = ccBuf.size();
+                row.contentCount          = folderRecs[i].contentCount;
+                row.contentUnreadCount    = 0u;
+                row.hasSubfolders         = false;
                 ipmHier.push_back(row);
             }
             const HierarchyTcRow* rowsPtr = ipmHier.empty() ? nullptr : ipmHier.data();
@@ -481,22 +803,17 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
         }
 
         // ============================================================
-        // 6. Per contact: contact PC. No subnodes for M8 Phase C.
+        // 6. Per contact: contact PC. Reuses the NIDs we pre-allocated
+        //    when building the per-folder Contents TC rows so each row's
+        //    PidTagLtpRowId resolves to the contact PC's NBT entry.
         // ============================================================
-        for (auto& rec : folderRecs) {
-            for (const auto* c : rec.src->contacts) {
-                if (c == nullptr) continue;
-                const Nid contactNid = alloc.allocate(NidType::NormalMessage);
+        for (auto& cr : contactRecs) {
+            MailPcBuildContext ctx;
+            ctx.providerUid  = config.providerUid;
+            ctx.subnodeStart = Nid{(cr.contactNid.value & ~uint32_t{0x1Fu}) + 0x10000u + 0x1u};
 
-                MailPcBuildContext ctx;
-                ctx.providerUid  = config.providerUid;
-                ctx.subnodeStart = Nid{(contactNid.value & ~uint32_t{0x1Fu}) + 0x10000u + 0x1u};
-
-                MailPcResult pc = buildContactPc(*c, ctx);
-                // M8 Phase C: contact PC has no subnodes (we emit only
-                // top-level scalar PidTags). Drop pc.subnodes.
-                scheduleNode(contactNid, rec.folderNid, std::move(pc.hnBytes));
-            }
+            MailPcResult pc = buildContactPc(*cr.src, ctx);
+            scheduleNode(cr.contactNid, cr.folder->folderNid, std::move(pc.hnBytes));
         }
 
         // ============================================================
@@ -509,7 +826,7 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
 
         vector<M5DataBlockSpec> m5Blocks;
         vector<M5Node>          m5Nodes;
-        m5Blocks.reserve(dataBlocks.size());
+        m5Blocks.reserve(dataBlocks.size() + slBlocks.size());
         m5Nodes.reserve(nodes.size());
 
         uint64_t cursorIb = kBlocksStart;
@@ -522,6 +839,21 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             spec.bid          = blk.bid;
             spec.encodedBlock = encoded;
             spec.cb           = static_cast<uint16_t>(blk.bodyBytes.size());
+            m5Blocks.push_back(std::move(spec));
+            cursorIb += encoded.size();
+        }
+
+        // SLBLOCKs after data blocks. Ordering is for deterministic
+        // layout; the M5 layer indexes by BID so file position is free.
+        for (const auto& sl : slBlocks) {
+            const auto encoded = buildSlBlock(
+                sl.entries.data(), sl.entries.size(),
+                sl.bid, Ib{cursorIb});
+            M5DataBlockSpec spec;
+            spec.bid          = sl.bid;
+            spec.encodedBlock = encoded;
+            // SLBLOCK structured-body size: 8-byte header + 24-byte entries.
+            spec.cb = static_cast<uint16_t>(8 + sl.entries.size() * 24);
             m5Blocks.push_back(std::move(spec));
             cursorIb += encoded.size();
         }
