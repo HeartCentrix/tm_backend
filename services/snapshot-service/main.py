@@ -1106,8 +1106,13 @@ async def list_snapshot_emails(
         filters.append(SnapshotItem.folder_path == folder)
     if search:
         filters.append(SnapshotItem.name.ilike(f"%{search}%"))
+    # Pull every row, dedup by external_id, then sort by send-time DESC so
+    # page 1 = newest emails (Gmail / Outlook order). Sorting by
+    # SnapshotItem.created_at alone was effectively random — all rows in a
+    # single backup share roughly the same insert timestamp, so emails
+    # appeared in worker-write order (arbitrary) instead of chronological.
     all_rows = (await db.execute(
-        select(SnapshotItem).where(*filters).order_by(SnapshotItem.created_at.desc())
+        select(SnapshotItem).where(*filters)
     )).scalars().all()
     seen: set = set()
     deduped = []
@@ -1117,6 +1122,17 @@ async def list_snapshot_emails(
             continue
         seen.add(key)
         deduped.append(it)
+    def _mail_sort_key(r):
+        raw = (r.extra_data or {}).get("raw") or {}
+        # receivedDateTime is the inbox-arrival timestamp (what Outlook /
+        # Gmail order on). Falls back to sentDateTime for items in Sent
+        # Items and to row created_at for malformed rows so we never get
+        # a None comparator that would blow up the sort.
+        ts = raw.get("receivedDateTime") or raw.get("sentDateTime")
+        if ts:
+            return ts  # ISO-8601 strings sort lexicographically by time
+        return r.created_at.isoformat() if r.created_at else ""
+    deduped.sort(key=_mail_sort_key, reverse=True)
     total = len(deduped)
     offset = (page - 1) * size
     items = deduped[offset: offset + size]
