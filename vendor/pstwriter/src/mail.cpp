@@ -833,60 +833,23 @@ MailPcResult buildAttachmentPc(const graph::Attachment&  att,
 }
 
 // ============================================================================
-// buildMailFolderPc — extends M6 folder PC with PidTagContainerClass +
-// PidTagPstHidden* properties for full Outlook compat.
+// buildMailFolderPc — IPF.Note folder PC wrapper. The universal property
+// envelope (DisplayName, content counts, search key, design id, etc.) is
+// emitted by buildFolderPcExtended in messaging.cpp; this wrapper just
+// supplies the mail-specific PidTagContainerClass bytes.
+//
+// History: M12.6 (2026-05-12) introduced the 14-property folder envelope
+// after byte-diff against a real Outlook-exported PST showed the prior
+// 5-property folders were silently rejected by Outlook's Import wizard.
+// M12.7 (2026-05-12) split the single mail-shaped builder into three
+// per-content-type wrappers so each pipeline owns its own folder code.
 // ============================================================================
 PcResult buildMailFolderPc(const M7FolderSchema& schema,
                            Nid                   firstSubnodeNid)
 {
-    array<uint8_t, 4> contentCountBytes{};
-    detail::writeU32(contentCountBytes.data(), 0, schema.contentCount);
-
-    array<uint8_t, 4> contentUnreadBytes{};
-    detail::writeU32(contentUnreadBytes.data(), 0, schema.contentUnreadCount);
-
-    array<uint8_t, 1> subfoldersBytes{
-        static_cast<uint8_t>(schema.hasSubfolders ? 1u : 0u)
-    };
-
-    array<uint8_t, 4> hiddenCountBytes{};
-    detail::writeU32(hiddenCountBytes.data(), 0, schema.pstHiddenCount);
-    array<uint8_t, 4> hiddenUnreadBytes{};
-    detail::writeU32(hiddenUnreadBytes.data(), 0, schema.pstHiddenUnreadCount);
-
-    vector<PcProperty> props;
-    props.reserve(7);
-
-    if (schema.displayNameSize > 0)
-        props.push_back({ 0x3001u, PropType::Unicode,
-                          schema.displayNameUtf16le, schema.displayNameSize,
-                          PropStorageHint::Auto });
-    props.push_back({ 0x3602u, PropType::Int32,
-                      contentCountBytes.data(), 4u, PropStorageHint::Auto });
-    props.push_back({ 0x3603u, PropType::Int32,
-                      contentUnreadBytes.data(), 4u, PropStorageHint::Auto });
-    props.push_back({ 0x360Au, PropType::Boolean,
-                      subfoldersBytes.data(), 1u, PropStorageHint::Auto });
-    if (schema.containerClassSize > 0)
-        props.push_back({ 0x3613u, PropType::Unicode,
-                          schema.containerClassUtf16le, schema.containerClassSize,
-                          PropStorageHint::Auto });
-    // PR_PstHiddenCount / PR_PstHiddenUnreadCount: only emit when non-zero.
-    // The Hierarchy-TC-row schema includes these at iBit 11/12, but the
-    // row builder never sets those CEB bits (HierarchyTcRow has no fields
-    // for them). When the PC carries 0x6635/0x6636 unconditionally, scanpst
-    // finds them in the child PC but absent in the parent's hierarchy row
-    // and flags "Hierarchy Table for X, row doesn't match sub-object".
-    // Emitting only when non-zero (i.e. when there are actual hidden
-    // subfolders) matches what real Outlook-emitted PSTs do.
-    if (schema.pstHiddenCount != 0u)
-        props.push_back({ 0x6635u, PropType::Int32,
-                          hiddenCountBytes.data(), 4u, PropStorageHint::Auto });
-    if (schema.pstHiddenUnreadCount != 0u)
-        props.push_back({ 0x6636u, PropType::Int32,
-                          hiddenUnreadBytes.data(), 4u, PropStorageHint::Auto });
-
-    return buildPropertyContext(props.data(), props.size(), firstSubnodeNid);
+    return buildFolderPcExtended(schema, firstSubnodeNid,
+                                 kContainerClassMail.data(),
+                                 kContainerClassMail.size());
 }
 
 // ============================================================================
@@ -1205,14 +1168,17 @@ WriteResult writeM7Pst(const M7PstConfig& config) noexcept
             folderNameStore.push_back(containerClassBuf);
             const auto& ccBuf = folderNameStore.back();
 
+            // Container class ("IPF.Note") is hardcoded by
+            // buildMailFolderPc; ccBuf still feeds child folder
+            // hierarchy rows lower down.
+            (void)ccBuf;
+
             M7FolderSchema schema{};
             schema.displayNameUtf16le    = nameBuf.data();
             schema.displayNameSize       = nameBuf.size();
             schema.contentCount          = rec.contentCount;
             schema.contentUnreadCount    = rec.contentUnreadCount;
             schema.hasSubfolders         = false;
-            schema.containerClassUtf16le = ccBuf.data();
-            schema.containerClassSize    = ccBuf.size();
 
             // Resolve the effective parent NID. If the caller supplied
             // a parentPath, look it up against the path→NID map built

@@ -70,6 +70,14 @@ MailPcResult buildEventPc(const graph::GraphEvent&    event,
                           const MailPcBuildContext&   ctx);
 
 // ============================================================================
+// Build a Calendar (IPF.Appointment) folder PC. Wraps the universal
+// envelope builder `buildFolderPcExtended` (mail.hpp / messaging.cpp)
+// with the calendar container-class bytes baked in.
+// ============================================================================
+PcResult buildCalendarFolderPc(const M7FolderSchema& schema,
+                               Nid                   firstSubnodeNid);
+
+// ============================================================================
 // M9 — Folder for calendar events (IPF.Appointment).
 // ============================================================================
 struct M9CalendarFolder {

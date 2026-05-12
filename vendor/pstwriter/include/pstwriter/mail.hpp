@@ -166,33 +166,55 @@ MailPcResult buildAttachmentPc(const graph::Attachment&   att,
                                const MailPcBuildContext&  ctx);
 
 // ============================================================================
-// M7 folder schema — extends M6's FolderPcSchema with PidTagContainerClass.
+// M7 folder schema — shared between mail / calendar / contact folder PCs.
 //
-// Per Decision 6 in M7 pre-flight: PidTagContainerClass distinguishes
-// folder types ("IPF.Note" for mail). M7 folders also include
-// PidTagPstHiddenCount/Unread (0x6635/0x6636) for full Outlook
-// compatibility.
+// The PidTagContainerClass that distinguishes folder types is supplied
+// by the per-content-type wrappers:
+//   * mail     -> buildMailFolderPc      (this header)
+//   * calendar -> buildCalendarFolderPc  (event.hpp)
+//   * contact  -> buildContactFolderPc   (contact.hpp)
+// Each wrapper forwards into the universal envelope builder
+// `buildFolderPcExtended` (messaging.cpp) with its own pre-baked
+// container-class bytes from the `kContainerClass{Mail,Calendar,Contact}`
+// constants below.
 // ============================================================================
 struct M7FolderSchema {
-    // Core display + counts (same as M6).
     const uint8_t* displayNameUtf16le {nullptr};
     size_t         displayNameSize    {0};
     uint32_t       contentCount       {0u};
     uint32_t       contentUnreadCount {0u};
     bool           hasSubfolders      {false};
 
-    // PidTagContainerClass UTF-16-LE bytes, e.g. "IPF.Note" for mail.
-    // May be empty for folders that don't carry a container class.
-    const uint8_t* containerClassUtf16le {nullptr};
-    size_t         containerClassSize    {0};
-
     // PidTagPstHiddenCount / PidTagPstHiddenUnread (0x6635 / 0x6636).
     uint32_t pstHiddenCount       {0u};
     uint32_t pstHiddenUnreadCount {0u};
 };
 
-// Build an M7-format folder PC. When `containerClassSize == 0`, the
-// builder degrades to the M6 4-property schema for backward compat.
+// Pre-computed UTF-16-LE bytes for the three Outlook container classes.
+//   "IPF.Note"        =  8 chars × 2 = 16 bytes  (mail)
+//   "IPF.Appointment" = 15 chars × 2 = 30 bytes  (calendar)
+//   "IPF.Contact"     = 11 chars × 2 = 22 bytes  (contacts)
+inline constexpr std::array<uint8_t, 16> kContainerClassMail = {
+    'I',0,'P',0,'F',0,'.',0,'N',0,'o',0,'t',0,'e',0
+};
+inline constexpr std::array<uint8_t, 30> kContainerClassCalendar = {
+    'I',0,'P',0,'F',0,'.',0,'A',0,'p',0,'p',0,'o',0,
+    'i',0,'n',0,'t',0,'m',0,'e',0,'n',0,'t',0
+};
+inline constexpr std::array<uint8_t, 22> kContainerClassContact = {
+    'I',0,'P',0,'F',0,'.',0,'C',0,'o',0,'n',0,'t',0,
+    'a',0,'c',0,'t',0
+};
+
+// Universal 14-property folder PC envelope builder (defined in
+// messaging.cpp). Each per-content-type wrapper supplies its own
+// containerClass bytes; everything else is content-agnostic.
+PcResult buildFolderPcExtended(const M7FolderSchema& schema,
+                               Nid                   firstSubnodeNid,
+                               const uint8_t*        containerClassUtf16le,
+                               size_t                containerClassSize);
+
+// Build a Mail (IPF.Note) folder PC.
 PcResult buildMailFolderPc(const M7FolderSchema& schema,
                            Nid                   firstSubnodeNid);
 

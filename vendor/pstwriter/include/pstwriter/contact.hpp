@@ -76,6 +76,14 @@ MailPcResult buildContactPc(const graph::GraphContact& contact,
                             const MailPcBuildContext&  ctx);
 
 // ============================================================================
+// Build a Contact (IPF.Contact) folder PC. Wraps the universal envelope
+// builder `buildFolderPcExtended` (mail.hpp / messaging.cpp) with the
+// contact container-class bytes baked in.
+// ============================================================================
+PcResult buildContactFolderPc(const M7FolderSchema& schema,
+                              Nid                   firstSubnodeNid);
+
+// ============================================================================
 // M8 — Folder for contacts (IPF.Contact).
 //
 // Reuses M7Folder shape but defaults containerClass to "IPF.Contact".
