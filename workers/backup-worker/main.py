@@ -2519,6 +2519,30 @@ class BackupWorker:
                     _hc_items_total = 0
                     _hc_bytes_total = 0
                     _hc_interleaved_msg_ids: set = set()
+                    # ATTACHMENTS interleave — mirror of hostedContent above.
+                    # Each chat's file-attachment fetch fires as a background
+                    # task the moment that chat finishes draining, so Phase-2
+                    # file-attachment work overlaps with remaining chat drains
+                    # rather than blocking on the drain barrier. Validated and
+                    # on by default; toggle with USER_CHATS_INTERLEAVE_ATTACHMENTS=false.
+                    _interleave_att = os.getenv(
+                        "USER_CHATS_INTERLEAVE_ATTACHMENTS", "true",
+                    ).lower() in ("true", "1", "yes")
+                    # Outer cap on simultaneous per-chat attachment kicks.
+                    # _userchats_backup_attachments has its own inner semaphores
+                    # (USER_CHATS_ATTACHMENT_CONCURRENCY, CHAT_HC_DOWNLOAD/
+                    # UPLOAD_CONCURRENCY); the outer cap prevents N parallel
+                    # kicks from blowing past the multi-app Graph RPS budget.
+                    _att_chat_concurrency = int(os.getenv(
+                        "USER_CHATS_INTERLEAVE_ATTACHMENT_CONCURRENCY", "4",
+                    ))
+                    _att_chat_sem: Optional[asyncio.Semaphore] = (
+                        asyncio.Semaphore(_att_chat_concurrency) if _interleave_att else None
+                    )
+                    _att_tasks: List[asyncio.Task] = []
+                    _att_items_total: List[SnapshotItem] = []
+                    _att_bytes_total = 0
+                    _att_interleaved_msg_ids: set = set()
                     # Signal key mutated on each successfully-fetched
                     # message so Phase 2's filter (line ~2127) skips it.
                     # Safe because persist (line ~1785) already ran before
@@ -2578,6 +2602,38 @@ class BackupWorker:
                                         f"chat={str(m_chat_id)[:8]}: "
                                         f"{type(_e).__name__}: {_e}"
                                     )
+
+                    async def _kick_attachments_for_chat(
+                        cid: str, msgs: List[Dict[str, Any]],
+                    ) -> None:
+                        """Fetch file attachments for a chat's messages in
+                        parallel with ongoing drains of other chats. Mirrors
+                        _kick_hosted_content_for_chat: successfully-processed
+                        messages get _att_interleaved=True so Phase-2's filter
+                        skips them. Failures stay unmarked so Phase-2 retries
+                        them from items_data."""
+                        nonlocal _att_bytes_total
+                        msgs_with_att = [m for m in msgs if m.get("attachments")]
+                        if not msgs_with_att:
+                            return
+                        async with _att_chat_sem:
+                            try:
+                                items, b = await self._userchats_backup_attachments(
+                                    graph_client, resource, snapshot, tenant, msgs_with_att,
+                                )
+                                _att_items_total.extend(items)
+                                _att_bytes_total += b
+                                for m in msgs_with_att:
+                                    m_id = m.get("id")
+                                    if m_id:
+                                        _att_interleaved_msg_ids.add(m_id)
+                                    m["_att_interleaved"] = True
+                            except Exception as _e:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"att interleave failed chat={cid[:8]}: "
+                                    f"{type(_e).__name__}: {_e}"
+                                )
 
                     async def _stream_persist_chat_items(
                         cid: str,
@@ -2938,6 +2994,16 @@ class BackupWorker:
                                 _kick_hosted_content_for_chat(cid, msgs_local),
                             ))
 
+                        # Same pattern for file attachments — runs in parallel
+                        # with the remaining drains AND the hostedContent task
+                        # above. Together they collapse Phase-2 down to just
+                        # the fall-through for messages whose interleave
+                        # failed.
+                        if _interleave_att and msgs_local and not _chat_fanout_cancelled:
+                            _att_tasks.append(asyncio.create_task(
+                                _kick_attachments_for_chat(cid, msgs_local),
+                            ))
+
                         _progress["chats_done"] += 1
                         _progress["msgs"] += len(msgs_local)
                         # Heartbeat every 10 chats so operators can see
@@ -3006,6 +3072,21 @@ class BackupWorker:
                             f"drained {len(_hc_interleaved_msg_ids)} msgs "
                             f"({_hc_items_total} items, "
                             f"{_hc_bytes_total} bytes) in {hc_elapsed:.1f}s "
+                            f"(overlapped with drain phase)"
+                        )
+
+                    # Same barrier for file-attachment interleave so Phase 2
+                    # sees consistent _att_interleaved_msg_ids and the
+                    # accumulated items list before it computes the fall-through.
+                    if _interleave_att and _att_tasks:
+                        att_started_mono = time.monotonic()
+                        await asyncio.gather(*_att_tasks, return_exceptions=True)
+                        att_elapsed = time.monotonic() - att_started_mono
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] att interleave "
+                            f"drained {len(_att_interleaved_msg_ids)} msgs "
+                            f"({len(_att_items_total)} items, "
+                            f"{_att_bytes_total} bytes) in {att_elapsed:.1f}s "
                             f"(overlapped with drain phase)"
                         )
 
@@ -3409,10 +3490,23 @@ class BackupWorker:
                 if resource.type.value == "USER_MAIL":
                     user_id = (resource.extra_data or {}).get("user_id")
                     if user_id:
+                        # Graph's `hasAttachments` flag only reports file/item/
+                        # reference attachments — NOT inline images embedded
+                        # via `cid:` in the body. Service-generated mail
+                        # (Planner, OneDrive share, Teams notifications) tends
+                        # to ship logos/icons as inline-only attachments with
+                        # hasAttachments=false, so the body renders broken
+                        # icons in recovery. Detect `cid:` in the body and
+                        # force-include those messages too.
+                        def _needs_attachments(raw: Dict[str, Any]) -> bool:
+                            if raw.get("hasAttachments"):
+                                return True
+                            body = (raw.get("body") or {}).get("content") or ""
+                            return 'cid:' in body or 'CID:' in body
                         emails_with_att = [
                             extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
                             if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
-                            and extra["raw"].get("hasAttachments")
+                            and _needs_attachments(extra["raw"])
                         ]
                         if emails_with_att:
                             att_items, att_bytes = await self._usermail_backup_attachments(
@@ -3422,15 +3516,27 @@ class BackupWorker:
                     user_id = (
                         (resource.extra_data or {}).get("user_id") or resource.external_id
                     )
+                    # Fold in attachments captured by the drain-time interleave.
+                    # Drain barrier (above) has already awaited all _att_tasks
+                    # so these nonlocals are stable when we read them here.
+                    try:
+                        if _att_items_total:
+                            att_items.extend(_att_items_total)
+                        att_bytes += _att_bytes_total
+                    except NameError:
+                        pass
                     chats_with_att = [
                         extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
                         if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
                         and extra["raw"].get("attachments")
+                        and not extra["raw"].get("_att_interleaved")
                     ]
                     if chats_with_att:
-                        att_items, att_bytes = await self._userchats_backup_attachments(
+                        fb_items, fb_bytes = await self._userchats_backup_attachments(
                             graph_client, resource, snapshot, tenant, chats_with_att,
                         )
+                        att_items.extend(fb_items)
+                        att_bytes += fb_bytes
                     # Inline-image capture (hostedContents). Runs per message
                     # so each (message, hosted_content) pair gets its own
                     # CHAT_HOSTED_CONTENT SnapshotItem, streamed straight to
