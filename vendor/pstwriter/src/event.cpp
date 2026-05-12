@@ -30,6 +30,21 @@ using std::vector;
 
 namespace pstwriter {
 
+// ============================================================================
+// buildCalendarFolderPc — IPF.Appointment folder PC wrapper. The universal
+// property envelope (DisplayName, content counts, search key, design id,
+// etc.) is emitted by buildFolderPcExtended in messaging.cpp; this wrapper
+// just supplies the calendar-specific PidTagContainerClass bytes. See
+// M7FolderSchema in mail.hpp for the input shape.
+// ============================================================================
+PcResult buildCalendarFolderPc(const M7FolderSchema& schema,
+                               Nid                   firstSubnodeNid)
+{
+    return buildFolderPcExtended(schema, firstSubnodeNid,
+                                 kContainerClassCalendar.data(),
+                                 kContainerClassCalendar.size());
+}
+
 namespace {
 
 // ----------------------------------------------------------------------------
@@ -519,14 +534,17 @@ WriteResult writeM9Pst(const M9PstConfig& config) noexcept
                 }
             }
 
+            // Container class ("IPF.Appointment") is hardcoded by
+            // buildCalendarFolderPc; ccBuf still feeds child folder
+            // hierarchy rows lower down.
+            (void)ccBuf;
+
             M7FolderSchema schema{};
             schema.displayNameUtf16le    = nameBuf.data();
             schema.displayNameSize       = nameBuf.size();
             schema.contentCount          = rec.contentCount;
             schema.contentUnreadCount    = 0u;
             schema.hasSubfolders         = anyChild;
-            schema.containerClassUtf16le = ccBuf.data();
-            schema.containerClassSize    = ccBuf.size();
 
             // Resolve effective parent via parentPath lookup. Empty
             // parentPath falls back to the explicit parentNid the
@@ -539,7 +557,7 @@ WriteResult writeM9Pst(const M9PstConfig& config) noexcept
                 }
             }
 
-            auto pc = buildMailFolderPc(schema, kDummySub);
+            auto pc = buildCalendarFolderPc(schema, kDummySub);
             scheduleNode(rec.folderNid, effectiveParentNid, std::move(pc.hnBytes));
 
             // Per-folder Hierarchy TC: list rows for any child folders

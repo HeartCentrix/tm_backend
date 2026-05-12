@@ -30,6 +30,21 @@ using std::vector;
 
 namespace pstwriter {
 
+// ============================================================================
+// buildContactFolderPc — IPF.Contact folder PC wrapper. The universal
+// property envelope (DisplayName, content counts, search key, design id,
+// etc.) is emitted by buildFolderPcExtended in messaging.cpp; this
+// wrapper just supplies the contact-specific PidTagContainerClass bytes.
+// See M7FolderSchema in mail.hpp for the input shape.
+// ============================================================================
+PcResult buildContactFolderPc(const M7FolderSchema& schema,
+                              Nid                   firstSubnodeNid)
+{
+    return buildFolderPcExtended(schema, firstSubnodeNid,
+                                 kContainerClassContact.data(),
+                                 kContainerClassContact.size());
+}
+
 namespace {
 
 // ----------------------------------------------------------------------------
@@ -600,16 +615,19 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             folderBufStore.push_back(u16le(rec.src->containerClass));
             const auto& ccBuf = folderBufStore.back();
 
+            // Container class ("IPF.Contact") is hardcoded by
+            // buildContactFolderPc; ccBuf only feeds the IPM Subtree
+            // hierarchy TC row built lower down (folderBufStore[2*i+1]).
+            (void)ccBuf;
+
             M7FolderSchema schema{};
             schema.displayNameUtf16le    = nameBuf.data();
             schema.displayNameSize       = nameBuf.size();
             schema.contentCount          = rec.contentCount;
             schema.contentUnreadCount    = 0u;
             schema.hasSubfolders         = false;
-            schema.containerClassUtf16le = ccBuf.data();
-            schema.containerClassSize    = ccBuf.size();
 
-            auto pc = buildMailFolderPc(schema, kDummySub);
+            auto pc = buildContactFolderPc(schema, kDummySub);
             scheduleNode(rec.folderNid, rec.src->parentNid, std::move(pc.hnBytes));
 
             // Hierarchy TC: contacts folder has no children → 0 rows.

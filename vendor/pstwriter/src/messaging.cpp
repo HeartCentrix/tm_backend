@@ -10,7 +10,9 @@
 #include "messaging.hpp"
 
 #include "block.hpp"
+#include "graph_convert.hpp"  // graph::deriveMessageSearchKey
 #include "ltp.hpp"
+#include "mail.hpp"            // M7FolderSchema + buildFolderPcExtended decl
 #include "types.hpp"
 #include "writer.hpp"
 
@@ -167,6 +169,142 @@ PcResult buildFolderPc(const FolderPcSchema& schema,
     };
 
     return buildPropertyContext(props, 4, firstSubnodeNid);
+}
+
+// ----------------------------------------------------------------------------
+// buildFolderPcExtended — 14-property folder PC envelope used by the three
+// per-content-type wrappers (buildMailFolderPc / buildCalendarFolderPc /
+// buildContactFolderPc). Universal across mail / calendar / contacts; the
+// only per-type variation is the PidTagContainerClass bytes the caller
+// passes in.
+//
+// History: M12.6 (2026-05-12) added 9 Outlook-canonical properties after
+// byte-diff against a real Outlook-exported PST showed the prior 5-prop
+// folders were silently rejected by Outlook's Import wizard. M12.7
+// (2026-05-12) split the single mail-shaped builder into per-content-type
+// wrappers (one per cpp), with this universal envelope living here.
+//
+// Properties emitted (all stub values; Outlook overwrites at runtime):
+//   0x3001 PidTagDisplayName_W         — UTF-16 folder name
+//   0x7B9E PR_CONTAINER_HIERARCHY      — display name (sort key)
+//   0x3602 PidTagContentCount          — message count
+//   0x3603 PidTagContentUnreadCount    — unread count
+//   0x360A PidTagSubfolders            — hasSubfolders boolean
+//   0x3613 PidTagContainerClass_W      — "IPF.Note" / "IPF.Appointment" /
+//                                         "IPF.Contact" (per-type bytes)
+//   0x3007 PR_CREATION_TIME            — 8B FILETIME stub
+//   0x3008 PR_LAST_MODIFICATION_TIME   — 8B FILETIME stub
+//   0x300B PR_SEARCH_KEY               — 16-byte hash of display name
+//   0x3900 PR_DISPLAY_TYPE             — 0x01000000 (DT_FOLDER)
+//   0x123A (unnamed)                   — 2 (folder type marker)
+//   0x301D (unnamed)                   — 128 (0x80 folder flag)
+//   0x7C0E PR_PST_FOLDER_DESIGN_ID     — 3749765689 (REF value)
+//   0x7C0F PR_PST_FOLDER_DESIGN_CLS    — 6 (REF value)
+//   0x6635/0x6636 PR_PstHidden{Count,Unread}  — only when non-zero
+// ----------------------------------------------------------------------------
+PcResult buildFolderPcExtended(const M7FolderSchema& schema,
+                               Nid                   firstSubnodeNid,
+                               const uint8_t*        containerClassUtf16le,
+                               size_t                containerClassSize)
+{
+    array<uint8_t, 4> contentCountBytes{};
+    detail::writeU32(contentCountBytes.data(), 0, schema.contentCount);
+
+    array<uint8_t, 4> contentUnreadBytes{};
+    detail::writeU32(contentUnreadBytes.data(), 0, schema.contentUnreadCount);
+
+    array<uint8_t, 1> subfoldersBytes{
+        static_cast<uint8_t>(schema.hasSubfolders ? 1u : 0u)
+    };
+
+    array<uint8_t, 4> hiddenCountBytes{};
+    detail::writeU32(hiddenCountBytes.data(), 0, schema.pstHiddenCount);
+    array<uint8_t, 4> hiddenUnreadBytes{};
+    detail::writeU32(hiddenUnreadBytes.data(), 0, schema.pstHiddenUnreadCount);
+
+    // M12.6 additions — storage owned here so pointers stay valid through
+    // buildPropertyContext().
+    array<uint8_t, 8> creationTimeBytes{};
+    detail::writeU64(creationTimeBytes.data(), 0, 1ull); // FILETIME 1 stub
+    array<uint8_t, 8> modTimeBytes{};
+    detail::writeU64(modTimeBytes.data(), 0, 1ull);
+    array<uint8_t, 4> displayTypeBytes{};
+    detail::writeU32(displayTypeBytes.data(), 0, 0x01000000u);
+    array<uint8_t, 4> folderFlagsBytes{};
+    detail::writeU32(folderFlagsBytes.data(), 0, 2u);
+    array<uint8_t, 4> hierFlagBytes{};
+    detail::writeU32(hierFlagBytes.data(), 0, 0x80u);
+    array<uint8_t, 4> designIdBytes{};
+    detail::writeU32(designIdBytes.data(), 0, 0xDF80E239u);
+    array<uint8_t, 4> designClassBytes{};
+    detail::writeU32(designClassBytes.data(), 0, 6u);
+    // Search key: 16-byte deterministic hash of the folder's display name
+    // so the value is stable across rebuilds and matches what an Outlook
+    // Sync-style consumer would expect to see.
+    vector<uint8_t> searchKeyBytes;
+    if (schema.displayNameSize > 0) {
+        const std::string dn(
+            reinterpret_cast<const char*>(schema.displayNameUtf16le),
+            schema.displayNameSize);
+        const auto sk = graph::deriveMessageSearchKey(dn);
+        searchKeyBytes.assign(sk.begin(), sk.end());
+    } else {
+        searchKeyBytes.assign(16, 0u);
+    }
+
+    vector<PcProperty> props;
+    props.reserve(16);
+
+    if (schema.displayNameSize > 0)
+        props.push_back({ 0x3001u, PropType::Unicode,
+                          schema.displayNameUtf16le, schema.displayNameSize,
+                          PropStorageHint::Auto });
+    // M12.6: PR_CONTAINER_HIERARCHY mirrors display name. Outlook reads it
+    // for folder-tree sorting and breadcrumb navigation.
+    if (schema.displayNameSize > 0)
+        props.push_back({ 0x7B9Eu, PropType::Unicode,
+                          schema.displayNameUtf16le, schema.displayNameSize,
+                          PropStorageHint::Auto });
+    props.push_back({ 0x3602u, PropType::Int32,
+                      contentCountBytes.data(), 4u, PropStorageHint::Auto });
+    props.push_back({ 0x3603u, PropType::Int32,
+                      contentUnreadBytes.data(), 4u, PropStorageHint::Auto });
+    props.push_back({ 0x360Au, PropType::Boolean,
+                      subfoldersBytes.data(), 1u, PropStorageHint::Auto });
+    if (containerClassSize > 0)
+        props.push_back({ 0x3613u, PropType::Unicode,
+                          containerClassUtf16le, containerClassSize,
+                          PropStorageHint::Auto });
+
+    // M12.6 — Outlook-canonical folder envelope.
+    props.push_back({ 0x3007u, PropType::SystemTime,
+                      creationTimeBytes.data(), 8u, PropStorageHint::Auto });
+    props.push_back({ 0x3008u, PropType::SystemTime,
+                      modTimeBytes.data(), 8u, PropStorageHint::Auto });
+    props.push_back({ 0x300Bu, PropType::Binary,
+                      searchKeyBytes.data(), searchKeyBytes.size(),
+                      PropStorageHint::Auto });
+    props.push_back({ 0x3900u, PropType::Int32,
+                      displayTypeBytes.data(), 4u, PropStorageHint::Auto });
+    props.push_back({ 0x123Au, PropType::Int32,
+                      folderFlagsBytes.data(), 4u, PropStorageHint::Auto });
+    props.push_back({ 0x301Du, PropType::Int32,
+                      hierFlagBytes.data(), 4u, PropStorageHint::Auto });
+    props.push_back({ 0x7C0Eu, PropType::Int32,
+                      designIdBytes.data(), 4u, PropStorageHint::Auto });
+    props.push_back({ 0x7C0Fu, PropType::Int32,
+                      designClassBytes.data(), 4u, PropStorageHint::Auto });
+
+    // PR_PstHiddenCount / PR_PstHiddenUnreadCount: only emit when non-zero
+    // (matches real-Outlook-PST behaviour).
+    if (schema.pstHiddenCount != 0u)
+        props.push_back({ 0x6635u, PropType::Int32,
+                          hiddenCountBytes.data(), 4u, PropStorageHint::Auto });
+    if (schema.pstHiddenUnreadCount != 0u)
+        props.push_back({ 0x6636u, PropType::Int32,
+                          hiddenUnreadBytes.data(), 4u, PropStorageHint::Auto });
+
+    return buildPropertyContext(props.data(), props.size(), firstSubnodeNid);
 }
 
 // ----------------------------------------------------------------------------
