@@ -1727,12 +1727,71 @@ class BackupWorker:
                     # (recurses into every subfolder by default). Without
                     # this we'd only see root-level items. Reference:
                     # https://learn.microsoft.com/graph/api/driveitem-delta
+                    #
+                    # Incremental: on a subsequent run we resume from the
+                    # saved @odata.deltaLink — Graph then returns ONLY the
+                    # items that changed (created / modified / renamed /
+                    # moved / deleted) since that token, including a fresh
+                    # deltaLink to rotate to. A "no-change" incremental
+                    # therefore emits zero rows and the file-bytes phase
+                    # below short-circuits at the empty-list guard
+                    # (main.py:3145), so the whole handler completes in
+                    # seconds instead of re-listing + re-downloading every
+                    # file in the drive. First run (no saved link) walks
+                    # the full drive once and captures the initial token.
+                    saved_delta = (resource.extra_data or {}).get(
+                        "onedrive_delta_link",
+                    )
                     out = []
-                    next_url = f"{graph_client.GRAPH_URL}/drives/{drive_id}/root/delta"
+                    deleted_ids: List[str] = []
+                    new_delta_link: Optional[str] = None
+                    if saved_delta:
+                        next_url = saved_delta
+                        print(
+                            f"[{self.worker_id}] [USER_ONEDRIVE] "
+                            f"{resource.display_name}: resuming from saved deltaLink"
+                        )
+                    else:
+                        next_url = f"{graph_client.GRAPH_URL}/drives/{drive_id}/root/delta"
                     pages_seen = 0
                     while next_url:
-                        page = await graph_client._get(next_url, params={"$top": "200"} if pages_seen == 0 else None)
+                        try:
+                            page = await graph_client._get(
+                                next_url,
+                                params={"$top": "1000"} if pages_seen == 0 and not saved_delta else None,
+                            )
+                        except httpx.HTTPStatusError as he:
+                            # 410 Gone signals the saved token has been
+                            # invalidated (Graph drops tokens after ~30
+                            # days or after major drive churn). Re-bootstrap
+                            # from /root/delta so the next run gets a
+                            # fresh token; this run then re-walks the drive.
+                            if (
+                                saved_delta
+                                and getattr(he.response, "status_code", 0) == 410
+                            ):
+                                print(
+                                    f"[{self.worker_id}] [USER_ONEDRIVE] "
+                                    f"saved deltaLink expired (410); "
+                                    f"re-bootstrapping from /root/delta"
+                                )
+                                saved_delta = None
+                                next_url = f"{graph_client.GRAPH_URL}/drives/{drive_id}/root/delta"
+                                out = []
+                                deleted_ids = []
+                                pages_seen = 0
+                                continue
+                            raise
                         for f in page.get("value", []):
+                            # @removed marks deletions. We don't actively
+                            # tombstone prior rows — restore reads the
+                            # last-known-good snapshot per file — but we
+                            # also don't want to re-download or emit them.
+                            if "@removed" in f:
+                                _id = f.get("id")
+                                if _id:
+                                    deleted_ids.append(_id)
+                                continue
                             # Skip the root folder itself (no name / no parentReference).
                             if not f.get("parentReference"):
                                 continue
@@ -1750,10 +1809,49 @@ class BackupWorker:
                             clean = parent_path.split(":", 1)[1] if ":" in parent_path else parent_path
                             clean = clean or "/"
                             out.append(("ONEDRIVE_FILE", f.get("name") or "(unnamed)", f.get("id"), {"raw": f}, clean))
+                        # @odata.deltaLink appears ONLY on the terminal
+                        # page of a delta stream (mutually exclusive with
+                        # @odata.nextLink). Capture it for the next run.
+                        if "@odata.deltaLink" in page:
+                            new_delta_link = page["@odata.deltaLink"]
                         next_url = page.get("@odata.nextLink")
                         pages_seen += 1
                         if pages_seen > 10000:
                             break  # runaway guard, not an intentional cap
+
+                    # Persist the new deltaLink so the next run skips
+                    # listing of unchanged files. Always overwrite — Graph
+                    # tokens chain forward; rotating to the freshest one
+                    # is what guarantees we don't miss a change emitted
+                    # between runs.
+                    if new_delta_link:
+                        try:
+                            async with async_session_factory() as _s:
+                                r = await _s.get(Resource, resource.id)
+                                if r is not None:
+                                    ed = dict(r.extra_data or {})
+                                    ed["onedrive_delta_link"] = new_delta_link
+                                    r.extra_data = ed
+                                    await _s.commit()
+                        except Exception as _e:
+                            print(
+                                f"[{self.worker_id}] [USER_ONEDRIVE] "
+                                f"deltaLink persist failed: {_e}"
+                            )
+
+                    if saved_delta:
+                        print(
+                            f"[{self.worker_id}] [USER_ONEDRIVE] "
+                            f"{resource.display_name}: incremental — "
+                            f"{len(out)} changed file(s), "
+                            f"{len(deleted_ids)} deletion(s)"
+                        )
+                    else:
+                        print(
+                            f"[{self.worker_id}] [USER_ONEDRIVE] "
+                            f"{resource.display_name}: first-run full sync — "
+                            f"{len(out)} file(s) across {pages_seen} page(s)"
+                        )
                     return out
 
                 if kind == "USER_CONTACTS":
@@ -2033,7 +2131,18 @@ class BackupWorker:
                     # Layer D first: harvest inline-expanded members when
                     # Graph honoured $expand=members. Zero extra HTTP cost
                     # because the data already rode on the chat-list page.
+                    #
+                    # We also capture each member's userId so that, when
+                    # $expand returns membership rows without displayName /
+                    # email (common for @thread.v2 group chats, federated
+                    # users, or memberships Graph hasn't fully hydrated),
+                    # we can resolve the missing names via a downstream
+                    # /users/{id} $batch lookup. Without that backfill,
+                    # those chats end up named "Group Chat (19:xxxxx)"
+                    # forever (until baseline expires) because the inline
+                    # path returns 0 names → fallback name → cached.
                     member_lookup: Dict[str, Tuple[List[str], List[str]]] = {}
+                    chat_user_ids: Dict[str, List[str]] = {}
                     if chat_members_inline:
                         for c in chats_raw:
                             cid = c.get("id")
@@ -2049,6 +2158,10 @@ class BackupWorker:
                                 if m.get("displayName")
                             ]
                             member_lookup[cid] = (emails, names)
+                            chat_user_ids[cid] = [
+                                m.get("userId") for m in inline
+                                if m.get("userId")
+                            ]
 
                     # Fallback path: $batch /chats/{id}/members for any
                     # fresh chat we don't yet have members for (legacy
@@ -2080,8 +2193,88 @@ class BackupWorker:
                                 emails = [m.get("email") for m in value if m.get("email")]
                                 names = [m.get("displayName") for m in value if m.get("displayName")]
                                 member_lookup[cid] = (emails, names)
+                                chat_user_ids[cid] = [
+                                    m.get("userId") for m in value
+                                    if m.get("userId")
+                                ]
                             else:
                                 member_lookup[cid] = ([], [])
+
+                    # Backfill via /users/{id} for chats where the member
+                    # endpoints returned userIds but no displayName/email.
+                    # Graph's $expand=members is known to return partial
+                    # rows for @thread.v2 group chats — the membership row
+                    # exists but the user fields aren't expanded. The
+                    # /users/{id} endpoint always returns proper fields
+                    # for live users (404 for deleted users — tolerated).
+                    # Batched 20-at-a-time to stay under the per-app RPS
+                    # ceiling; runs at most once per chat per full rescan.
+                    unresolved_cids = [
+                        cid for cid, uids in chat_user_ids.items()
+                        if uids and not member_lookup.get(cid, ([], []))[1]
+                    ]
+                    if unresolved_cids:
+                        unique_uids: List[str] = []
+                        _seen: set = set()
+                        for cid in unresolved_cids:
+                            for uid in chat_user_ids.get(cid) or []:
+                                if uid and uid not in _seen:
+                                    _seen.add(uid)
+                                    unique_uids.append(uid)
+                        user_meta: Dict[str, Dict[str, str]] = {}
+                        USER_BATCH = 20
+                        for i in range(0, len(unique_uids), USER_BATCH):
+                            sub = unique_uids[i:i + USER_BATCH]
+                            reqs = [
+                                BatchRequest(
+                                    id=uid, method="GET",
+                                    url=f"/users/{uid}?$select=displayName,mail",
+                                )
+                                for uid in sub
+                            ]
+                            try:
+                                u_result = await graph_client.batch(reqs)
+                            except Exception as e:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"users batch failed: "
+                                    f"{type(e).__name__}: {e}"
+                                )
+                                u_result = {}
+                            for uid, r in u_result.items():
+                                if r.status == 200 and isinstance(r.body, dict):
+                                    user_meta[uid] = {
+                                        "displayName": r.body.get("displayName") or "",
+                                        "mail": r.body.get("mail") or "",
+                                    }
+                                # 404 / 403: leave uid out of user_meta;
+                                # the chat keeps its fallback name.
+                        resolved = 0
+                        for cid in unresolved_cids:
+                            new_names: List[str] = []
+                            new_emails: List[str] = []
+                            for uid in chat_user_ids.get(cid) or []:
+                                um = user_meta.get(uid) or {}
+                                if um.get("displayName"):
+                                    new_names.append(um["displayName"])
+                                if um.get("mail"):
+                                    new_emails.append(um["mail"])
+                            if new_names or new_emails:
+                                # Merge with whatever the membership row
+                                # already had — keep dedup so a partially-
+                                # hydrated chat doesn't lose existing data.
+                                existing_emails, existing_names = member_lookup.get(cid, ([], []))
+                                merged_emails = list(dict.fromkeys((existing_emails or []) + new_emails))
+                                merged_names = list(dict.fromkeys((existing_names or []) + new_names))
+                                member_lookup[cid] = (merged_emails, merged_names)
+                                if new_names:
+                                    resolved += 1
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] "
+                            f"/users backfill: resolved names for "
+                            f"{resolved}/{len(unresolved_cids)} chats "
+                            f"({len(unique_uids)} unique user IDs)"
+                        )
 
                     # Replay cached metadata for reused chats — no member
                     # fetch needed, just rehydrate the existing entry into

@@ -162,7 +162,9 @@ AUDIT_PRESETS = [
                  "CHAT_EXPORT_DOWNLOADED", "CHAT_EXPORT_FORCE_DELETED"]},
 ]
 
-WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE", "RANSOMWARE_SIGNAL"}
+WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE"}
+# RANSOMWARE_SIGNAL deliberately excluded — it belongs in the Audit + Risk
+# tabs, not the Tasks/Activity feed (it isn't a job outcome).
 
 # Discovery events (run start + completion, per-tenant) are surfaced in the
 # activity feed so users can see auto- and manual-triggered discoveries.
@@ -412,6 +414,22 @@ async def list_activities(
 
         for event in warning_events:
             details = event.details or {}
+            message = details.get("message")
+            if not message:
+                if event.action == "RANSOMWARE_SIGNAL":
+                    anomaly = details.get("anomaly_type") or "Anomaly"
+                    avg_prior = details.get("avg_prior_item_count")
+                    current = details.get("current_item_count")
+                    drop_pct = details.get("drop_pct")
+                    if anomaly == "ITEM_COUNT_DROP" and avg_prior is not None and current is not None:
+                        pct = f" ({drop_pct}% drop)" if drop_pct is not None else ""
+                        message = f"Ransomware signal: item count dropped from avg {avg_prior} to {current}{pct}."
+                    else:
+                        message = f"Ransomware signal detected ({anomaly})."
+                elif event.action == "BACKUP_SKIPPED_SLA_SCOPE":
+                    message = "Backup skipped because the assigned SLA does not cover this resource type."
+                else:
+                    message = ACTIONS.get(event.action, event.action)
             items.append({
                 "id": f"audit-{event.id}",
                 "start_time": event.occurred_at.isoformat() if event.occurred_at else "",
@@ -419,7 +437,7 @@ async def list_activities(
                 "object": event.resource_name or event.resource_type or "Unknown resource",
                 "status": "Warning",
                 "finish_time": event.occurred_at.isoformat() if event.occurred_at else "",
-                "details": details.get("message") or "Backup skipped because the assigned SLA does not cover this resource type.",
+                "details": message,
             })
 
         # Discovery events: pair each DISCOVERY_STARTED with its matching
@@ -1000,11 +1018,16 @@ async def get_high_risk_events(
         to_date = datetime.utcnow().isoformat()
 
     async with async_session_factory() as db:
-        # Use PostgreSQL JSONB containment operator via text()
+        # A row qualifies as a risk signal if it carries an explicit
+        # `risk_signals` payload (legacy scorer output) OR is a
+        # RANSOMWARE_SIGNAL action emitted by the anomaly detector.
         filters = [
             AuditEvent.occurred_at >= datetime.fromisoformat(from_date),
             AuditEvent.occurred_at <= datetime.fromisoformat(to_date),
-            text("details @> '{\"risk_signals\":{}}'"),  # Has risk_signals key
+            or_(
+                text("details @> '{\"risk_signals\":{}}'"),
+                AuditEvent.action == "RANSOMWARE_SIGNAL",
+            ),
         ]
         if tenantId:
             filters.append(AuditEvent.tenant_id == uuid.UUID(tenantId))
@@ -1027,6 +1050,32 @@ async def get_high_risk_events(
             item = _format_event(e)
             details = e.details or {}
             risk_signals = details.get("risk_signals", {})
+            # RANSOMWARE_SIGNAL events don't carry a `risk_signals` payload —
+            # synthesize one from the anomaly fields so the Risk tab can
+            # surface them with a score and level.
+            if not risk_signals and e.action == "RANSOMWARE_SIGNAL":
+                drop_pct = details.get("drop_pct") or 0
+                anomaly = details.get("anomaly_type") or "ANOMALY"
+                if drop_pct >= 90:
+                    level = "CRITICAL"
+                    score = 90
+                elif drop_pct >= 70:
+                    level = "HIGH"
+                    score = 70
+                elif drop_pct >= 50:
+                    level = "MEDIUM"
+                    score = 50
+                else:
+                    level = "LOW"
+                    score = 30
+                risk_signals = {
+                    "risk_level": level,
+                    "risk_score": score,
+                    "anomaly_type": anomaly,
+                    "drop_pct": drop_pct,
+                    "current_item_count": details.get("current_item_count"),
+                    "avg_prior_item_count": details.get("avg_prior_item_count"),
+                }
             item["risk_signals"] = risk_signals
             item["risk_score"] = risk_signals.get("risk_score", 0)
             item["risk_level"] = risk_signals.get("risk_level", "UNKNOWN")
