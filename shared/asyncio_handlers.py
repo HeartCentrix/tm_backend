@@ -39,6 +39,40 @@ _TRANSIENT_BROKER_EXC = {
     "AMQPConnectionError",
 }
 
+# Exception classes whose orphan-future noise comes from the Azure
+# Storage SDK's aiohttp transport during connector cleanup under high
+# upload concurrency. The SDK's own retry policy plus our
+# upload_blob_with_retry wrapper already handle these at the API
+# boundary — what reaches the loop handler is the *connector cleanup
+# task* dying after the upload result has already been returned to the
+# caller. Demoting these to debug prevents the cascade from killing the
+# worker via a downstream TaskGroup that catches "any" exception.
+_TRANSIENT_HTTP_TRANSPORT_EXC = {
+    "ClientConnectionError",   # aiohttp connector cleanup
+    "ServerDisconnectedError", # aiohttp peer-closed mid-stream
+    "ClientPayloadError",
+}
+
+# Messages that indicate the same cleanup-cascade category even when
+# the exception class is generic (TimeoutError, OSError, etc.).
+_TRANSIENT_HTTP_MSG_PATTERNS = (
+    "SSL shutdown timed out",
+    "Timeout on reading data from socket",
+    "Cannot write to closing transport",
+    "Connection lost",
+)
+
+
+def _is_transient_http_transport(exc: BaseException, msg: str) -> bool:
+    """True when the exception/message pair matches an Azure-SDK-aiohttp
+    cleanup-cascade pattern that's already been handled at the upload
+    retry layer."""
+    if exc is not None and exc.__class__.__name__ in _TRANSIENT_HTTP_TRANSPORT_EXC:
+        return True
+    text = str(exc) if exc is not None else ""
+    haystack = f"{msg} {text}"
+    return any(p in haystack for p in _TRANSIENT_HTTP_MSG_PATTERNS)
+
 
 def _handle(loop: asyncio.AbstractEventLoop, context: dict) -> None:
     exc = context.get("exception")
@@ -53,6 +87,19 @@ def _handle(loop: asyncio.AbstractEventLoop, context: dict) -> None:
         return
     if "Future exception was never retrieved" in msg and exc is not None and exc.__class__.__name__ in _TRANSIENT_BROKER_EXC:
         logger.debug("[asyncio] suppressed orphan future: %s", exc)
+        return
+    if _is_transient_http_transport(exc, msg):
+        # Azure SDK's aiohttp transport cleanup-cascade. Already retried
+        # at the upload layer; the orphan exception here would otherwise
+        # propagate via the default handler and trip a TaskGroup that
+        # exits the worker cleanly with ExitCode=0 (root cause of
+        # worker-2 mid-run cycles documented in benchmarks/comparison-
+        # 2026-05-11.md). Demote to debug.
+        logger.debug(
+            "[asyncio] suppressed transient HTTP transport noise %s: %s | msg=%s",
+            exc.__class__.__name__ if exc is not None else "<no-exc>",
+            exc, msg,
+        )
         return
     # Anything else — preserve the default loud behaviour so real bugs
     # still get caught.
