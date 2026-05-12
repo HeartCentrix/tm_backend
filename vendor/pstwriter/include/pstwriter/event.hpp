@@ -56,10 +56,15 @@ namespace pstwriter {
 //     PidTagSubject suffix is NOT done; instead we just skip location
 //     (M10 hardening adds PidLidLocation).
 //
-// Notes / KNOWN_UNVERIFIED M9-1: Outlook reads canonical appointment
-// properties from named props. M9 emits the PidTag-mirrors documented
-// in [MS-OXPROPS] but Outlook's Calendar UI may not surface them
-// without the named-property variants.
+// M10: PidLid* named props under PSETID_Appointment are now emitted
+// alongside the legacy PidTag mirrors. The Name-to-Id Map at NID 0x61
+// (see buildNameToIdMapPc in messaging.cpp) registers:
+//   * kLidAppointmentStartWhole (dispid 0x820D) — PtypTime
+//   * kLidAppointmentEndWhole   (dispid 0x820E) — PtypTime
+//   * kLidLocation              (dispid 0x8208) — PtypString
+//   * kLidAppointmentDuration   (dispid 0x8213) — PtypInteger32
+//   * kLidAppointmentSubType    (dispid 0x8215) — PtypBoolean
+// Outlook's Calendar UI reads these named variants to render the grid.
 // ============================================================================
 MailPcResult buildEventPc(const graph::GraphEvent&    event,
                           const MailPcBuildContext&   ctx);
@@ -72,6 +77,18 @@ struct M9CalendarFolder {
     Nid          nid;
     Nid          parentNid;
     std::string  containerClass {"IPF.Appointment"};
+
+    // Optional folder identity for nesting (same contract as M7Folder).
+    // When ``path`` is non-empty and ``parentPath`` references another
+    // M9CalendarFolder's ``path`` in the same config, the writer
+    // resolves the parent's allocated NID and overrides ``parentNid``
+    // accordingly. Use these to materialise the source mailbox's
+    // multi-calendar layout in Outlook (e.g. "Calendar/Default",
+    // "Calendar/United States holidays") instead of a single flat
+    // "Calendar" folder. Empty values fall back to legacy parentNid
+    // wiring.
+    std::string  path;
+    std::string  parentPath;
 
     std::vector<const graph::GraphEvent*> events;
 };

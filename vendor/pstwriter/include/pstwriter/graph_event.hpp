@@ -141,6 +141,15 @@ struct GraphEvent {
     // Online meeting
     std::string onlineMeetingProvider;
     std::string onlineMeetingUrl;
+
+    // Human-readable folder path supplied by the exporter (e.g.
+    // "Calendar/Default", "Calendar/United States holidays"). When
+    // present, pst_convert groups events by this string to rebuild the
+    // calendar-source folder hierarchy in the output PST. Falls back
+    // to a single flat "Calendar" folder when empty so legacy snapshots
+    // stay functional. Wire format: under-key ``_folderPath`` on the
+    // event JSON.
+    std::string folderPath;
 };
 
 // ============================================================================
