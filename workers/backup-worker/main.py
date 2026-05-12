@@ -282,6 +282,43 @@ from shared.entra_fingerprint import fingerprint_object as _entra_fp
 logger = logging.getLogger(__name__)
 
 
+class _ChatAttDedup:
+    """Snapshot-wide dedup state for chat-attachment capture.
+
+    Without this, every per-chat ``_userchats_backup_attachments`` call
+    builds its own URL / driveItem / content-hash caches. A screenshot
+    referenced in six chats is therefore resolved 6×, downloaded 6×, and
+    hashed 6× before content-hash dedup finally collapses the upload.
+    Sharing one instance across every per-chat kick within one USER_CHATS
+    run cuts the redundant Graph round-trips and CDN egress.
+
+    Memory note: ``url_cache`` retains resolved bytes for as long as ANY
+    chat still references that URL. Bounded by ``unique_urls × avg_size``
+    — empirically ~300 unique URLs × ~2 MB ≈ 600 MB peak on a fat
+    tenant, which is well inside the backup-worker container budget.
+
+    Must be instantiated from an async context (locks pin to the
+    current event loop on first use).
+    """
+    __slots__ = (
+        "url_cache", "url_tasks",
+        "driveitem_tasks", "driveitem_lock", "di_dedup_hits",
+        "hash_upload_tasks", "hash_upload_lock", "hash_stats",
+    )
+
+    def __init__(self) -> None:
+        self.url_cache: Dict[str, Optional[bytes]] = {}
+        self.url_tasks: Dict[str, "asyncio.Task[Optional[bytes]]"] = {}
+        self.driveitem_tasks: Dict[str, "asyncio.Future[Optional[bytes]]"] = {}
+        self.driveitem_lock = asyncio.Lock()
+        self.di_dedup_hits: Dict[str, int] = {"n": 0}
+        self.hash_upload_tasks: Dict[str, "asyncio.Future[Optional[str]]"] = {}
+        self.hash_upload_lock = asyncio.Lock()
+        self.hash_stats: Dict[str, int] = {
+            "in_phase_hits": 0, "db_hits": 0, "uploads": 0,
+        }
+
+
 def _classify_chat_drain_error(status: Optional[int], exc: Exception) -> str:
     """Map a chat-drain failure to a category that decides whether the next
     backup retries this chat or skips it.
@@ -2598,12 +2635,20 @@ class BackupWorker:
                     # UPLOAD_CONCURRENCY); the outer cap prevents N parallel
                     # kicks from blowing past the multi-app Graph RPS budget.
                     _att_chat_concurrency = int(os.getenv(
-                        "USER_CHATS_INTERLEAVE_ATTACHMENT_CONCURRENCY", "4",
+                        "USER_CHATS_INTERLEAVE_ATTACHMENT_CONCURRENCY", "12",
                     ))
                     _att_chat_sem: Optional[asyncio.Semaphore] = (
                         asyncio.Semaphore(_att_chat_concurrency) if _interleave_att else None
                     )
                     _att_tasks: List[asyncio.Task] = []
+                    # Snapshot-wide dedup shared by every per-chat kick AND
+                    # the Phase-2 fallback path. Lifts the URL / driveItem /
+                    # content-hash caches out of the per-call closure so
+                    # popular shared files (logos, screenshots, MoM
+                    # templates that surface in many chats) are resolved
+                    # once, downloaded once, and hashed once across the
+                    # entire USER_CHATS run instead of once per chat.
+                    _att_dedup = _ChatAttDedup()
                     # _att_items_total used to be a list collected for Phase-2
                     # to flush via session.add_all. That pattern is broken
                     # because Phase-2 lives in _backup_one (a sibling function)
@@ -2695,6 +2740,7 @@ class BackupWorker:
                             try:
                                 items, b = await self._userchats_backup_attachments(
                                     graph_client, resource, snapshot, tenant, msgs_with_att,
+                                    att_dedup=_att_dedup,
                                 )
                                 if items:
                                     try:
@@ -3793,8 +3839,12 @@ class BackupWorker:
                         and not extra["raw"].get("_att_interleaved")
                     ]
                     if chats_with_att:
+                        # Reuse the same snapshot-wide dedup the interleave
+                        # path used so the fallback doesn't re-resolve /
+                        # re-download URLs already handled during drain.
                         fb_items, fb_bytes = await self._userchats_backup_attachments(
                             graph_client, resource, snapshot, tenant, chats_with_att,
+                            att_dedup=_att_dedup,
                         )
                         att_items.extend(fb_items)
                         att_bytes += fb_bytes
@@ -4390,6 +4440,8 @@ class BackupWorker:
         snapshot: Snapshot,
         tenant: Tenant,
         messages_with_attachments: List[Dict[str, Any]],
+        *,
+        att_dedup: Optional["_ChatAttDedup"] = None,
     ) -> Tuple[List[SnapshotItem], int]:
         """Capture chat-message attachments as separate `CHAT_ATTACHMENT`
         SnapshotItems, mirroring the email path.
@@ -4455,6 +4507,17 @@ class BackupWorker:
         upload_sem = asyncio.Semaphore(max(
             1, int(os.getenv("CHAT_HC_UPLOAD_CONCURRENCY", "32"))
         ))
+        # Snapshot dedup-state sizes at entry, so the phase-complete log
+        # reports THIS call's contribution rather than the cumulative
+        # cross-chat totals (which would print identical numbers from
+        # every per-chat kick once the cache fills up).
+        _pre_urls = len(url_cache)
+        _pre_di = len(driveitem_tasks)
+        _pre_hash = len(hash_upload_tasks)
+        _pre_uploads = hash_stats["uploads"]
+        _pre_db_hits = hash_stats["db_hits"]
+        _pre_phase_hits = hash_stats["in_phase_hits"]
+        _pre_di_hits = di_dedup_hits["n"]
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
 
@@ -4464,12 +4527,22 @@ class BackupWorker:
         # URL-level dedup cache. Stores `None` for failed fetches so
         # repeat references to a broken URL short-circuit. Stores
         # resolved bytes so repeat references to a valid URL reuse
-        # the download. Scoped to this phase only — cleared at end.
+        # the download.
+        #
+        # Scope: if the caller supplied `att_dedup`, the cache spans the
+        # entire USER_CHATS run (snapshot-wide). Otherwise it's per-call
+        # (the legacy behavior). Snapshot-wide is the production default
+        # — popular shared files now resolve / download / hash exactly
+        # once per snapshot instead of once per chat.
+        #
         # Note: the GraphClient also keeps a worker-lifetime cache of
         # URLs that resolved to permanent 4xx (see _unreachable_urls)
-        # — that one survives across phases and across resources.
-        url_cache: Dict[str, Optional[bytes]] = {}
-        url_tasks: Dict[str, asyncio.Task] = {}
+        # — that one survives across phases AND across resources AND
+        # across snapshots in the same worker process.
+        if att_dedup is None:
+            att_dedup = _ChatAttDedup()
+        url_cache = att_dedup.url_cache
+        url_tasks = att_dedup.url_tasks
 
         # driveItem.id-keyed download dedup. A forwarded SharePoint /
         # OneDrive file generates a NEW sharing URL each time it's
@@ -4482,9 +4555,9 @@ class BackupWorker:
         # cuts CDN traffic on heavily-forwarded files (the dominant
         # cost when content includes 20+ MB videos / screenshots).
         # Telemetry: di_dedup_hits below.
-        driveitem_tasks: Dict[str, asyncio.Future] = {}
-        driveitem_lock = asyncio.Lock()
-        di_dedup_hits = {"n": 0}
+        driveitem_tasks = att_dedup.driveitem_tasks
+        driveitem_lock = att_dedup.driveitem_lock
+        di_dedup_hits = att_dedup.di_dedup_hits
 
         # CONTENT-hash dedup. URL-level dedup collapses 4,430
         # attachments down to ~741 unique downloads, but each of
@@ -4500,9 +4573,9 @@ class BackupWorker:
         # `dedup_min_size` matches blob_dedup's default — below this
         # the DB round-trip cost outweighs dedup savings.
         dedup_min_size = int(os.getenv("BLOB_DEDUP_MIN_SIZE_BYTES", "1024"))
-        hash_upload_tasks: Dict[str, asyncio.Future] = {}
-        hash_upload_lock = asyncio.Lock()
-        hash_stats = {"in_phase_hits": 0, "db_hits": 0, "uploads": 0}
+        hash_upload_tasks = att_dedup.hash_upload_tasks
+        hash_upload_lock = att_dedup.hash_upload_lock
+        hash_stats = att_dedup.hash_stats
 
         async def _upload_once_per_hash(
             content_hash: str,
@@ -4844,25 +4917,49 @@ class BackupWorker:
             all_items.append(item)
 
         # Phase-end telemetry.
-        if url_cache:
-            resolved_count = sum(1 for v in url_cache.values() if v is not None)
-            unique_hashes = len(hash_upload_tasks)
-            unique_driveitems = len(driveitem_tasks)
+        #
+        # Reports THIS call's contribution as deltas. With snapshot-wide
+        # dedup, the shared caches grow across every per-chat call —
+        # logging cumulative sizes would print misleadingly-large
+        # "unique URL" counts that don't correspond to this chat's
+        # work. Deltas show how many NEW unique URLs / driveItems /
+        # hashes this call added on top of what the prior kicks
+        # already resolved. Cumulative numbers are recovered by
+        # summing the deltas (the snapshot-level summary lives
+        # elsewhere, in the USER_CHATS finalize block).
+        new_urls = len(url_cache) - _pre_urls
+        new_di = len(driveitem_tasks) - _pre_di
+        new_hash = len(hash_upload_tasks) - _pre_hash
+        if new_urls or new_di or new_hash or all_items:
+            new_uploads = hash_stats["uploads"] - _pre_uploads
+            new_db_hits = hash_stats["db_hits"] - _pre_db_hits
+            new_phase_hits = hash_stats["in_phase_hits"] - _pre_phase_hits
+            new_di_hits = di_dedup_hits["n"] - _pre_di_hits
+            # `resolved_count` is over THIS call's new URLs only.
+            new_url_keys = list(url_cache.keys())[_pre_urls:]
+            resolved_count = sum(
+                1 for k in new_url_keys if url_cache.get(k) is not None
+            )
+            unreachable_count = len(new_url_keys) - resolved_count
             print(
                 f"[{self.worker_id}] [CHAT-ATT] phase complete: "
                 f"{len(all_items)} items across "
                 f"{len(messages_with_attachments)} msgs, "
-                f"{len(url_cache)} unique URLs "
+                f"+{new_urls} new URLs "
                 f"({resolved_count} resolved, "
-                f"{len(url_cache) - resolved_count} unreachable) → "
-                f"{unique_driveitems} unique driveItems "
-                f"(saved {di_dedup_hits['n']} redundant downloads) → "
-                f"{unique_hashes} unique content_hashes "
-                f"[uploads={hash_stats['uploads']}, "
-                f"db_dedup={hash_stats['db_hits']}, "
-                f"in_phase_dedup={hash_stats['in_phase_hits']}]"
+                f"{unreachable_count} unreachable) → "
+                f"+{new_di} new driveItems "
+                f"(saved {new_di_hits} redundant downloads) → "
+                f"+{new_hash} new content_hashes "
+                f"[uploads={new_uploads}, "
+                f"db_dedup={new_db_hits}, "
+                f"in_phase_dedup={new_phase_hits}]"
                 + (f" [deduped {dup_count} in-memory collision(s)]"
                    if dup_count else "")
+                + (f" [shared-cache: {len(url_cache)} urls, "
+                   f"{len(driveitem_tasks)} driveItems, "
+                   f"{len(hash_upload_tasks)} hashes]"
+                   if (_pre_urls + _pre_di + _pre_hash) else "")
             )
         return all_items, total_bytes
 
