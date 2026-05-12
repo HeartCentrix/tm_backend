@@ -4507,14 +4507,6 @@ class BackupWorker:
         upload_sem = asyncio.Semaphore(max(
             1, int(os.getenv("CHAT_HC_UPLOAD_CONCURRENCY", "32"))
         ))
-        # Snapshot dedup-counter values at entry. The phase-complete log
-        # prints (current - entry) so each per-chat kick reports its
-        # contribution to upload / db-dedup / in-phase-dedup activity
-        # instead of the cumulative snapshot-wide totals.
-        _pre_uploads = hash_stats["uploads"]
-        _pre_db_hits = hash_stats["db_hits"]
-        _pre_phase_hits = hash_stats["in_phase_hits"]
-        _pre_di_hits = di_dedup_hits["n"]
         shard = azure_storage_manager.get_shard_for_resource(str(resource.id), str(tenant.id))
         container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
 
@@ -4573,6 +4565,18 @@ class BackupWorker:
         hash_upload_tasks = att_dedup.hash_upload_tasks
         hash_upload_lock = att_dedup.hash_upload_lock
         hash_stats = att_dedup.hash_stats
+
+        # Snapshot dedup-counter values at entry. The phase-complete log
+        # prints (current - entry) so each per-chat kick reports its
+        # contribution to upload / db-dedup / in-phase-dedup activity
+        # instead of the cumulative snapshot-wide totals. MUST come
+        # after the `hash_stats`/`di_dedup_hits` rebind above — otherwise
+        # Python treats them as function-locals (because they're assigned
+        # below) and these reads raise UnboundLocalError.
+        _pre_uploads = hash_stats["uploads"]
+        _pre_db_hits = hash_stats["db_hits"]
+        _pre_phase_hits = hash_stats["in_phase_hits"]
+        _pre_di_hits = di_dedup_hits["n"]
 
         async def _upload_once_per_hash(
             content_hash: str,
