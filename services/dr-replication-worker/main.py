@@ -548,6 +548,217 @@ async def reconcile_dr_lifecycle_policies():
             )
 
 
+# ============================================================================
+# Plan P1 — Chat singleton table replication to DR PG.
+#
+# The Level 2 architecture moves message bodies + URL cache + chat metadata
+# out of per-snapshot snapshot_items and into three tenant-singleton tables:
+#   - chat_threads          (per-(tenant,chat) cursor + failure state)
+#   - chat_thread_messages  (canonical message bodies, single copy per tenant)
+#   - chat_url_cache        (URL → driveItem → blob mapping)
+#
+# Per-snapshot blob replication above doesn't replicate these PG rows. If
+# primary PG is lost, the DR side has all the snapshot_items (replicated
+# blob-by-blob to Azure Blob DR) but no chat bodies — every chat in every
+# snapshot would render empty.
+#
+# This worker pulls deltas from each enabled tenant's primary PG and
+# upserts into the DR PG (configured via DR_PG_DSN). Cadence: every 10 min,
+# incremental for chat_thread_messages (created_at watermark), full upsert
+# for the two small metadata tables.
+# ============================================================================
+
+import os as _os
+
+_DR_PG_DSN = _os.getenv("DR_PG_DSN", "").strip()
+_DR_CHAT_REPL_INTERVAL_S = int(_os.getenv("DR_CHAT_REPL_INTERVAL_S", "600"))
+
+
+async def _dr_pg_connect():
+    """Open a fresh asyncpg connection to the DR PG. Returns None if DSN
+    not configured (typical for local dev — DR worker no-ops the chat
+    replication loop). Caller is responsible for closing the connection.
+    """
+    if not _DR_PG_DSN:
+        return None
+    try:
+        import asyncpg as _ap
+        return await _ap.connect(_DR_PG_DSN, timeout=10)
+    except Exception as e:
+        logger.error("[dr-chat-repl] DR PG connect failed: %s", e)
+        return None
+
+
+async def replicate_chat_singletons_once():
+    """One pass through the three singleton tables. Idempotent: rerun is
+    safe (UPSERT on natural keys).
+
+    Watermark for `chat_thread_messages` is stored on the DR side in a
+    small table `dr_chat_replication_state` so worker restarts don't
+    re-replicate everything. The other two tables are small (~hundreds
+    to ~thousands of rows per tenant) and get a full upsert per pass.
+    """
+    if not _DR_PG_DSN:
+        logger.debug("[dr-chat-repl] DR_PG_DSN unset — skipping pass")
+        return
+    dr_conn = await _dr_pg_connect()
+    if dr_conn is None:
+        return
+    try:
+        # Bootstrap the DR-side state table on first run.
+        await dr_conn.execute(
+            "CREATE TABLE IF NOT EXISTS dr_chat_replication_state ("
+            "  table_name TEXT PRIMARY KEY, "
+            "  last_replicated_at TIMESTAMPTZ NOT NULL "
+            ")"
+        )
+        # Watermark read.
+        wm_row = await dr_conn.fetchrow(
+            "SELECT last_replicated_at FROM dr_chat_replication_state "
+            "WHERE table_name = 'chat_thread_messages'"
+        )
+        watermark = wm_row["last_replicated_at"] if wm_row else None
+
+        # ── Source-side pulls ──
+        # Reuse the worker's existing async SQLAlchemy session factory
+        # for the SOURCE side (primary PG that backups write to).
+        from shared.database import async_session_factory as _src_factory
+        from sqlalchemy import text as _text
+        async with _src_factory() as src:
+            # chat_threads — small, full snapshot.
+            threads = (await src.execute(_text(
+                "SELECT id, tenant_id, chat_id, chat_type, chat_topic, "
+                "       member_names_json, last_updated_at, last_drained_at, "
+                "       drain_cursor, drain_failure_state, created_at, "
+                "       updated_at "
+                "  FROM chat_threads"
+            ))).all()
+            # chat_url_cache — small, full snapshot.
+            urls = (await src.execute(_text(
+                "SELECT tenant_id, url_sha256, drive_item_id, content_hash, "
+                "       blob_path, content_size, inline_b64, unreachable, "
+                "       first_seen_at, last_used_at "
+                "  FROM chat_url_cache"
+            ))).all()
+            # chat_thread_messages — large, incremental.
+            if watermark is None:
+                msgs = (await src.execute(_text(
+                    "SELECT id, chat_thread_id, message_external_id, "
+                    "       created_date_time, last_modified_date_time, "
+                    "       from_user_id, from_display_name, body_content, "
+                    "       body_content_type, deleted_date_time, "
+                    "       metadata_raw, content_hash, content_size, "
+                    "       created_at "
+                    "  FROM chat_thread_messages"
+                ))).all()
+            else:
+                msgs = (await src.execute(_text(
+                    "SELECT id, chat_thread_id, message_external_id, "
+                    "       created_date_time, last_modified_date_time, "
+                    "       from_user_id, from_display_name, body_content, "
+                    "       body_content_type, deleted_date_time, "
+                    "       metadata_raw, content_hash, content_size, "
+                    "       created_at "
+                    "  FROM chat_thread_messages "
+                    " WHERE created_at > :wm"
+                ), {"wm": watermark})).all()
+            new_max_created = max(
+                (m.created_at for m in msgs if m.created_at is not None),
+                default=watermark,
+            )
+
+        # ── DR-side upserts ──
+        # chat_threads
+        for t in threads:
+            await dr_conn.execute(
+                "INSERT INTO chat_threads ("
+                "  id, tenant_id, chat_id, chat_type, chat_topic, "
+                "  member_names_json, last_updated_at, last_drained_at, "
+                "  drain_cursor, drain_failure_state, created_at, updated_at"
+                ") VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10::jsonb,$11,$12) "
+                "ON CONFLICT (tenant_id, chat_id) DO UPDATE SET "
+                "  chat_type = EXCLUDED.chat_type, "
+                "  chat_topic = EXCLUDED.chat_topic, "
+                "  member_names_json = EXCLUDED.member_names_json, "
+                "  last_updated_at = EXCLUDED.last_updated_at, "
+                "  last_drained_at = EXCLUDED.last_drained_at, "
+                "  drain_cursor = EXCLUDED.drain_cursor, "
+                "  drain_failure_state = EXCLUDED.drain_failure_state, "
+                "  updated_at = EXCLUDED.updated_at",
+                t.id, t.tenant_id, t.chat_id, t.chat_type, t.chat_topic,
+                (t.member_names_json or None),
+                t.last_updated_at, t.last_drained_at, t.drain_cursor,
+                (t.drain_failure_state or None),
+                t.created_at, t.updated_at,
+            )
+        # chat_url_cache
+        for u in urls:
+            await dr_conn.execute(
+                "INSERT INTO chat_url_cache ("
+                "  tenant_id, url_sha256, drive_item_id, content_hash, "
+                "  blob_path, content_size, inline_b64, unreachable, "
+                "  first_seen_at, last_used_at"
+                ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) "
+                "ON CONFLICT (tenant_id, url_sha256) DO UPDATE SET "
+                "  drive_item_id = EXCLUDED.drive_item_id, "
+                "  content_hash = EXCLUDED.content_hash, "
+                "  blob_path = EXCLUDED.blob_path, "
+                "  content_size = EXCLUDED.content_size, "
+                "  inline_b64 = EXCLUDED.inline_b64, "
+                "  unreachable = EXCLUDED.unreachable, "
+                "  last_used_at = EXCLUDED.last_used_at",
+                u.tenant_id, u.url_sha256, u.drive_item_id, u.content_hash,
+                u.blob_path, u.content_size, u.inline_b64, u.unreachable,
+                u.first_seen_at, u.last_used_at,
+            )
+        # chat_thread_messages
+        for m in msgs:
+            await dr_conn.execute(
+                "INSERT INTO chat_thread_messages ("
+                "  id, chat_thread_id, message_external_id, "
+                "  created_date_time, last_modified_date_time, "
+                "  from_user_id, from_display_name, body_content, "
+                "  body_content_type, deleted_date_time, metadata_raw, "
+                "  content_hash, content_size, created_at"
+                ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14) "
+                "ON CONFLICT (chat_thread_id, message_external_id) DO UPDATE SET "
+                "  last_modified_date_time = EXCLUDED.last_modified_date_time, "
+                "  from_user_id = EXCLUDED.from_user_id, "
+                "  from_display_name = EXCLUDED.from_display_name, "
+                "  body_content = EXCLUDED.body_content, "
+                "  body_content_type = EXCLUDED.body_content_type, "
+                "  deleted_date_time = EXCLUDED.deleted_date_time, "
+                "  metadata_raw = EXCLUDED.metadata_raw, "
+                "  content_hash = EXCLUDED.content_hash, "
+                "  content_size = EXCLUDED.content_size",
+                m.id, m.chat_thread_id, m.message_external_id,
+                m.created_date_time, m.last_modified_date_time,
+                m.from_user_id, m.from_display_name, m.body_content,
+                m.body_content_type, m.deleted_date_time,
+                (m.metadata_raw or None),
+                m.content_hash, m.content_size, m.created_at,
+            )
+        # Persist watermark for the next pass.
+        if new_max_created is not None and new_max_created != watermark:
+            await dr_conn.execute(
+                "INSERT INTO dr_chat_replication_state (table_name, last_replicated_at) "
+                "VALUES ('chat_thread_messages', $1) "
+                "ON CONFLICT (table_name) DO UPDATE SET last_replicated_at = EXCLUDED.last_replicated_at",
+                new_max_created,
+            )
+        logger.info(
+            "[dr-chat-repl] pass complete — threads=%d urls=%d msgs=%d new_wm=%s",
+            len(threads), len(urls), len(msgs), new_max_created,
+        )
+    except Exception as e:
+        logger.exception("[dr-chat-repl] pass failed: %s", e)
+    finally:
+        try:
+            await dr_conn.close()
+        except Exception:
+            pass
+
+
 async def main():
     from shared.storage.startup import startup_router
     await startup_router()
@@ -583,8 +794,25 @@ async def main():
             except Exception as e:
                 logger.exception("[dr_lifecycle_loop] DR lifecycle reconciliation failed: %s\n%s", e, traceback.format_exc())
 
-    logger.info("[main] Starting scan loop (every 5 min) and DR lifecycle loop (every 6 hours)")
-    await asyncio.gather(scan_loop(), dr_lifecycle_loop())
+    # Plan P1 — chat singleton replication loop (no-op until DR_PG_DSN is set).
+    async def chat_singleton_repl_loop():
+        if not _DR_PG_DSN:
+            logger.info(
+                "[dr-chat-repl] DR_PG_DSN not configured — chat replication "
+                "loop will idle (per-snapshot blob replication still runs)"
+            )
+        while True:
+            try:
+                await replicate_chat_singletons_once()
+            except Exception as e:
+                logger.exception("[dr-chat-repl] loop iteration failed: %s", e)
+            await asyncio.sleep(_DR_CHAT_REPL_INTERVAL_S)
+
+    logger.info(
+        "[main] Starting scan loop (5 min), chat-singleton loop (%ds), DR lifecycle loop (6h)",
+        _DR_CHAT_REPL_INTERVAL_S,
+    )
+    await asyncio.gather(scan_loop(), dr_lifecycle_loop(), chat_singleton_repl_loop())
 
 
 if __name__ == "__main__":
