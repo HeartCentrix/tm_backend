@@ -25,8 +25,24 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Dashboard Service", version="1.0.0", lifespan=lifespan)
 
 
+# Per-user content types — these all roll up under a single "Users" card in
+# Protection Status. Both legacy (MAILBOX/ONEDRIVE) and post-refactor Tier-2
+# (USER_MAIL/USER_ONEDRIVE/USER_CONTACTS/USER_CALENDAR/USER_CHATS) live here
+# because they all belong to one ENTRA_USER parent and should not be counted
+# separately. The Users bucket is special-cased below to DISTINCT-count by
+# parent_resource_id so 9 users × 5 child types still shows as 9, not 45.
+USER_CONTENT_TYPES = {
+    ResourceType.MAILBOX,
+    ResourceType.ONEDRIVE,
+    ResourceType.USER_MAIL,
+    ResourceType.USER_ONEDRIVE,
+    ResourceType.USER_CONTACTS,
+    ResourceType.USER_CALENDAR,
+    ResourceType.USER_CHATS,
+}
+
 PROTECTION_BUCKETS = {
-    "users": {ResourceType.MAILBOX, ResourceType.ONEDRIVE},
+    "users": USER_CONTENT_TYPES,
     "sharedMailboxes": {ResourceType.SHARED_MAILBOX},
     "rooms": {ResourceType.ROOM_MAILBOX},
     "sharepointSites": {ResourceType.SHAREPOINT_SITE},
@@ -369,6 +385,33 @@ async def get_protection_status(
         }
 
     bucket_values = {name: bucket_item(name, PROTECTION_BUCKETS) for name in PROTECTION_BUCKETS}
+
+    # Users bucket: dedupe by email so a user with both MAILBOX+ONEDRIVE
+    # (or with multiple Tier-2 USER_* rows) counts as ONE user. We use
+    # lower(email) as the dedup key to match resource-service
+    # /resources/users (which groups the Resources page table by email);
+    # parent_resource_id is unreliable here because legacy MAILBOX/ONEDRIVE
+    # rows may not have been linked to an ENTRA_USER parent. Falls back to
+    # external_id when email is NULL (rare).
+    user_key = func.coalesce(func.lower(Resource.email), Resource.external_id)
+    user_filters = list(filters) + [Resource.type.in_(USER_CONTENT_TYPES)]
+    users_total = (
+        await db.execute(
+            select(func.count(func.distinct(user_key))).where(*user_filters)
+        )
+    ).scalar() or 0
+    users_protected = (
+        await db.execute(
+            select(func.count(func.distinct(user_key))).where(
+                *user_filters, Resource.sla_policy_id.isnot(None)
+            )
+        )
+    ).scalar() or 0
+    bucket_values["users"] = {
+        "total": int(users_total),
+        "protectedCount": int(users_protected),
+    }
+
     total = sum(item["total"] for item in bucket_values.values())
     protected = sum(item["protectedCount"] for item in bucket_values.values())
     percentage = round(protected / total * 100, 2) if total > 0 else 0
