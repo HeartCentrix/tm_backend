@@ -125,6 +125,15 @@ M365_RESOURCE_TYPES = {
     ResourceType.TEAMS_CHAT,
     ResourceType.ENTRA_USER,
     ResourceType.ENTRA_GROUP,
+    # Unified (modern) M365 group — distinct row type from ENTRA_GROUP and
+    # required here so the Protection Status m365 filter doesn't silently
+    # drop the 7 M365_GROUP rows. Without this entry, Groups & Teams card
+    # reads 4 (ENTRA_GROUP only) when the Tab shows 11 (both types).
+    ResourceType.M365_GROUP,
+    # Per-tenant "Azure Active Directory" singleton — the Entra ID card on
+    # Overview needs to count this one row. Missing here previously caused
+    # the card to read 0/0 even though the Tab list shows 1.
+    ResourceType.ENTRA_DIRECTORY,
     ResourceType.ENTRA_APP,
     ResourceType.ENTRA_DEVICE,
     ResourceType.ENTRA_SERVICE_PRINCIPAL,
