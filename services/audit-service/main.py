@@ -153,9 +153,34 @@ async def _verify_chat_integrity_once():
             ))).all()
         if not chats:
             return
-        # Initialize one Graph client per pass — token caches are
-        # per-instance, fine for a once-a-day job.
-        gc = _GraphClient()
+        # GraphClient(client_id, client_secret, tenant_id) — needs per-tenant
+        # creds. Build a small (tenant_id -> GraphClient) cache so we only
+        # instantiate once per tenant in this sweep. Skip a tenant entirely
+        # if we can't resolve usable creds (dev envs without secrets, or a
+        # tenant whose secret ref isn't fetchable) — better to no-op the
+        # integrity check than crash the whole sweep with a TypeError.
+        _gc_cache: Dict[str, Optional[Any]] = {}
+
+        async def _gc_for_tenant(tid: str):
+            if tid in _gc_cache:
+                return _gc_cache[tid]
+            try:
+                async with async_session_factory() as ds:
+                    t = await ds.get(Tenant, uuid.UUID(tid))
+                if not t or not (t.client_id and t.external_tenant_id):
+                    _gc_cache[tid] = None
+                    return None
+                client = _GraphClient(
+                    client_id=t.client_id,
+                    client_secret="",
+                    tenant_id=t.external_tenant_id,
+                )
+                _gc_cache[tid] = client
+                return client
+            except Exception:
+                _gc_cache[tid] = None
+                return None
+
         gaps_found = 0
         for c in chats:
             try:
@@ -168,6 +193,9 @@ async def _verify_chat_integrity_once():
                 if n is None:
                     continue
                 # Graph ground-truth count.
+                gc = await _gc_for_tenant(str(c.tenant_id))
+                if gc is None:
+                    continue
                 graph_total = await gc.count_chat_messages(c.chat_id)
                 if graph_total is None:
                     continue

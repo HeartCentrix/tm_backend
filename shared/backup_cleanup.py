@@ -56,10 +56,9 @@ async def cleanup_cancelled_snapshots(
     ----------
     job_id
         The cancelled Job's UUID. Snapshots are matched via
-        ``Snapshot.last_backup_job_id`` OR via ``Snapshot.id IN
-        snapshot_ids stored on the job spec`` — we use the
-        ``Snapshot.last_backup_job_id`` link since it's set on every
-        worker write.
+        ``Snapshot.job_id`` — populated by create_snapshot on every
+        worker write. (``last_backup_job_id`` is the Resource field;
+        Snapshot's own FK column is ``job_id``.)
     session_factory
         ``async_session_factory`` — opens a fresh DB session per batch
         so the cleanup doesn't hold one connection for the whole run.
@@ -88,7 +87,7 @@ async def cleanup_cancelled_snapshots(
     async with session_factory() as session:
         stmt = (
             select(Snapshot.id)
-            .where(Snapshot.last_backup_job_id == job_id)
+            .where(Snapshot.job_id == job_id)
             .where(Snapshot.status.in_([
                 SnapshotStatus.IN_PROGRESS,
                 SnapshotStatus.COMPLETED,
