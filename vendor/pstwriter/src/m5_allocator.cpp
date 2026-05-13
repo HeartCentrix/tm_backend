@@ -53,6 +53,26 @@ constexpr uint32_t kMaxNidIndex = (1u << 27);
 // at 1 for parity.
 constexpr uint32_t kUserAllocStart = 0x400u;
 
+// M12.14 (2026-05-13) — start user-allocated NormalFolder (type 0x02)
+// NIDs at idx 0x404 instead of 0x400.
+//
+// idx 0x401/0x402/0x403 are claimed by the baseline IPM Subtree /
+// Search Root / Deleted Items reserved set, so user folders would
+// otherwise start at idx 0x400 (NID 0x8002). Real-Outlook contacts.pst
+// byte-diff (2026-05-13) shows the first user contact folder lives at
+// idx 0x404 (NID 0x8082) — idx 0x400 is left unused.
+//
+// Why this matters for the import wizard: when our user Contacts
+// folder lives at NID 0x8002 the IPM Subtree's Hierarchy TC sorts it
+// at row 0 (ahead of Deleted Items at 0x8062). REF puts Deleted Items
+// at row 0 and the user folder at row 1. The user's M12.13 test
+// imported our PST into a fresh local-test.pst and observed the
+// destination contained only Deleted Items + Search Folders — the
+// wizard did not create a destination Contacts folder, i.e. it didn't
+// recognise our source Contacts folder at all. Shifting to idx 0x404
+// makes our row layout match REF, eliminating that as a variable.
+constexpr uint32_t kNormalFolderUserAllocStart = 0x404u;
+
 } // namespace
 
 // --------------------------------------------------------------------------
@@ -89,6 +109,10 @@ M5Allocator::M5Allocator() noexcept
     }
     nextIndex_[static_cast<size_t>(NidType::HID)      & 0x1Fu] = 1u;
     nextIndex_[static_cast<size_t>(NidType::Internal) & 0x1Fu] = 1u;
+    // M12.14: NormalFolder starts at idx 0x404 (NID 0x8082 for first
+    // user folder) — matches real-Outlook layout. See kNormalFolderUserAllocStart
+    // comment for rationale.
+    nextIndex_[static_cast<size_t>(NidType::NormalFolder) & 0x1Fu] = kNormalFolderUserAllocStart;
     // Round L (byte-diff vs backup.pst): real-Outlook PSTs allocate
     // messages at idx ≥ 0x10001, separate from folder/table idx range
     // (≤ ~0x400). Sharing idx 0x400 between folder NID 0x8002 (type 02)

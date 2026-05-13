@@ -203,6 +203,17 @@ struct HierarchyTcRow {
     // whose PC also doesn't emit PR_CONTAINER_CLASS.
     const uint8_t* containerClassUtf16le {nullptr};
     size_t         containerClassSize    {0};
+
+    // M12.15: PR_PstHiddenCount / PstHiddenUnread (0x6635/0x6636) row
+    // cells. REF (real-Outlook contacts.pst, 2026-05-13) sets the matching
+    // CEB bits (11/12) on the IPM Subtree's row for the user Contacts
+    // folder, with value 0. When `emitPstHidden` is true, this row will
+    // claim those cells with the given values; otherwise the bits stay
+    // cleared (legacy behaviour). The child folder's PC must emit the
+    // same tags for the row/PC pair to validate.
+    bool     emitPstHidden       {false};
+    uint32_t pstHiddenCount      {0u};
+    uint32_t pstHiddenUnreadCount{0u};
 };
 
 // ============================================================================
@@ -412,6 +423,24 @@ constexpr uint16_t kLidEmail1DisplayName      = 0x8006;  // dispid 0x8080 — Pt
 constexpr uint16_t kLidEmail1AddressType      = 0x8007;  // dispid 0x8082 — PtypString
 constexpr uint16_t kLidEmail1EmailAddress     = 0x8008;  // dispid 0x8083 — PtypString
 constexpr uint16_t kLidEmail1OriginalDisplayName = 0x8009;  // dispid 0x8084 — PtypString
+// M12.12 (2026-05-13) — PidLidContactItemData (dispid 0x8007 under
+// PSETID_Address per [MS-OXOCNTC] §2.2.1.6.1) is a 6-element MvInt32
+// array Outlook reads to confirm an item is a "complete" contact. REF
+// emits it; we previously didn't, which made Outlook's Import wizard
+// classify our contact items as incomplete and silently skip them.
+constexpr uint16_t kLidContactItemData        = 0x800A;  // dispid 0x8007 — PtypMultipleInteger32
+
+// M12.13 (2026-05-13) — additional ContactV3 named properties REF carries
+// and Outlook's Import wizard reads to bind email1 to the contact. With
+// M12.12 alone (only PidLidContactItemData), the wizard still silently
+// dropped the contact — these three plumb the "Email 1 is populated"
+// signal end-to-end:
+//   * AddressBookProviderEmailList (MvInt32)   — which email slots are set
+//   * AddressBookProviderArrayType (Int32)     — bitmask of email slots
+//   * Email1OriginalEntryId         (Binary)   — OneOff EntryID for the email
+constexpr uint16_t kLidAbProviderEmailList    = 0x800B;  // dispid 0x8028 — PtypMultipleInteger32
+constexpr uint16_t kLidAbProviderArrayType    = 0x800C;  // dispid 0x8029 — PtypInteger32
+constexpr uint16_t kLidEmail1OriginalEntryId  = 0x800D;  // dispid 0x8085 — PtypBinary
 
 // ============================================================================
 // buildNameToIdMapPc — emit the §2.4.7 NID_NAME_TO_ID_MAP PC (NID 0x0061).
