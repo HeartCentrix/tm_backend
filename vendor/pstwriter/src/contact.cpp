@@ -430,7 +430,10 @@ MailPcResult buildContactPc(const graph::GraphContact& c,
     // writeM8Pst (set per-contact before buildContactPc runs).
     if (ctx.messageNid.value != 0u) {
         pb.addInt32(pid_contact::kLtpRowId,  ctx.messageNid.value);
-        pb.addInt32(pid_contact::kLtpRowVer, 0u);
+        // M12.20: PR_LtpRowVer must match the Contents TC row's rowVer
+        // value (REF emits non-zero values; the Import wizard's full-tree
+        // walk skips rows where LtpRowVer=0).
+        pb.addInt32(pid_contact::kLtpRowVer, ctx.messageRowVer);
     }
 
     // M12.11 — PR_LTP_PARENT_NID. M12.4 tried =0 and triggered libpff's
@@ -801,7 +804,14 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             const graph::GraphContact* src;
             FolderRecord*              folder;
             Nid                        contactNid;
+            uint32_t                   rowVer {0u};   // M12.20: shared by Contents TC row + PC
         };
+        // M12.20: monotonic non-zero LtpRowVer counter. REF emits unique
+        // small integers (Deleted Items=14, Contacts=23, etc.). Outlook's
+        // mount rewrites LtpRowVer=0 to a non-zero value, and the Import
+        // wizard's full-tree walk silently skips rows where LtpRowVer=0
+        // — the *only* remaining structural delta vs REF after M12.19.
+        uint32_t nextRowVer = 1u;
         vector<ContactRecord> contactRecs;
         for (auto& rec : folderRecs) {
             for (const auto* c : rec.src->contacts) {
@@ -810,6 +820,7 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
                 cr.src        = c;
                 cr.folder     = &rec;
                 cr.contactNid = alloc.allocate(NidType::NormalMessage);
+                cr.rowVer     = nextRowVer++;
                 contactRecs.push_back(cr);
             }
         }
@@ -834,53 +845,25 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             schema.displayNameSize       = nameBuf.size();
             schema.contentCount          = rec.contentCount;
             schema.contentUnreadCount    = 0u;
-            // M12.15: the user Contacts folder MUST advertise
-            // hasSubfolders=true so the Import wizard walks its Hierarchy
-            // TC and finds the 7 hidden contacts-anatomy sub-folders.
-            schema.hasSubfolders         = true;
-            // M12.15: REF emits PR_ATTR_HIDDEN=False explicitly on user
-            // contact folders, plus PR_PstHiddenCount/Unread = 0 so the
-            // IPM Subtree row's CEB bits 11/12 (which we also set below)
-            // have matching PC tags.
-            schema.emitAttrHidden        = true;
-            schema.attrHiddenValue       = false;
-            schema.emitPstHiddenZero     = true;
+            // M12.22: revert M12.15-M12.21 folder-PC decorations on the
+            // user contact folder. Mail PSTs import full-tree with no
+            // PR_ATTR_HIDDEN / PR_ATTR_SYSTEM / PR_ATTR_READONLY,
+            // no 0x36F7 CLSID, no folder-class triad, no hidden child
+            // sub-folders, and Outlook's wizard handles them fine.
+            // Same minimal shape is what the IPF.Contact user folder
+            // needs — earlier additions were chasing REF byte-for-byte
+            // when the wizard only checks a smaller subset.
+            schema.hasSubfolders         = false;
 
             auto pc = buildContactFolderPc(schema, kDummySub);
             scheduleNode(rec.folderNid, rec.src->parentNid, std::move(pc.hnBytes));
 
-            // M12.15: build the user folder's Hierarchy TC with 7 rows
-            // — one per hidden contacts-anatomy sub-folder. Sub-folder
-            // display-name + container-class buffers go into
-            // folderBufStore so the raw pointers stay valid until
-            // buildFolderHierarchyTc returns.
-            const size_t subBufBase = folderBufStore.size();
-            for (const auto& sf : rec.subs) {
-                folderBufStore.push_back(u16le(sf.spec->displayName));
-                folderBufStore.push_back(u16le(sf.spec->containerClass));
-            }
-            vector<HierarchyTcRow> subHier;
-            subHier.reserve(rec.subs.size());
-            for (size_t si = 0; si < rec.subs.size(); ++si) {
-                const auto& sf      = rec.subs[si];
-                const auto& nBuf    = folderBufStore[subBufBase + 2*si];
-                const auto& cBuf    = folderBufStore[subBufBase + 2*si + 1];
-                HierarchyTcRow row{};
-                row.rowId                 = sf.folderNid;
-                row.displayNameUtf16le    = nBuf.data();
-                row.displayNameSize       = nBuf.size();
-                row.containerClassUtf16le = cBuf.empty() ? nullptr : cBuf.data();
-                row.containerClassSize    = cBuf.size();
-                row.contentCount          = 0u;
-                row.contentUnreadCount    = 0u;
-                row.hasSubfolders         = false;
-                subHier.push_back(row);
-            }
-            // Sibling-table NBTENTRYs carry nidParent = 0 per
-            // [MS-PST] §3.12 (Aspose oracle, see KNOWN_UNVERIFIED M11-D).
+            // M12.22: empty Hierarchy TC — user contact folder has no
+            // children. Mail folders work full-tree with this shape;
+            // matching it eliminates the contact-specific decoration
+            // path that earlier rounds added.
             scheduleNode(rec.hierarchyNid, Nid{0u},
-                         buildFolderHierarchyTc(subHier.data(),
-                                                subHier.size()).hnBytes);
+                         buildFolderHierarchyTc(nullptr, 0).hnBytes);
 
             // Per-folder Contents TC: one populated row per contact the
             // folder owns. Outlook's Contacts view enumerates this TC
@@ -961,7 +944,7 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
 
                 ContentsTcRow row{};
                 row.rowId         = cr.contactNid;
-                row.rowVer        = 0u;
+                row.rowVer        = cr.rowVer;   // M12.20: matches contact PC's PR_LtpRowVer
                 row.importance    = 1;   // Normal
                 row.sensitivity   = 0;
                 row.messageStatus = 0;
@@ -1012,40 +995,14 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             scheduleNode(rec.faiNid, Nid{0u},
                          buildFolderFaiContentsTc().hnBytes);
 
-            // M12.15: schedule the 7 hidden contacts-anatomy sub-folders.
-            // Each sub-folder gets its own folder PC (with
-            // PR_ATTR_HIDDEN=True + container class like
-            // "IPF.Contact.RecipientCache") plus the 3 mandatory sibling
-            // tables (Hierarchy / Contents / FAI Contents), all empty
-            // (these folders are containers for Outlook-internal state
-            // that we leave un-populated — REF often leaves them empty
-            // too on a freshly-exported contacts.pst).
-            for (size_t si = 0; si < rec.subs.size(); ++si) {
-                const auto& sf      = rec.subs[si];
-                const auto& sfName  = folderBufStore[subBufBase + 2*si];
-                const auto& sfCC    = folderBufStore[subBufBase + 2*si + 1];
-
-                M7FolderSchema sfSchema{};
-                sfSchema.displayNameUtf16le = sfName.data();
-                sfSchema.displayNameSize    = sfName.size();
-                sfSchema.contentCount       = 0u;
-                sfSchema.contentUnreadCount = 0u;
-                sfSchema.hasSubfolders      = false;
-                // All 7 are hidden infrastructure folders.
-                sfSchema.emitAttrHidden     = true;
-                sfSchema.attrHiddenValue    = true;
-
-                auto sfPc = buildFolderPcExtended(sfSchema, kDummySub,
-                                                  sfCC.data(), sfCC.size());
-                scheduleNode(sf.folderNid, rec.folderNid,
-                             std::move(sfPc.hnBytes));
-                scheduleNode(sf.hierarchyNid, Nid{0u},
-                             buildFolderHierarchyTc(nullptr, 0).hnBytes);
-                scheduleNode(sf.contentsNid, Nid{0u},
-                             buildFolderContentsTc().hnBytes);
-                scheduleNode(sf.faiNid, Nid{0u},
-                             buildFolderFaiContentsTc().hnBytes);
-            }
+            // M12.22: do NOT emit the 7 hidden contacts-anatomy
+            // sub-folders. Mail proves the wizard doesn't require this
+            // anatomy; emitting it appears to actively confuse the
+            // wizard's recursive walk (full-tree import skipped the
+            // contact item through M12.21). rec.subs still has the
+            // pre-allocated NIDs, which are now intentionally unused —
+            // the allocator just reserved them and they get garbage
+            // collected.
         }
 
         // ============================================================
@@ -1067,6 +1024,7 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             {
                 HierarchyTcRow row{};
                 row.rowId                 = Nid{0x00008062u};
+                row.rowVer                = nextRowVer++;   // M12.20
                 row.displayNameUtf16le    = kDeletedItemsName.data();
                 row.displayNameSize       = kDeletedItemsName.size();
                 row.containerClassUtf16le = nullptr;  // matches baseline PC
@@ -1083,21 +1041,15 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             // was raised because the row had CEB-cleared containerClass
             // while the PC carried "IPF.Contact" — mismatch.
             //
-            // M12.15 — section 4 expanded each user contact folder to
-            // carry 7 hidden contacts-anatomy sub-folders + emits
-            // PR_PstHiddenCount/Unread = 0 on the folder PC. The
-            // matching row must therefore advertise hasSubfolders=TRUE
-            // (so the wizard walks the user folder's Hierarchy TC) and
-            // claim CEB bits 11/12 via emitPstHidden so row/PC tags
-            // stay aligned.
-            //
-            // NOTE: section 4 pushes sub-folder buffers into
-            // folderBufStore between user-folder pairs, so the legacy
-            // `2*i` math no longer lands on the user folder's name/CC.
-            // FolderRecord.bufIdx records the actual position.
+            // M12.22: reverted M12.15's hasSubfolders=true /
+            // emitPstHidden additions — mail folder rows don't carry
+            // these and import full-tree fine. The user contact folder
+            // is now a "simple leaf folder" the same way a Sent Items
+            // user folder is.
             for (size_t i = 0; i < folderRecs.size(); ++i) {
                 HierarchyTcRow row{};
                 row.rowId                 = folderRecs[i].folderNid;
+                row.rowVer                = nextRowVer++;   // M12.20
                 const auto& nameBuf       = folderBufStore[folderRecs[i].bufIdx];
                 const auto& ccBuf         = folderBufStore[folderRecs[i].bufIdx + 1];
                 row.displayNameUtf16le    = nameBuf.data();
@@ -1106,15 +1058,28 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
                 row.containerClassSize    = ccBuf.size();
                 row.contentCount          = folderRecs[i].contentCount;
                 row.contentUnreadCount    = 0u;
-                row.hasSubfolders         = true;          // M12.15: anatomy children present
-                row.emitPstHidden         = true;          // M12.15: bits 11/12 with value 0
-                row.pstHiddenCount        = 0u;
-                row.pstHiddenUnreadCount  = 0u;
+                row.hasSubfolders         = false;
                 ipmHier.push_back(row);
             }
             const HierarchyTcRow* rowsPtr = ipmHier.empty() ? nullptr : ipmHier.data();
             auto tc = buildFolderHierarchyTc(rowsPtr, ipmHier.size());
             scheduleNode(Nid{0x0000802Du}, Nid{0u}, std::move(tc.hnBytes));
+
+            // M12.23: emit IPM Subtree's Contents TC (0x802E) and FAI
+            // Contents TC (0x802F). The mail writer (writeM7Pst) learned
+            // during M11-N that Outlook's Import wizard recursion, when
+            // "Include subfolders" is checked at the store root, walks
+            // the IPM Subtree's bidSub looking for ALL THREE sibling
+            // tables (0x802D Hierarchy + 0x802E Contents + 0x802F FAI).
+            // Missing 0x802E/0x802F makes the wizard return zero
+            // imported items — exactly the user-visible "selecting root
+            // imports nothing but selecting Contacts subfolder works"
+            // symptom we hit on contact PSTs from M12.13 through M12.22.
+            // Mail already emits these; contacts never inherited the fix.
+            scheduleNode(Nid{0x0000802Eu}, Nid{0u},
+                         buildFolderContentsTc().hnBytes);
+            scheduleNode(Nid{0x0000802Fu}, Nid{0u},
+                         buildFolderFaiContentsTc().hnBytes);
         }
 
         // ============================================================
@@ -1128,6 +1093,7 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             ctx.subnodeStart    = Nid{(cr.contactNid.value & ~uint32_t{0x1Fu}) + 0x10000u + 0x1u};
             ctx.messageNid      = cr.contactNid;          // M12.10: PC's PR_LtpRowId must match row's
             ctx.parentFolderNid = cr.folder->folderNid;   // M12.11: PC's PR_LtpParentNid
+            ctx.messageRowVer   = cr.rowVer;              // M12.20: PC's PR_LtpRowVer must match row's
 
             MailPcResult pc = buildContactPc(*cr.src, ctx);
             scheduleNode(cr.contactNid, cr.folder->folderNid, std::move(pc.hnBytes));

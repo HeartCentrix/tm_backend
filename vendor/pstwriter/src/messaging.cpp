@@ -237,7 +237,7 @@ PcResult buildFolderPcExtended(const M7FolderSchema& schema,
     array<uint8_t, 4> designIdBytes{};
     detail::writeU32(designIdBytes.data(), 0, 0xDF80E239u);
     array<uint8_t, 4> designClassBytes{};
-    detail::writeU32(designClassBytes.data(), 0, 6u);
+    detail::writeU32(designClassBytes.data(), 0, schema.designClass);
     // Search key: 16-byte deterministic hash of the folder's display name
     // so the value is stable across rebuilds and matches what an Outlook
     // Sync-style consumer would expect to see.
@@ -310,9 +310,64 @@ PcResult buildFolderPcExtended(const M7FolderSchema& schema,
     array<uint8_t, 1> attrHiddenBytes{
         static_cast<uint8_t>(schema.attrHiddenValue ? 1u : 0u)
     };
+    // M12.16: PR_ATTR_SYSTEM (0x10F5) + PR_ATTR_READONLY (0x10F6). REF
+    // emits both on every folder where it emits 0x10F4, with the same
+    // visibility semantics (visible user folders + hidden contacts-anatomy
+    // sub-folders both get 0x10F5=False / 0x10F6=False).
+    array<uint8_t, 1> attrSystemBytes{0};
+    array<uint8_t, 1> attrReadonlyBytes{0};
+    // M12.17: PR_36F7 (CLSID 16B) + PR_36F8 (Int32) + PR_3700 (Int32=3) +
+    // PR_68CB (Int16=1) + PR_3FE4/PR_3FE5 (Boolean=False). REF emits this
+    // group on every folder that also emits the 0x10F4-0x10F6 ATTR_*
+    // triad. With the M12.16 changes the Import wizard's recursive
+    // "include subfolders" walk still skipped our user contacts folder
+    // — REF differs from us mainly in this group, so the wizard's
+    // walk-filter appears to gate on at least one of these being
+    // present. PR_36F7 is per-folder unique in REF (different sub-
+    // folders carry different GUIDs); we derive a deterministic 16-byte
+    // value from the folder's display name so each rebuild produces the
+    // same CLSID and matched scanpst output.
+    array<uint8_t, 16> clsidBytes{};
+    array<uint8_t, 4>  folderClass36F8Bytes{};
+    array<uint8_t, 4>  prop3700Bytes{};
+    array<uint8_t, 2>  prop68CBBytes{};
+    array<uint8_t, 1>  prop3FE4Bytes{0};
+    array<uint8_t, 1>  prop3FE5Bytes{0};
     if (schema.emitAttrHidden) {
+        // Compute a stable 16-byte "folder CLSID". Mix display name with
+        // a fixed pstwriter sentinel so the value is reproducible but
+        // distinct from PR_SEARCH_KEY (which uses display name alone).
+        std::string clsidSeed = "pstwriter:36F7:";
+        if (schema.displayNameSize > 0) {
+            clsidSeed.append(reinterpret_cast<const char*>(schema.displayNameUtf16le),
+                             schema.displayNameSize);
+        }
+        const auto cl = graph::deriveMessageSearchKey(clsidSeed);
+        std::copy(cl.begin(), cl.end(), clsidBytes.begin());
+
+        detail::writeU32(folderClass36F8Bytes.data(), 0, schema.folderClass36F8);
+        detail::writeU32(prop3700Bytes.data(),        0, 3u);
+        prop68CBBytes[0] = 0x01; prop68CBBytes[1] = 0x00;
+
         props.push_back({ 0x10F4u, PropType::Boolean,
                           attrHiddenBytes.data(), 1u, PropStorageHint::Auto });
+        props.push_back({ 0x10F5u, PropType::Boolean,
+                          attrSystemBytes.data(), 1u, PropStorageHint::Auto });
+        props.push_back({ 0x10F6u, PropType::Boolean,
+                          attrReadonlyBytes.data(), 1u, PropStorageHint::Auto });
+
+        props.push_back({ 0x36F7u, PropType::ClassId,
+                          clsidBytes.data(), 16u, PropStorageHint::Auto });
+        props.push_back({ 0x36F8u, PropType::Int32,
+                          folderClass36F8Bytes.data(), 4u, PropStorageHint::Auto });
+        props.push_back({ 0x3700u, PropType::Int32,
+                          prop3700Bytes.data(), 4u, PropStorageHint::Auto });
+        props.push_back({ 0x68CBu, PropType::Int16,
+                          prop68CBBytes.data(), 2u, PropStorageHint::Auto });
+        props.push_back({ 0x3FE4u, PropType::Boolean,
+                          prop3FE4Bytes.data(), 1u, PropStorageHint::Auto });
+        props.push_back({ 0x3FE5u, PropType::Boolean,
+                          prop3FE5Bytes.data(), 1u, PropStorageHint::Auto });
     }
 
     return buildPropertyContext(props.data(), props.size(), firstSubnodeNid);
@@ -323,10 +378,18 @@ PcResult buildFolderPcExtended(const M7FolderSchema& schema,
 // ----------------------------------------------------------------------------
 namespace {
 
-// §3.12 13-column schema (sorted by PidTag-tag ascending — buildTableContext
-// re-sorts internally so caller order is irrelevant; we list in spec order
-// for readability).
-constexpr TcColumn kHierarchyCols[13] = {
+// M12.19: 15-column schema matching real-Outlook contacts.pst byte-for-byte.
+// Two new Binary HID columns (0x36DA at iBit 13, 0x6670 at iBit 14) appear
+// in the schema even though REF doesn't set the matching CEB bits on any
+// row; the user's downloaded-then-mounted PST inspection shows Outlook
+// expanding our prior 13-col TC to 25 cols at mount-time, strongly
+// suggesting the Import wizard's full-tree recursive walk consults
+// TCINFO column set and silently skips children when expected columns
+// (specifically 0x36DA/0x6670) are absent. Subfolders moved from
+// ibData=52 → 60 to make room for the two new 4-byte HID slots at 52/56;
+// row size grows 55 → 63, CEB shifts to offset 61 (still 2 bytes since
+// 15 cols still fits 16-bit CEB).
+constexpr TcColumn kHierarchyCols[15] = {
     // PidTag, propType, ibData, cbData, iBit
     // M11-J: 0x0E30 is PtypBinary (PR_REPLICA_VERSION); was Int32
     // — scanpst flagged "missing required column (0E300102)" because
@@ -340,17 +403,19 @@ constexpr TcColumn kHierarchyCols[13] = {
     { 0x3001u, PropType::Unicode,   8,  4,  2 },  // DisplayName_W (HID)
     { 0x3602u, PropType::Int32,    12,  4,  3 },  // ContentCount
     { 0x3603u, PropType::Int32,    16,  4,  4 },  // ContentUnreadCount
-    { 0x360Au, PropType::Boolean,  52,  1,  5 },  // Subfolders
+    { 0x360Au, PropType::Boolean,  60,  1,  5 },  // Subfolders (M12.19: was 52)
     { 0x3613u, PropType::Unicode,  40,  4, 10 },  // ContainerClass_W (HID)
+    { 0x36DAu, PropType::Binary,   52,  4, 13 },  // M12.19: Binary HID, REF emits in schema (no CEB bits)
+    { 0x6670u, PropType::Binary,   56,  4, 14 },  // M12.19: Binary HID, REF emits in schema (no CEB bits)
     { 0x6635u, PropType::Int32,    44,  4, 11 },  // (PstHiddenCount)
     { 0x6636u, PropType::Int32,    48,  4, 12 },  // (PstHiddenUnread)
     { 0x67F2u, PropType::Int32,     0,  4,  0 },  // LtpRowId
     { 0x67F3u, PropType::Int32,     4,  4,  1 },  // LtpRowVer
 };
 
-// Per-row matrix size derived from rgib (53 fixed + 2 CEB = 55).
-constexpr size_t kHierarchyRowSize = 55;
-constexpr size_t kHierarchyCebOff  = 53;
+// Per-row matrix size derived from rgib (61 fixed + 2 CEB = 63). M12.19.
+constexpr size_t kHierarchyRowSize = 63;
+constexpr size_t kHierarchyCebOff  = 61;
 
 // Set the CEB bit for `iBit` (high-bit-first byte numbering — bit 0
 // of byte 0 is bit 7 of CEB[0]). Shared by all TC row builders below.
@@ -394,8 +459,10 @@ TcResult buildFolderHierarchyTc(const HierarchyTcRow* rows, size_t rowCount)
         detail::writeU32(dst, 44, src.pstHiddenCount);
         // Bytes 48..51: PstHiddenUnread (col 0x6636, iBit 12)
         detail::writeU32(dst, 48, src.pstHiddenUnreadCount);
-        // Byte  52:     Subfolders
-        dst[52] = src.hasSubfolders ? 1u : 0u;
+        // Bytes 52..55: 0x36DA HID slot (col iBit 13) — left zero, CEB bit cleared
+        // Bytes 56..59: 0x6670 HID slot (col iBit 14) — left zero, CEB bit cleared
+        // Byte  60:     Subfolders (M12.19: was offset 52)
+        dst[60] = src.hasSubfolders ? 1u : 0u;
 
         // M11-M (Tier 8): CEB now built dynamically based on what
         // values are actually meaningful, matching what
@@ -452,7 +519,7 @@ TcResult buildFolderHierarchyTc(const HierarchyTcRow* rows, size_t rowCount)
         tcRows[r].varlenCount = perRowVarlen[r].size();
     }
 
-    return buildTableContext(kHierarchyCols, 13,
+    return buildTableContext(kHierarchyCols, 15,
                              tcRows.data(), rowCount);
 }
 
