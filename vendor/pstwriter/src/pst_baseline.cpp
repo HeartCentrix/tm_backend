@@ -158,6 +158,21 @@ buildPstBaselineEntries(const array<uint8_t, 16>& providerUid,
     //  0x80040834 mid-walk. These NIDs need different (non-TC) shapes
     //  in real Outlook PSTs; emitting empty TCs there breaks scanpst's
     //  parser. Reverted.)
+    //
+    // M12.21 (2026-05-13): re-add the 6 NIDs as **empty queue nodes**
+    // (bidData=0, no block) instead of TCs. NBT diff vs REF
+    // (Outlook-exported contacts.pst) shows REF carries them; the
+    // Import wizard's full-tree recursive walk appears to validate
+    // their existence before recursing into IPM Subtree's children.
+    // Earlier mail PSTs and contacts PSTs both exhibited the
+    // "manually pick the folder" caveat — bidSub=0 empty-queue shape
+    // (same as SMQ 0x1E1 and SUQ 0xEC6) is the lowest-risk variant.
+    out.push_back(mkEmptyQueue(Nid{0x00000C01u}, Nid{0u}));
+    out.push_back(mkEmptyQueue(Nid{0x00000E01u}, Nid{0u}));
+    out.push_back(mkEmptyQueue(Nid{0x00000E41u}, Nid{0u}));
+    out.push_back(mkEmptyQueue(Nid{0x00000EE1u}, Nid{0u}));
+    out.push_back(mkEmptyQueue(Nid{0x00000F01u}, Nid{0u}));
+    out.push_back(mkEmptyQueue(Nid{0x00000F21u}, Nid{0u}));
 
     // 6c. NID 0xEC1 (Internal idx=0x76) + sibling SUQ at 0xEC6.
     //
@@ -335,7 +350,10 @@ void registerBaselineReservedNids(M5Allocator& alloc)
         0x0000064Cu,                          // OutgoingQueueTable (M11-N round 15)
         0x00000671u, 0x00000692u,
         0x000006B6u, 0x000006D7u, 0x000006F8u,// Additional templates (M11-N)
+        0x00000C01u,                          // M12.21: scheduler folder
+        0x00000E01u, 0x00000E41u,             // M12.21: task/notes infra
         0x00000EC1u, 0x00000EC6u,             // Procmon-confirmed extra search nodes
+        0x00000EE1u, 0x00000F01u, 0x00000F21u,// M12.21: journal/rss/todo infra
         0x00002223u, 0x00002226u, 0x00002227u, 0x00002230u,  // Spam search family
         0x00008022u, 0x0000802Du, 0x0000802Eu, 0x0000802Fu,
         0x00008042u, 0x0000804Du, 0x0000804Eu, 0x0000804Fu,

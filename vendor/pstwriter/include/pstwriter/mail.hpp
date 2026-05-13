@@ -67,6 +67,15 @@ struct MailPcBuildContext {
     // libpff/drag-from-mount tolerate its absence. Mail PCs leave it
     // zero (M12 attempts on mail showed no scanpst delta).
     Nid parentFolderNid {0u};
+
+    // M12.20: PR_LtpRowVer (0x67F3) value the PC should carry. MUST match
+    // the LtpRowVer set on the Contents TC row that references this
+    // message — REF emits non-zero values (mount-time inspection shows
+    // Outlook treats LtpRowVer=0 as uncommitted and the Import wizard's
+    // full-tree walk skips such rows). Caller (writeM8Pst, writeM7Pst,
+    // ...) maintains a monotonic counter and pairs each Contents TC row
+    // with the matching messageRowVer here.
+    uint32_t messageRowVer {0u};
 };
 
 struct MailPcSubnode {
@@ -212,6 +221,25 @@ struct M7FolderSchema {
     // those bits on user contact folder rows so the matching PC tags
     // must be present even with value 0.
     bool emitPstHiddenZero {false};
+
+    // M12.16: PR_PST_FOLDER_DESIGN_CLS (0x7C0F). REF varies this per
+    // folder-type: 6 on default IPF.Note user folders, 8 on the user
+    // IPF.Contact folder, 0 on hidden contacts-anatomy sub-folders.
+    // Default 6 preserves the historical behaviour for mail/calendar
+    // callers that don't override it. The Import wizard's "include
+    // subfolders" recursive walk appears to gate inclusion on this
+    // value matching the expected default class for the folder's
+    // container class.
+    uint32_t designClass {6u};
+
+    // M12.17: PR_36F8 (0x36F8 Int32). REF carries 0xA00000 on the user
+    // visible Contacts folder and 0x300000 on the 7 hidden contacts-
+    // anatomy sub-folders. Together with PR_36F7 (CLSID) and PR_3700
+    // (Int32=3), this triad appears to mark the folder as an
+    // "Outlook-recognised, real folder" for the Import wizard's
+    // recursive walk. Default 0xA00000 covers the visible-user-folder
+    // case; callers building hidden sub-folders override to 0x300000.
+    uint32_t folderClass36F8 {0x00A00000u};
 };
 
 // Pre-computed UTF-16-LE bytes for the three Outlook container classes.
