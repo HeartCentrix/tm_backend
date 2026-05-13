@@ -17,12 +17,27 @@ rows.
 Scoped to same-tenant only so one customer's files never leak into
 another customer's blob namespace, even under path-collision edge
 cases.
+
+In-process TTL-LRU layer
+------------------------
+File backups commonly hit the same content_hash repeatedly within a
+short window: a chat attachment shared across 50 users, a tenant
+templates folder, OneDrive auto-versions of slowly-evolving Office
+docs. Each repeat lookup is one round-trip to PG's index. A small
+in-memory TTL cache turns the repeat into O(1) memory access.
+
+Defaults tuned for a worker holding ~10k unique hashes in working
+set; entries expire after 5 minutes so transient PG state never
+goes stale beyond the next backup tick. Per-tenant key scope.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from typing import Dict, Iterable, Optional
+import time
+from collections import OrderedDict
+from typing import Dict, Iterable, Optional, Tuple
 from uuid import UUID
 
 from sqlalchemy import select
@@ -41,6 +56,69 @@ log = logging.getLogger(__name__)
 _BULK_CHUNK = int(os.getenv("BLOB_DEDUP_BULK_CHUNK", "500"))
 
 
+# In-process TTL-LRU cache for find_existing_blob. Keyed on
+# (tenant_id, content_checksum) so cross-tenant leakage is impossible.
+# A negative result (None) is also cached for a shorter TTL so we
+# don't pummel PG for unique content hashes that have no match.
+_LRU_MAX_ENTRIES = int(os.getenv("BLOB_DEDUP_LRU_MAX_ENTRIES", "10000"))
+_LRU_HIT_TTL_S = int(os.getenv("BLOB_DEDUP_LRU_HIT_TTL_S", "300"))
+_LRU_MISS_TTL_S = int(os.getenv("BLOB_DEDUP_LRU_MISS_TTL_S", "30"))
+
+# OrderedDict gives us LRU semantics: move_to_end on hit, popitem(last=False)
+# to evict oldest. Wrapped under an asyncio.Lock so concurrent coroutines
+# don't trample each other's mutations. Python dicts are technically thread-
+# safe for atomic ops but multi-step LRU bookkeeping is not.
+_lru_cache: "OrderedDict[Tuple[str, str], Tuple[Optional[str], float]]" = OrderedDict()
+_lru_lock = asyncio.Lock()
+
+
+def _lru_key(tenant_id: UUID, content_checksum: str) -> Tuple[str, str]:
+    return (str(tenant_id), content_checksum)
+
+
+async def _lru_get(tenant_id: UUID, content_checksum: str) -> Tuple[bool, Optional[str]]:
+    """Return (hit, value) for the LRU. value may be None (cached miss)."""
+    if not content_checksum:
+        return False, None
+    key = _lru_key(tenant_id, content_checksum)
+    async with _lru_lock:
+        entry = _lru_cache.get(key)
+        if entry is None:
+            return False, None
+        value, expires_at = entry
+        if expires_at < time.monotonic():
+            # Expired — purge and report miss
+            _lru_cache.pop(key, None)
+            return False, None
+        # Refresh LRU position
+        _lru_cache.move_to_end(key)
+        return True, value
+
+
+async def _lru_put(tenant_id: UUID, content_checksum: str, value: Optional[str]) -> None:
+    if not content_checksum:
+        return
+    key = _lru_key(tenant_id, content_checksum)
+    ttl = _LRU_HIT_TTL_S if value else _LRU_MISS_TTL_S
+    expires_at = time.monotonic() + ttl
+    async with _lru_lock:
+        _lru_cache[key] = (value, expires_at)
+        _lru_cache.move_to_end(key)
+        # Bound memory: evict oldest until under cap. _LRU_MAX_ENTRIES at
+        # ~150 bytes/entry = ~1.5 MB worst case per worker, trivial.
+        while len(_lru_cache) > _LRU_MAX_ENTRIES:
+            _lru_cache.popitem(last=False)
+
+
+def invalidate_dedup_cache_entry(tenant_id: UUID, content_checksum: str) -> None:
+    """Manual eviction hook for callers that just wrote a new dedup-target
+    blob. Synchronous because we never need to await; the OrderedDict
+    `pop` is atomic enough for this read-after-write."""
+    if not content_checksum:
+        return
+    _lru_cache.pop(_lru_key(tenant_id, content_checksum), None)
+
+
 async def find_existing_blob(
     session: AsyncSession,
     tenant_id: UUID,
@@ -55,9 +133,16 @@ async def find_existing_blob(
     ``min_size_bytes`` filters out trivial content where dedup savings
     don't outweigh the DB round-trip cost (tiny icons, 1-pixel GIFs).
     Default 1 KB — anything below that we just upload.
+
+    The hot path is served from a per-process TTL-LRU; cold lookups
+    hit PG on the (tenant_id, content_checksum) index. Both hits and
+    misses are cached (misses with a shorter TTL).
     """
     if not content_checksum:
         return None
+    cached, value = await _lru_get(tenant_id, content_checksum)
+    if cached:
+        return value
     try:
         stmt = select(SnapshotItem.blob_path).where(
             SnapshotItem.tenant_id == tenant_id,
@@ -67,6 +152,7 @@ async def find_existing_blob(
         ).limit(1)
         result = await session.execute(stmt)
         blob_path = result.scalar_one_or_none()
+        await _lru_put(tenant_id, content_checksum, blob_path)
         return blob_path
     except Exception as exc:
         # Dedup is advisory — on DB hiccup we fall through to a

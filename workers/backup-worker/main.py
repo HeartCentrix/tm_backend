@@ -651,6 +651,237 @@ async def _carry_forward_prior_chat_snapshot_items(
         return result.rowcount or 0
 
 
+class VersionListCoordinator:
+    """Async coordinator that bunches per-file /versions requests into
+    Graph $batch calls.
+
+    Design:
+      * Caller calls await coord.get_versions(file_id)
+      * The call registers a Future and either:
+          - triggers an immediate flush when pending >= batch_size, or
+          - starts a deadline timer (max_wait_ms) that flushes on expiry
+      * One $batch round-trip resolves up to batch_size waiters at once.
+      * On per-sub-request failure (None from list_file_versions_batch),
+        the coordinator falls back to a single-shot list_file_versions
+        for that file so the caller never gets stuck.
+
+    Why this exists: a single GET /versions costs ~150 ms of TCP/TLS/auth
+    handshake. With 2,745 files × one per file = 7 min just on the list
+    phase. Batched: 137 round trips × ~200 ms = 30 sec. Carry-forward
+    further reduces the *number* of files that need listing; this
+    coordinator makes the listing itself fast.
+
+    Memory: bounded by batch_size pending Futures. No background tasks
+    outlive a flush.
+    """
+
+    def __init__(
+        self,
+        graph_client,
+        drive_id: str,
+        batch_size: int = 20,
+        max_wait_ms: int = 200,
+    ):
+        self._gc = graph_client
+        self._drive_id = drive_id
+        self._batch_size = max(1, min(batch_size, 20))
+        self._max_wait_ms = max(50, max_wait_ms)
+        self._pending: List[Tuple[str, "asyncio.Future"]] = []
+        self._lock = asyncio.Lock()
+        self._timer_task: Optional["asyncio.Task"] = None
+
+    async def get_versions(self, file_id: str) -> List[Dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        fut: "asyncio.Future" = loop.create_future()
+        flush_now: Optional[List[Tuple[str, "asyncio.Future"]]] = None
+        async with self._lock:
+            self._pending.append((file_id, fut))
+            if len(self._pending) >= self._batch_size:
+                flush_now = self._pending
+                self._pending = []
+                self._timer_task = None
+            elif self._timer_task is None or self._timer_task.done():
+                self._timer_task = asyncio.create_task(self._wait_and_flush())
+        if flush_now is not None:
+            asyncio.create_task(self._flush(flush_now))
+        return await fut
+
+    async def _wait_and_flush(self):
+        try:
+            await asyncio.sleep(self._max_wait_ms / 1000.0)
+        except asyncio.CancelledError:
+            return
+        flush_now: Optional[List[Tuple[str, "asyncio.Future"]]] = None
+        async with self._lock:
+            if self._pending:
+                flush_now = self._pending
+                self._pending = []
+                self._timer_task = None
+        if flush_now is not None:
+            asyncio.create_task(self._flush(flush_now))
+
+    async def _flush(self, batch: List[Tuple[str, "asyncio.Future"]]):
+        file_ids = [fid for fid, _ in batch]
+        try:
+            results = await self._gc.list_file_versions_batch(self._drive_id, file_ids)
+        except Exception as e:
+            # Whole batch blew up — fall every waiter back to a single-shot
+            # call so we never deadlock a backup on a batched failure.
+            for fid, fut in batch:
+                if fut.done():
+                    continue
+                try:
+                    versions = await self._gc.list_file_versions(self._drive_id, fid)
+                    fut.set_result(versions)
+                except Exception as e2:
+                    fut.set_exception(e2)
+            return
+        # Resolve per-file; fall back to single-shot for any None (batch
+        # retry budget exhausted for that sub-request).
+        for fid, fut in batch:
+            if fut.done():
+                continue
+            versions = results.get(fid)
+            if versions is None:
+                try:
+                    versions = await self._gc.list_file_versions(self._drive_id, fid)
+                except Exception as e3:
+                    fut.set_exception(e3)
+                    continue
+            fut.set_result(versions or [])
+
+
+async def _fetch_prior_file_etag_map(
+    *,
+    resource_id: str,
+    current_snapshot_id: str,
+    file_ids: List[str],
+) -> Tuple[Optional[str], Dict[str, str], Dict[str, set]]:
+    """Look up the immediate prior COMPLETED snapshot for this resource and
+    return:
+
+    - prior_snap_id (str or None)
+    - prior_etag_by_file: {file_id → source_etag} from that snapshot's FILE rows
+    - captured_versions_by_file: {file_id → {version_id, ...}} from that snapshot's
+      FILE_VERSION rows. Pulled from metadata->>'version_id' since that's the
+      stable cross-version identity.
+
+    Why a single helper: lets the caller compute everything in TWO indexed
+    queries per resource (not per file), then make per-file carry-forward
+    decisions in pure Python with no further DB round-trips.
+    """
+    if not (resource_id and current_snapshot_id and file_ids):
+        return None, {}, {}
+    async with async_session_factory() as s:
+        prior_row = (await s.execute(
+            text(
+                "SELECT id FROM snapshots "
+                " WHERE resource_id = :rid AND id <> :csid "
+                "   AND status IN ('COMPLETED', 'PARTIAL') "
+                " ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"rid": resource_id, "csid": current_snapshot_id},
+        )).first()
+        if prior_row is None:
+            return None, {}, {}
+        prior_snap_id = str(prior_row[0])
+
+        # Pull both FILE and FILE_VERSION rows in one query (still narrowly
+        # filtered by snapshot_id + file_id set so the planner uses the
+        # snapshot_id index then a small index scan).
+        # FILE rows store etag at metadata->'structured'->>'source_etag'
+        # (see _create_file_snapshot_item — wraps the SharePoint metadata
+        # under a 'structured' key). FILE_VERSION rows we write at
+        # _backup_file_versions store version_id at the top level of
+        # metadata. COALESCE both paths so the query works for either layout.
+        rows = (await s.execute(
+            text(
+                "SELECT external_id, item_type, parent_external_id, "
+                "       COALESCE("
+                "         metadata->'structured'->>'source_etag', "
+                "         metadata->>'source_etag'"
+                "       ) AS file_etag, "
+                "       metadata->>'version_id' AS version_id "
+                "  FROM snapshot_items "
+                " WHERE snapshot_id = :sid "
+                "   AND ( "
+                "         (item_type = 'FILE'         AND external_id = ANY(:fids)) "
+                "      OR (item_type = 'FILE_VERSION' AND parent_external_id = ANY(:fids)) "
+                "       )"
+            ),
+            {"sid": prior_snap_id, "fids": file_ids},
+        )).all()
+    prior_etag_by_file: Dict[str, str] = {}
+    captured_versions_by_file: Dict[str, set] = {}
+    for ext_id, item_type, parent_ext, file_etag, version_id in rows:
+        if item_type == "FILE":
+            if file_etag:
+                prior_etag_by_file[ext_id] = file_etag
+        elif item_type == "FILE_VERSION":
+            if parent_ext and version_id:
+                captured_versions_by_file.setdefault(parent_ext, set()).add(version_id)
+    return prior_snap_id, prior_etag_by_file, captured_versions_by_file
+
+
+async def _carry_forward_prior_file_versions(
+    *,
+    target_snapshot_id: str,
+    prior_snap_id: str,
+    file_ids: List[str],
+) -> int:
+    """Bulk-clone FILE_VERSION rows for the given file_ids from prior snapshot
+    into the target. Returns rows-copied count.
+
+    Triggered when the current FILE's eTag matches the prior snapshot's FILE
+    eTag — proving the file is byte-identical, so its version chain is
+    necessarily identical too. No Graph calls, no downloads — pure SQL row
+    duplication pointing at the existing (tenant-deduped) Seaweed blobs.
+
+    Idempotent via NOT EXISTS on (snapshot_id, external_id, item_type) — safe
+    to call multiple times within the same snapshot run.
+
+    Indexing assumption: parent_external_id is populated on FILE_VERSION rows
+    going forward. Rows from before that change have parent_external_id=NULL
+    and won't be cloned by this query — those resources fall through to the
+    normal re-capture path on the first post-deploy backup, then carry-forward
+    naturally from the second backup onward.
+    """
+    if not (target_snapshot_id and prior_snap_id and file_ids):
+        return 0
+    async with async_session_factory() as s:
+        result = await s.execute(
+            text(
+                "INSERT INTO snapshot_items ("
+                "  id, snapshot_id, tenant_id, item_type, external_id, "
+                "  parent_external_id, name, folder_path, content_hash, "
+                "  content_checksum, content_size, blob_path, "
+                "  encryption_key_id, backup_version, metadata, is_deleted, "
+                "  indexed_at, backend_id, created_at"
+                ") "
+                "SELECT gen_random_uuid(), :tsid, src.tenant_id, src.item_type, "
+                "       src.external_id, src.parent_external_id, src.name, "
+                "       src.folder_path, src.content_hash, src.content_checksum, "
+                "       src.content_size, src.blob_path, src.encryption_key_id, "
+                "       COALESCE(src.backup_version, 1), src.metadata, "
+                "       COALESCE(src.is_deleted, false), src.indexed_at, "
+                "       src.backend_id, NOW() "
+                "  FROM snapshot_items src "
+                " WHERE src.snapshot_id = :psid "
+                "   AND src.item_type = 'FILE_VERSION' "
+                "   AND src.parent_external_id = ANY(:fids) "
+                "   AND NOT EXISTS ("
+                "         SELECT 1 FROM snapshot_items dst "
+                "          WHERE dst.snapshot_id = :tsid "
+                "            AND dst.external_id = src.external_id "
+                "            AND dst.item_type = src.item_type"
+                "       )"
+            ),
+            {"tsid": target_snapshot_id, "psid": prior_snap_id, "fids": file_ids},
+        )
+        await s.commit()
+        return result.rowcount or 0
+
+
 async def _copy_chat_attachment_rows_to_snapshot(
     *,
     tenant_id: str,
@@ -4922,6 +5153,18 @@ class BackupWorker:
                 # 2 GB missing on Amit Mishra's snapshot.
                 bytes_total = max(bytes_total + att_bytes, persisted_bytes)
 
+                # Drain any pending FILE_VERSION rows from the worker's bulk
+                # buffer BEFORE the snapshot flips to COMPLETED — otherwise
+                # the "Done" state could be visible while a few hundred rows
+                # are still in-buffer waiting on the next size/time trigger.
+                try:
+                    flushed = await self.flush_version_rows(force=True)
+                    if flushed:
+                        print(f"[{self.worker_id}]   [VERSIONS] pre-COMPLETED flush: {flushed} rows")
+                except Exception as fe:
+                    print(f"[{self.worker_id}]   [VERSIONS] pre-COMPLETED flush warning: "
+                          f"{type(fe).__name__}: {fe}")
+
                 async with async_session_factory() as session:
                     snap = await session.get(Snapshot, snapshot.id)
                     snap.item_count = total_items
@@ -7037,16 +7280,102 @@ class BackupWorker:
             # at MAX_FILE_VERSIONS (default 5) to bound storage. Only runs on
             # newly-streamed files; skip-already-present files keep their prior
             # snapshot's versions.
-            try:
-                ver_count, ver_bytes = await self._backup_file_versions(
-                    graph_client, tenant, snapshot, drive_id, file_id, file_name,
-                    container, shard, current_etag=source_etag,
-                )
-                if ver_count:
-                    print(f"[{self.worker_id}]   [VERSIONS] {file_name}: {ver_count} prior version(s), {ver_bytes} bytes")
-            except Exception as ve:
-                # Version capture is best-effort — don't fail the file backup.
-                print(f"[{self.worker_id}]   [VERSIONS WARN] {file_name}: {type(ve).__name__}: {ve}")
+            #
+            # Three-layer fast path (most → least expensive skip):
+            #
+            #   Layer 1: fileSystemInfo.createdDateTime == lastModifiedDateTime
+            #     → file has never been edited → no prior versions possible.
+            #
+            #   Layer 2: prior snapshot's FILE row has identical eTag to this run
+            #     → file is byte-identical → version chain is identical → clone
+            #       FILE_VERSION rows from prior snapshot via SQL (no Graph at
+            #       all). Gated by VERSION_CARRY_FORWARD_ENABLED.
+            #
+            #   Layer 3: normal capture path with skip-set for any version_ids
+            #     already in the prior snapshot (avoids redundant downloads).
+            fs_info = file_item.get("fileSystemInfo") or {}
+            created_at = fs_info.get("createdDateTime") or file_item.get("createdDateTime")
+            modified_at = fs_info.get("lastModifiedDateTime") or file_item.get("lastModifiedDateTime")
+            never_edited = bool(created_at) and created_at == modified_at
+            if not never_edited:
+                # Lazy-load per-snapshot prior state. Cached on the snapshot
+                # object so all files for this resource share two indexed SQL
+                # queries (not 2*N).
+                if not hasattr(snapshot, "_prior_state_loaded"):
+                    try:
+                        # NOTE: this collects across the lifetime of the
+                        # snapshot — the first file pays for ALL files we'll
+                        # eventually process. To bound memory we cap at the
+                        # files we have observed so far + filled lazily on
+                        # next file. Simpler: pass a single file_id and grow.
+                        ps_id, etag_map, ver_map = await _fetch_prior_file_etag_map(
+                            resource_id=str(snapshot.resource_id),
+                            current_snapshot_id=str(snapshot.id),
+                            file_ids=[file_id],
+                        )
+                        snapshot._prior_state_loaded = True
+                        snapshot._prior_snap_id = ps_id
+                        snapshot._prior_etag_by_file = etag_map
+                        snapshot._prior_versions_by_file = ver_map
+                    except Exception as pe:
+                        # Best-effort: if the lookup fails we fall through to
+                        # the full capture path — no data loss, just no
+                        # carry-forward optimization.
+                        print(f"[{self.worker_id}]   [VERSIONS] prior-state lookup failed: {type(pe).__name__}: {pe}")
+                        snapshot._prior_state_loaded = True
+                        snapshot._prior_snap_id = None
+                        snapshot._prior_etag_by_file = {}
+                        snapshot._prior_versions_by_file = {}
+                else:
+                    # Grow the maps lazily as new file_ids arrive (the first
+                    # call only loaded for one file). Skip the DB roundtrip
+                    # entirely when we've already seen this file_id.
+                    if file_id not in snapshot._prior_etag_by_file \
+                       and file_id not in snapshot._prior_versions_by_file \
+                       and snapshot._prior_snap_id is not None:
+                        try:
+                            _, etag_map2, ver_map2 = await _fetch_prior_file_etag_map(
+                                resource_id=str(snapshot.resource_id),
+                                current_snapshot_id=str(snapshot.id),
+                                file_ids=[file_id],
+                            )
+                            snapshot._prior_etag_by_file.update(etag_map2)
+                            for k, v in ver_map2.items():
+                                snapshot._prior_versions_by_file.setdefault(k, set()).update(v)
+                        except Exception:
+                            pass
+
+                prior_etag = snapshot._prior_etag_by_file.get(file_id)
+                # Layer 2: carry-forward when eTag matches.
+                carry_forward_did_run = False
+                if self.VERSION_CARRY_FORWARD_ENABLED and prior_etag and prior_etag == source_etag \
+                        and snapshot._prior_snap_id:
+                    try:
+                        copied = await _carry_forward_prior_file_versions(
+                            target_snapshot_id=str(snapshot.id),
+                            prior_snap_id=snapshot._prior_snap_id,
+                            file_ids=[file_id],
+                        )
+                        if copied:
+                            print(f"[{self.worker_id}]   [VERSIONS-CARRY] {file_name}: {copied} prior row(s) cloned (eTag unchanged)")
+                            carry_forward_did_run = True
+                    except Exception as cfe:
+                        print(f"[{self.worker_id}]   [VERSIONS-CARRY WARN] {file_name}: {type(cfe).__name__}: {cfe}")
+
+                # Layer 3: normal capture (with skip-set when available).
+                if not carry_forward_did_run:
+                    try:
+                        skip_set = snapshot._prior_versions_by_file.get(file_id, set())
+                        ver_count, ver_bytes = await self._backup_file_versions(
+                            graph_client, tenant, snapshot, drive_id, file_id, file_name,
+                            container, shard, current_etag=source_etag,
+                            skip_version_ids=skip_set if skip_set else None,
+                        )
+                        if ver_count:
+                            print(f"[{self.worker_id}]   [VERSIONS] {file_name}: {ver_count} prior version(s), {ver_bytes} bytes")
+                    except Exception as ve:
+                        # Version capture is best-effort — don't fail the file backup.
+                        print(f"[{self.worker_id}]   [VERSIONS WARN] {file_name}: {type(ve).__name__}: {ve}")
 
             return {"success": True, "size": size, "method": "streaming",
                     "blob_path": blob_path, "sha256": sha256,
@@ -7077,6 +7406,14 @@ class BackupWorker:
         metadata["drive_id"] = drive_id or (file_item.get("parentReference") or {}).get("driveId")
         if file_item.get("_site_label"):
             metadata["site_label"] = file_item["_site_label"]
+        # Persist source_etag + lastModifiedDateTime on the FILE row so the
+        # next backup's carry-forward path can compare without re-reading the
+        # blob's Azure metadata. M365 updates eTag on every content edit;
+        # identical eTag between snapshots means the file is byte-identical,
+        # which is the trigger for cloning FILE_VERSION rows (skipping all
+        # Graph calls + downloads).
+        metadata["source_etag"] = (file_item.get("eTag") or "")[:64]
+        metadata["source_modified"] = file_item.get("lastModifiedDateTime") or ""
         content_hash = hashes.get("sha256") or hashes.get("quickxor") or ""
 
         # Best-effort permission capture. Failure here doesn't fail the file
@@ -7126,6 +7463,45 @@ class BackupWorker:
     # FILE row). Override per-deployment via env var; expose per-policy later.
     MAX_FILE_VERSIONS = int(os.environ.get("MAX_FILE_VERSIONS", "5"))
 
+    # ─── Version-capture tunables ───────────────────────────────────────────
+    # Defaults chosen so the worst-case memory footprint fits comfortably in
+    # the existing per-replica RAM budget (Railway Pro 32 GiB):
+    #
+    #   peak ≈ VERSION_GLOBAL_PARALLEL × VERSION_INLINE_BUFFER_MB
+    #        = 32 × 32 MiB = 1 GiB
+    #
+    # Plus a ceiling pass: any version > VERSION_INLINE_BUFFER_MB streams in
+    # VERSION_STREAM_CHUNK_MB chunks (single chunk in flight per stream); any
+    # version > VERSION_STREAM_DISK_THRESHOLD_MB spills to disk-temp to keep
+    # RAM bounded regardless of file size.
+
+    # 95th-percentile OneDrive file is <50 MB; 32 MB inline buffer keeps the
+    # whole-file single-shot path for ~95% of versions (fastest).
+    VERSION_INLINE_BUFFER_MB = int(os.environ.get("VERSION_INLINE_BUFFER_MB", "32"))
+    # Above this size we stop holding the whole file in RAM and switch to a
+    # disk-temp resumable download — protects against OOM on a stray multi-GB
+    # version (PowerPoint with embedded video, etc.).
+    VERSION_STREAM_DISK_THRESHOLD_MB = int(os.environ.get("VERSION_STREAM_DISK_THRESHOLD_MB", "256"))
+    # Chunk size for the medium tier (inline_buffer < size ≤ disk_threshold).
+    # 16 MiB amortizes HTTP overhead while keeping per-stream peak bounded.
+    VERSION_STREAM_CHUNK_MB = int(os.environ.get("VERSION_STREAM_CHUNK_MB", "16"))
+    # Global ceiling on concurrent in-flight version downloads per replica.
+    # 32 caps RAM at INLINE_BUFFER × 32 (~1 GiB) and also stays under typical
+    # multi-app Graph throttle ceilings — increase only if you've added app
+    # shards and verified throttle headroom.
+    VERSION_GLOBAL_PARALLEL = int(os.environ.get("VERSION_GLOBAL_PARALLEL", "32"))
+    # Microsoft Graph $batch hard cap is 20; surface as a knob for testing.
+    VERSION_GRAPH_BATCH_SIZE = min(int(os.environ.get("VERSION_GRAPH_BATCH_SIZE", "20")), 20)
+    # Flush the FILE_VERSION row buffer every N files OR T seconds, whichever
+    # first. Coalesces 1-row inserts into bulk inserts → fewer PG round-trips.
+    VERSION_DB_FLUSH_FILES = int(os.environ.get("VERSION_DB_FLUSH_FILES", "100"))
+    VERSION_DB_FLUSH_SECONDS = int(os.environ.get("VERSION_DB_FLUSH_SECONDS", "5"))
+    # Carry-forward: when current file's eTag matches the prior snapshot's
+    # captured eTag, clone the prior snapshot's FILE_VERSION rows into the
+    # new snapshot via SQL — no Graph calls at all. Disable via env if you
+    # ever need to force-recapture (e.g. data-quality audit).
+    VERSION_CARRY_FORWARD_ENABLED = os.environ.get("VERSION_CARRY_FORWARD_ENABLED", "true").lower() == "true"
+
     async def _backup_file_versions(
         self,
         graph_client: GraphClient,
@@ -7137,23 +7513,57 @@ class BackupWorker:
         container: str,
         shard,
         current_etag: str,
+        pre_listed_versions: Optional[List[Dict[str, Any]]] = None,
+        skip_version_ids: Optional[set] = None,
     ) -> Tuple[int, int]:
         """Capture historical versions of a single file as separate blobs.
 
         Behavior:
-          - Lists /versions newest-first.
+          - Lists /versions newest-first (or uses the caller-supplied
+            `pre_listed_versions` if a batched list was pre-fetched).
           - Skips the most recent entry (it matches the live file we just uploaded).
           - Caps the number of older versions captured at MAX_FILE_VERSIONS.
+          - Skips any version_id already in `skip_version_ids` (already in DB).
           - Each version becomes a SnapshotItem(item_type="FILE_VERSION") with
-            extra_data.parent_item_id = file_id.
+            extra_data.parent_item_id = file_id AND parent_external_id = file_id
+            (the column is populated so prior-snapshot carry-forward can match
+            on an indexed column without JSON extraction).
 
-        Tradeoff: capturing every version mirrors afi's behavior but multiplies
-        storage roughly by (avg version count + 1). The cap keeps the worst case
-        bounded; raise it per-policy when retention requirements demand it.
+        Memory safety: uses the 3-tier downloader on the GraphClient — small
+        files held in RAM, medium streamed in chunks, large spilled to disk-
+        temp — and a per-replica global semaphore (`_version_sem`) caps total
+        concurrent in-flight version downloads at VERSION_GLOBAL_PARALLEL.
         """
         if self.MAX_FILE_VERSIONS <= 0:
             return 0, 0
-        versions = await graph_client.list_file_versions(drive_id, file_id)
+        if pre_listed_versions is not None:
+            versions = pre_listed_versions
+        else:
+            # Route through the per-drive VersionListCoordinator so concurrent
+            # _backup_file_versions calls bunch their /versions requests into
+            # one $batch HTTP. Lazy-init per drive_id on the worker instance —
+            # one coordinator per drive, sharing batches across all files in
+            # that drive. If the coordinator path errors at the env level,
+            # fall back to the per-file call.
+            try:
+                if getattr(self, "_version_coords", None) is None:
+                    self._version_coords = {}
+                coord = self._version_coords.get(drive_id)
+                if coord is None:
+                    coord = VersionListCoordinator(
+                        graph_client,
+                        drive_id,
+                        batch_size=self.VERSION_GRAPH_BATCH_SIZE,
+                        max_wait_ms=int(os.environ.get("VERSION_LIST_BATCH_WAIT_MS", "200")),
+                    )
+                    self._version_coords[drive_id] = coord
+                versions = await coord.get_versions(file_id)
+            except Exception as _coord_e:
+                # Coordinator path failed unexpectedly — degrade to single-shot
+                # so version capture still works.
+                print(f"[{self.worker_id}]   [VERSIONS] coord fallback for {file_name}: "
+                      f"{type(_coord_e).__name__}: {_coord_e}")
+                versions = await graph_client.list_file_versions(drive_id, file_id)
         if not versions or len(versions) < 2:
             # 0 or 1 entries — only the live version exists; nothing to back up.
             return 0, 0
@@ -7161,86 +7571,260 @@ class BackupWorker:
         # Skip index 0 (the current version, already captured) — capture at most
         # MAX_FILE_VERSIONS older entries.
         prior = versions[1 : 1 + self.MAX_FILE_VERSIONS]
-        rows_to_insert: List[dict] = []
-        total_bytes = 0
+        if skip_version_ids:
+            prior = [v for v in prior if v.get("id") not in skip_version_ids]
+            if not prior:
+                return 0, 0
 
-        for v in prior:
+        # Lazy-init the per-replica version semaphore. Stored on the worker
+        # instance so all parallel _backup_files_parallel calls share one
+        # ceiling. Capacity is intentionally NOT re-expanded on subsequent
+        # calls (env hot-reload should not raise the RAM budget mid-run).
+        if getattr(self, "_version_sem", None) is None:
+            self._version_sem = asyncio.Semaphore(self.VERSION_GLOBAL_PARALLEL)
+            self._version_sem_capacity = self.VERSION_GLOBAL_PARALLEL
+            print(
+                f"[{self.worker_id}] version-capture global semaphore: "
+                f"{self.VERSION_GLOBAL_PARALLEL} concurrent priors "
+                f"(inline_buffer={self.VERSION_INLINE_BUFFER_MB} MiB, "
+                f"disk_threshold={self.VERSION_STREAM_DISK_THRESHOLD_MB} MiB, "
+                f"chunk={self.VERSION_STREAM_CHUNK_MB} MiB)"
+            )
+        version_sem = self._version_sem
+
+        from shared.azure_storage import upload_blob_with_dedup
+
+        async def _capture_one(v) -> Optional[dict]:
+            """Download + upload a single prior version. Returns the row dict
+            on success, None on any failure (best-effort). Uses the 3-tier
+            streamer so peak per-stream RAM is bounded regardless of file size.
+            """
             version_id = v.get("id")
             if not version_id:
-                continue
-            v_size = v.get("size") or 0
-            v_modified = v.get("lastModifiedDateTime")
+                return None
+            v_size_hint = v.get("size") or 0
+            tmp_path: Optional[str] = None
+            content_bytes: Optional[bytes] = None
             try:
-                content_bytes = await graph_client.get_file_version_content(
-                    drive_id, file_id, version_id,
-                )
+                async with version_sem:
+                    content_bytes, tmp_path, total_size = await graph_client.stream_file_version_3tier(
+                        drive_id, file_id, version_id,
+                        size_hint=v_size_hint,
+                        inline_buffer_mb=self.VERSION_INLINE_BUFFER_MB,
+                        disk_threshold_mb=self.VERSION_STREAM_DISK_THRESHOLD_MB,
+                        chunk_mb=self.VERSION_STREAM_CHUNK_MB,
+                    )
             except Exception as e:
                 print(f"[{self.worker_id}]     [VERSION FAIL] {file_name} v={version_id}: {type(e).__name__}: {e}")
-                continue
-            if not content_bytes:
-                continue
-            content_hash = hashlib.sha256(content_bytes).hexdigest()
-            blob_path = azure_storage_manager.build_blob_path(
-                str(tenant.id), str(snapshot.resource_id), str(snapshot.id),
-                f"ver_{file_id}_{version_id}",
-            )
-            # Dedup-aware upload — OneDrive versioning keeps many
-            # copies of the same file content across users and
-            # snapshots. Same-tenant content-hash match reuses the
-            # existing blob instead of uploading again. First run
-            # is pure cost (~one indexed DB lookup per file); every
-            # subsequent run with unchanged content skips the upload
-            # entirely.
-            from shared.azure_storage import upload_blob_with_dedup
-            upload_result = await upload_blob_with_dedup(
-                tenant.id, content_hash,
-                container, blob_path, content_bytes, shard,
-                max_retries=3,
-            )
-            if not (isinstance(upload_result, dict) and upload_result.get("success")):
-                continue
-            blob_path = upload_result.get("blob_path", blob_path)
-            total_bytes += len(content_bytes)
-            # IMPORTANT: building row dicts (not ORM objects) so we can
-            # use pg_insert(...).on_conflict_do_nothing() below. Use DB
-            # column names — SnapshotItem.extra_data maps to "metadata".
-            rows_to_insert.append({
-                "snapshot_id": snapshot.id,
-                "tenant_id": tenant.id,
-                "external_id": f"{file_id}::v::{version_id}",
-                "item_type": "FILE_VERSION",
-                "name": file_name,
-                "content_hash": content_hash,
-                "content_size": len(content_bytes),
-                "blob_path": blob_path,
-                "content_checksum": content_hash,
-                "metadata": {
-                    "parent_item_id": file_id,
-                    "drive_id": drive_id,
-                    "version_id": version_id,
-                    "modified_at": v_modified,
-                    "current_file_etag": current_etag,
-                    "size": v_size,
-                },
-            })
+                return None
+            try:
+                # Compute hash from whichever tier returned content.
+                if content_bytes is not None:
+                    payload = content_bytes
+                    content_size = len(payload)
+                    content_hash = hashlib.sha256(payload).hexdigest()
+                elif tmp_path is not None:
+                    content_size = total_size
+                    hasher = hashlib.sha256()
+                    with open(tmp_path, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(8 * 1024 * 1024), b""):
+                            hasher.update(chunk)
+                    content_hash = hasher.hexdigest()
+                    payload = None  # signal disk path to upload helper below
+                else:
+                    return None
+                if content_size <= 0:
+                    return None
+                blob_path = azure_storage_manager.build_blob_path(
+                    str(tenant.id), str(snapshot.resource_id), str(snapshot.id),
+                    f"ver_{file_id}_{version_id}",
+                )
+                # Dedup-aware upload — OneDrive versioning keeps many copies of
+                # the same file content across users and snapshots. Same-tenant
+                # content-hash match reuses the existing blob instead of
+                # re-uploading.
+                if payload is not None:
+                    # Tier 1 + 2: bytes already in RAM — single-shot dedup-upload.
+                    upload_result = await upload_blob_with_dedup(
+                        tenant.id, content_hash,
+                        container, blob_path, payload, shard,
+                        max_retries=3,
+                    )
+                else:
+                    # Tier 3: disk-temp path. Avoid reading the whole file back
+                    # into RAM (that would defeat the disk-temp tier's whole
+                    # purpose). Do an explicit dedup probe against the tenant's
+                    # content_hash index; on cache miss stream-upload from disk.
+                    upload_result = None
+                    try:
+                        from shared.blob_dedup import find_existing_blob
+                        from shared.database import async_session_factory as _asf
+                        async with _asf() as _session:
+                            existing = await find_existing_blob(
+                                _session, tenant.id, content_hash, min_size_bytes=1024,
+                            )
+                        if existing:
+                            # Probe in the *active* container to avoid
+                            # cross-container path mismatch (same probe logic
+                            # upload_blob_with_dedup uses internally).
+                            ok = False
+                            try:
+                                if hasattr(shard, "get_blob_properties"):
+                                    props = await shard.get_blob_properties(container, existing)
+                                    if props is not None:
+                                        sz = (
+                                            getattr(props, "size", None)
+                                            if not isinstance(props, dict)
+                                            else props.get("size")
+                                        )
+                                        ok = bool(sz and sz > 0)
+                            except Exception:
+                                ok = False
+                            if ok:
+                                upload_result = {
+                                    "success": True,
+                                    "blob_path": existing,
+                                    "method": "dedup_hit",
+                                }
+                    except Exception:
+                        pass
+                    if upload_result is None:
+                        # Stream-upload from disk — bounded RAM, suitable for
+                        # multi-GB versions.
+                        upload_result = await upload_blob_with_retry_from_file(
+                            container_name=container,
+                            blob_path=blob_path,
+                            file_path=tmp_path,
+                            shard=shard,
+                            file_size=content_size,
+                            metadata={"sha256": content_hash},
+                        )
+                if not (isinstance(upload_result, dict) and upload_result.get("success")):
+                    return None
+                blob_path = upload_result.get("blob_path", blob_path)
+                return {
+                    "row": {
+                        "snapshot_id": snapshot.id,
+                        "tenant_id": tenant.id,
+                        "external_id": f"{file_id}::v::{version_id}",
+                        "parent_external_id": file_id,
+                        "item_type": "FILE_VERSION",
+                        "name": file_name,
+                        "content_hash": content_hash,
+                        "content_size": content_size,
+                        "blob_path": blob_path,
+                        "content_checksum": content_hash,
+                        "metadata": {
+                            "parent_item_id": file_id,
+                            "drive_id": drive_id,
+                            "version_id": version_id,
+                            "modified_at": v.get("lastModifiedDateTime"),
+                            "current_file_etag": current_etag,
+                            "size": v_size_hint,
+                        },
+                    },
+                    "bytes": content_size,
+                }
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+        # Fetch + upload all priors concurrently. The inner cap is
+        # MAX_FILE_VERSIONS (default 5) per file; the outer cap is
+        # VERSION_GLOBAL_PARALLEL across the whole replica via _version_sem.
+        results = await asyncio.gather(*[_capture_one(v) for v in prior])
+        rows_to_insert: List[dict] = [r["row"] for r in results if r]
+        total_bytes = sum(r["bytes"] for r in results if r)
 
         if rows_to_insert:
-            # UPSERT semantics: on the second backup run, the same file
-            # version row already exists — bulk add_all() would raise
-            # UniqueViolation on uq_snapshot_items_snap_ext_type and
-            # poison the whole batch (every other version in the same
-            # commit gets rolled back). on_conflict_do_nothing lets the
-            # incremental be a true no-op for unchanged versions. The
-            # row's blob_path / content_hash are content-derived, so
-            # re-using the existing row is correctness-preserving.
-            from sqlalchemy.dialects.postgresql import insert as _pg_insert
-            stmt = _pg_insert(SnapshotItem.__table__).values(rows_to_insert).on_conflict_do_nothing(
+            # Hand off to the worker-scoped row buffer. The buffer flushes
+            # opportunistically (size OR time threshold) so up to
+            # VERSION_DB_FLUSH_FILES files' worth of rows ride one
+            # transaction → ~100× fewer PG round-trips on first-run
+            # backups. Buffer is drained on snapshot completion (see
+            # flush_version_rows below).
+            await self._enqueue_version_rows(rows_to_insert)
+        return len(rows_to_insert), total_bytes
+
+    async def _enqueue_version_rows(self, rows: List[dict]) -> None:
+        """Append FILE_VERSION rows to the worker-scoped buffer and trigger
+        a flush when size or time threshold is hit. Thread-safe via lock.
+
+        Recovery: on INSERT failure the rows are re-buffered so a later
+        flush retries them — the on_conflict_do_nothing semantics keep
+        retries idempotent.
+        """
+        if not rows:
+            return
+        if not hasattr(self, "_ver_buf"):
+            self._ver_buf: List[dict] = []
+            self._ver_buf_lock = asyncio.Lock()
+            self._ver_last_flush = time.monotonic()
+        to_flush: Optional[List[dict]] = None
+        async with self._ver_buf_lock:
+            self._ver_buf.extend(rows)
+            # Threshold = N files × avg ~3 rows/file → trigger on either
+            # row count OR elapsed seconds. The row-count form keeps a
+            # single INSERT's parameter count well under the PG limit
+            # (~65k binds; we'd burn out at ~5k rows × 12 cols = 60k).
+            row_threshold = max(1, self.VERSION_DB_FLUSH_FILES) * 3
+            elapsed = time.monotonic() - self._ver_last_flush
+            if len(self._ver_buf) >= row_threshold or elapsed >= self.VERSION_DB_FLUSH_SECONDS:
+                to_flush = self._ver_buf
+                self._ver_buf = []
+                self._ver_last_flush = time.monotonic()
+        if to_flush:
+            await self._do_flush_version_rows(to_flush)
+
+    async def _do_flush_version_rows(self, rows: List[dict]) -> None:
+        """Issue bulk INSERTs with on_conflict_do_nothing. Chunked at
+        FLUSH_CHUNK_ROWS to stay well under PG's 65,535 bind-parameter
+        limit regardless of env misconfiguration (rows × ~12 cols).
+        On any chunk error the failing chunk's rows are re-buffered for
+        the next flush attempt."""
+        if not rows:
+            return
+        from sqlalchemy.dialects.postgresql import insert as _pg_insert
+        # 500 rows × 12 cols = 6,000 binds — well under the 65k PG cap.
+        FLUSH_CHUNK_ROWS = 500
+        failed_rows: List[dict] = []
+        for i in range(0, len(rows), FLUSH_CHUNK_ROWS):
+            chunk = rows[i:i + FLUSH_CHUNK_ROWS]
+            stmt = _pg_insert(SnapshotItem.__table__).values(chunk).on_conflict_do_nothing(
                 index_elements=["snapshot_id", "external_id", "item_type"],
             )
-            async with async_session_factory() as session:
-                await session.execute(stmt)
-                await session.commit()
-        return len(rows_to_insert), total_bytes
+            try:
+                async with async_session_factory() as session:
+                    await session.execute(stmt)
+                    await session.commit()
+            except Exception as e:
+                print(f"[{self.worker_id}]   [VERSIONS] bulk flush chunk failed "
+                      f"({len(chunk)} rows): {type(e).__name__}: {e}; re-buffering")
+                failed_rows.extend(chunk)
+        if failed_rows and hasattr(self, "_ver_buf_lock"):
+            async with self._ver_buf_lock:
+                self._ver_buf.extend(failed_rows)
+
+    async def flush_version_rows(self, force: bool = True) -> int:
+        """Drain the version row buffer. Call before marking a snapshot
+        COMPLETED so the "Done" state contains all captured FILE_VERSION
+        rows in PG (no lingering writes).
+
+        Returns the number of rows flushed.
+        """
+        if not hasattr(self, "_ver_buf"):
+            return 0
+        async with self._ver_buf_lock:
+            if not self._ver_buf:
+                return 0
+            to_flush = self._ver_buf
+            self._ver_buf = []
+            self._ver_last_flush = time.monotonic()
+        await self._do_flush_version_rows(to_flush)
+        return len(to_flush)
 
     async def _parallel_range_stream_to_backend(
         self,
@@ -12325,6 +12909,16 @@ class BackupWorker:
         snapshot.bytes_added = result.get("bytes_added", 0)
         snapshot.bytes_total = result.get("bytes_added", 0)
         snapshot.delta_token = result.get("new_delta_token")
+
+        # Drain pending FILE_VERSION rows before flipping status (see the
+        # earlier finalize site for rationale).
+        try:
+            flushed = await self.flush_version_rows(force=True)
+            if flushed:
+                print(f"[{self.worker_id}]   [VERSIONS] pre-status flush: {flushed} rows")
+        except Exception as fe:
+            print(f"[{self.worker_id}]   [VERSIONS] pre-status flush warning: "
+                  f"{type(fe).__name__}: {fe}")
 
         # Set status: PARTIAL if there are failed files, COMPLETE otherwise
         file_tracking = snapshot.delta_tokens_json or {}

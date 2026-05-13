@@ -123,7 +123,15 @@ class GraphClient:
             # max_keepalive_connections=50 sized so a worker with 10
             # parallel folder drains × 2-4 in-flight pages each fits
             # without recycling sockets.
+            # HTTP/2: opt-in via GRAPHCLIENT_HTTP2=true. h2 is in requirements
+            # but disabled by default until rolled out behind the flag — flip
+            # the env var to true on one replica first and watch for stream
+            # reset / connection errors before enabling fleet-wide. HTTP/2
+            # multiplexes hundreds of in-flight requests on one TCP
+            # connection → no per-request TLS handshake on the hot path.
+            use_http2 = os.environ.get("GRAPHCLIENT_HTTP2", "false").lower() == "true"
             self._http = httpx.AsyncClient(
+                http2=use_http2,
                 timeout=httpx.Timeout(
                     connect=30.0, read=600.0, write=300.0, pool=30.0,
                 ),
@@ -3664,6 +3672,130 @@ class GraphClient:
             result = await self._get(result["@odata.nextLink"])
             items.extend(result.get("value", []))
         return items
+
+    async def list_file_versions_batch(
+        self,
+        drive_id: str,
+        item_ids: List[str],
+        chunk_size: int = 20,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Bulk-list /versions for many items via Graph /$batch.
+
+        Returns {item_id → versions_list}, newest-first per item.
+        Missing items (403/404) map to []. Items that exhaust the batch
+        retry budget map to None so the caller can fall back to a
+        per-item call.
+
+        Why this exists: each item needs its own GET /versions which costs
+        a TCP/TLS/auth round-trip; on a 5k-user, millions-of-files corpus
+        that overhead dominates list-phase wall time. $batch bundles up to
+        20 sub-requests behind one auth handshake.
+
+        Note: $batch does not follow @odata.nextLink. The /versions
+        endpoint defaults to ~50 results; we cap callers at MAX_FILE_VERSIONS
+        which is well under that, so single-page is sufficient.
+        """
+        if not item_ids:
+            return {}
+
+        from shared.graph_batch import BatchRequest
+
+        # Build one BatchRequest per item. Sub-request URLs use the relative
+        # path Microsoft Graph expects inside $batch (no host prefix). We
+        # avoid $top= because graph_batch.validate_requests rejects it.
+        requests: List[BatchRequest] = [
+            BatchRequest(
+                id=str(i),
+                method="GET",
+                url=f"/drives/{drive_id}/items/{item_id}/versions",
+            )
+            for i, item_id in enumerate(item_ids)
+        ]
+        # Honor caller-provided chunk_size if smaller than the Graph hard
+        # cap of 20. BatchClient handles its own chunking via the global
+        # GRAPH_BATCH_MAX_SIZE setting.
+        responses = await self.batch(requests)
+
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for i, item_id in enumerate(item_ids):
+            resp = responses.get(str(i))
+            if resp is None:
+                out[item_id] = []
+                continue
+            if resp.status in (403, 404):
+                out[item_id] = []
+                continue
+            if 200 <= resp.status < 300:
+                out[item_id] = (resp.body or {}).get("value", []) or []
+                continue
+            # Unrecoverable (429 after retries, 5xx). Signal None so the
+            # caller can fall back to a single-shot list_file_versions().
+            out[item_id] = None  # type: ignore
+        return out
+
+    async def stream_file_version_3tier(
+        self,
+        drive_id: str,
+        item_id: str,
+        version_id: str,
+        size_hint: int,
+        inline_buffer_mb: int = 32,
+        disk_threshold_mb: int = 256,
+        chunk_mb: int = 16,
+    ) -> Tuple[Optional[bytes], Optional[str], int]:
+        """Three-tier version content fetch.
+
+        - size ≤ inline_buffer_mb  → single GET into memory, return (bytes, None, size)
+        - size ≤ disk_threshold_mb → chunked streaming into memory, return (bytes, None, size)
+        - else                     → streaming download to disk-temp, return (None, path, size)
+
+        Caller is responsible for cleaning up the disk-temp path if returned.
+        On any network failure raises the underlying httpx exception so the
+        outer per-version best-effort try/except can log and continue.
+        """
+        url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/versions/{version_id}/content"
+        token = await self._get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        inline_cap = inline_buffer_mb * 1024 * 1024
+        disk_cap = disk_threshold_mb * 1024 * 1024
+        chunk_bytes = max(chunk_mb * 1024 * 1024, 1024 * 1024)
+
+        async with self._http_session() as client:
+            # Tier 1 — small files: single non-streaming GET, simplest path.
+            if size_hint and size_hint <= inline_cap:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                return resp.content, None, len(resp.content)
+
+            # Tier 2/3 — stream the response. Decide memory-vs-disk based on
+            # actual content-length once response headers arrive (size_hint
+            # may be stale or 0 for unknown sizes).
+            async with client.stream("GET", url, headers=headers) as resp:
+                resp.raise_for_status()
+                cl_header = resp.headers.get("Content-Length")
+                actual_size = int(cl_header) if cl_header and cl_header.isdigit() else (size_hint or 0)
+                if actual_size and actual_size <= disk_cap:
+                    # Tier 2 — buffer in memory, chunked.
+                    buf = bytearray()
+                    async for chunk in resp.aiter_bytes(chunk_size=chunk_bytes):
+                        buf.extend(chunk)
+                    return bytes(buf), None, len(buf)
+                # Tier 3 — spill to disk, bounded RAM.
+                import tempfile
+                fd, tmp_path = tempfile.mkstemp(prefix="ver_", suffix=".bin")
+                total = 0
+                try:
+                    with os.fdopen(fd, "wb") as fh:
+                        async for chunk in resp.aiter_bytes(chunk_size=chunk_bytes):
+                            fh.write(chunk)
+                            total += len(chunk)
+                    return None, tmp_path, total
+                except BaseException:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise
 
     async def get_file_version_content(
         self, drive_id: str, item_id: str, version_id: str
