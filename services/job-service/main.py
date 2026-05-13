@@ -176,6 +176,77 @@ async def _create_batch_backup_jobs(
             detail=f"Resources must have SLA policies assigned. {len(resources_without_sla)} resource(s) missing policy: {', '.join(resources_without_sla[:5])}"
         )
 
+    # G1 — cross-bulk per-resource dedup. If the operator clicks "Backup
+    # all M365 now" three times in quick succession, we DO NOT want
+    # three backups for the same users: it triples Graph load + storage
+    # writes for zero new data. Filter requested resources against any
+    # IN_PROGRESS snapshot in the last hour. The 1-hour window matches
+    # the scheduler stale-sweep horizon (30 min idle threshold + 30 min
+    # safety) so a worker that genuinely died mid-flight gets re-
+    # scheduled on the next click after sweep reaps it.
+    #
+    # Three outcomes:
+    #   * All overlap → return deduped pointer to the existing in-flight
+    #     bulk Job ID(s), no new Job created, no new Activity row.
+    #   * Partial overlap → trim resources_map to the residual set so
+    #     just-arrived users still get backed up.
+    #   * No overlap → normal flow.
+    #
+    # Defense in depth: the worker fan-out path also runs the same
+    # dedup query in _fanout_bulk_to_per_resource to catch the race
+    # window between trigger and worker pickup.
+    dedup_skipped: List[str] = []
+    try:
+        requested_ids = list(resources_map.keys())
+        inflight_rows = (await db.execute(
+            text(
+                """
+                SELECT DISTINCT s.resource_id, s.job_id
+                FROM tm_vault.snapshots s
+                WHERE s.resource_id = ANY(:rids)
+                  AND s.status = 'IN_PROGRESS'
+                  AND s.started_at > NOW() - INTERVAL '1 hour'
+                """
+            ),
+            {"rids": requested_ids},
+        )).all()
+        if inflight_rows:
+            inflight_resource_ids = {str(r[0]) for r in inflight_rows}
+            inflight_job_ids = {str(r[1]) for r in inflight_rows if r[1]}
+            dedup_skipped = [rid for rid in requested_ids if rid in inflight_resource_ids]
+            for rid in dedup_skipped:
+                resources_map.pop(rid, None)
+            print(
+                f"[JOB_SERVICE] G1 dedup: {len(dedup_skipped)}/{len(requested_ids)} "
+                f"resources already in-flight, trimmed from this bulk "
+                f"(parents: {sorted(inflight_job_ids)[:3]}{'...' if len(inflight_job_ids) > 3 else ''})"
+            )
+            if not resources_map:
+                # All overlap — every requested resource is already
+                # being backed up by an earlier click. Don't create a
+                # new Job; point the caller at the existing in-flight
+                # parent(s) so the UI keeps polling the same row.
+                parent_job_id = sorted(inflight_job_ids)[0] if inflight_job_ids else None
+                return [{
+                    "jobId": parent_job_id,
+                    "status": "RUNNING",
+                    "resourceId": "BATCH",
+                    "resourceCount": 0,
+                    "queue": "deduped",
+                    "deduped": True,
+                    "alreadyInFlight": len(dedup_skipped),
+                    "message": (
+                        "All requested resources already being backed up — "
+                        "tracking the existing in-flight job."
+                    ),
+                }]
+    except Exception as dedup_exc:
+        # Best-effort dedup — on DB hiccup, fall through and let the
+        # worker-side G2 catch the duplicates. Never silently swallow
+        # a real schema problem: surface it so we notice.
+        print(f"[JOB_SERVICE] G1 dedup query failed (non-fatal): {dedup_exc}")
+        dedup_skipped = []
+
     # Partition by (tenant, queue). Oversized OneDrive children land in a
     # separate (tenant, backup.heavy) bucket so they don't get stuck
     # behind light resources on the shared urgent queue, and vice-versa
@@ -264,6 +335,13 @@ async def _create_batch_backup_jobs(
             extra_details={"note": note, "batch": True} if note else {"batch": True},
         )
 
+    if dedup_skipped:
+        # Partial-overlap callers: annotate the response so the UI can
+        # surface "Scheduled M resources; N already in-flight". Without
+        # this the operator sees only the smaller M and wonders where
+        # the rest of their click went.
+        for j in jobs_created:
+            j["dedupedCount"] = len(dedup_skipped)
     return jobs_created
 
 
