@@ -3048,6 +3048,32 @@ class GraphClient:
         result["value"] = all_value
         return result
 
+    async def count_chat_messages(self, chat_id: str) -> Optional[int]:
+        """Return Graph's authoritative message count for a chat thread.
+
+        Used by the audit-service's nightly integrity verifier (plan P4)
+        to compare against `chat_thread_messages` row count and detect
+        silent drops from a prior drain. Returns None if Graph rejects
+        the call (permission, 404, throttle) so the caller skips.
+
+        Graph's chat-messages endpoint does NOT support `$count=true`, so
+        we paginate and tally. With `$top=999` this is typically 1-3
+        round trips per chat — acceptable for a once-a-day sweep.
+        """
+        try:
+            url = f"{self.GRAPH_URL}/chats/{chat_id}/messages"
+            params = {"$top": "999"}
+            total = 0
+            result = await self._get(url, params=params)
+            total += len(result.get("value", []) or [])
+            while "@odata.nextLink" in result:
+                next_url = result["@odata.nextLink"]
+                result = await self._get(next_url)
+                total += len(result.get("value", []) or [])
+            return total
+        except Exception:
+            return None
+
     async def get_group_profile(self, group_id: str) -> Dict[str, Any]:
         """
         Get Entra ID group profile.

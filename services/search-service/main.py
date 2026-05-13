@@ -262,6 +262,8 @@ async def index_snapshot_item(item: SnapshotItem, db: AsyncSession):
                     " WHERE ct.tenant_id = :tid "
                     "   AND ct.chat_id = :cid "
                     "   AND ctm.message_external_id = :ext "
+                    "   AND ct.archived_at IS NULL "
+                    "   AND ctm.archived_at IS NULL "
                     " LIMIT 1"
                 ), {
                     "tid": str(item.tenant_id),

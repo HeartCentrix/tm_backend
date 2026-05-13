@@ -188,6 +188,11 @@ class Tenant(Base):
     azure_pg_servers_configured = Column(JSON, default=dict, nullable=False)
     extra_data = Column(MutableDict.as_mutable(JSON), default=dict, nullable=True)
 
+    # P2: soft delete. archived_at != NULL hides the tenant from all read
+    # paths but keeps rows physically present until tenant-purge-worker
+    # collects them after a 30-day grace period.
+    archived_at = Column(DateTime(timezone=True), nullable=True)
+
 
 class PlatformUser(Base):
     __tablename__ = "platform_users"
@@ -871,7 +876,9 @@ class ChatThread(Base):
     """
     __tablename__ = "chat_threads"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    # P2: RESTRICT (not CASCADE) so an accidental tenant DELETE fails
+    # loud instead of silently wiping every chat singleton.
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=False, index=True)
     chat_id = Column(String(256), nullable=False)
     chat_type = Column(String(32), nullable=True)        # oneOnOne / group / meeting_*
     chat_topic = Column(Text, nullable=True)             # group name; null for 1:1
@@ -880,6 +887,7 @@ class ChatThread(Base):
     last_drained_at = Column(DateTime(timezone=True), nullable=True)   # when we last hit Graph
     drain_cursor = Column(Text, nullable=True)
     drain_failure_state = Column(JSONB, nullable=True)
+    archived_at = Column(DateTime(timezone=True), nullable=True)  # P2 soft delete
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
@@ -895,7 +903,8 @@ class ChatThreadMessage(Base):
     """
     __tablename__ = "chat_thread_messages"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    chat_thread_id = Column(UUID(as_uuid=True), ForeignKey("chat_threads.id", ondelete="CASCADE"), nullable=False, index=True)
+    # P2: RESTRICT FK — see ChatThread for rationale.
+    chat_thread_id = Column(UUID(as_uuid=True), ForeignKey("chat_threads.id", ondelete="RESTRICT"), nullable=False, index=True)
     message_external_id = Column(String(256), nullable=False)
     created_date_time = Column(DateTime(timezone=True), nullable=True)
     last_modified_date_time = Column(DateTime(timezone=True), nullable=True)
@@ -907,4 +916,5 @@ class ChatThreadMessage(Base):
     metadata_raw = Column(JSONB, nullable=True)
     content_hash = Column(String(64), nullable=True)
     content_size = Column(BigInteger, nullable=True)
+    archived_at = Column(DateTime(timezone=True), nullable=True)  # P2 soft delete
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)

@@ -4,18 +4,42 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 try:
-    from fastapi import Depends, HTTPException, status
+    from fastapi import Depends, HTTPException, Request, status
     from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 except ModuleNotFoundError:  # pragma: no cover - worker-only runtimes
     Depends = None
     HTTPException = None
+    Request = None
     status = None
     HTTPBearer = None
     HTTPAuthorizationCredentials = Any
 
 from shared.config import settings
 
-security = HTTPBearer() if HTTPBearer else None
+if HTTPBearer is not None:
+    class _HTTPBearer401(HTTPBearer):
+        """HTTPBearer that 401s (not 403s) on missing/malformed header.
+
+        Why: the SPA's global fetch shim auto-refreshes on 401 only. The
+        default HTTPBearer raises 403 for "Not authenticated", which silently
+        bypasses the refresh path and surfaces as a permission error to the
+        user. 401 keeps the cookie-refresh flow working.
+        """
+        async def __call__(self, request: Request):  # type: ignore[override]
+            try:
+                return await super().__call__(request)
+            except HTTPException as exc:
+                if exc.status_code == 403:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Not authenticated",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    ) from exc
+                raise
+
+    security = _HTTPBearer401()
+else:
+    security = None
 
 
 # ==================== Secret Encryption ====================

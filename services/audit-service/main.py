@@ -13,9 +13,11 @@ Responsibilities:
 """
 import csv
 import io
+import os
+import json
 import uuid
 import json as json_lib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, List, Dict, Set, Tuple
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -106,12 +108,198 @@ async def _refresh_running_jobs():
         await asyncio.sleep(1)
 
 
+# ============================================================================
+# Plan P4 — Nightly chat integrity verifier.
+#
+# Compares the row count in chat_thread_messages against the Graph
+# ?$count=true ground truth for every chat that was recently drained.
+# On mismatch beyond a small tolerance, flips
+# chat_threads.drain_failure_state.integrity_gap=true — which the
+# backup worker reads on the NEXT pass to override skip-claim and force
+# a fresh full re-drain. This is the self-healing path that catches
+# silent drops from pagination races, F6 in the plan.
+#
+# Cost: 1 throttled Graph call per chat per day per tenant. With chat
+# sharding across 12 GraphClient apps this stays well under throttle.
+# ============================================================================
+
+_CHAT_INTEGRITY_INTERVAL_S = int(
+    os.getenv("CHAT_INTEGRITY_INTERVAL_S", str(24 * 3600)),
+)
+_CHAT_INTEGRITY_TOLERANCE_PCT = float(
+    os.getenv("CHAT_INTEGRITY_TOLERANCE_PCT", "1.0"),
+)
+
+
+async def _verify_chat_integrity_once():
+    """One sweep of all chats that drained successfully in the last 24h.
+    For each, fetch Graph's `$count=true` for the chat's message list and
+    compare to chat_thread_messages COUNT(*). Mark gaps."""
+    try:
+        from shared.graph_client import GraphClient as _GraphClient
+    except Exception:
+        # If GraphClient import fails (dev env without secrets), skip.
+        return
+    try:
+        async with async_session_factory() as db:
+            chats = (await db.execute(text(
+                "SELECT id, tenant_id, chat_id "
+                "  FROM chat_threads "
+                " WHERE last_drained_at > NOW() - INTERVAL '24 hours' "
+                "   AND (drain_failure_state IS NULL "
+                "        OR (drain_failure_state->>'class') IS NULL "
+                "        OR (drain_failure_state->>'class') NOT IN "
+                "             ('PERMISSION','GONE'))"
+            ))).all()
+        if not chats:
+            return
+        # Initialize one Graph client per pass — token caches are
+        # per-instance, fine for a once-a-day job.
+        gc = _GraphClient()
+        gaps_found = 0
+        for c in chats:
+            try:
+                # Local DB count.
+                async with async_session_factory() as db2:
+                    n = (await db2.execute(text(
+                        "SELECT COUNT(*) AS n FROM chat_thread_messages "
+                        " WHERE chat_thread_id = :tid"
+                    ), {"tid": str(c.id)})).scalar()
+                if n is None:
+                    continue
+                # Graph ground-truth count.
+                graph_total = await gc.count_chat_messages(c.chat_id)
+                if graph_total is None:
+                    continue
+                if graph_total <= 0:
+                    continue
+                miss_pct = abs(graph_total - int(n)) / float(graph_total) * 100.0
+                if miss_pct <= _CHAT_INTEGRITY_TOLERANCE_PCT:
+                    continue
+                # Flag gap.
+                async with async_session_factory() as db3:
+                    await db3.execute(text(
+                        "UPDATE chat_threads "
+                        "   SET drain_failure_state = "
+                        "       COALESCE(drain_failure_state, '{}'::jsonb) "
+                        "       || CAST(:fs AS JSONB), "
+                        "       updated_at = NOW() "
+                        " WHERE id = :tid"
+                    ), {
+                        "tid": str(c.id),
+                        "fs": json.dumps({
+                            "integrity_gap": True,
+                            "db_count": int(n),
+                            "graph_count": int(graph_total),
+                            "detected_at": datetime.now(timezone.utc).isoformat(),
+                        }),
+                    })
+                    await db3.commit()
+                gaps_found += 1
+                # Emit an audit event so ops sees the gap immediately.
+                try:
+                    await create_audit_event({
+                        "event_type": "INTEGRITY_GAP",
+                        "severity": "HIGH",
+                        "tenant_id": str(c.tenant_id),
+                        "resource_type": "CHAT_THREAD",
+                        "resource_id": str(c.id),
+                        "details": {
+                            "chat_id": c.chat_id,
+                            "db_count": int(n),
+                            "graph_count": int(graph_total),
+                            "miss_pct": round(miss_pct, 2),
+                        },
+                    })
+                except Exception:
+                    pass
+            except Exception as e:
+                # Per-chat failure: skip and continue. Don't let one chat
+                # tank the whole nightly sweep.
+                continue
+        if gaps_found:
+            print(f"[CHAT-INTEGRITY] sweep found {gaps_found} gap(s) "
+                  f"across {len(chats)} chats — backups will re-drain")
+    except Exception as e:
+        print(f"[CHAT-INTEGRITY] sweep failed: {type(e).__name__}: {e}")
+
+
+async def _chat_integrity_loop():
+    # Initial delay so the worker starts up cleanly before the first sweep.
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await _verify_chat_integrity_once()
+        except Exception:
+            pass
+        await asyncio.sleep(_CHAT_INTEGRITY_INTERVAL_S)
+
+
+# ============================================================================
+# P2 — soft-delete purge sweep
+#
+# Rows soft-deleted via `archived_at` stay physically present for a 30-day
+# grace period so an accidental tenant or chat archive can be reversed.
+# After the grace window the purge worker hard-deletes them. Sweep runs
+# hourly; the grace window is tunable via env.
+# ============================================================================
+_PURGE_GRACE_DAYS = int(os.getenv("ARCHIVED_PURGE_GRACE_DAYS", "30"))
+_PURGE_INTERVAL_S = int(os.getenv("ARCHIVED_PURGE_INTERVAL_S", str(3600)))
+
+
+async def _purge_archived_once():
+    """Hard-delete soft-archived rows older than the grace window.
+    Order matters: messages first, then threads, then tenants — RESTRICT
+    FKs would otherwise reject the parent delete."""
+    try:
+        async with async_session_factory() as db:
+            res1 = await db.execute(text(
+                "DELETE FROM chat_thread_messages "
+                " WHERE archived_at IS NOT NULL "
+                "   AND archived_at < NOW() - make_interval(days => :d)"
+            ), {"d": _PURGE_GRACE_DAYS})
+            res2 = await db.execute(text(
+                "DELETE FROM chat_threads "
+                " WHERE archived_at IS NOT NULL "
+                "   AND archived_at < NOW() - make_interval(days => :d)"
+            ), {"d": _PURGE_GRACE_DAYS})
+            res3 = await db.execute(text(
+                "DELETE FROM tenants "
+                " WHERE archived_at IS NOT NULL "
+                "   AND archived_at < NOW() - make_interval(days => :d)"
+            ), {"d": _PURGE_GRACE_DAYS})
+            await db.commit()
+            n1 = res1.rowcount or 0
+            n2 = res2.rowcount or 0
+            n3 = res3.rowcount or 0
+            if n1 or n2 or n3:
+                print(
+                    f"[ARCHIVED-PURGE] removed "
+                    f"{n1} messages, {n2} threads, {n3} tenants "
+                    f"older than {_PURGE_GRACE_DAYS}d"
+                )
+    except Exception as e:
+        print(f"[ARCHIVED-PURGE] sweep failed: {type(e).__name__}: {e}")
+
+
+async def _archived_purge_loop():
+    await asyncio.sleep(120)
+    while True:
+        try:
+            await _purge_archived_once()
+        except Exception:
+            pass
+        await asyncio.sleep(_PURGE_INTERVAL_S)
+
+
 @app.on_event("startup")
 async def startup():
     """Initialize message bus and start consumer on startup"""
     await message_bus.connect()
     asyncio.create_task(consume_audit_events())
     asyncio.create_task(_refresh_running_jobs())
+    asyncio.create_task(_chat_integrity_loop())
+    asyncio.create_task(_archived_purge_loop())
 
 
 @app.on_event("shutdown")

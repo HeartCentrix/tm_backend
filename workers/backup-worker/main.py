@@ -332,6 +332,44 @@ async def _claim_or_load_chat_thread(
                 has_new_activity
                 or age_s > _CHAT_THREAD_DRAIN_FRESHNESS_S
             )
+
+            # Plan P7 — skip-claim sanity check. If we're about to skip
+            # (claimed=False), do one cheap MAX(created_date_time) check
+            # against chat.lastUpdatedDateTime. A healthy drain leaves the
+            # latest message timestamp roughly equal to the chat's. If
+            # they diverge by more than ~24h, the prior drainer either
+            # silently dropped pages (F6) or wrote corrupted timestamps —
+            # we override the skip and force a fresh re-drain. Cheap to
+            # run (~1 PG query per skip), catches integrity gaps inline
+            # without waiting for the P4 nightly verifier.
+            if not claimed and new_lu is not None:
+                try:
+                    _mx = (await s.execute(
+                        text(
+                            "SELECT MAX(created_date_time) AS mx "
+                            "  FROM chat_thread_messages "
+                            " WHERE chat_thread_id = :tid"
+                        ),
+                        {"tid": str(row.id)},
+                    )).first()
+                    _max_msg_ts = _mx.mx if _mx else None
+                    if _max_msg_ts is not None:
+                        _gap = (
+                            new_lu.replace(tzinfo=None)
+                            - _max_msg_ts.replace(tzinfo=None)
+                        ).total_seconds()
+                        if _gap > 86400:  # 24h tolerance
+                            claimed = True
+                            print(
+                                f"[CHAT-CLAIM SANITY] chat_thread_id="
+                                f"{row.id} gap={int(_gap)}s — overriding "
+                                f"skip-claim, forcing re-drain"
+                            )
+                except Exception:
+                    # Sanity check is best-effort. Don't fail the claim
+                    # on a quirky PG hiccup; the worst case is we still
+                    # skip and rely on P4 to catch it nightly.
+                    pass
         return {
             "thread_id": thread_id,
             "claimed": claimed,
@@ -369,25 +407,37 @@ async def _mark_chat_thread_drained(
     if failure_state is not None:
         set_parts.append("drain_failure_state = CAST(:fs AS JSONB)")
         params["fs"] = json.dumps(failure_state)
-    try:
-        async with async_session_factory() as s:
-            await s.execute(
-                text(
-                    "UPDATE chat_threads SET " + ", ".join(set_parts) +
-                    " WHERE id = :tid"
-                ),
-                params,
-            )
-            await s.commit()
-    except Exception as e:
-        # Cursor/failure-state persistence is advisory — a DB hiccup
-        # here just means the next backup re-drains the same range.
-        # Idempotency comes from UNIQUE(chat_thread_id, message_external_id)
-        # on chat_thread_messages, so re-drain is safe.
-        logger.warning(
-            "_mark_chat_thread_drained failed thread=%s: %s",
-            thread_id, e,
-        )
+    # Plan P5 — this is the FINAL step in the drain chain and must
+    # commit, because earlier steps (chat_thread_messages upsert,
+    # snapshot_items pointer-write) already succeeded by the time we
+    # get here. If we silently lose the cursor advance, the next
+    # backup wastes work re-draining the same range; if we silently
+    # lose the failure_state write, smart-skip never engages on a
+    # known-broken chat. So: short retry with backoff before giving up.
+    last_err: Optional[Exception] = None
+    for _attempt in range(3):
+        try:
+            async with async_session_factory() as s:
+                await s.execute(
+                    text(
+                        "UPDATE chat_threads SET " + ", ".join(set_parts) +
+                        " WHERE id = :tid"
+                    ),
+                    params,
+                )
+                await s.commit()
+                return
+        except Exception as e:
+            last_err = e
+            if _attempt < 2:
+                await asyncio.sleep(0.25 * (_attempt + 1))
+                continue
+    # All retries exhausted. Idempotency on chat_thread_messages still
+    # makes re-drain safe; logged loudly so ops can investigate.
+    logger.warning(
+        "_mark_chat_thread_drained failed thread=%s after 3 retries: %s",
+        thread_id, last_err,
+    )
 
 
 _CHAT_THREAD_MSG_BULK_CHUNK = 500
@@ -513,6 +563,76 @@ async def _load_chat_thread_messages_for_pointer(
             }
             for r in rows
         ]
+
+
+async def _copy_chat_attachment_rows_to_snapshot(
+    *,
+    tenant_id: str,
+    target_snapshot_id: str,
+    chat_id: str,
+) -> int:
+    """Per-snapshot CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT pointer rows for
+    claim-skipped users (plan P8).
+
+    Today, attachment rows are only persisted in the FIRST drainer's
+    snapshot. Akshat's skip-claim path writes message pointer rows but no
+    attachment rows -- so Akshat's UI would show attachment chips via the
+    tenant-wide /attachments fallback (snapshot-service:2273), but if
+    Amit's snapshot is later deleted (retention, GDPR, account
+    deactivation), Akshat loses the chips entirely.
+
+    Fix: INSERT ... SELECT from any existing tenant CHAT_ATTACHMENT /
+    CHAT_HOSTED_CONTENT row whose parent_external_id is a message in this
+    chat thread, with new id + target snapshot_id. The blob_path is
+    reused (same SeaweedFS blob, no upload). Idempotent via WHERE NOT
+    EXISTS on (target_snapshot_id, external_id, item_type).
+
+    Returns the number of rows actually inserted.
+    """
+    if not tenant_id or not target_snapshot_id or not chat_id:
+        return 0
+    async with async_session_factory() as s:
+        result = await s.execute(
+            text(
+                "INSERT INTO snapshot_items ("
+                "  id, snapshot_id, tenant_id, item_type, external_id, "
+                "  parent_external_id, name, folder_path, content_hash, "
+                "  content_checksum, content_size, blob_path, "
+                "  encryption_key_id, backup_version, metadata, is_deleted, "
+                "  indexed_at, backend_id, created_at"
+                ") "
+                "SELECT gen_random_uuid(), :tsid, :tid, src.item_type, "
+                "       src.external_id, src.parent_external_id, src.name, "
+                "       src.folder_path, src.content_hash, "
+                "       src.content_checksum, src.content_size, "
+                "       src.blob_path, src.encryption_key_id, "
+                "       COALESCE(src.backup_version, 1), src.metadata, "
+                "       COALESCE(src.is_deleted, false), src.indexed_at, "
+                "       src.backend_id, NOW() "
+                "  FROM snapshot_items src "
+                " WHERE src.tenant_id = :tid "
+                "   AND src.item_type IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT') "
+                "   AND src.parent_external_id IN ( "
+                "         SELECT m.message_external_id "
+                "           FROM chat_thread_messages m "
+                "           JOIN chat_threads t ON t.id = m.chat_thread_id "
+                "          WHERE t.tenant_id = :tid AND t.chat_id = :cid "
+                "       ) "
+                "   AND NOT EXISTS ( "
+                "         SELECT 1 FROM snapshot_items dst "
+                "          WHERE dst.snapshot_id = :tsid "
+                "            AND dst.external_id = src.external_id "
+                "            AND dst.item_type = src.item_type "
+                "       )"
+            ),
+            {
+                "tsid": target_snapshot_id,
+                "tid": tenant_id,
+                "cid": chat_id,
+            },
+        )
+        await s.commit()
+        return result.rowcount or 0
 
 
 async def _is_job_cancelled(job_id) -> bool:
@@ -3389,6 +3509,29 @@ class BackupWorker:
                                         await _bulk_upsert_snapshot_items(_ps, _rows)
                                     _persisted_total += len(_rows)
                                     _persisted_bytes += _bytes
+                                # Plan P8 — also copy CHAT_ATTACHMENT and
+                                # CHAT_HOSTED_CONTENT pointer rows into this
+                                # snapshot so attachment chips work even if
+                                # the original drainer's snapshot is later
+                                # deleted (retention / GDPR / mistake).
+                                # Blob_path is shared (one SeaweedFS object),
+                                # we just need a snapshot-owned row pointing
+                                # at it. Idempotent — NOT EXISTS guard.
+                                try:
+                                    _att_copied = await _copy_chat_attachment_rows_to_snapshot(
+                                        tenant_id=str(tenant.id),
+                                        target_snapshot_id=str(snapshot.id),
+                                        chat_id=cid,
+                                    )
+                                    if _att_copied:
+                                        _persisted_total += _att_copied
+                                except Exception as _ae:
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"chat {cid[:8]} att-copy on "
+                                        f"skip-claim failed: "
+                                        f"{type(_ae).__name__}: {_ae}"
+                                    )
                             except Exception as _se:
                                 print(
                                     f"[{self.worker_id}] [USER_CHATS] "
@@ -3545,7 +3688,22 @@ class BackupWorker:
                                     )
                                 return cid, [], saved_cursor
                         url = f"{graph_client.GRAPH_URL}/chats/{cid}/messages"
-                        params: Dict[str, str] = {"$top": "50"}
+                        # $expand=hostedContents inlines each message's
+                        # hostedContents[] array (id + contentType per
+                        # inline image). Without it, Graph returns
+                        # messages with no hostedContents field, so the
+                        # interleave loop sees nothing and EVERY inline
+                        # image / logo / pasted screenshot ends up
+                        # un-backed-up — body HTML still references the
+                        # original graph.microsoft.com URL which the
+                        # browser can't load (401 + CORS), giving the
+                        # "refused to connect" broken-image you see in
+                        # Recovery UI. Bytes are then fetched per-item
+                        # via _userchats_backup_hosted_contents.
+                        params: Dict[str, str] = {
+                            "$top": "50",
+                            "$expand": "hostedContents",
+                        }
                         # If saved_cursor looks like a full URL (legacy
                         # nextLink/deltaLink), use it verbatim so resume
                         # still works. Otherwise treat it as an ISO
@@ -5509,7 +5667,32 @@ class BackupWorker:
                 # Write back to the persisted cache so the next backup
                 # of any user in this tenant skips both resolve AND
                 # download. Only successful resolutions are stored.
-                if content_hash is not None and content_url:
+                # Plan P3 — for blob-backed entries, HEAD the storage
+                # to confirm the bytes are actually retrievable before
+                # caching the path. Otherwise a silent upload failure
+                # or post-upload deletion would make EVERY subsequent
+                # user 404 on download, with no recovery path. Inline
+                # entries don't go through storage so they skip the
+                # verify.
+                _cache_ok = True
+                if blob_path:
+                    try:
+                        _props = await shard.get_blob_properties(container, blob_path)
+                        if _props is None:
+                            _cache_ok = False
+                            print(
+                                f"[{self.worker_id}] [CHAT-ATT] cache-write "
+                                f"skipped — blob verify miss for "
+                                f"{blob_path} (will re-resolve next backup)"
+                            )
+                    except Exception as e:
+                        _cache_ok = False
+                        print(
+                            f"[{self.worker_id}] [CHAT-ATT] cache-write "
+                            f"skipped — blob verify error "
+                            f"{type(e).__name__}: {e}"
+                        )
+                if _cache_ok and content_hash is not None and content_url:
                     u_sha = hashlib.sha256(content_url.encode("utf-8")).hexdigest()
                     await _write_tenant_url_cache(
                         u_sha,

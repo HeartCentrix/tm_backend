@@ -80,7 +80,9 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
                     "       ctm.message_external_id, ctm.metadata_raw "
                     "  FROM chat_thread_messages ctm "
                     "  JOIN chat_threads ct ON ct.id = ctm.chat_thread_id "
-                    " WHERE ctm.message_external_id = ANY(:ext_ids)"
+                    " WHERE ctm.message_external_id = ANY(:ext_ids) "
+                    "   AND ct.archived_at IS NULL "
+                    "   AND ctm.archived_at IS NULL"
                 ),
                 {"ext_ids": ext_ids_raw},
             )).all()
@@ -90,17 +92,62 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
             raw_by_key: dict = {}
             for hr in hydrate_rows:
                 raw_by_key[(str(hr.tenant_id), hr.chat_id, hr.message_external_id)] = hr.metadata_raw
+            _hydrate_missing = 0
+            _hydrate_total = 0
+            _gap_tenant_id: str | None = None
+            _gap_chat_id: str | None = None
             for m in msgs:
+                _hydrate_total += 1
                 raw = raw_by_key.get(
                     (str(m.tenant_id), m.parent_external_id, m.external_id)
                 )
                 if raw is None:
+                    _hydrate_missing += 1
+                    if _gap_tenant_id is None and getattr(m, "tenant_id", None):
+                        _gap_tenant_id = str(m.tenant_id)
+                    if _gap_chat_id is None and m.parent_external_id:
+                        _gap_chat_id = m.parent_external_id
                     continue
                 ed = dict(m.extra_data or {})
                 ed["raw"] = raw if isinstance(raw, dict) else {}
                 # SQLAlchemy lets us mutate the JSON column even on a
                 # detached row; the renderer reads it as a plain dict.
                 m.extra_data = ed
+
+            # P6: integrity-gap alert from the export hot path. If >20% of
+            # pointer rows in this export scope have no backing
+            # chat_thread_messages row, the export will render placeholder
+            # bodies — fire an INTEGRITY_GAP audit so ops can re-drain.
+            if _hydrate_total >= 5 and _hydrate_missing > 0:
+                _miss_pct = (_hydrate_missing / float(_hydrate_total)) * 100.0
+                if _miss_pct >= 20.0:
+                    try:
+                        import os as _os
+                        import httpx as _httpx_alert
+                        _audit_url = _os.getenv(
+                            "AUDIT_SERVICE_URL", "http://audit-service:8012"
+                        )
+                        async with _httpx_alert.AsyncClient(timeout=2.0) as _c:
+                            await _c.post(
+                                f"{_audit_url}/api/v1/audit/log",
+                                json={
+                                    "action": "INTEGRITY_GAP",
+                                    "actor_type": "SYSTEM",
+                                    "tenant_id": _gap_tenant_id,
+                                    "resource_type": "CHAT_THREAD",
+                                    "resource_id": _gap_chat_id,
+                                    "outcome": "DETECTED",
+                                    "details": {
+                                        "chat_id": _gap_chat_id,
+                                        "scope_total": _hydrate_total,
+                                        "missing_count": _hydrate_missing,
+                                        "miss_pct": round(_miss_pct, 2),
+                                        "source": "chat-export-worker:scope.resolve",
+                                    },
+                                },
+                            )
+                    except Exception:
+                        pass
 
     ext_ids = [m.external_id for m in msgs]
     att_map: dict = {}

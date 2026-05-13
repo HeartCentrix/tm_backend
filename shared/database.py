@@ -333,6 +333,7 @@ async def init_db() -> None:
             azure_refresh_token_updated_at TIMESTAMP,
             azure_subscriptions_cached JSON DEFAULT '[]',
             azure_sql_servers_configured JSON DEFAULT '[]',
+            archived_at TIMESTAMPTZ,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -802,7 +803,7 @@ async def init_db() -> None:
         """
         CREATE TABLE IF NOT EXISTS chat_threads (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
             chat_id VARCHAR(256) NOT NULL,
             chat_type VARCHAR(32),
             chat_topic TEXT,
@@ -811,6 +812,7 @@ async def init_db() -> None:
             last_drained_at TIMESTAMPTZ,
             drain_cursor TEXT,
             drain_failure_state JSONB,
+            archived_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (tenant_id, chat_id)
@@ -819,7 +821,7 @@ async def init_db() -> None:
         """
         CREATE TABLE IF NOT EXISTS chat_thread_messages (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            chat_thread_id UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+            chat_thread_id UUID NOT NULL REFERENCES chat_threads(id) ON DELETE RESTRICT,
             message_external_id VARCHAR(256) NOT NULL,
             created_date_time TIMESTAMPTZ,
             last_modified_date_time TIMESTAMPTZ,
@@ -831,6 +833,7 @@ async def init_db() -> None:
             metadata_raw JSONB,
             content_hash CHAR(64),
             content_size BIGINT,
+            archived_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (chat_thread_id, message_external_id)
         )
@@ -915,6 +918,14 @@ async def init_db() -> None:
     ]
 
     add_column_statements = [
+        # P2: soft-delete columns on tenants + chat_thread tables. A
+        # tenant or chat marked with archived_at is invisible to read
+        # paths but physically present until the 30-day purge worker
+        # collects it. RESTRICT FKs (DDL above) prevent accidental
+        # cascade deletes from wiping chat singletons.
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
+        "ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
+        "ALTER TABLE chat_thread_messages ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
         # Chat export v1 — link CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT rows to
         # their parent message without scanning the metadata JSONB.
         "ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS parent_external_id VARCHAR;",

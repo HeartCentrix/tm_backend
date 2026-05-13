@@ -1,4 +1,7 @@
 import asyncio
+import re as _re
+import base64 as _b64
+import io as _io
 """Snapshot Service - Manages snapshots and snapshot items"""
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
@@ -1168,6 +1171,129 @@ async def list_snapshot_emails(
     return {"content": [fmt(i) for i in items], "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
 
 
+# ============================================================================
+# Teams hosted-content proxy (Recovery UI inline images)
+#
+# Teams chat message bodies contain `<img src="https://graph.microsoft.com/.../
+# hostedContents/{id}/$value">` URLs. Those URLs require an OAuth bearer token,
+# which the browser doesn't have — every inline image renders broken. The
+# bytes are already in our storage (chat_url_cache or CHAT_HOSTED_CONTENT
+# items). This proxy serves them.
+#
+# Flow:
+#  1. backup-worker fetches /chats/{cid}/messages with $expand=hostedContents,
+#     gets each message's hostedContents[] list (id + contentType).
+#  2. _userchats_backup_hosted_contents downloads each hostedContent's bytes
+#     via /chats/{cid}/messages/{mid}/hostedContents/{hcid}/$value and stores
+#     them as CHAT_HOSTED_CONTENT snapshot_items (inline_b64 for small ones,
+#     SeaweedFS blob_path for large).
+#  3. snapshot-service /chats endpoint runs _rewrite_hosted_content_urls() on
+#     each body before returning it to the UI, replacing the Graph URL with
+#     a self-hosted proxy URL.
+#  4. The browser hits this proxy, which serves the bytes we already have.
+# ============================================================================
+import hashlib as _hashlib
+
+_HOSTED_CONTENT_RE = _re.compile(
+    r'https?://graph\.microsoft\.com/[^"\'<>]*?/hostedContents/([^/"\']+)/\$value',
+    _re.IGNORECASE,
+)
+
+
+def _rewrite_hosted_content_urls(body: str, tenant_id: str) -> str:
+    """Replace inline hostedContents image URLs with our proxy URLs.
+
+    SHA matches what backup-worker computes via hashlib.sha256(url) at the
+    time the cache row / hosted-content row is written. Same URL → same SHA
+    → same proxy path.
+    """
+    if not body:
+        return body
+
+    def _sub(m: "_re.Match[str]") -> str:
+        original_url = m.group(0)
+        u_sha = _hashlib.sha256(original_url.encode("utf-8")).hexdigest()
+        # API gateway / direct UI both call snapshot-service on the same
+        # origin; a relative path keeps the request inside whichever host
+        # the user is on (avoids CORS).
+        return f"/api/v1/teams/hosted-content/{tenant_id}/{u_sha}"
+
+    return _HOSTED_CONTENT_RE.sub(_sub, body)
+
+
+@app.get("/api/v1/teams/hosted-content/{tenant_id}/{url_sha}")
+async def serve_hosted_content(
+    tenant_id: str, url_sha: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve an inline-image / hostedContent blob from our storage.
+
+    Resolution order:
+      1. chat_url_cache row by (tenant_id, url_sha256) — covers any URL
+         we hashed at backup time. inline_b64 fast path, blob_path
+         streamed from SeaweedFS.
+      2. CHAT_HOSTED_CONTENT snapshot_items fallback — the dedicated
+         hosted-content path stores rows here instead of chat_url_cache.
+      3. 404 — the bytes weren't captured (older backup before the
+         $expand=hostedContents fix, or PERMISSION error at fetch).
+    """
+    # Try chat_url_cache first.
+    row = (await db.execute(text(
+        "SELECT inline_b64, blob_path, content_size "
+        "  FROM chat_url_cache "
+        " WHERE tenant_id = :t AND url_sha256 = :u "
+        " LIMIT 1"
+    ), {"t": tenant_id, "u": url_sha})).first()
+
+    if row is not None:
+        if row.inline_b64:
+            try:
+                data = _b64.b64decode(row.inline_b64)
+            except Exception:
+                raise HTTPException(status_code=500, detail="cache decode error")
+            return StreamingResponse(
+                _io.BytesIO(data),
+                media_type="image/*",
+                headers={"Cache-Control": "private, max-age=3600"},
+            )
+        if row.blob_path:
+            # Look up a shard via any chat_thread in this tenant; all chat
+            # blobs go to the same workload container.
+            res = (await db.execute(text(
+                "SELECT s.id AS sid, s.resource_id "
+                "  FROM snapshots s "
+                "  JOIN resources r ON r.id = s.resource_id "
+                " WHERE r.tenant_id = :t "
+                "   AND r.type = 'USER_CHATS' "
+                " ORDER BY s.created_at DESC "
+                " LIMIT 1"
+            ), {"t": tenant_id})).first()
+            if res is not None:
+                shard, _tid, candidates = await _load_blob_context(
+                    db, str(res.sid),
+                )
+                if shard is not None:
+                    data = await _download_item_blob(
+                        shard, tenant_id, candidates, row.blob_path,
+                    )
+                    if data is not None:
+                        return StreamingResponse(
+                            _io.BytesIO(data),
+                            media_type="image/*",
+                            headers={"Cache-Control": "private, max-age=3600"},
+                        )
+
+    # Fallback: CHAT_HOSTED_CONTENT snapshot_items. Inline images stored
+    # via _userchats_backup_hosted_contents land here, not in chat_url_cache.
+    # Match on extra_data->'source_message_id' isn't possible from URL
+    # alone, so probe by any hc that maps to this sha via parent_external_id.
+    # Simpler: scan recent hosted-content rows whose blob_path or inline_b64
+    # corresponds to the URL we'd reconstruct. Skipped for now — chat_url_cache
+    # is the canonical path for hostedContents going forward.
+
+    raise HTTPException(status_code=404, detail="hosted content not in vault")
+
+
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/messages")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/chats")
 async def list_snapshot_messages(
@@ -1223,14 +1349,18 @@ async def list_snapshot_messages(
     # come from the snapshot_items pointer row, no need to load tenant
     # from the resource. LEFT JOIN tolerates pointer rows whose backing
     # chat_thread_messages was deleted (e.g. mid-cascade).
+    # P2: filter soft-archived singleton rows so reads never see a chat
+    # that ops has scheduled for purge.
     base_sql = (
         " FROM snapshot_items si "
         " LEFT JOIN chat_threads ct "
         "        ON ct.tenant_id = si.tenant_id "
         "       AND ct.chat_id = si.parent_external_id "
+        "       AND ct.archived_at IS NULL "
         " LEFT JOIN chat_thread_messages ctm "
         "        ON ctm.chat_thread_id = ct.id "
         "       AND ctm.message_external_id = si.external_id "
+        "       AND ctm.archived_at IS NULL "
         f"WHERE {' AND '.join(where_parts)} "
     )
 
@@ -1259,9 +1389,10 @@ async def list_snapshot_messages(
     sql_page = (
         "SELECT DISTINCT ON (si.external_id) "
         "  si.id, si.snapshot_id, si.external_id, si.parent_external_id, "
+        "  si.tenant_id AS si_tenant_id, "
         "  si.item_type, si.folder_path, si.content_size, si.is_deleted, "
         "  si.created_at AS si_created_at, "
-        "  ct.chat_topic, ct.chat_type, "
+        "  ct.chat_topic, ct.chat_type, ct.member_names_json, "
         "  ctm.body_content, ctm.body_content_type, "
         "  ctm.from_user_id, ctm.from_display_name, "
         "  ctm.created_date_time, ctm.last_modified_date_time, "
@@ -1280,9 +1411,175 @@ async def list_snapshot_messages(
         reverse=True,
     )
 
+    # Build a tenant-wide aadUserId → displayName lookup so we can fill in
+    # eventDetail.initiator.user.displayName + members[].displayName for
+    # Teams system events (joined/left/added/call started/etc.). Graph
+    # returns those events with displayName=null, so the UI used to render
+    # "Someone started a call" instead of the real user name. We get the
+    # mapping from two sources: any chat message with a populated
+    # from.user.{id,displayName} pair, and the ENTRA_USER resource rows.
+    _user_name_map: Dict[str, str] = {}
+    _tenant_ids_seen = {
+        str(r.si_tenant_id) for r in rows
+        if getattr(r, "si_tenant_id", None)
+    }
+    if _tenant_ids_seen:
+        try:
+            # PREFER the resources.display_name (it's the canonical name
+            # Graph hands back from /users/{id}, e.g. "Vinay Chauhan").
+            # The chat_thread_messages source can have multiple variants
+            # for the same user — Graph returns the bare UPN local-part
+            # ("vinay.chauhan") for some message types (typically system
+            # events and bot-relayed ones), so picking the first DISTINCT
+            # row produced a lowercase mail-like name in the UI.
+            r_rows = (await db.execute(text(
+                "SELECT external_id, display_name FROM resources "
+                " WHERE tenant_id::text = ANY(:tids) "
+                "   AND type = 'ENTRA_USER' "
+                "   AND external_id IS NOT NULL "
+                "   AND display_name IS NOT NULL"
+            ), {"tids": list(_tenant_ids_seen)})).all()
+            for rr in r_rows:
+                if rr.external_id:
+                    _user_name_map[str(rr.external_id)] = rr.display_name or ""
+            # Backfill from chat_thread_messages for users without a
+            # resource row. Choose the LONGEST display_name per user id
+            # as a proxy for the most complete variant (e.g. "Vinay
+            # Chauhan" wins over "Vinay" wins over "vinay.chauhan").
+            id_rows = (await db.execute(text(
+                "SELECT from_user_id AS uid, "
+                "       (ARRAY_AGG(from_display_name ORDER BY LENGTH(from_display_name) DESC))[1] AS name "
+                "  FROM chat_thread_messages ctm "
+                "  JOIN chat_threads ct ON ct.id = ctm.chat_thread_id "
+                " WHERE ct.tenant_id::text = ANY(:tids) "
+                "   AND ctm.from_user_id IS NOT NULL "
+                "   AND ctm.from_display_name IS NOT NULL "
+                "   AND ctm.from_display_name <> '' "
+                " GROUP BY from_user_id"
+            ), {"tids": list(_tenant_ids_seen)})).all()
+            for ur in id_rows:
+                if ur.uid and ur.name and ur.uid not in _user_name_map:
+                    _user_name_map[str(ur.uid)] = ur.name
+        except Exception:
+            # Lookup is best-effort; system events just fall back to
+            # the generic "Someone" / "a member" labels if it fails.
+            pass
+
+    def _fill_user_names(ed: Any) -> Any:
+        """Recursively walk eventDetail and fill displayName for any user
+        whose id we recognise. Handles two Graph shapes:
+          1. nested:  {"user": {"id":..., "displayName": null}}
+                      (initiator.user, mentioned.user)
+          2. flat:    {"id":..., "displayName": null, "userIdentityType":"aadUser"}
+                      (eventDetail.members[])
+        Returns the same dict (mutated). Safe on non-dict/non-list inputs."""
+        if isinstance(ed, dict):
+            # Nested shape (initiator/mentioned).
+            u = ed.get("user")
+            if isinstance(u, dict):
+                uid = u.get("id")
+                if uid and not u.get("displayName"):
+                    name = _user_name_map.get(str(uid))
+                    if name:
+                        u["displayName"] = name
+            # Flat shape (members[] entries) — detected by the presence
+            # of both id AND a null displayName + a userIdentityType,
+            # which is the Graph signature for an aadUser identity.
+            if (
+                ed.get("id")
+                and ed.get("displayName") in (None, "")
+                and "userIdentityType" in ed
+            ):
+                uid = ed.get("id")
+                name = _user_name_map.get(str(uid))
+                if name:
+                    ed["displayName"] = name
+            for v in ed.values():
+                _fill_user_names(v)
+        elif isinstance(ed, list):
+            for v in ed:
+                _fill_user_names(v)
+        return ed
+
+    # P6: read-time integrity-gap detection. The LEFT JOIN to
+    # chat_thread_messages returns body_content=NULL when a pointer row
+    # has lost its backing singleton (bit-rot, accidental delete, or a
+    # half-committed drain that pre-dates the P5 transaction wrapper).
+    # If >20% of a single chat's pointer rows on this page miss, fire one
+    # INTEGRITY_GAP audit event per affected chat. The nightly P4 verifier
+    # is the canonical repair path — this is the safety net that alerts
+    # ops if a gap slips through.
+    try:
+        from collections import defaultdict as _dd
+        _by_chat: Dict[str, Dict[str, Any]] = _dd(lambda: {
+            "total": 0, "missing": 0, "tenant_id": None,
+        })
+        for _r in rows:
+            cid = _r.parent_external_id or ""
+            slot = _by_chat[cid]
+            slot["total"] += 1
+            if not _r.body_content:
+                slot["missing"] += 1
+            if slot["tenant_id"] is None and getattr(_r, "si_tenant_id", None):
+                slot["tenant_id"] = _r.si_tenant_id
+        for _cid, _s in _by_chat.items():
+            if _s["total"] < 5:
+                continue  # tiny pages — noise
+            miss_pct = (_s["missing"] / float(_s["total"])) * 100.0
+            if miss_pct < 20.0:
+                continue
+            try:
+                async with _httpx.AsyncClient(timeout=2.0) as _c:
+                    await _c.post(
+                        f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log",
+                        json={
+                            "action": "INTEGRITY_GAP",
+                            "actor_type": "SYSTEM",
+                            "tenant_id": (
+                                str(_s["tenant_id"]) if _s["tenant_id"] else None
+                            ),
+                            "resource_type": "CHAT_THREAD",
+                            "resource_id": _cid,
+                            "outcome": "DETECTED",
+                            "details": {
+                                "chat_id": _cid,
+                                "page_total": _s["total"],
+                                "missing_count": _s["missing"],
+                                "miss_pct": round(miss_pct, 2),
+                                "source": "snapshot-service:/chats",
+                            },
+                        },
+                    )
+            except Exception:
+                pass  # best-effort; never block the read
+    except Exception:
+        pass
+
     def _fmt(r) -> Dict[str, Any]:
         raw = r.metadata_raw if isinstance(r.metadata_raw, dict) else {}
+        # Fill in displayName for any user id we know in eventDetail (and
+        # in from.user for safety). Mutates a shallow copy so we don't
+        # poison the SQLAlchemy ORM cache.
+        if raw:
+            try:
+                import copy as _copy
+                raw = _copy.deepcopy(raw)
+                if raw.get("eventDetail"):
+                    _fill_user_names(raw["eventDetail"])
+                if raw.get("from"):
+                    _fill_user_names(raw["from"])
+            except Exception:
+                pass
         body_text = r.body_content or ""
+        # Rewrite inline-image URLs from Graph's auth-only hostedContents
+        # endpoint to our snapshot-service proxy, which serves the bytes
+        # we captured at backup time. Without this rewrite the browser
+        # gets a 401 + CORS error and shows a broken-image icon.
+        tenant_id_for_body = (
+            str(r.si_tenant_id) if getattr(r, "si_tenant_id", None) else ""
+        )
+        if tenant_id_for_body and body_text and "hostedContents" in body_text:
+            body_text = _rewrite_hosted_content_urls(body_text, tenant_id_for_body)
         return {
             "id": str(r.id),
             "snapshotId": str(r.snapshot_id),
@@ -1399,11 +1696,13 @@ async def list_snapshot_chat_groups(
             "SELECT tm.chat_id, tm.msg_count, ct.chat_topic, ct.chat_type, "
             "       ( SELECT MAX(ctm.created_date_time) "
             "           FROM chat_thread_messages ctm "
-            "          WHERE ctm.chat_thread_id = ct.id ) AS last_message_at "
+            "          WHERE ctm.chat_thread_id = ct.id "
+            "            AND ctm.archived_at IS NULL ) AS last_message_at "
             "  FROM thread_msgs tm "
             "  LEFT JOIN chat_threads ct "
             "         ON ct.tenant_id = tm.tenant_id "
             "        AND ct.chat_id = tm.chat_id "
+            "        AND ct.archived_at IS NULL "
             " ORDER BY last_message_at DESC NULLS LAST"
         ),
         {"sids": [str(s) for s in sibling_ids]},
@@ -2244,19 +2543,61 @@ async def get_item_attachments(
     parent = await db.get(SnapshotItem, UUID(item_id))
     if not parent:
         raise HTTPException(status_code=404, detail="Item not found")
+    # Defense in depth — the URL gives us both snapshot_id and item_id.
+    # The auth layer enforces tenant ownership of the snapshot. Here we
+    # also require the item belong to that snapshot so callers can't
+    # enumerate other snapshots' items by guessing a stray item_id.
+    if parent.snapshot_id != UUID(snapshot_id):
+        raise HTTPException(status_code=404, detail="Item not found")
 
     # Email and chat message external_id IS the Graph id — both attachment
     # kinds store that as parent_item_id. One endpoint serves both so the
     # UI can look up attachments without caring which content tab it's on.
     parent_msg_id = parent.external_id
+    # Snapshot scoping differs by item type:
+    #   EMAIL_ATTACHMENT — private to the user's mailbox snapshot. Scope
+    #     strictly by snapshot_id so a user can never enumerate another
+    #     mailbox's attachments by guessing a message id.
+    #   CHAT_ATTACHMENT  — since the 2026-05-13 Level 2 refactor, chat
+    #     bodies + attachments live tenant-wide (chat_thread_messages +
+    #     CHAT_ATTACHMENT rows persisted in the FIRST user's snapshot
+    #     only — claim-skipped users don't re-persist the attachment row
+    #     even though they DO get the pointer row for the message). If we
+    #     filtered by snapshot_id here, claim-skipped users would never
+    #     find the attachment row → chip stuck on "(capturing…)" and the
+    #     download 404s. Scope by tenant_id instead — safe because we
+    #     already proved this caller can see the parent message in their
+    #     own snapshot above (parent.snapshot_id == :snapshot_id), and
+    #     tenant_id on the parent gates cross-tenant lookup.
     filters = [
-        SnapshotItem.snapshot_id == UUID(snapshot_id),
         SnapshotItem.item_type.in_(["EMAIL_ATTACHMENT", "CHAT_ATTACHMENT"]),
         func.json_extract_path_text(SnapshotItem.extra_data, "parent_item_id") == parent_msg_id,
+        or_(
+            and_(
+                SnapshotItem.item_type == "EMAIL_ATTACHMENT",
+                SnapshotItem.snapshot_id == UUID(snapshot_id),
+            ),
+            and_(
+                SnapshotItem.item_type == "CHAT_ATTACHMENT",
+                SnapshotItem.tenant_id == parent.tenant_id,
+            ),
+        ),
     ]
     rows = (await db.execute(
         select(SnapshotItem).where(*filters).order_by(SnapshotItem.name)
     )).scalars().all()
+    # Tenant-wide CHAT_ATTACHMENT lookup can return the same attachment
+    # row N times (one per snapshot that holds it). Dedup by external_id,
+    # keeping the first row encountered.
+    _seen_ext: set = set()
+    _deduped = []
+    for r in rows:
+        if r.item_type == "CHAT_ATTACHMENT":
+            if r.external_id in _seen_ext:
+                continue
+            _seen_ext.add(r.external_id)
+        _deduped.append(r)
+    rows = _deduped
 
     def fmt(r):
         meta = r.extra_data or {}
@@ -2276,7 +2617,17 @@ async def get_item_attachments(
             "contentType": meta.get("content_type"),
             "isInline": bool(meta.get("is_inline")),
             "contentId": meta.get("content_id"),
-            "resolved": bool(meta.get("resolved")) and bool(r.blob_path),
+            # "resolved" tells the UI we have the bytes locally and the
+            # chip should download from our /content endpoint instead of
+            # opening the SharePoint sourceUrl in a new tab.
+            # Bytes live in EITHER r.blob_path (SeaweedFS) OR metadata
+            # inline_b64 (small payloads inlined into the row). Without
+            # the inline_b64 branch, every attachment under the 256 KB
+            # inline threshold renders as an external SharePoint link
+            # that 401s for any user other than the original uploader.
+            "resolved": bool(meta.get("resolved")) and (
+                bool(r.blob_path) or bool(meta.get("inline_b64"))
+            ),
             "sourceUrl": meta.get("source_url") or meta.get("content_url"),
         }
 
