@@ -7813,6 +7813,18 @@ class BackupWorker:
                                 f"persist failed: {_e}"
                             )
 
+                    # Mark the snapshot COMPLETED before update_resource_backup_info
+                    # runs — that helper re-derives storage_bytes from the latest
+                    # COMPLETED snapshot, and without this flip the mass-backup
+                    # path left snapshots IN_PROGRESS (later reaped to PARTIAL),
+                    # so the resource row showed storage_bytes=0 forever.
+                    async with async_session_factory() as sess:
+                        await self.complete_snapshot(
+                            sess, snapshot,
+                            {"item_count": totals["items"],
+                             "bytes_added": totals["bytes"]},
+                        )
+
                     async with async_session_factory() as sess:
                         await self.update_resource_backup_info(
                             sess, resource, job_id, snapshot.id,
@@ -11924,6 +11936,13 @@ class BackupWorker:
         prev = resource.storage_bytes or 0
         if latest_completed is not None:
             storage_bytes = int(latest_completed)
+        elif result and isinstance(result, dict) and int(result.get("bytes_added") or 0) > 0:
+            # Defense-in-depth: handlers that call update_resource_backup_info
+            # before complete_snapshot lands (or whose snapshot ends up PARTIAL
+            # via the orphan reaper) would otherwise leave storage_bytes
+            # untouched. Trust the result dict's bytes_added — it's the same
+            # number we'd have read once the snapshot flipped to COMPLETED.
+            storage_bytes = int(result["bytes_added"])
         else:
             # No completed content-bearing snapshot yet — keep prior value.
             storage_bytes = prev
