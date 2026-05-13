@@ -76,6 +76,11 @@ class MessageBus:
                 )
                 await self._declare_queue("discovery.m365", routing_key="discovery.m365")
                 await self._declare_queue("discovery.azure", routing_key="discovery.azure")
+                # Per-user Tier-2 content discovery (USER_MAIL / USER_ONEDRIVE /
+                # USER_CONTACTS / USER_CALENDAR / USER_CHATS). Separate from
+                # tenant-wide discovery.m365 because Tier-2 is a fan-out of
+                # many small per-user jobs that mustn't block tenant rediscovery.
+                await self._declare_queue("discovery.tier2", routing_key="discovery.tier2")
                 await self._declare_queue("notification", routing_key="notification")
                 await self._declare_queue("export.normal", routing_key="export.normal")
                 await self._declare_queue("delete.low", routing_key="delete.low")

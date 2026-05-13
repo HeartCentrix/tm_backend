@@ -418,7 +418,9 @@ async def startup():
                         SELECT s.id,
                                s.started_at,
                                s.resource_id,
-                               s.tenant_id,
+                               -- snapshots has no tenant_id column — derive
+                               -- it from the joined Resource at retry time
+                               -- (the loop below already does session.get).
                                (SELECT count(*) FROM snapshot_items si
                                 WHERE si.snapshot_id = s.id) AS n_items,
                                (SELECT MAX(si.created_at) FROM snapshot_items si
@@ -458,7 +460,7 @@ async def startup():
                                         'handler orphaned by worker restart')
                     FROM counts c
                     WHERE s.id = c.id
-                    RETURNING s.id, s.status::text, s.resource_id, s.tenant_id
+                    RETURNING s.id, s.status::text, s.resource_id
                 """))
                 rows = result.fetchall()
                 await session.commit()
@@ -484,7 +486,7 @@ async def startup():
                 except Exception:
                     pick_backup_queue = None
                 async with async_session_factory() as session:
-                    for _snap_id, _status, _rid, _tid in failed_rows:
+                    for _snap_id, _status, _rid in failed_rows:
                         try:
                             res = await session.get(Resource, _rid)
                             if not res:
@@ -505,7 +507,7 @@ async def startup():
                             msg = _mk(
                                 job_id=str(uuid.uuid4()),
                                 resource_id=str(_rid),
-                                tenant_id=str(_tid),
+                                tenant_id=str(res.tenant_id),
                                 full_backup=False,
                             )
                             msg["retry_of_snapshot"] = str(_snap_id)
@@ -609,6 +611,53 @@ async def startup():
 
     scheduler.add_job(
         _reconcile_stuck_queued_jobs, "interval", minutes=3,
+    )
+
+    # Tier-2 backstop sweep — catches users whose SLA was assigned before
+    # the SLA-hook shipped, or whose Tier-2 children got soft-deleted, or
+    # whose discovery message lost a race. Idempotent — the helper skips
+    # users that already have all 5 USER_* rows.
+    #
+    # Interval matches the production backup cadence (3×/day at 8h
+    # intervals) so the sweep runs once between backup rounds, ensuring
+    # every scheduled backup finds discovery already done. Env-tunable
+    # for tenants on different cadences.
+    _TIER2_BACKSTOP_S = int(os.getenv("TIER2_DISCOVERY_BACKSTOP_S", str(7 * 3600)))
+
+    async def _sweep_tier2_gaps():
+        try:
+            from shared.tier2_discovery import find_users_missing_tier2
+            from shared.message_bus import message_bus as _mb
+            async with async_session_factory() as session:
+                missing = await find_users_missing_tier2(session, require_sla=True)
+            if not missing:
+                return
+            await _mb.connect()
+            # Group by tenant — discovery-worker builds one GraphClient per
+            # tenant per message, so tenant batching is materially cheaper.
+            by_tenant: dict[str, list[str]] = {}
+            for u in missing:
+                by_tenant.setdefault(str(u.tenant_id), []).append(str(u.id))
+            for tid, user_ids in by_tenant.items():
+                await _mb.publish(
+                    "discovery.tier2",
+                    {
+                        "tenantId": tid,
+                        "userResourceIds": user_ids,
+                        "source": "SCHEDULER_BACKSTOP",
+                        "thenBackup": False,
+                    },
+                    priority=4,
+                )
+            print(
+                f"[backup-scheduler] tier2_backstop: enqueued discovery for "
+                f"{len(missing)} user(s) across {len(by_tenant)} tenant(s)",
+            )
+        except Exception as exc:
+            print(f"[backup-scheduler] tier2_backstop failed: {exc}")
+
+    scheduler.add_job(
+        _sweep_tier2_gaps, "interval", seconds=_TIER2_BACKSTOP_S,
     )
 
     # Stuck-RUNNING job reaper — fixes the "all snapshots COMPLETED

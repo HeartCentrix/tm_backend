@@ -26,6 +26,7 @@ from shared.schemas import (
     ResourceGroupRequest, ResourceGroupResponse,
     GroupPolicyAssignmentRequest,
 )
+from shared.message_bus import message_bus
 from shared.sla_validation import (
     gate_immutability_lock as _gate_immutability_lock,
     validate_policy_payload as _validate_policy_payload,
@@ -57,6 +58,51 @@ async def notify_scheduler_reschedule():
             await client.post("http://backup-scheduler:8008/scheduler/reschedule-all")
     except Exception as e:
         print(f"[resource-service] Failed to notify scheduler: {e}")
+
+
+async def _enqueue_tier2_for_entra_users(resources: Iterable[Resource]) -> None:
+    """Fire-and-forget Tier-2 discovery prep when SLA gets attached to one or
+    more ENTRA_USERs.
+
+    The bulk-backup, scheduled backup, and per-user backup paths all expect
+    USER_MAIL/USER_ONEDRIVE/USER_CONTACTS/USER_CALENDAR/USER_CHATS rows to
+    exist for any user with SLA. Without this hook, those rows would only be
+    created the first time the operator clicked into a user's backup flow,
+    leaving scheduled and bulk runs to silently skip the user's content.
+
+    thenBackup=false: SLA assignment is a "be ready" signal, not an
+    immediate backup request. The next scheduled or manual backup picks up
+    the now-existing children via the normal `M365_RESOURCE_TYPES + SLA`
+    query."""
+    if not settings.RABBITMQ_ENABLED:
+        return
+    # Group by tenant — discovery-worker batches Graph calls per tenant for
+    # token-cache efficiency.
+    by_tenant: Dict[str, List[str]] = {}
+    for r in resources:
+        if r.type != ResourceType.ENTRA_USER:
+            continue
+        by_tenant.setdefault(str(r.tenant_id), []).append(str(r.id))
+    for tid, user_ids in by_tenant.items():
+        try:
+            await message_bus.publish(
+                "discovery.tier2",
+                {
+                    "tenantId": tid,
+                    "userResourceIds": user_ids,
+                    "source": "SLA_ASSIGNED",
+                    "thenBackup": False,
+                },
+                priority=5,
+            )
+            print(
+                f"[resource-service] Tier-2 prep enqueued for {len(user_ids)} user(s) "
+                f"under tenant {tid}",
+            )
+        except Exception as e:
+            # Best-effort. Backstop sweep + bulk-trigger fallback both cover
+            # the gap if this publish fails.
+            print(f"[resource-service] Tier-2 prep publish failed (non-fatal): {e}")
 
 
 async def notify_lifecycle_reconcile():
@@ -1062,6 +1108,7 @@ async def assign_policy(resource_id: str, request: AssignPolicyRequest, db: Asyn
         target.sla_policy_id = UUID(request.policyId)
         target.status = ResourceStatus.ACTIVE
     await db.commit()
+    await _enqueue_tier2_for_entra_users(resources)
 
 
 @app.post("/api/v1/resources/{resource_id}/unassign-policy", status_code=204)
@@ -1195,9 +1242,10 @@ async def bulk_assign_policy(request: BulkAssignRequest, db: AsyncSession = Depe
         resource.sla_policy_id = policy_id
         resource.status = ResourceStatus.ACTIVE
         updated_count += 1
-    
+
     await db.commit()
-    
+    await _enqueue_tier2_for_entra_users(expanded_resources)
+
     return {
         "assigned": updated_count,
         "not_found": not_found,

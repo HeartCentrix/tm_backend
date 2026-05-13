@@ -281,6 +281,10 @@ class TriggerBulkBackupRequest(BaseModel):
     fullBackup: Optional[bool] = True
     priority: Optional[int] = 1
     note: Optional[str] = None
+    # Optional. When set, every Job created by this call stamps the same
+    # batch_id into spec.batch_id, so audit-service can group multi-stage
+    # batches (e.g. parent bulk + Tier-2 child fan-out) under one row.
+    batchId: Optional[str] = None
 
 
 class TriggerDatasourceBackupRequest(BaseModel):

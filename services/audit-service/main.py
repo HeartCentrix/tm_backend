@@ -87,6 +87,97 @@ def _compute_details(job: Job) -> str:
     return f"Progress: {job.progress_pct or 0}%"
 
 
+def _group_batch_jobs(
+    groups: Dict[Tuple[Any, str, str], List[Job]],
+    status_reverse_map: Dict[Any, str],
+) -> List[Dict[str, Any]]:
+    """Collapse partitioned batch Jobs into one Activity row per click.
+
+    Sibling Jobs from one _create_batch_backup_jobs call share a natural
+    key (tenant_id, triggered_by, created_at). Aggregating on read keeps
+    backend queue partitioning intact while presenting one row per
+    operator action."""
+    rows: List[Dict[str, Any]] = []
+    for (_tenant, _trigger, _created), children in groups.items():
+        if not children:
+            continue
+
+        statuses = [c.status for c in children]
+        any_active = any(
+            s in (JobStatus.RUNNING, JobStatus.QUEUED, JobStatus.RETRYING)
+            for s in statuses
+        )
+        any_failed = any(s == JobStatus.FAILED for s in statuses)
+        all_cancelled = all(s == JobStatus.CANCELLED for s in statuses)
+        all_completed = all(s == JobStatus.COMPLETED for s in statuses)
+
+        if any_active:
+            group_status = "In Progress"
+        elif any_failed:
+            group_status = "Failed"
+        elif all_cancelled:
+            group_status = "Canceled"
+        elif all_completed:
+            group_status = "Done"
+        else:
+            group_status = status_reverse_map.get(statuses[0], "In Progress")
+
+        total_resources = 0
+        data_backed_up = 0
+        total_data = 0
+        for c in children:
+            spec = c.spec or {}
+            total_resources += int(spec.get("resource_count") or 0)
+            cached = _running_job_cache.get(str(c.id), {})
+            data_backed_up += int(cached.get("data_backed_up", c.bytes_processed or 0) or 0)
+            total_data += int(
+                cached.get("total_data")
+                or (c.result.get("total_bytes", 0) if c.result else 0)
+                or 0
+            )
+
+        completed_at = [c.completed_at for c in children if c.completed_at]
+        finish_iso = max(completed_at).isoformat() if completed_at and not any_active else ""
+
+        if group_status == "Done":
+            if total_data > 0:
+                details = f"{_fmt_bytes(data_backed_up or total_data)} backed up"
+            elif data_backed_up > 0:
+                details = f"{_fmt_bytes(data_backed_up)} backed up"
+            else:
+                details = "Completed"
+        elif group_status == "Failed":
+            first_err = next((c.error_message for c in children if c.error_message), None)
+            details = first_err or "Failed"
+        elif group_status == "Canceled":
+            details = "Cancelled"
+        else:
+            if total_data > 0:
+                pct = min(100, int((data_backed_up / total_data) * 100))
+                details = f"{pct}% ({_fmt_bytes(data_backed_up)} / {_fmt_bytes(total_data)})"
+            elif data_backed_up > 0:
+                details = f"{_fmt_bytes(data_backed_up)} backed up"
+            else:
+                avg_pct = sum((c.progress_pct or 0) for c in children) // max(len(children), 1)
+                details = f"Progress: {avg_pct}%"
+
+        job_ids_sorted = sorted(str(c.id) for c in children)
+        first = children[0]
+        rows.append({
+            "id": job_ids_sorted[0],
+            "jobIds": job_ids_sorted,
+            "start_time": first.created_at.isoformat() if first.created_at else "",
+            "operation": first.type.value if hasattr(first.type, "value") else str(first.type),
+            "object": f"{total_resources} resources" if total_resources else "Bulk Operation",
+            "status": group_status,
+            "finish_time": finish_iso,
+            "details": details,
+            "data_backed_up": data_backed_up,
+            "total_data": total_data,
+        })
+    return rows
+
+
 async def _refresh_running_jobs():
     """Background task: refresh data_backed_up/total_data for RUNNING jobs every second."""
     while True:
@@ -356,6 +447,8 @@ ACTIONS = {
     "AZURE_DB_DOWNLOAD": "Azure DB content downloaded (SQL / PostgreSQL)",
     "AZURE_VM_DOWNLOAD": "Azure VM content downloaded (config / volume files)",
     "DISCOVERY_RUN": "Resource discovery executed",
+    "TIER2_RESOURCES_DISCOVERED": "Per-user content (Mail/OneDrive/Contacts/Calendar/Chats) discovered",
+    "BULK_BACKUP_PENDING_DISCOVERY": "Bulk backup deferred Tier-2 discovery for users without per-content rows",
     "SLA_CREATED": "SLA policy created",
     "SLA_UPDATED": "SLA policy updated",
     "SLA_DELETED": "SLA policy deleted",
@@ -605,13 +698,14 @@ async def list_activities(
         }
 
         items = []
-        for job in jobs:
-            # Try to resolve resource name from resource_id
+        single_jobs = [j for j in jobs if j.resource_id is not None]
+        batch_jobs = [j for j in jobs if j.resource_id is None]
+
+        for job in single_jobs:
             resource_name = "Bulk Operation"
-            if job.resource_id:
-                resource = await db.get(Resource, job.resource_id)
-                if resource:
-                    resource_name = resource.display_name
+            resource = await db.get(Resource, job.resource_id)
+            if resource:
+                resource_name = resource.display_name
 
             cached = _running_job_cache.get(str(job.id), {})
             data_backed_up = cached.get("data_backed_up", job.bytes_processed or 0)
@@ -627,6 +721,39 @@ async def list_activities(
                 "data_backed_up": data_backed_up,
                 "total_data": total_data,
             })
+
+        # Batch Jobs: a single "Backup all" click partitions resources by
+        # (tenant, routing_key) and creates one Job row per partition. The
+        # operator sees one click — so collapse children sharing
+        # (tenant_id, triggered_by, created_at) into one Activity row.
+        # Queue lane labels (urgent/heavy/low) are an internal scheduling
+        # detail and never surface to the UI.
+        # Grouping key:
+        #   * Preferred: spec.batch_id — set explicitly by job-service when
+        #     a single operator click might fan out across stages (parent
+        #     bulk → Tier-2 child fan-out via the discovery worker). One
+        #     batch_id ⇒ one Activity row regardless of timestamp drift.
+        #   * Fallback: (triggered_by, second-precision created_at) for
+        #     legacy Jobs predating batch_id (and for paths that genuinely
+        #     don't share a batch — e.g. scheduled / SLA-driven backups).
+        groups: Dict[Tuple[Any, str, str], List[Job]] = {}
+        for job in batch_jobs:
+            spec = job.spec or {}
+            batch_id = spec.get("batch_id")
+            if batch_id:
+                # str() in case some legacy row stored it as UUID-typed.
+                groups.setdefault((job.tenant_id, "BATCH", str(batch_id)), []).append(job)
+                continue
+            trigger = str(spec.get("triggered_by") or "")
+            if job.created_at:
+                created_key = job.created_at.replace(microsecond=0).isoformat()
+            else:
+                created_key = ""
+            groups.setdefault((job.tenant_id, trigger, created_key), []).append(job)
+
+        items.extend(_group_batch_jobs(groups, status_reverse_map))
+        # Per-group collapse reduces the post-pagination total.
+        job_total -= max(0, len(batch_jobs) - len(groups))
 
         for event in warning_events:
             details = event.details or {}
