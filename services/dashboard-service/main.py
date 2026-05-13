@@ -76,12 +76,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Dashboard Service", version="1.0.0", lifespan=lifespan)
 
 
-# Per-user content types — these all roll up under a single "Users" card in
-# Protection Status. Both legacy (MAILBOX/ONEDRIVE) and post-refactor Tier-2
-# (USER_MAIL/USER_ONEDRIVE/USER_CONTACTS/USER_CALENDAR/USER_CHATS) live here
-# because they all belong to one ENTRA_USER parent and should not be counted
-# separately. The Users bucket is special-cased below to DISTINCT-count by
-# parent_resource_id so 9 users × 5 child types still shows as 9, not 45.
+# Per-user content types — kept for M365_RESOURCE_TYPES below (service-level
+# rollups need to know which row types carry per-user backup bytes). The
+# Protection Status "Users" card no longer counts these; it counts ENTRA_USER
+# rows directly so the card's total equals the Users tab list exactly.
 USER_CONTENT_TYPES = {
     ResourceType.MAILBOX,
     ResourceType.ONEDRIVE,
@@ -92,14 +90,20 @@ USER_CONTENT_TYPES = {
     ResourceType.USER_CHATS,
 }
 
+# Each bucket's type set MUST exactly mirror the corresponding tab in
+# tm_vault/src/services/resource.ts:M365_TAB_TYPE_MAP. The denominator of
+# every Protection Status card has to equal the count shown when the operator
+# clicks into that tab — anything else is a lie. SharePoint additionally
+# applies the same group-name-collision exclusion that
+# /api/v1/resources/by-type?type=SHAREPOINT_SITE applies (handled below).
 PROTECTION_BUCKETS = {
-    "users": USER_CONTENT_TYPES,
+    "users": {ResourceType.ENTRA_USER},
     "sharedMailboxes": {ResourceType.SHARED_MAILBOX},
     "rooms": {ResourceType.ROOM_MAILBOX},
     "sharepointSites": {ResourceType.SHAREPOINT_SITE},
-    "groupsAndTeams": {ResourceType.TEAMS_CHANNEL, ResourceType.TEAMS_CHAT, ResourceType.ENTRA_GROUP, ResourceType.DYNAMIC_GROUP},
-    "entraId": {ResourceType.ENTRA_USER, ResourceType.ENTRA_APP, ResourceType.ENTRA_DEVICE, ResourceType.ENTRA_SERVICE_PRINCIPAL},
-    "powerPlatform": {ResourceType.POWER_BI, ResourceType.POWER_APPS, ResourceType.POWER_AUTOMATE, ResourceType.POWER_DLP},
+    "groupsAndTeams": {ResourceType.ENTRA_GROUP, ResourceType.M365_GROUP, ResourceType.TEAMS_CHANNEL},
+    "entraId": {ResourceType.ENTRA_DIRECTORY},
+    "powerPlatform": {ResourceType.POWER_BI, ResourceType.POWER_APPS, ResourceType.POWER_AUTOMATE},
 }
 
 AZURE_PROTECTION_BUCKETS = {
@@ -437,30 +441,41 @@ async def get_protection_status(
 
     bucket_values = {name: bucket_item(name, PROTECTION_BUCKETS) for name in PROTECTION_BUCKETS}
 
-    # Users bucket: dedupe by email so a user with both MAILBOX+ONEDRIVE
-    # (or with multiple Tier-2 USER_* rows) counts as ONE user. We use
-    # lower(email) as the dedup key to match resource-service
-    # /resources/users (which groups the Resources page table by email);
-    # parent_resource_id is unreliable here because legacy MAILBOX/ONEDRIVE
-    # rows may not have been linked to an ENTRA_USER parent. Falls back to
-    # external_id when email is NULL (rare).
-    user_key = func.coalesce(func.lower(Resource.email), Resource.external_id)
-    user_filters = list(filters) + [Resource.type.in_(USER_CONTENT_TYPES)]
-    users_total = (
-        await db.execute(
-            select(func.count(func.distinct(user_key))).where(*user_filters)
-        )
-    ).scalar() or 0
-    users_protected = (
-        await db.execute(
-            select(func.count(func.distinct(user_key))).where(
-                *user_filters, Resource.sla_policy_id.isnot(None)
-            )
-        )
-    ).scalar() or 0
-    bucket_values["users"] = {
-        "total": int(users_total),
-        "protectedCount": int(users_protected),
+    # SharePoint sites: the Sites tab hides sites whose name collides with an
+    # M365 group / Entra group / Teams channel (the admin API surfaces the
+    # group's display name as the site title, so a single Team appears as
+    # both a SP site row AND a Groups & Teams row otherwise). The Overview
+    # card must hide the same rows or the denominator inflates above what
+    # the operator can actually click into. The exclusion below MUST stay
+    # in sync with resource-service /api/v1/resources/by-type's
+    # sp_exclude_clause — a future change to the rule has to touch both.
+    sp_params = {}
+    sp_tenant_clause = ""
+    if tenantId:
+        sp_tenant_clause = "AND r.tenant_id = :tenant_id"
+        sp_params["tenant_id"] = str(UUID(tenantId))
+    sp_total_row = (await db.execute(text(f"""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE r.sla_policy_id IS NOT NULL) AS protected_count
+        FROM resources r
+        WHERE r.type = 'SHAREPOINT_SITE'
+          AND r.status IN ('DISCOVERED', 'ACTIVE')
+          {sp_tenant_clause}
+          AND NOT EXISTS (
+            SELECT 1 FROM resources g
+            WHERE g.tenant_id = r.tenant_id
+              AND g.type IN ('M365_GROUP', 'ENTRA_GROUP', 'TEAMS_CHANNEL')
+              AND LOWER(g.display_name) = LOWER(r.display_name)
+              AND (
+                    COALESCE(r.email, '') = ''
+                 OR LOWER(COALESCE(g.email, '')) = LOWER(COALESCE(r.email, ''))
+              )
+          )
+    """), sp_params)).first()
+    bucket_values["sharepointSites"] = {
+        "total": int(sp_total_row.total or 0),
+        "protectedCount": int(sp_total_row.protected_count or 0),
     }
 
     total = sum(item["total"] for item in bucket_values.values())
