@@ -1,4 +1,6 @@
 """Dashboard Service - Aggregated metrics and statistics"""
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 from uuid import UUID
@@ -10,14 +12,63 @@ from sqlalchemy import select, func, text, and_, or_
 from shared.database import get_db, close_db, AsyncSession, engine
 from shared.models import Resource, Job, JobType, JobStatus, Snapshot, SnapshotItem, SnapshotStatus, ResourceType, ResourceStatus, Tenant, TenantType
 
+log = logging.getLogger("dashboard-service")
+
+
+async def _wait_for_db(timeout_total_s: int = 120) -> None:
+    """Ping the DB with exponential backoff so the lifespan startup can
+    survive Railway's internal-DNS / Postgres cold-start race.
+
+    Observed Railway 2026-05-13: dashboard-service crashed in a restart
+    loop because asyncpg's default connect timeout (10s) raced PG coming
+    online, the lifespan ``SELECT 1`` ping raised TimeoutError, and
+    Uvicorn exited. Without a retry the only recovery was a manual
+    redeploy. Other services in this repo (tenant_service, job_service,
+    audit_service, etc.) all retry their startup checks for the same
+    reason; dashboard was the outlier.
+
+    Retries 1s → 2s → 4s → 8s → 8s … up to ``timeout_total_s`` wall.
+    Each individual attempt is capped at 10s by asyncpg's default, so
+    a "stuck DB" scenario can't hold a single attempt forever. Logs
+    every failed attempt for visibility into how flaky the dep is.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_total_s
+    delay = 1.0
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            if attempt > 1:
+                log.warning(
+                    "[startup] DB reachable after %d attempt(s)", attempt,
+                )
+            return
+        except Exception as exc:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                log.error(
+                    "[startup] DB unreachable after %ds (%d attempts): %s — "
+                    "exiting so Railway can restart the container",
+                    timeout_total_s, attempt, exc,
+                )
+                raise
+            log.warning(
+                "[startup] DB ping attempt %d failed (%s: %s); "
+                "retrying in %.1fs (deadline in %.0fs)",
+                attempt, type(exc).__name__, exc, delay, remaining,
+            )
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, 8.0)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Dashboard is read-only and should not run heavyweight schema migration logic
     # during startup. That path can block on application traffic from other services
     # and leave the container stuck in "Waiting for application startup".
-    async with engine.connect() as conn:
-        await conn.execute(text("SELECT 1"))
+    await _wait_for_db()
     yield
     await close_db()
 
