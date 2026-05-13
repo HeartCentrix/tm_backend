@@ -218,23 +218,40 @@ async def _claim_or_load_chat_thread(
       * ``drain_failure_state`` — failure record from a prior backup or {}.
     """
     member_names_json = list(member_names or [])
+    # Two-step in one statement: SELECT the prior row inside a WITH CTE so we
+    # see the value of last_updated_at BEFORE the UPSERT overwrites it, then
+    # do the UPSERT and JOIN them back together in the outer SELECT. PG
+    # documents that the SELECT inside a data-modifying CTE observes the
+    # pre-modification snapshot — exactly what we need to detect "this row
+    # already existed with an older Graph timestamp."
     async with async_session_factory() as s:
         row = (await s.execute(
             text(
-                "INSERT INTO chat_threads "
-                "  (tenant_id, chat_id, chat_type, chat_topic, member_names_json, "
-                "   last_updated_at, last_drained_at, created_at, updated_at) "
-                "VALUES "
-                "  (:tid, :cid, :ct, :tp, CAST(:mn AS JSONB), "
-                "   CAST(:lu AS TIMESTAMPTZ), NULL, NOW(), NOW()) "
-                "ON CONFLICT (tenant_id, chat_id) DO UPDATE SET "
-                "  chat_type         = COALESCE(EXCLUDED.chat_type, chat_threads.chat_type), "
-                "  chat_topic        = COALESCE(EXCLUDED.chat_topic, chat_threads.chat_topic), "
-                "  member_names_json = COALESCE(EXCLUDED.member_names_json, chat_threads.member_names_json), "
-                "  last_updated_at   = COALESCE(EXCLUDED.last_updated_at, chat_threads.last_updated_at), "
-                "  updated_at        = NOW() "
-                "RETURNING id, drain_cursor, last_updated_at, drain_failure_state, "
-                "          last_drained_at, (xmax = 0) AS inserted"
+                "WITH prior AS ( "
+                "  SELECT last_updated_at AS prior_lu "
+                "    FROM chat_threads "
+                "   WHERE tenant_id = :tid AND chat_id = :cid "
+                "), "
+                "upserted AS ( "
+                "  INSERT INTO chat_threads "
+                "    (tenant_id, chat_id, chat_type, chat_topic, member_names_json, "
+                "     last_updated_at, last_drained_at, created_at, updated_at) "
+                "  VALUES "
+                "    (:tid, :cid, :ct, :tp, CAST(:mn AS JSONB), "
+                "     CAST(:lu AS TIMESTAMPTZ), NULL, NOW(), NOW()) "
+                "  ON CONFLICT (tenant_id, chat_id) DO UPDATE SET "
+                "    chat_type         = COALESCE(EXCLUDED.chat_type, chat_threads.chat_type), "
+                "    chat_topic        = COALESCE(EXCLUDED.chat_topic, chat_threads.chat_topic), "
+                "    member_names_json = COALESCE(EXCLUDED.member_names_json, chat_threads.member_names_json), "
+                "    last_updated_at   = COALESCE(EXCLUDED.last_updated_at, chat_threads.last_updated_at), "
+                "    updated_at        = NOW() "
+                "  RETURNING id, drain_cursor, last_updated_at, drain_failure_state, "
+                "            last_drained_at, (xmax = 0) AS inserted "
+                ") "
+                "SELECT u.id, u.drain_cursor, u.last_updated_at, u.drain_failure_state, "
+                "       u.last_drained_at, u.inserted, p.prior_lu "
+                "  FROM upserted u "
+                "  LEFT JOIN prior p ON TRUE"
             ),
             {
                 "tid": tenant_id, "cid": chat_id, "ct": chat_type,
@@ -262,17 +279,37 @@ async def _claim_or_load_chat_thread(
         prior_failure = row.drain_failure_state or {}
         last_drained_at = row.last_drained_at
 
-        # Determine claim outcome. Fresh row (inserted=True) → we win.
-        # Existing row with stale last_drained_at → we win and re-drain.
-        # Existing row with fresh last_drained_at → another worker is
-        # currently draining (or just did); skip + reuse.
+        # Determine claim outcome.
+        #
+        #   1. Fresh row (inserted=True) or no prior drain  → claim. Always.
+        #   2. Activity-aware override — Graph just told us this chat's
+        #      lastUpdatedDateTime is strictly newer than what we drained
+        #      against. Claim regardless of freshness window: an incremental
+        #      re-drain (cursor-based) picks up only the new messages and is
+        #      cheap. This is the durability guarantee — without it, a
+        #      message that arrives mid-batch is invisible to every snapshot
+        #      taken inside the freshness window.
+        #   3. Stale last_drained_at (age > freshness window) → claim. Plain
+        #      time-based re-drain.
+        #   4. Otherwise → skip + reuse another backup's recently-drained
+        #      messages.
         claimed: bool
         if row.inserted or last_drained_at is None:
             claimed = True
         else:
+            prior_lu = row.prior_lu
+            new_lu = row.last_updated_at  # what we just stamped in via UPSERT
+            has_new_activity = bool(
+                new_lu is not None
+                and prior_lu is not None
+                and new_lu > prior_lu
+            )
             age_s = (datetime.utcnow().replace(tzinfo=None) -
                      last_drained_at.replace(tzinfo=None)).total_seconds()
-            claimed = age_s > _CHAT_THREAD_DRAIN_FRESHNESS_S
+            claimed = (
+                has_new_activity
+                or age_s > _CHAT_THREAD_DRAIN_FRESHNESS_S
+            )
         return {
             "thread_id": thread_id,
             "claimed": claimed,
