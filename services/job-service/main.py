@@ -20,6 +20,25 @@ from shared.schemas import (
 from shared.message_bus import message_bus, create_backup_message, create_restore_message
 from shared.audit import emit_backup_triggered
 
+
+def _parse_uuid(value: Optional[str], field_name: str) -> Optional[UUID]:
+    """Parse a UUID from external input, raising 400 on malformed strings.
+
+    Bare `UUID(value)` raises ValueError which FastAPI surfaces as 500 — a
+    request that's only malformed user input. Every handler that takes a
+    UUID-string query/body param should funnel through here so an invalid
+    cache key in localStorage (or a curl probe with a typo) reads as a
+    clean 400 instead of waking oncall.
+    """
+    if not value:
+        return None
+    try:
+        return UUID(value)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400, detail=f"Invalid {field_name}: not a UUID",
+        )
+
 # AZ-4: Azure workload resources go to dedicated queues (not backup.*)
 AZURE_WORKLOAD_QUEUES = {
     "AZURE_VM": "azure.vm",
@@ -145,6 +164,7 @@ async def _create_batch_backup_jobs(
     priority: int = 1,
     note: Optional[str] = None,
     trigger_label: str = "MANUAL_BATCH",
+    batch_id: Optional[str] = None,
 ):
     if not resources_map:
         raise HTTPException(status_code=404, detail="No valid resources found")
@@ -197,6 +217,12 @@ async def _create_batch_backup_jobs(
                 "fullBackup": effective_full_backup,
                 "note": note,
                 "queue": routing_key,
+                # batch_id stitches every Job that came from one operator
+                # click together — even when those Jobs are produced in
+                # separate stages (parent-bulk + Tier-2 child fan-out).
+                # Audit grouping keys on this first; falls back to
+                # (tenant, triggered_by, created_at) for legacy rows.
+                "batch_id": batch_id,
             },
         )
         db.add(job)
@@ -362,7 +388,10 @@ def _build_job_response(job: "Job", roll: Optional[Dict]) -> JobResponse:
 
 @app.get("/api/v1/jobs")
 async def list_jobs(
-    page: int = Query(1, ge=1),
+    # ge=0 (not 1) so a frontend caller passing page=0 — natural
+    # offset-style — gets the first page instead of a 422. Both 0 and 1
+    # map to offset 0; subsequent pages behave identically to before.
+    page: int = Query(1, ge=0),
     size: int = Query(50, ge=1),
     tenantId: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
@@ -370,15 +399,17 @@ async def list_jobs(
     db: AsyncSession = Depends(get_db),
 ):
     filters = []
-    if tenantId:
-        filters.append(Job.tenant_id == UUID(tenantId))
+    tenant_uuid = _parse_uuid(tenantId, "tenantId")
+    if tenant_uuid:
+        filters.append(Job.tenant_id == tenant_uuid)
     if status:
         filters.append(Job.status == status)
     if type:
         filters.append(Job.type == type)
 
     total = (await db.execute(select(func.count(Job.id)).where(*filters))).scalar() or 0
-    stmt = select(Job).where(*filters).order_by(Job.created_at.desc()).offset((page-1)*size).limit(size)
+    offset = max(page - 1, 0) * size
+    stmt = select(Job).where(*filters).order_by(Job.created_at.desc()).offset(offset).limit(size)
     result = await db.execute(stmt)
     jobs = result.scalars().all()
 
@@ -390,14 +421,14 @@ async def list_jobs(
         totalPages=max(1, (total + size - 1) // size),
         totalElements=total,
         size=size, number=page,
-        first=page == 1,
+        first=page <= 1,
         last=page >= (total + size - 1) // size,
     )
 
 
 @app.get("/api/v1/jobs/{job_id}", response_model=JobResponse)
 async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
-    stmt = select(Job).where(Job.id == UUID(job_id))
+    stmt = select(Job).where(Job.id == _parse_uuid(job_id, "job_id"))
     result = await db.execute(stmt)
     job = result.scalar_one_or_none()
     if not job:
@@ -508,7 +539,7 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
     In-flight workers poll `_is_job_cancelled()` between items and
     raise early, so the window between "cancel issued" and "no more new
     blobs written" is bounded by one item, not one resource."""
-    job = (await db.execute(select(Job).where(Job.id == UUID(job_id)))).scalar_one_or_none()
+    job = (await db.execute(select(Job).where(Job.id == _parse_uuid(job_id, "job_id")))).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status not in (JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.RETRYING):
@@ -614,7 +645,7 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/v1/jobs/{job_id}/retry", response_model=JobResponse)
 async def retry_job(job_id: str, db: AsyncSession = Depends(get_db)):
-    stmt = select(Job).where(Job.id == UUID(job_id))
+    stmt = select(Job).where(Job.id == _parse_uuid(job_id, "job_id"))
     result = await db.execute(stmt)
     job = result.scalar_one_or_none()
     if not job:
@@ -634,7 +665,7 @@ async def retry_job(job_id: str, db: AsyncSession = Depends(get_db)):
 
 @app.get("/api/v1/jobs/{job_id}/logs")
 async def get_job_logs(job_id: str, page: int = Query(1), size: int = Query(50), db: AsyncSession = Depends(get_db)):
-    stmt = select(JobLog).where(JobLog.job_id == UUID(job_id)).order_by(JobLog.timestamp.desc()).offset((page-1)*size).limit(size)
+    stmt = select(JobLog).where(JobLog.job_id == _parse_uuid(job_id, "job_id")).order_by(JobLog.timestamp.desc()).offset((page-1)*size).limit(size)
     result = await db.execute(stmt)
     logs = result.scalars().all()
     return [
@@ -647,7 +678,8 @@ async def get_job_logs(job_id: str, page: int = Query(1), size: int = Query(50),
 @app.post("/api/v1/backups/trigger", response_model=JobResponse)
 async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depends(get_db)):
     # Fetch resource to get tenant info
-    resource_stmt = select(Resource).where(Resource.id == UUID(request.resourceId))
+    resource_uuid = _parse_uuid(request.resourceId, "resourceId")
+    resource_stmt = select(Resource).where(Resource.id == resource_uuid)
     resource_result = await db.execute(resource_stmt)
     resource = resource_result.scalar_one_or_none()
     if not resource:
@@ -683,7 +715,7 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
     job = Job(
         id=uuid4(), type=JobType.BACKUP,
         tenant_id=resource.tenant_id,
-        resource_id=UUID(request.resourceId),
+        resource_id=resource_uuid,
         status=JobStatus.QUEUED, priority=request.priority or 1,
         progress_pct=0, items_processed=0, bytes_processed=0,
         spec={"fullBackup": effective_full_backup, "note": request.note, "triggered_by": "MANUAL"},
@@ -742,7 +774,7 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
         resources_map = {}
         inaccessible_resources = []
         for rid in request.resourceIds:
-            res_stmt = select(Resource).where(Resource.id == UUID(rid))
+            res_stmt = select(Resource).where(Resource.id == _parse_uuid(rid, "resourceId"))
             res_result = await db.execute(res_stmt)
             res = res_result.scalar_one_or_none()
             if res:
@@ -767,10 +799,12 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
             priority=request.priority or 1,
             note=request.note,
             trigger_label="MANUAL_BATCH",
+            batch_id=request.batchId,
         )
 
     elif resource_id:
-        res_stmt = select(Resource).where(Resource.id == UUID(resource_id))
+        single_resource_uuid = _parse_uuid(resource_id, "resource_id")
+        res_stmt = select(Resource).where(Resource.id == single_resource_uuid)
         res_result = await db.execute(res_stmt)
         res = res_result.scalar_one_or_none()
         if not res:
@@ -802,7 +836,7 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
         job = Job(
             id=uuid4(), type=JobType.BACKUP,
             tenant_id=res.tenant_id,
-            resource_id=UUID(resource_id),
+            resource_id=single_resource_uuid,
             status=JobStatus.QUEUED, priority=1,
             progress_pct=0, items_processed=0, bytes_processed=0,
             spec={"triggered_by": "MANUAL", "fullBackup": effective_full_backup},
@@ -843,13 +877,23 @@ async def trigger_datasource_backup(request: TriggerDatasourceBackupRequest, db:
     if resource_types is None:
         raise HTTPException(status_code=400, detail="Unsupported serviceType. Expected 'm365' or 'azure'.")
 
+    # One operator click = one batch_id. Threaded through:
+    #   1. _create_batch_backup_jobs (parent-resource Jobs)
+    #   2. discovery.tier2 message → discovery-worker → trigger-bulk POST
+    #      (Tier-2 child Jobs created a few seconds later)
+    # Both stages stamp `spec.batch_id`, so audit-service collapses them
+    # into one Activity row regardless of timestamp drift or different
+    # `triggered_by` labels.
+    batch_id = str(uuid4())
+
     excluded_statuses = [
         ResourceStatus.INACCESSIBLE,
         ResourceStatus.SUSPENDED,
         ResourceStatus.PENDING_DELETION,
     ]
+    tenant_uuid = _parse_uuid(request.tenantId, "tenantId")
     scoped_filters = [
-        Resource.tenant_id == UUID(request.tenantId),
+        Resource.tenant_id == tenant_uuid,
         Resource.type.in_(resource_types),
     ]
     summary_stmt = select(
@@ -899,15 +943,84 @@ async def trigger_datasource_backup(request: TriggerDatasourceBackupRequest, db:
             detail=f"No backup-eligible {service_key.upper()} resources found for this datasource. Make sure discovery has run and SLA policies are assigned."
         )
 
+    # Tier-2 gap-fill (M365 only). USER_MAIL / USER_ONEDRIVE / USER_CONTACTS /
+    # USER_CALENDAR / USER_CHATS rows only exist for users who've been through
+    # per-user "Backup now" discovery before. SLA'd ENTRA_USERs without those
+    # children would otherwise only get their profile backed up while their
+    # actual content (emails, chats, calendar, files, contacts) is silently
+    # skipped — which is the bulk-vs-single dichotomy the operator reported.
+    #
+    # We don't block this HTTP request on Graph calls (5k users would be
+    # ~25k Graph round-trips). Instead, enqueue a discovery.tier2 message per
+    # user-batch with thenBackup=true. The discovery-worker creates the rows,
+    # then calls trigger-bulk for the children. The operator sees the parent
+    # ENTRA_USER backups start immediately + child backups arrive on the
+    # next pass — all under one Activity row because of the (tenant_id,
+    # triggered_by, created_at) grouping rule.
+    users_missing_tier2: List[Resource] = []
+    if service_key == "m365":
+        from shared.tier2_discovery import find_users_missing_tier2
+        sla_user_ids = [r.id for r in resources if r.type == ResourceType.ENTRA_USER]
+        if sla_user_ids:
+            users_missing_tier2 = await find_users_missing_tier2(
+                db, user_resource_ids=sla_user_ids, require_sla=True,
+            )
+        if users_missing_tier2 and settings.RABBITMQ_ENABLED:
+            try:
+                await message_bus.publish(
+                    "discovery.tier2",
+                    {
+                        "tenantId": str(tenant_uuid),
+                        "userResourceIds": [str(u.id) for u in users_missing_tier2],
+                        "source": "BULK_TRIGGER",
+                        "thenBackup": True,
+                        "fullBackup": bool(request.fullBackup or False),
+                        # Same batch_id used for the parent-resource Jobs
+                        # below. The discovery-worker passes this through
+                        # to trigger-bulk so child Jobs join the same group.
+                        "batchId": batch_id,
+                    },
+                    priority=8,
+                )
+                print(
+                    f"[JOB_SERVICE] Tier-2 gap-fill: enqueued discovery.tier2 for "
+                    f"{len(users_missing_tier2)} user(s) under tenant {tenant_uuid}",
+                )
+            except Exception as e:
+                # Discovery enqueue failing must NOT block the immediate
+                # parent-resource backup. Log and continue with whatever we
+                # can back up right now.
+                print(f"[JOB_SERVICE] Tier-2 gap-fill publish failed (non-fatal): {e}")
+
     resources_map = {str(resource.id): resource for resource in resources}
-    return await _create_batch_backup_jobs(
+    jobs = await _create_batch_backup_jobs(
         resources_map=resources_map,
         db=db,
         full_backup=request.fullBackup or False,
         priority=request.priority or 1,
         note=request.note,
         trigger_label=f"MANUAL_DATASOURCE_{service_key.upper()}",
+        batch_id=batch_id,
     )
+    # Emit an audit event for the gap-fill rather than mutating the
+    # response shape (callers expect a list). Operators can read the
+    # count from the Audit feed under BULK_BACKUP_PENDING_DISCOVERY.
+    if users_missing_tier2:
+        try:
+            from shared.audit import emit_audit_event
+            await emit_audit_event(
+                action="BULK_BACKUP_PENDING_DISCOVERY",
+                tenant_id=str(tenant_uuid),
+                resource_type=service_key.upper(),
+                details={
+                    "users_pending": len(users_missing_tier2),
+                    "source": "BULK_TRIGGER",
+                },
+            )
+        except Exception as _e:
+            # Audit emit failure must not block the trigger response.
+            print(f"[JOB_SERVICE] BULK_BACKUP_PENDING_DISCOVERY audit emit failed: {_e}")
+    return jobs
 
 
 @app.post("/api/v1/jobs/restore")
@@ -982,12 +1095,12 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
     resource_id = None
     snapshot = None
     if snapshot_ids:
-        stmt = sa_select(Snapshot).where(Snapshot.id == UUID(snapshot_ids[0]))
+        stmt = sa_select(Snapshot).where(Snapshot.id == _parse_uuid(snapshot_ids[0], "snapshotId"))
         snapshot = (await db.execute(stmt)).scalar_one_or_none()
     if not snapshot and item_ids:
         # Item-driven restore — derive snapshot from the first item, then
         # snapshot.resource_id gives us the source resource.
-        item_stmt = sa_select(SnapshotItem).where(SnapshotItem.id == UUID(item_ids[0]))
+        item_stmt = sa_select(SnapshotItem).where(SnapshotItem.id == _parse_uuid(item_ids[0], "itemId"))
         first_item = (await db.execute(item_stmt)).scalar_one_or_none()
         if first_item:
             snapshot = await db.get(Snapshot, first_item.snapshot_id)
@@ -1012,11 +1125,11 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
         from sqlalchemy import func as _func
         if item_ids:
             stmt = sa_select(_func.coalesce(_func.sum(SnapshotItem.content_size), 0)).where(
-                SnapshotItem.id.in_([UUID(i) for i in item_ids])
+                SnapshotItem.id.in_([_parse_uuid(i, "itemId") for i in item_ids])
             )
         elif snapshot_ids:
             stmt = sa_select(_func.coalesce(_func.sum(SnapshotItem.content_size), 0)).where(
-                SnapshotItem.snapshot_id.in_([UUID(s) for s in snapshot_ids])
+                SnapshotItem.snapshot_id.in_([_parse_uuid(s, "snapshotId") for s in snapshot_ids])
             )
         else:
             stmt = None
@@ -1130,7 +1243,7 @@ async def trigger_restore(request: dict = None, db: AsyncSession = Depends(get_d
 
 @app.get("/api/v1/jobs/restore/{job_id}/status")
 async def get_restore_status(job_id: str, db: AsyncSession = Depends(get_db)):
-    stmt = select(Job).where(Job.id == UUID(job_id))
+    stmt = select(Job).where(Job.id == _parse_uuid(job_id, "job_id"))
     result = await db.execute(stmt)
     job = result.scalar_one_or_none()
     if not job:
@@ -1165,11 +1278,11 @@ async def trigger_export(request: dict, db: AsyncSession = Depends(get_db)):
     snapshot = None
     if snapshot_ids:
         snapshot = (await db.execute(
-            select(Snapshot).where(Snapshot.id == UUID(snapshot_ids[0]))
+            select(Snapshot).where(Snapshot.id == _parse_uuid(snapshot_ids[0], "snapshotId"))
         )).scalar_one_or_none()
     if not snapshot and item_ids:
         first_item = (await db.execute(
-            select(SnapshotItem).where(SnapshotItem.id == UUID(item_ids[0]))
+            select(SnapshotItem).where(SnapshotItem.id == _parse_uuid(item_ids[0], "itemId"))
         )).scalar_one_or_none()
         if first_item:
             snapshot = await db.get(Snapshot, first_item.snapshot_id)
@@ -1313,7 +1426,7 @@ async def files_export_or_restore(
     Delegates to ``trigger_restore`` so queueing / auditing / size-cap
     logic stays in one place.
     """
-    resource = await db.get(Resource, uuid.UUID(resource_id))
+    resource = await db.get(Resource, _parse_uuid(resource_id, "resourceId"))
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
@@ -1405,7 +1518,7 @@ async def sharepoint_download(resource_id: str, request: dict, db: AsyncSession 
     if scope not in ("site", "folder", "file"):
         raise HTTPException(status_code=400, detail="scope must be site, folder, or file")
 
-    resource = await db.get(Resource, UUID(resource_id))
+    resource = await db.get(Resource, _parse_uuid(resource_id, "resourceId"))
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
@@ -1437,7 +1550,7 @@ async def sharepoint_download(resource_id: str, request: dict, db: AsyncSession 
             SnapshotItem.folder_path.startswith(folder_path),
         )
         if snap_id:
-            stmt = stmt.where(SnapshotItem.snapshot_id == UUID(snap_id))
+            stmt = stmt.where(SnapshotItem.snapshot_id == _parse_uuid(snap_id, "snapshotId"))
         else:
             # Restrict to snapshots of this resource so a bare folderPath
             # can't bleed across sites.
@@ -1473,7 +1586,7 @@ async def sharepoint_download(resource_id: str, request: dict, db: AsyncSession 
 
 @app.get("/api/v1/jobs/export/{job_id}/status")
 async def get_export_status(job_id: str, db: AsyncSession = Depends(get_db)):
-    stmt = select(Job).where(Job.id == UUID(job_id))
+    stmt = select(Job).where(Job.id == _parse_uuid(job_id, "job_id"))
     result = await db.execute(stmt)
     job = result.scalar_one_or_none()
     if not job:
@@ -1495,7 +1608,7 @@ async def download_export_zip(job_id: str, db: AsyncSession = Depends(get_db)):
     Without this, the frontend gets a 404 when it tries to download — what was
     happening on Recovery exports."""
     from fastapi.responses import StreamingResponse
-    job = await db.get(Job, UUID(job_id))
+    job = await db.get(Job, _parse_uuid(job_id, "job_id"))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     status_val = job.status.value if hasattr(job.status, "value") else str(job.status)

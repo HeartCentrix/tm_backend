@@ -1175,6 +1175,163 @@ async def consume_azure_discovery_queue():
                     pass
 
 
+async def _consume_tier2_discovery():
+    """Consume discovery.tier2 messages.
+
+    Message shape (both single-user and batch forms supported):
+      {
+        "tenantId": "<uuid>",
+        "userResourceIds": ["<uuid>", ...],   # preferred — batch many users
+        "userResourceId": "<uuid>",           # legacy single-user
+        "source": "SLA_ASSIGNED|BULK_TRIGGER|SCHEDULER_BACKSTOP",
+        "thenBackup": true,                   # default false
+        "fullBackup": false                   # forwarded to trigger-bulk
+      }
+
+    For each user, runs the idempotent helper, then — only if `thenBackup` —
+    POSTs the resulting child IDs to job-service `/backups/trigger-bulk`.
+    Sequencing matters: rows must exist before the backup is enqueued, or the
+    backup worker would chase ghost UUIDs. The HTTP call is what stitches the
+    two stages safely without a separate event channel."""
+    from shared.tier2_discovery import ensure_tier2_children
+
+    max_retries = 30
+    for attempt in range(max_retries):
+        try:
+            await message_bus.connect()
+            if message_bus.channel:
+                break
+            raise RuntimeError("Channel is None after connect")
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning("[tier2-discovery] RabbitMQ not ready (attempt %d/%d): %s", attempt + 1, max_retries, e)
+                await asyncio.sleep(5)
+            else:
+                logger.error("[tier2-discovery] Failed to connect to RabbitMQ after %d attempts", max_retries)
+                raise
+
+    try:
+        queue = await message_bus.channel.get_queue("discovery.tier2")
+    except Exception:
+        logger.warning("[tier2-discovery] Queue discovery.tier2 not declared yet, skipping consumer")
+        return
+
+    logger.info("[tier2-discovery] Listening on discovery.tier2...")
+
+    from shared.graph_client import graph_priority
+    from shared.graph_priority import priority_for_queue
+    # Reuse the m365 discovery priority — Tier-2 is a downstream fan-out of
+    # the same discovery class and shouldn't queue behind heavy backups on
+    # the Graph rate limiter.
+    queue_priority = priority_for_queue("discovery.m365")
+
+    async with queue.iterator() as queue_iter:
+        async for message in queue_iter:
+            try:
+                body = json.loads(message.body.decode())
+                tenant_id = UUID(body["tenantId"])
+                user_ids_raw = body.get("userResourceIds") or (
+                    [body["userResourceId"]] if body.get("userResourceId") else []
+                )
+                if not user_ids_raw:
+                    logger.warning("[tier2-discovery] message has no userResourceId(s); dropping")
+                    await message.ack()
+                    continue
+                user_ids = [UUID(u) for u in user_ids_raw]
+                then_backup = bool(body.get("thenBackup", False))
+                full_backup = bool(body.get("fullBackup", False))
+                source = body.get("source") or "UNKNOWN"
+                # batch_id propagates from the original bulk-trigger so
+                # child Jobs created below share the same Activity row
+                # with their parent.
+                forward_batch_id = body.get("batchId")
+
+                logger.info(
+                    "[tier2-discovery] %s tenant=%s users=%d thenBackup=%s",
+                    source, tenant_id, len(user_ids), then_backup,
+                )
+
+                # Build the GraphClient ONCE per tenant for the whole batch —
+                # avoids rebuilding the MSAL app + token cache per user.
+                async with async_session_factory() as db:
+                    tenant = await db.get(Tenant, tenant_id)
+                    if tenant is None:
+                        logger.warning("[tier2-discovery] tenant %s not found", tenant_id)
+                        await message.ack()
+                        continue
+                    client_id = tenant.graph_client_id or settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
+                    client_secret = await decrypt_tenant_secret(tenant)
+                    ext_tenant_id = tenant.external_tenant_id or settings.MICROSOFT_TENANT_ID or settings.AZURE_AD_TENANT_ID or "common"
+                    if not client_id or not client_secret:
+                        logger.warning("[tier2-discovery] missing M365 creds for tenant %s, dropping", tenant_id)
+                        await message.ack()
+                        continue
+                    graph = GraphClient(client_id, client_secret, ext_tenant_id)
+
+                    all_child_ids: list[str] = []
+                    for uid in user_ids:
+                        user = await db.get(Resource, uid)
+                        if user is None or user.type != ResourceType.ENTRA_USER:
+                            logger.info("[tier2-discovery] skipping %s (not an ENTRA_USER)", uid)
+                            continue
+                        with graph_priority(queue_priority):
+                            try:
+                                children = await ensure_tier2_children(db, user, graph, commit=False)
+                            except Exception as gex:
+                                logger.exception("[tier2-discovery] discovery failed for user %s: %s", uid, gex)
+                                continue
+                        all_child_ids.extend(
+                            str(c.id) for c in children
+                            if c.status != ResourceStatus.INACCESSIBLE
+                        )
+                    # Commit all users in one transaction — keeps the batch
+                    # atomic and amortises the WAL flush across N users.
+                    await db.commit()
+
+                if then_backup and all_child_ids:
+                    try:
+                        import httpx as _httpx
+                        async with _httpx.AsyncClient(timeout=15.0) as _c:
+                            payload = {
+                                "resourceIds": all_child_ids,
+                                "fullBackup": full_backup,
+                                "priority": 1,
+                            }
+                            if forward_batch_id:
+                                payload["batchId"] = forward_batch_id
+                            r = await _c.post(
+                                f"{settings.JOB_SERVICE_URL}/api/v1/backups/trigger-bulk",
+                                json=payload,
+                            )
+                            if r.status_code >= 300:
+                                logger.warning(
+                                    "[tier2-discovery] trigger-bulk rejected (%d): %s",
+                                    r.status_code, r.text[:300],
+                                )
+                            else:
+                                logger.info(
+                                    "[tier2-discovery] queued bulk backup for %d Tier-2 child(ren)",
+                                    len(all_child_ids),
+                                )
+                    except Exception as e:
+                        logger.exception("[tier2-discovery] trigger-bulk call failed: %s", e)
+
+                await message.ack()
+
+            except Exception as e:
+                logger.exception("[tier2-discovery] error processing message: %s", e)
+                try:
+                    headers = message.headers or {}
+                    retry_count = int(headers.get("x-retry-count", 0))
+                    if retry_count >= 5:
+                        logger.error("[tier2-discovery] exceeded max retries (5), routing to DLQ")
+                        await message.reject(requeue=False)
+                    else:
+                        await message.nack(requeue=True)
+                except Exception:
+                    pass
+
+
 async def run_all_discoveries():
     """Run discovery for all eligible tenants (periodic fallback)."""
     async with async_session_factory() as db:
@@ -1220,6 +1377,9 @@ async def main():
     # Start Azure discovery queue consumer (separate from M365)
     azure_consumer_task = asyncio.create_task(consume_azure_discovery_queue())
 
+    # Per-user Tier-2 content discovery consumer
+    tier2_consumer_task = asyncio.create_task(_consume_tier2_discovery())
+
     # Also run periodic M365 discovery as fallback (every 24 hours)
     async def periodic_discovery():
         while True:
@@ -1230,7 +1390,12 @@ async def main():
     periodic_task = asyncio.create_task(periodic_discovery())
 
     # Wait forever
-    await asyncio.gather(m365_consumer_task, azure_consumer_task, periodic_task)
+    await asyncio.gather(
+        m365_consumer_task,
+        azure_consumer_task,
+        tier2_consumer_task,
+        periodic_task,
+    )
 
 
 if __name__ == "__main__":
