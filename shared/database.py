@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from time import monotonic
 from typing import AsyncGenerator
 
@@ -84,7 +85,16 @@ engine = create_async_engine(
     max_overflow=settings.DB_MAX_OVERFLOW,
     pool_timeout=settings.DB_POOL_TIMEOUT,
     pool_recycle=settings.DB_POOL_RECYCLE,
-    connect_args={"server_settings": {"search_path": SEARCH_PATH}},
+    # statement_cache_size=0 prevents asyncpg's prepared-statement cache from
+    # outliving a schema change. Without this, a tenant-wipe / DROP SCHEMA
+    # leaves dashboard_service holding cached statement plans with stale
+    # enum OIDs, producing `cache lookup failed for type 119228`. The cache
+    # is a 5-15% throughput win on hot paths; correctness matters more during
+    # demos/dev. Heavy-load prod can override by setting STATEMENT_CACHE_SIZE>0.
+    connect_args={
+        "server_settings": {"search_path": SEARCH_PATH},
+        "statement_cache_size": int(os.getenv("STATEMENT_CACHE_SIZE", "0")),
+    },
 )
 
 async_session_factory = async_sessionmaker(

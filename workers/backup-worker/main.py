@@ -565,6 +565,92 @@ async def _load_chat_thread_messages_for_pointer(
         ]
 
 
+async def _carry_forward_prior_chat_snapshot_items(
+    *,
+    tenant_id: str,
+    resource_id: str,
+    target_snapshot_id: str,
+) -> int:
+    """Copy chat-related snapshot_items from this resource's immediate prior
+    backup into the new snapshot.
+
+    Why this exists: chat drain is incremental — each run pulls only NEW
+    messages from Graph and writes only new pointer rows + freshly
+    downloaded CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT rows. Without
+    carry-forward, the new snapshot would contain just the delta from this
+    run, so snapshot.bytes_total (and the user-facing "Backup size")
+    collapses on every incremental.
+
+    The semantics we want: each chat snapshot IS the full point-in-time
+    backup at completion time — a true superset of the prior snapshot
+    plus newly-drained content. With that invariant restored:
+      * Resource.storage_bytes (derived from latest snapshot's bytes_total)
+        grows monotonically with incrementals
+      * P8 cross-user backfill + this cross-time carry-forward together
+        eliminate drain-order asymmetry: each user's snapshot stands on
+        its own regardless of who drained first or when
+
+    The actual blobs in SeaweedFS are tenant-deduped (one copy per
+    content_hash), so carry-forward just re-emits the metadata pointer —
+    no storage overhead in the object store. Per-snapshot row cost is
+    ~200 bytes × items: negligible against the content.
+
+    Called AFTER the drain + P8 cross-user backfill so any freshly drained
+    rows in the new snapshot win the unique-key race. Carry-forward uses
+    NOT EXISTS on (snapshot_id, external_id, item_type) so existing rows
+    in the target are never overwritten.
+    """
+    if not tenant_id or not resource_id or not target_snapshot_id:
+        return 0
+    async with async_session_factory() as s:
+        result = await s.execute(
+            text(
+                "INSERT INTO snapshot_items ("
+                "  id, snapshot_id, tenant_id, item_type, external_id, "
+                "  parent_external_id, name, folder_path, content_hash, "
+                "  content_checksum, content_size, blob_path, "
+                "  encryption_key_id, backup_version, metadata, is_deleted, "
+                "  indexed_at, backend_id, created_at"
+                ") "
+                "SELECT gen_random_uuid(), :tsid, src.tenant_id, src.item_type, "
+                "       src.external_id, src.parent_external_id, src.name, "
+                "       src.folder_path, src.content_hash, src.content_checksum, "
+                "       src.content_size, src.blob_path, src.encryption_key_id, "
+                "       COALESCE(src.backup_version, 1), src.metadata, "
+                "       COALESCE(src.is_deleted, false), src.indexed_at, "
+                "       src.backend_id, NOW() "
+                "  FROM snapshot_items src "
+                "  JOIN snapshots ps ON ps.id = src.snapshot_id "
+                " WHERE ps.resource_id = :rid "
+                "   AND ps.id <> :tsid "
+                "   AND ps.status IN ('COMPLETED', 'PARTIAL') "
+                "   AND src.item_type IN ("
+                "         'CHAT_MESSAGE', 'CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT'"
+                "       ) "
+                "   AND ps.id = ("
+                "         SELECT s2.id FROM snapshots s2 "
+                "          WHERE s2.resource_id = :rid "
+                "            AND s2.id <> :tsid "
+                "            AND s2.status IN ('COMPLETED', 'PARTIAL') "
+                "          ORDER BY s2.created_at DESC "
+                "          LIMIT 1"
+                "       ) "
+                "   AND NOT EXISTS ("
+                "         SELECT 1 FROM snapshot_items dst "
+                "          WHERE dst.snapshot_id = :tsid "
+                "            AND dst.external_id = src.external_id "
+                "            AND dst.item_type = src.item_type"
+                "       )"
+            ),
+            {
+                "tsid": target_snapshot_id,
+                "rid": resource_id,
+            },
+        )
+        await s.commit()
+        return result.rowcount or 0
+
+
 async def _copy_chat_attachment_rows_to_snapshot(
     *,
     tenant_id: str,
@@ -602,7 +688,9 @@ async def _copy_chat_attachment_rows_to_snapshot(
                 "  indexed_at, backend_id, created_at"
                 ") "
                 "SELECT gen_random_uuid(), :tsid, :tid, src.item_type, "
-                "       src.external_id, src.parent_external_id, src.name, "
+                "       src.external_id, "
+                "       COALESCE(src.parent_external_id, split_part(src.external_id, '::', 1)), "
+                "       src.name, "
                 "       src.folder_path, src.content_hash, "
                 "       src.content_checksum, src.content_size, "
                 "       src.blob_path, src.encryption_key_id, "
@@ -612,7 +700,7 @@ async def _copy_chat_attachment_rows_to_snapshot(
                 "  FROM snapshot_items src "
                 " WHERE src.tenant_id = :tid "
                 "   AND src.item_type IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT') "
-                "   AND src.parent_external_id IN ( "
+                "   AND COALESCE(src.parent_external_id, split_part(src.external_id, '::', 1)) IN ( "
                 "         SELECT m.message_external_id "
                 "           FROM chat_thread_messages m "
                 "           JOIN chat_threads t ON t.id = m.chat_thread_id "
@@ -4713,6 +4801,40 @@ class BackupWorker:
                                 f"without att items."
                             )
 
+                # Cross-time carry-forward for USER_CHATS: chat drain is
+                # incremental (delta cursor), so this snapshot's rows reflect
+                # only the delta from this run. Without carry-forward, every
+                # incremental backup would collapse Resource.storage_bytes
+                # back to a single drain's worth (~30 MB instead of 1955 MB).
+                #
+                # Pre-finalize, copy CHAT_MESSAGE / CHAT_ATTACHMENT /
+                # CHAT_HOSTED_CONTENT rows from the user's previous chat
+                # snapshot into this one. NOT EXISTS guard keeps drained
+                # rows in this snapshot authoritative; carry-forward only
+                # fills gaps. Cheap — pointer rows only, ~200 B each, and
+                # SeaweedFS blobs are tenant-deduped (no blob copies).
+                if resource.type.value == "USER_CHATS":
+                    try:
+                        _cf = await _carry_forward_prior_chat_snapshot_items(
+                            tenant_id=str(tenant.id),
+                            resource_id=str(resource.id),
+                            target_snapshot_id=str(snapshot.id),
+                        )
+                        if _cf:
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] "
+                                f"{resource.display_name or resource.id}: "
+                                f"carried forward {_cf} pointer rows from "
+                                f"prior snapshot"
+                            )
+                    except Exception as _cf_err:
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] "
+                            f"{resource.display_name or resource.id}: "
+                            f"carry-forward failed: "
+                            f"{type(_cf_err).__name__}: {_cf_err}"
+                        )
+
                 # Count from the DB rather than `len(items_data)` because the
                 # USER_MAIL streaming-persist path filters items_data down to
                 # attachment-candidates (so the generic persist step doesn't
@@ -5709,6 +5831,12 @@ class BackupWorker:
                 snapshot_id=snapshot.id,
                 tenant_id=tenant.id,
                 external_id=f"{msg_id}::{att_id}",
+                # Populate parent_external_id with the message id so P8's
+                # claim-skip back-fill JOIN can find these rows by chat. The
+                # legacy code stored the linkage only in extra_data.parent_item_id,
+                # which silently broke cross-snapshot attachment back-fill
+                # and produced first-drainer / second-drainer size asymmetry.
+                parent_external_id=msg_id,
                 item_type="CHAT_ATTACHMENT",
                 name=(name or "")[:255],
                 folder_path=folder_path,
@@ -6873,21 +7001,32 @@ class BackupWorker:
             except Exception as pe:
                 print(f"[{self.worker_id}]   [PERMS WARN] {file_name}: {type(pe).__name__}: {pe}")
 
-        snapshot_item = SnapshotItem(
-            snapshot_id=snapshot.id,
-            tenant_id=tenant.id,
-            external_id=file_id,
-            item_type="FILE",
-            name=file_name,
-            folder_path=file_item.get("parentReference", {}).get("path"),
-            content_hash=content_hash if content_hash else None,
-            content_size=content_size,
-            blob_path=blob_path,
-            extra_data={"structured": metadata},
-            content_checksum=content_hash if content_hash else None,
+        # SharePoint delta pages can return the same file twice (when a file
+        # appears in multiple drives that the same site exposes, or when a
+        # version transition emits the live row on consecutive pages). Two
+        # concurrent _backup_file_one_drive calls then race the INSERT and the
+        # loser hits uq_snapshot_items_snap_ext_type → spurious "FILE FAIL".
+        # Use a single-row UPSERT instead so the second writer is a no-op
+        # (the row is already correct — same external_id, same blob_path).
+        from sqlalchemy.dialects.postgresql import insert as _pg_insert
+        row = {
+            "snapshot_id": snapshot.id,
+            "tenant_id": tenant.id,
+            "external_id": file_id,
+            "item_type": "FILE",
+            "name": file_name,
+            "folder_path": file_item.get("parentReference", {}).get("path"),
+            "content_hash": content_hash if content_hash else None,
+            "content_size": content_size,
+            "blob_path": blob_path,
+            "extra_data": {"structured": metadata},
+            "content_checksum": content_hash if content_hash else None,
+        }
+        stmt = _pg_insert(SnapshotItem.__table__).values(**row).on_conflict_do_nothing(
+            index_elements=["snapshot_id", "external_id", "item_type"],
         )
         async with async_session_factory() as session:
-            session.add(snapshot_item)
+            await session.execute(stmt)
             await session.commit()
 
     # Maximum prior versions to capture per file. 5 = the 5 most recent
@@ -7583,13 +7722,19 @@ class BackupWorker:
                                 f"{resource.external_id}/mailFolders/"
                                 f"{fid}/messages/delta"
                             )
-                            params = {"$top": "50", "$select": mbx_select}
+                            # $top=999 is Graph's max for /messages and matches the
+                            # USER_MAIL v2 path. The legacy $top=50 produced 20× more
+                            # round-trips per mailbox and capped Vinay's 7,277-msg
+                            # drain at ~6 msg/s. Larger pages let the per-stream
+                            # rate limiter (GRAPH_STREAM_PACE_REQS_PER_SEC) cover
+                            # ~999 msg/s of theoretical headroom instead of 50.
+                            params = {"$top": "999", "$select": mbx_select}
                         else:
                             url = (
                                 f"{graph_client.GRAPH_URL}/users/"
                                 f"{resource.external_id}/messages"
                             )
-                            params = {"$top": "50", "$select": mbx_select}
+                            params = {"$top": "999", "$select": mbx_select}
 
                         folder_path = (folder_tree.get(fid) if fid else "") or ""
                         folder_msgs: List[Dict[str, Any]] = []
@@ -7787,6 +7932,18 @@ class BackupWorker:
                                 f"[{self.worker_id}] [MAILBOX] delta "
                                 f"persist failed: {_e}"
                             )
+
+                    # Mark the snapshot COMPLETED before update_resource_backup_info
+                    # runs — that helper re-derives storage_bytes from the latest
+                    # COMPLETED snapshot, and without this flip the mass-backup
+                    # path left snapshots IN_PROGRESS (later reaped to PARTIAL),
+                    # so the resource row showed storage_bytes=0 forever.
+                    async with async_session_factory() as sess:
+                        await self.complete_snapshot(
+                            sess, snapshot,
+                            {"item_count": totals["items"],
+                             "bytes_added": totals["bytes"]},
+                        )
 
                     async with async_session_factory() as sess:
                         await self.update_resource_backup_info(
@@ -11899,6 +12056,13 @@ class BackupWorker:
         prev = resource.storage_bytes or 0
         if latest_completed is not None:
             storage_bytes = int(latest_completed)
+        elif result and isinstance(result, dict) and int(result.get("bytes_added") or 0) > 0:
+            # Defense-in-depth: handlers that call update_resource_backup_info
+            # before complete_snapshot lands (or whose snapshot ends up PARTIAL
+            # via the orphan reaper) would otherwise leave storage_bytes
+            # untouched. Trust the result dict's bytes_added — it's the same
+            # number we'd have read once the snapshot flipped to COMPLETED.
+            storage_bytes = int(result["bytes_added"])
         else:
             # No completed content-bearing snapshot yet — keep prior value.
             storage_bytes = prev
