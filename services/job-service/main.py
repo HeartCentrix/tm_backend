@@ -165,6 +165,7 @@ async def _create_batch_backup_jobs(
     note: Optional[str] = None,
     trigger_label: str = "MANUAL_BATCH",
     batch_id: Optional[str] = None,
+    tier2: bool = False,
 ):
     if not resources_map:
         raise HTTPException(status_code=404, detail="No valid resources found")
@@ -294,6 +295,16 @@ async def _create_batch_backup_jobs(
                 # Audit grouping keys on this first; falls back to
                 # (tenant, triggered_by, created_at) for legacy rows.
                 "batch_id": batch_id,
+                # True for the Tier-2 fan-out wave: the user-clicked
+                # resources are already counted on the parent siblings,
+                # so audit-service excludes these from the Activity-row
+                # "X resources" total to avoid double-counting (an
+                # 18-user click stays "18 resources" even after 36
+                # OneDrives + 9 mailboxes are discovered and queued).
+                # The work is still shown — these siblings still drive
+                # status / progress — only the displayed count omits
+                # them.
+                "tier2": bool(tier2),
             },
         )
         db.add(job)
@@ -878,6 +889,7 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
             note=request.note,
             trigger_label="MANUAL_BATCH",
             batch_id=request.batchId,
+            tier2=bool(getattr(request, "tier2", False)),
         )
 
     elif resource_id:

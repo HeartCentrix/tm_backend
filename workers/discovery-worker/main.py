@@ -1296,6 +1296,13 @@ async def _consume_tier2_discovery():
                                 "resourceIds": all_child_ids,
                                 "fullBackup": full_backup,
                                 "priority": 1,
+                                # Mark this fan-out as Tier-2 so audit-service
+                                # doesn't double-count the discovered children
+                                # in the parent click's Activity-row "X
+                                # resources" total. The Jobs still run, still
+                                # contribute progress / status — only the
+                                # display count omits them.
+                                "tier2": True,
                             }
                             if forward_batch_id:
                                 payload["batchId"] = forward_batch_id

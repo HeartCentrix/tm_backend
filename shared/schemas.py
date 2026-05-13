@@ -285,6 +285,14 @@ class TriggerBulkBackupRequest(BaseModel):
     # batch_id into spec.batch_id, so audit-service can group multi-stage
     # batches (e.g. parent bulk + Tier-2 child fan-out) under one row.
     batchId: Optional[str] = None
+    # Set by discovery-worker when fanning out Tier-2 discovered children
+    # (USER_ONEDRIVE / USER_MAILBOX / USER_CHATS / …) under an existing
+    # batch. Those resources are sub-resources of users the operator
+    # already counted in the initial click, so the Activity-row total
+    # excludes their resource_count to avoid double-counting (e.g. an
+    # 18-user click should keep showing "18 resources", not 72 once the
+    # fan-out lands).
+    tier2: Optional[bool] = False
 
 
 class TriggerDatasourceBackupRequest(BaseModel):

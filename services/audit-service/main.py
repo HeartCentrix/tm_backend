@@ -122,12 +122,25 @@ def _group_batch_jobs(
         else:
             group_status = status_reverse_map.get(statuses[0], "In Progress")
 
-        total_resources = 0
+        # total_resources reflects what the OPERATOR clicked, not the work
+        # the system fanned out internally. Tier-2 child Jobs (spec.tier2)
+        # represent discovered sub-resources of users the operator already
+        # counted on the parent siblings — including them here would
+        # balloon "18 users" into "72 resources" once OneDrives + mailboxes
+        # land. Skip them in the displayed total; they still contribute to
+        # status and progress aggregation below.
+        # Fallback when ALL siblings are tier2 (legacy rows without a
+        # primary, or a pure tier-2 trigger): sum them anyway so the row
+        # still shows a non-zero count.
+        primary_children = [c for c in children if not (c.spec or {}).get("tier2")]
+        counting_children = primary_children if primary_children else children
+        total_resources = sum(
+            int((c.spec or {}).get("resource_count") or 0)
+            for c in counting_children
+        )
         data_backed_up = 0
         total_data = 0
         for c in children:
-            spec = c.spec or {}
-            total_resources += int(spec.get("resource_count") or 0)
             cached = _running_job_cache.get(str(c.id), {})
             data_backed_up += int(cached.get("data_backed_up", c.bytes_processed or 0) or 0)
             total_data += int(
@@ -161,12 +174,20 @@ def _group_batch_jobs(
                 avg_pct = sum((c.progress_pct or 0) for c in children) // max(len(children), 1)
                 details = f"Progress: {avg_pct}%"
 
+        # Use the EARLIEST sibling's created_at as the row's start_time so
+        # the Activity row keeps the click-time the operator remembers —
+        # never the later Tier-2 fan-out spawn time. Two simultaneous
+        # polls (Home widget + Audit page) then agree on the same
+        # timestamp instead of one showing the parent click and the other
+        # showing the fan-out moment.
+        created_times = [c.created_at for c in children if c.created_at]
+        start_iso = min(created_times).isoformat() if created_times else ""
         job_ids_sorted = sorted(str(c.id) for c in children)
         first = children[0]
         rows.append({
             "id": job_ids_sorted[0],
             "jobIds": job_ids_sorted,
-            "start_time": first.created_at.isoformat() if first.created_at else "",
+            "start_time": start_iso,
             "operation": first.type.value if hasattr(first.type, "value") else str(first.type),
             "object": f"{total_resources} resources" if total_resources else "Bulk Operation",
             "status": group_status,

@@ -4073,11 +4073,39 @@ class BackupWorker:
                         # thin pointer rows from the messages A already
                         # persisted in chat_thread_messages.
                         _ct_info = chat_meta.get(cid) or {}
+                        # CHAT NAME RESOLUTION — persistence policy.
+                        #
+                        # ``chat_threads.chat_topic`` must hold ONLY the real
+                        # Graph-provided topic (string from Microsoft Graph
+                        # ``chat.topic``), never the synthetic fallback
+                        # displayName we build at line ~3491. The display-
+                        # name ladder above produces things like
+                        # ``"Group Chat (19:044e5)"`` or
+                        # ``"1-on-1 Chat (19:247fe)"`` when both ``topic``
+                        # and member resolution come back empty — writing
+                        # those to ``chat_topic`` POISONS the row: every
+                        # subsequent snapshot-service read returns the
+                        # hex-truncated string forever (snapshot-service
+                        # reads chat_topic verbatim).
+                        #
+                        # Rule: pass only the real ``topic`` field. If that
+                        # is None/empty, store None — snapshot-service has
+                        # its own read-time fallback ladder that composes
+                        # a name from member-names or message authors and
+                        # auto-recovers when member resolution succeeds
+                        # later. Member names are still passed separately
+                        # so the thread row carries them for read-time
+                        # composition.
+                        _raw_topic = _ct_info.get("topic")
+                        if isinstance(_raw_topic, str) and _raw_topic.strip():
+                            _persist_topic = _raw_topic.strip()
+                        else:
+                            _persist_topic = None
                         _claim = await _claim_or_load_chat_thread(
                             tenant_id=str(tenant.id),
                             chat_id=cid,
                             chat_type=_ct_info.get("chatType"),
-                            chat_topic=_ct_info.get("displayName") or _ct_info.get("topic"),
+                            chat_topic=_persist_topic,
                             member_names=(_ct_info.get("memberNames") or []),
                             last_updated_at_iso=chat_last_updated_map.get(cid),
                         )
@@ -7518,11 +7546,17 @@ class BackupWorker:
             )
 
             # Capture historical file versions — afi keeps every version. We cap
-            # at MAX_FILE_VERSIONS (default 5) to bound storage. Only runs on
-            # newly-streamed files; skip-already-present files keep their prior
-            # snapshot's versions.
+            # at MAX_FILE_VERSIONS (default 3) to bound storage. Only runs on
+            # newly-streamed files AND only on Office filename extensions
+            # (VERSIONABLE_EXTS); other binary types either don't produce
+            # server-side versions or do so too rarely to justify the
+            # per-file /versions Graph call.
             #
             # Three-layer fast path (most → least expensive skip):
+            #
+            #   Layer 0 (NEW): filename extension not in VERSIONABLE_EXTS
+            #     → skip the whole version block; saves an entire Graph
+            #       round-trip per non-Office file.
             #
             #   Layer 1: fileSystemInfo.createdDateTime == lastModifiedDateTime
             #     → file has never been edited → no prior versions possible.
@@ -7538,7 +7572,7 @@ class BackupWorker:
             created_at = fs_info.get("createdDateTime") or file_item.get("createdDateTime")
             modified_at = fs_info.get("lastModifiedDateTime") or file_item.get("lastModifiedDateTime")
             never_edited = bool(created_at) and created_at == modified_at
-            if not never_edited:
+            if not never_edited and self._is_versionable_file(file_name):
                 # Lazy-load per-snapshot prior state. Cached on the snapshot
                 # object so all files for this resource share two indexed SQL
                 # queries (not 2*N).
@@ -7699,10 +7733,44 @@ class BackupWorker:
             await session.execute(stmt)
             await session.commit()
 
-    # Maximum prior versions to capture per file. 5 = the 5 most recent
+    # Maximum prior versions to capture per file. 3 = the 3 most recent
     # historical versions (current version is captured separately as the live
     # FILE row). Override per-deployment via env var; expose per-policy later.
-    MAX_FILE_VERSIONS = int(os.environ.get("MAX_FILE_VERSIONS", "5"))
+    MAX_FILE_VERSIONS = int(os.environ.get("MAX_FILE_VERSIONS", "3"))
+
+    # Office file extensions that have meaningful version history in Graph.
+    # Other binary types (PDFs, images, archives, video, code…) either don't
+    # produce server-side autosave versions or produce them so rarely that
+    # paying the per-file /versions Graph call is wasted budget. Override
+    # via VERSIONABLE_EXTS="docx,xlsx,pptx,..." (comma-sep, no dots) if a
+    # tenant needs a wider net.
+    _DEFAULT_VERSIONABLE_EXTS = (
+        "docx,doc,docm,dotx,dotm,"
+        "xlsx,xls,xlsm,xlsb,xltx,xltm,"
+        "pptx,ppt,pptm,potx,potm,ppsx,"
+        "vsdx,vsd,vsdm,vstx,vstm,"
+        "loop,one,onetoc2,"
+        "rtf,odt,ods,odp"
+    )
+    VERSIONABLE_EXTS = frozenset(
+        e.strip().lower().lstrip(".")
+        for e in os.environ.get("VERSIONABLE_EXTS", _DEFAULT_VERSIONABLE_EXTS).split(",")
+        if e.strip()
+    )
+
+    @classmethod
+    def _is_versionable_file(cls, file_name: Optional[str]) -> bool:
+        """True iff file_name's extension is in the Office allowlist.
+
+        Driving the version-capture decision off filename (not MIME) matches
+        how OneDrive itself decides whether to autosave version history.
+        """
+        if not file_name:
+            return False
+        i = file_name.rfind(".")
+        if i < 0 or i == len(file_name) - 1:
+            return False
+        return file_name[i + 1 :].lower() in cls.VERSIONABLE_EXTS
 
     # ─── Version-capture tunables ───────────────────────────────────────────
     # Defaults chosen so the worst-case memory footprint fits comfortably in
@@ -14023,8 +14091,18 @@ class BackupWorker:
         is NULL) the bulk path was never used, so this helper is a
         no-op and the caller falls back to the legacy
         ``update_job_status`` flip. Returns the terminal status the
-        parent landed in (one of 'COMPLETED'/'FAILED'/'PARTIAL') if
-        we flipped, else None."""
+        parent landed in ('COMPLETED' or 'FAILED') if we flipped,
+        else None.
+
+        Terminal-status mapping — only the two values the
+        ``jobstatus`` enum actually has (COMPLETED, FAILED). The
+        codebase has never had a Job-level PARTIAL. Snapshots CAN
+        be PARTIAL (snapshot-level outcome of a single resource),
+        but the bulk Job rolls up to: COMPLETED if any child made
+        progress (counts.completed > 0 or counts.partial > 0);
+        FAILED only when every single child failed. Operators see
+        the per-resource breakdown via the snapshots table — Job
+        status is the coarse outcome."""
         try:
             row = (await session.execute(
                 text("""
@@ -14051,9 +14129,8 @@ class BackupWorker:
                     UPDATE jobs j SET
                         status = (CASE
                             WHEN c.terminal < e.n THEN j.status
-                            WHEN c.failed = 0 THEN 'COMPLETED'::jobstatus
                             WHEN c.completed = 0 AND c.partial = 0 THEN 'FAILED'::jobstatus
-                            ELSE 'PARTIAL'::jobstatus
+                            ELSE 'COMPLETED'::jobstatus
                         END),
                         completed_at = (CASE
                             WHEN c.terminal = e.n THEN NOW()
@@ -14091,7 +14168,7 @@ class BackupWorker:
             terminal = row.terminal if hasattr(row, "terminal") else row[1]
             expected = row.n if hasattr(row, "n") else row[2]
             if int(terminal) >= int(expected) and new_status in (
-                "COMPLETED", "FAILED", "PARTIAL",
+                "COMPLETED", "FAILED",
             ):
                 print(
                     f"[{self.worker_id}] [FANOUT/FINALIZE] job={job_id} "

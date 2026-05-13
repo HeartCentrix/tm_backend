@@ -570,11 +570,15 @@ async def startup():
                             GROUP BY s.job_id
                         )
                         UPDATE jobs j SET
+                            -- Terminal-status mapping matches jobstatus
+                            -- enum (COMPLETED / FAILED only — no PARTIAL
+                            -- at the Job level). Mixed-outcome bulks
+                            -- flip to COMPLETED with c.failed in result;
+                            -- only an all-failed bulk lands at FAILED.
                             status = (CASE
-                                WHEN c.failed = 0 THEN 'COMPLETED'::jobstatus
                                 WHEN c.completed = 0 AND c.partial = 0
                                     THEN 'FAILED'::jobstatus
-                                ELSE 'PARTIAL'::jobstatus
+                                ELSE 'COMPLETED'::jobstatus
                             END),
                             completed_at = NOW(),
                             progress_pct = 100,

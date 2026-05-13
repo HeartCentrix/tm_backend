@@ -85,6 +85,37 @@ async def _backfill_folder_paths():
         await session.commit()
 
 
+async def _backfill_chat_topic_fallbacks():
+    """One-shot: null out chat_threads.chat_topic rows that were poisoned with
+    synthetic fallback display names ("Group Chat (19:abcd1)", "1-on-1 Chat
+    (19:abcd1)", "Chat 19:abcd1"). The write path no longer persists those —
+    it now stores NULL when Graph returns no real topic — and the read path
+    composes the displayName from member_names_json + chat_type at request
+    time. Leaving the poisoned values in place would make those rows skip
+    the new composition, so we erase them here. Idempotent: re-running
+    against already-cleaned rows is a no-op.
+    """
+    from sqlalchemy import text as _text
+    sql = (
+        "UPDATE chat_threads "
+        "   SET chat_topic = NULL "
+        " WHERE chat_topic IS NOT NULL "
+        "   AND ( chat_topic LIKE 'Group Chat (19:%' "
+        "      OR chat_topic LIKE '1-on-1 Chat (19:%' "
+        "      OR chat_topic LIKE 'Chat 19:%' ) "
+    )
+    from shared.database import async_session_factory as _factory
+    async with _factory() as session:
+        try:
+            result = await session.execute(_text(sql))
+            await session.commit()
+            n = getattr(result, "rowcount", None)
+            if n:
+                print(f"[SNAPSHOT] backfilled {n} chat_threads.chat_topic → NULL (synthetic fallback)")
+        except Exception as e:
+            print(f"[SNAPSHOT] chat_topic backfill skipped: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from shared.storage.startup import startup_router, shutdown_router
@@ -93,6 +124,10 @@ async def lifespan(app: FastAPI):
         await _backfill_folder_paths()
     except Exception as e:
         print(f"[SNAPSHOT] folder backfill failed (non-fatal): {e}")
+    try:
+        await _backfill_chat_topic_fallbacks()
+    except Exception as e:
+        print(f"[SNAPSHOT] chat_topic backfill failed (non-fatal): {e}")
     await startup_router()
     try:
         yield
@@ -1694,6 +1729,7 @@ async def list_snapshot_chat_groups(
             "   GROUP BY si.tenant_id, si.parent_external_id "
             ") "
             "SELECT tm.chat_id, tm.msg_count, ct.chat_topic, ct.chat_type, "
+            "       ct.member_names_json, "
             "       ( SELECT MAX(ctm.created_date_time) "
             "           FROM chat_thread_messages ctm "
             "          WHERE ctm.chat_thread_id = ct.id "
@@ -1708,15 +1744,40 @@ async def list_snapshot_chat_groups(
         {"sids": [str(s) for s in sibling_ids]},
     )).all()
 
-    def _topic_or_fallback(chat_id: str, topic: Optional[str]) -> str:
-        if topic:
-            return topic
+    def _compose_chat_name(
+        chat_id: str,
+        topic: Optional[str],
+        chat_type: Optional[str],
+        member_names: Optional[list],
+    ) -> str:
+        # 1. Real Graph topic always wins.
+        if isinstance(topic, str) and topic.strip():
+            return topic.strip()
+        # 2. Compose from member names if we captured them.
+        names = []
+        if isinstance(member_names, list):
+            names = [
+                str(n).strip()
+                for n in member_names
+                if isinstance(n, str) and n.strip()
+            ]
+        if names:
+            ct = (chat_type or "").lower()
+            if ct == "oneonone":
+                return " | ".join(names[:2])
+            # group / meeting / unknown — show first three names + +N more
+            if len(names) <= 3:
+                return ", ".join(names)
+            return ", ".join(names[:3]) + f" +{len(names) - 3} more"
+        # 3. Last-resort fallback — never persisted, computed at read time.
         return f"Chat {chat_id[:8]}"
 
     return [
         {
             "chatId": r.chat_id,
-            "displayName": _topic_or_fallback(r.chat_id, r.chat_topic),
+            "displayName": _compose_chat_name(
+                r.chat_id, r.chat_topic, r.chat_type, r.member_names_json,
+            ),
             "count": int(r.msg_count or 0),
             "lastMessageAt": (
                 r.last_message_at.isoformat() if r.last_message_at else None
