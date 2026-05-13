@@ -816,3 +816,95 @@ class StorageToggleEvent(Base):
     pre_flight_checks = Column(JSONB)
     drained_job_count = Column(Integer)
     retried_job_count = Column(Integer)
+
+
+# ==================== Cross-user chat dedup (2026-05-13) ====================
+# Two cooperating stores added together:
+#   chat_url_cache       - tenant-scoped persisted SharePoint URL → driveItem
+#                          resolution cache. Lets the N+1th backup skip the
+#                          Graph /shares resolve AND the CDN download for any
+#                          URL an earlier backup already drained.
+#   chat_threads         - tenant-scoped singleton row per (tenant, chat_id).
+#                          The cross-user drain claim lives here: when User B's
+#                          backup lands within CHAT_THREAD_DRAIN_FRESHNESS_S of
+#                          User A's, B short-circuits and reuses A's drained
+#                          messages.
+#   chat_thread_messages - the actual message bodies, written once per
+#                          (chat_thread_id, message_external_id). snapshot_items
+#                          carries thin pointer rows joined at read time.
+
+
+class ChatUrlCache(Base):
+    """Tenant-scoped cache of chat-attachment URL → driveItem resolution.
+
+    Keyed by SHA-256 of the SharePoint share URL (cheaper PK than indexing TEXT).
+    A hit short-circuits both the Graph /shares/{id}/driveItem resolve and the
+    SharePoint CDN download — caller reuses the existing `blob_path` (or
+    `inline_b64` for tiny payloads).
+
+    `unreachable=True` is set when the resolve / download returns a permanent
+    4xx, so subsequent backups don't keep re-trying broken URLs. Complements
+    GraphClient._unreachable_urls (which is worker-process-lifetime only).
+    """
+    __tablename__ = "chat_url_cache"
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True)
+    url_sha256 = Column(String(64), primary_key=True)
+    drive_item_id = Column(String(256), nullable=True)
+    content_hash = Column(String(64), nullable=True)
+    blob_path = Column(Text, nullable=True)
+    content_size = Column(BigInteger, nullable=True)
+    inline_b64 = Column(Text, nullable=True)
+    unreachable = Column(Boolean, nullable=False, default=False)
+    first_seen_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    last_used_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class ChatThread(Base):
+    """Singleton row per (tenant_id, chat_id). Stores the cross-user drain
+    claim, the chat's metadata, and the per-chat drain cursor / failure state
+    (relocated from Resource.extra_data so it's tenant-scoped, not user-scoped).
+
+    Drain claim mechanic: each backup attempts an INSERT…ON CONFLICT DO UPDATE
+    that bumps `last_drained_at` only if the existing row is older than the
+    freshness window. RETURNING (xmax = 0) tells the worker whether it won the
+    claim (drain) or lost (skip + reuse messages already in chat_thread_messages).
+    """
+    __tablename__ = "chat_threads"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    chat_id = Column(String(256), nullable=False)
+    chat_type = Column(String(32), nullable=True)        # oneOnOne / group / meeting_*
+    chat_topic = Column(Text, nullable=True)             # group name; null for 1:1
+    member_names_json = Column(JSONB, nullable=True)     # snapshot of members at last drain
+    last_updated_at = Column(DateTime(timezone=True), nullable=True)   # mirrors chat.lastUpdatedDateTime
+    last_drained_at = Column(DateTime(timezone=True), nullable=True)   # when we last hit Graph
+    drain_cursor = Column(Text, nullable=True)
+    drain_failure_state = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class ChatThreadMessage(Base):
+    """Tenant-scoped, drained-once-per-batch chat message store.
+
+    snapshot_items carries a thin pointer row per (snapshot, message) keyed by
+    parent_external_id=chat_id + external_id=message_external_id; reads JOIN
+    here to hydrate body + sender + attachments. metadata_raw holds the full
+    Graph payload (attachments, mentions, reactions, hostedContents, etc.) so
+    later read paths don't need to widen the column set.
+    """
+    __tablename__ = "chat_thread_messages"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    chat_thread_id = Column(UUID(as_uuid=True), ForeignKey("chat_threads.id", ondelete="CASCADE"), nullable=False, index=True)
+    message_external_id = Column(String(256), nullable=False)
+    created_date_time = Column(DateTime(timezone=True), nullable=True)
+    last_modified_date_time = Column(DateTime(timezone=True), nullable=True)
+    from_user_id = Column(String(128), nullable=True)
+    from_display_name = Column(String(256), nullable=True)
+    body_content = Column(Text, nullable=True)
+    body_content_type = Column(String(16), nullable=True)
+    deleted_date_time = Column(DateTime(timezone=True), nullable=True)
+    metadata_raw = Column(JSONB, nullable=True)
+    content_hash = Column(String(64), nullable=True)
+    content_size = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)

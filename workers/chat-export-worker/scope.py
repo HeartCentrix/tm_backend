@@ -1,10 +1,15 @@
 """Resolve job payload -> (messages, attachment_map, hosted_map, layout).
 
 SnapshotItem.resource_id does not exist -- JOIN Snapshot to filter by resource.
+
+Chat message bodies were relocated to ``chat_thread_messages`` in the 2026-05-13
+Level 2 refactor. snapshot_items now carries thin pointer rows; we hydrate
+each row's ``extra_data['raw']`` from ``chat_thread_messages.metadata_raw``
+before handing the list to the renderer.
 """
 from dataclasses import dataclass
 import mimetypes
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import aliased
 from shared.models import SnapshotItem, Snapshot, Resource
 
@@ -61,6 +66,41 @@ async def resolve(sess, *, resource_id, snapshot_ids, thread_path: str | None,
             raise ValueError("SCOPE_EMPTY")
         effective = next(iter(paths))
         layout = "per_message"
+
+    # Hydrate each message's raw payload from chat_thread_messages. The
+    # renderer expects ``extra_data['raw']`` to carry the full Graph
+    # message dict (body, from, attachments, mentions, reactions, etc.).
+    # Without this step every exported message would render as "(empty)".
+    if msgs:
+        ext_ids_raw = [m.external_id for m in msgs if m.external_id]
+        if ext_ids_raw:
+            hydrate_rows = (await sess.execute(
+                text(
+                    "SELECT ct.tenant_id, ct.chat_id, "
+                    "       ctm.message_external_id, ctm.metadata_raw "
+                    "  FROM chat_thread_messages ctm "
+                    "  JOIN chat_threads ct ON ct.id = ctm.chat_thread_id "
+                    " WHERE ctm.message_external_id = ANY(:ext_ids)"
+                ),
+                {"ext_ids": ext_ids_raw},
+            )).all()
+            # Key by (tenant_id, chat_id, message_external_id) — message_external_id
+            # alone collides across tenants in theory, and we already have the
+            # other identifiers on each SnapshotItem.
+            raw_by_key: dict = {}
+            for hr in hydrate_rows:
+                raw_by_key[(str(hr.tenant_id), hr.chat_id, hr.message_external_id)] = hr.metadata_raw
+            for m in msgs:
+                raw = raw_by_key.get(
+                    (str(m.tenant_id), m.parent_external_id, m.external_id)
+                )
+                if raw is None:
+                    continue
+                ed = dict(m.extra_data or {})
+                ed["raw"] = raw if isinstance(raw, dict) else {}
+                # SQLAlchemy lets us mutate the JSON column even on a
+                # detached row; the renderer reads it as a plain dict.
+                m.extra_data = ed
 
     ext_ids = [m.external_id for m in msgs]
     att_map: dict = {}

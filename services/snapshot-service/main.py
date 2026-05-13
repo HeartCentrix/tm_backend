@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, distinct, and_, or_
+from sqlalchemy import select, func, distinct, and_, or_, text
 
 from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType
@@ -1175,117 +1175,148 @@ async def list_snapshot_messages(
     page: int = Query(1, ge=1),
     size: int = Query(500, ge=1),
     chatId: Optional[str] = Query(None),
-    folder: Optional[str] = Query(None, description="Filter to one chat by folder_path (e.g. 'chats/Vinay Chauhan')"),
-    search: Optional[str] = Query(None, description="Case-insensitive substring match on name (= body preview)"),
+    folder: Optional[str] = Query(None, description="Filter to one chat by folder_path"),
+    search: Optional[str] = Query(None, description="Case-insensitive substring match on body"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return Teams messages with sender/body/date extracted from metadata.
+    """Return Teams chat messages joined to the tenant-singleton
+    ``chat_thread_messages`` store.
 
-    Two filters:
-      - `folder`: matches SnapshotItem.folder_path — used by the new flat
-        chat-folder left panel (paths look like "chats/Vinay Chauhan" or
-        "chats/Group: Hemant, Vinay +5 more").
-      - `chatId`: legacy filter — matches the chatId field in extra_data.
-        Kept so old links and the legacy TEAMS_CHAT_EXPORT data still work."""
-    CHAT_TYPES = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
-    # Chat backups run in delta mode (saved @odata.deltaLink resumes on
-    # subsequent runs) so each snapshot holds only what changed since the
-    # prior one. Aggregate rows across every sibling snapshot for this
-    # resource and dedupe by external_id (newest-wins) so the Recovery
-    # view shows the full chat history, not just the latest delta.
-    # Auto-resolve to the USER_CHATS sibling if caller passed a
-    # Contacts/Mail/Calendar/ENTRA_USER snapshot (common UX bug —
-    # without it the endpoint returned 0 silently).
+    Since the 2026-05-13 Level 2 refactor, ``snapshot_items`` for chat
+    messages holds only thin pointer rows (per-snapshot inventory).
+    The actual body / sender / attachments live in
+    ``chat_thread_messages``, keyed by (chat_thread_id, message_external_id).
+    A row resolves via:
+      snapshot_items (parent_external_id, tenant_id, external_id)
+        → chat_threads (tenant_id, chat_id)
+        → chat_thread_messages (chat_thread_id, message_external_id)
+
+    Auto-resolves to the USER_CHATS sibling when the caller passes the
+    ENTRA_USER parent or a non-chat sibling's snapshot id.
+    """
+    CHAT_TYPES = ("TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY")
     sibling_ids = await _resolve_sibling_snapshot_ids(
         db, snapshot_id, target_child_type=ResourceType.USER_CHATS,
     )
     if not sibling_ids:
         sibling_ids = [UUID(snapshot_id)]
-    filters = [
-        SnapshotItem.snapshot_id.in_(sibling_ids),
-        SnapshotItem.item_type.in_(CHAT_TYPES),
+
+    where_parts = [
+        "si.snapshot_id = ANY(:sids)",
+        "si.item_type = ANY(:types)",
     ]
+    params: Dict[str, Any] = {
+        "sids": [str(s) for s in sibling_ids],
+        "types": list(CHAT_TYPES),
+    }
     if folder is not None:
-        filters.append(SnapshotItem.folder_path == folder)
-    if search:
-        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
+        where_parts.append("si.folder_path = :folder")
+        params["folder"] = folder
     if chatId:
-        # `extra_data` is a plain JSON column (not JSONB) so the `[].astext`
-        # accessor is unavailable. Use json_extract_path_text and check
-        # both possible nestings: top-level (legacy chat-export shards) and
-        # nested under raw (Tier 2 USER_CHATS handler).
-        from sqlalchemy import or_
-        filters.append(or_(
-            func.json_extract_path_text(SnapshotItem.extra_data, "chatId") == chatId,
-            func.json_extract_path_text(SnapshotItem.extra_data, "raw", "chatId") == chatId,
-        ))
-    # Pull every matching row newest-snapshot-first, dedupe by
-    # external_id in memory, then paginate by message send-time.
-    order_col = func.json_extract_path_text(SnapshotItem.extra_data, "raw", "createdDateTime").desc()
-    all_rows = (await db.execute(
-        select(SnapshotItem).where(*filters).order_by(SnapshotItem.created_at.desc(), order_col)
-    )).scalars().all()
-    seen: set = set()
-    deduped = []
-    for it in all_rows:
-        key = it.external_id or str(it.id)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(it)
-    # After dedup, sort once by actual message send-time (newest first)
-    # so page N maps to a chronological window of messages.
-    def _sort_key(r):
-        try:
-            ed = r.extra_data or {}
-            return (ed.get("raw") or {}).get("createdDateTime") or ""
-        except Exception:
-            return ""
-    deduped.sort(key=_sort_key, reverse=True)
-    total = len(deduped)
+        where_parts.append("si.parent_external_id = :cid")
+        params["cid"] = chatId
+    if search:
+        where_parts.append("ctm.body_content ILIKE :search")
+        params["search"] = f"%{search}%"
+
+    # The JOIN to chat_threads is keyed by (tenant_id, chat_id) — both
+    # come from the snapshot_items pointer row, no need to load tenant
+    # from the resource. LEFT JOIN tolerates pointer rows whose backing
+    # chat_thread_messages was deleted (e.g. mid-cascade).
+    base_sql = (
+        " FROM snapshot_items si "
+        " LEFT JOIN chat_threads ct "
+        "        ON ct.tenant_id = si.tenant_id "
+        "       AND ct.chat_id = si.parent_external_id "
+        " LEFT JOIN chat_thread_messages ctm "
+        "        ON ctm.chat_thread_id = ct.id "
+        "       AND ctm.message_external_id = si.external_id "
+        f"WHERE {' AND '.join(where_parts)} "
+    )
+
+    # Newest-first by message send time. NULLs (pointer rows that lost
+    # their backing message somehow) sort last.
+    order_clause = (
+        " ORDER BY ctm.created_date_time DESC NULLS LAST, "
+        "          si.created_at DESC "
+    )
+
+    # Dedup by external_id across sibling snapshots — multiple snapshots
+    # carry pointer rows for the same Graph msg id (the chat_thread_messages
+    # row is single, so the body is consistent). Use DISTINCT ON to keep
+    # one pointer per external_id (the newest-by-snapshot one).
+    sql_count = (
+        "SELECT COUNT(DISTINCT si.external_id) AS n " + base_sql
+    )
+    total_row = (await db.execute(text(sql_count), params)).first()
+    total = int(total_row.n or 0) if total_row else 0
+
     offset = (page - 1) * size
-    items = deduped[offset: offset + size]
+    params_page = dict(params)
+    params_page["limit"] = size
+    params_page["offset"] = offset
 
-    shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
-    sem = asyncio.Semaphore(20)
+    sql_page = (
+        "SELECT DISTINCT ON (si.external_id) "
+        "  si.id, si.snapshot_id, si.external_id, si.parent_external_id, "
+        "  si.item_type, si.folder_path, si.content_size, si.is_deleted, "
+        "  si.created_at AS si_created_at, "
+        "  ct.chat_topic, ct.chat_type, "
+        "  ctm.body_content, ctm.body_content_type, "
+        "  ctm.from_user_id, ctm.from_display_name, "
+        "  ctm.created_date_time, ctm.last_modified_date_time, "
+        "  ctm.deleted_date_time, ctm.metadata_raw "
+        + base_sql +
+        " ORDER BY si.external_id, ctm.created_date_time DESC NULLS LAST, "
+        "          si.created_at DESC "
+        " LIMIT :limit OFFSET :offset"
+    )
+    # PG requires the outer ORDER BY for pagination to match the DISTINCT ON
+    # leading column. Re-sort the page in-process by message timestamp.
+    rows = (await db.execute(text(sql_page), params_page)).all()
+    rows = sorted(
+        rows,
+        key=lambda r: (r.created_date_time or r.si_created_at, ""),
+        reverse=True,
+    )
 
-    async def fmt(i):
-        raw = _raw(i)
-        # Read blob concurrently if metadata is empty
-        if (not raw or len(raw) <= 2) and i.blob_path:
-            async with sem:
-                raw = await _read_blob_json(shard, tenant_id, candidates, i.blob_path)
-        if not isinstance(raw, dict): raw = {}
-        _from = raw.get("from") or {}
-        sender_obj = (_from.get("user") or _from.get("application") or {}) if isinstance(_from, dict) else {}
-        body_obj = raw.get("body", {})
-        # Fallback: name column stores the body text
-        body_text = body_obj.get("content") or (i.name if i.name and i.name != "<systemEventMessage/>" else "")
+    def _fmt(r) -> Dict[str, Any]:
+        raw = r.metadata_raw if isinstance(r.metadata_raw, dict) else {}
+        body_text = r.body_content or ""
         return {
-            "id": str(i.id),
-            "snapshotId": str(i.snapshot_id),
-            "externalId": i.external_id,
-            "itemType": i.item_type,
-            "sender": sender_obj.get("displayName") or "",
-            "senderEmail": sender_obj.get("userPrincipalName") or sender_obj.get("email") or "",
+            "id": str(r.id),
+            "snapshotId": str(r.snapshot_id),
+            "externalId": r.external_id,
+            "itemType": r.item_type,
+            "sender": r.from_display_name or "",
+            "senderEmail": (raw.get("from") or {}).get("user", {}).get("userPrincipalName")
+                            if isinstance(raw.get("from"), dict) else "",
             "body": body_text,
-            "bodyContentType": body_obj.get("contentType") or "html",
-            "date": raw.get("createdDateTime") or (i.created_at.isoformat() if i.created_at else None),
-            "chatTopic": (i.extra_data or {}).get("chatTopic") or "",
-            "channelName": (i.extra_data or {}).get("channelName") or "",
-            "folderPath": i.folder_path,
-            "attachments": raw.get("attachments", []),
-            "mentions": raw.get("mentions", []),
-            "isDeleted": bool(raw.get("deletedDateTime")),
-            "isReply": i.item_type == "TEAMS_MESSAGE_REPLY",
-            "contentSize": i.content_size or 0,
-            "createdAt": i.created_at.isoformat() if i.created_at else "",
-            "name": sender_obj.get("displayName") or "",
+            "bodyContentType": r.body_content_type or "html",
+            "date": (
+                r.created_date_time.isoformat() if r.created_date_time
+                else (r.si_created_at.isoformat() if r.si_created_at else None)
+            ),
+            "chatTopic": r.chat_topic or "",
+            "channelName": "",
+            "folderPath": r.folder_path,
+            "attachments": raw.get("attachments", []) if isinstance(raw, dict) else [],
+            "mentions": raw.get("mentions", []) if isinstance(raw, dict) else [],
+            "isDeleted": bool(r.deleted_date_time) or bool(r.is_deleted),
+            "isReply": r.item_type == "TEAMS_MESSAGE_REPLY",
+            "contentSize": r.content_size or 0,
+            "createdAt": r.si_created_at.isoformat() if r.si_created_at else "",
+            "name": r.from_display_name or "",
             "metadata": {"raw": raw},
         }
 
-    results = await asyncio.gather(*[fmt(i) for i in items])
-    return {"content": list(results), "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
+    return {
+        "content": [_fmt(r) for r in rows],
+        "totalElements": total,
+        "totalPages": max(1, (total + size - 1) // size),
+        "size": size,
+        "number": page,
+    }
 
 
 WELL_KNOWN_CONTACT_FOLDERS = [
@@ -1330,18 +1361,17 @@ async def list_snapshot_chat_groups(
 ):
     """Distinct chats inside a USER_CHATS snapshot, with display name + count.
 
-    The display name is derived from the first message's `chatTopic` if
-    present, otherwise falls back to the sender's display name to give the
-    user a meaningful label for 1:1 chats. Powers the chats tab's left
-    panel — clicking a row sets ?chatId=<id> on the messages query.
+    Aggregates pointer rows from this snapshot (+ siblings) by
+    parent_external_id = chat_id, then joins chat_threads for the
+    canonical chat_topic and chat_thread_messages for the newest message
+    timestamp. Powers the chats tab's left panel — clicking a row sets
+    ?chatId=<id> on the messages query.
 
     Auto-resolves to the USER_CHATS sibling if the caller passed the
-    ENTRA_USER parent's snapshot id or a non-chat sibling's. Without
-    this, the left-panel thread list rendered empty even when the user
-    had thousands of backed-up chat messages (the UI commonly uses the
-    user's ENTRA_USER snapshot for navigation). Also aggregates across
-    every prior USER_CHATS snapshot via the sibling helper so delta-only
-    later runs don't drop threads captured by an earlier full run.
+    ENTRA_USER parent's snapshot id or a non-chat sibling's. Aggregating
+    across all prior USER_CHATS snapshots via the sibling helper means a
+    delta-only later run does not drop threads captured by an earlier
+    full run.
     """
     sibling_ids = await _resolve_sibling_snapshot_ids(
         db, snapshot_id, target_child_type=ResourceType.USER_CHATS,
@@ -1349,50 +1379,52 @@ async def list_snapshot_chat_groups(
     if not sibling_ids:
         sibling_ids = [UUID(snapshot_id)]
 
-    items = (await db.execute(
-        select(SnapshotItem)
-        .where(SnapshotItem.snapshot_id.in_(sibling_ids))
-        .where(SnapshotItem.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
-        .order_by(SnapshotItem.created_at.desc())
-    )).scalars().all()
+    # The aggregate query:
+    #   1. Pull pointer rows for these sibling snapshots, group by
+    #      chat_id (parent_external_id), counting distinct external_ids.
+    #   2. JOIN chat_threads on (tenant_id, chat_id) → chat_topic.
+    #   3. LEFT JOIN to chat_thread_messages to pick the newest
+    #      createdDateTime as the lastMessageAt label.
+    rows = (await db.execute(
+        text(
+            "WITH thread_msgs AS ( "
+            "  SELECT si.tenant_id, si.parent_external_id AS chat_id, "
+            "         COUNT(DISTINCT si.external_id) AS msg_count "
+            "    FROM snapshot_items si "
+            "   WHERE si.snapshot_id = ANY(:sids) "
+            "     AND si.item_type IN ('TEAMS_CHAT_MESSAGE','TEAMS_MESSAGE','TEAMS_MESSAGE_REPLY') "
+            "     AND si.parent_external_id IS NOT NULL "
+            "   GROUP BY si.tenant_id, si.parent_external_id "
+            ") "
+            "SELECT tm.chat_id, tm.msg_count, ct.chat_topic, ct.chat_type, "
+            "       ( SELECT MAX(ctm.created_date_time) "
+            "           FROM chat_thread_messages ctm "
+            "          WHERE ctm.chat_thread_id = ct.id ) AS last_message_at "
+            "  FROM thread_msgs tm "
+            "  LEFT JOIN chat_threads ct "
+            "         ON ct.tenant_id = tm.tenant_id "
+            "        AND ct.chat_id = tm.chat_id "
+            " ORDER BY last_message_at DESC NULLS LAST"
+        ),
+        {"sids": [str(s) for s in sibling_ids]},
+    )).all()
 
-    # Dedupe by external_id across sibling snapshots (newest-wins).
-    # Aggregating across prior delta runs can surface the same Graph
-    # message twice if two snapshots both captured it; without this
-    # dedupe the per-chat counts would double on every delta run.
-    seen: set = set()
-    deduped = []
-    for it in items:
-        key = it.external_id or str(it.id)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(it)
-    items = deduped
+    def _topic_or_fallback(chat_id: str, topic: Optional[str]) -> str:
+        if topic:
+            return topic
+        return f"Chat {chat_id[:8]}"
 
-    groups: Dict[str, Dict[str, Any]] = {}
-    for it in items:
-        meta = it.extra_data or {}
-        raw = meta.get("raw") or {}
-        chat_id = raw.get("chatId") or meta.get("chatId")
-        if not chat_id:
-            continue
-        g = groups.setdefault(chat_id, {"chatId": chat_id, "displayName": "", "count": 0, "lastMessageAt": None})
-        g["count"] += 1
-        # Pick a display name once (first row that has one).
-        if not g["displayName"]:
-            topic = raw.get("chatTopic") or meta.get("chatTopic")
-            if topic:
-                g["displayName"] = topic
-            else:
-                _from = raw.get("from") or {}
-                sender = (_from.get("user") or _from.get("application") or {}) if isinstance(_from, dict) else {}
-                g["displayName"] = sender.get("displayName") or f"Chat {chat_id[:8]}"
-        ts = raw.get("createdDateTime")
-        if ts and (g["lastMessageAt"] is None or ts > g["lastMessageAt"]):
-            g["lastMessageAt"] = ts
-
-    return sorted(groups.values(), key=lambda g: (g.get("lastMessageAt") or ""), reverse=True)
+    return [
+        {
+            "chatId": r.chat_id,
+            "displayName": _topic_or_fallback(r.chat_id, r.chat_topic),
+            "count": int(r.msg_count or 0),
+            "lastMessageAt": (
+                r.last_message_at.isoformat() if r.last_message_at else None
+            ),
+        }
+        for r in rows
+    ]
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/azure-db/export")
