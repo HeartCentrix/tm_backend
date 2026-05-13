@@ -7,10 +7,12 @@ state is usable. A fresh DB (schema drop/re-create) becomes self-healing.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import uuid
+from typing import Optional
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -121,30 +123,81 @@ def _seaweed_config() -> dict:
     }
 
 
+async def _try_acquire_bootstrap_lock(
+    conn,
+    lock_key: int,
+    deadline_s: float,
+) -> bool:
+    """Try to acquire the bootstrap advisory lock with bounded backoff.
+
+    Uses ``pg_try_advisory_lock`` (non-blocking) so a stuck holder can never
+    wedge the caller indefinitely. Returns True if acquired, False if we
+    gave up — in which case the caller proceeds *without* the lock,
+    relying on the per-statement SAVEPOINT recovery to handle the rare
+    CREATE FUNCTION race (idempotent DDL is safe to run concurrently;
+    SAVEPOINTs ensure we don't poison the transaction if it loses).
+    """
+    delay = 0.25
+    elapsed = 0.0
+    attempts = 0
+    while True:
+        attempts += 1
+        got = (await conn.execute(
+            text(f"SELECT pg_try_advisory_lock({lock_key})"),
+        )).scalar()
+        if got:
+            if attempts > 1:
+                log.info(
+                    "[storage-bootstrap] acquired lock after %d attempt(s) (%.1fs)",
+                    attempts, elapsed,
+                )
+            return True
+        if elapsed >= deadline_s:
+            log.warning(
+                "[storage-bootstrap] could not acquire lock %d after %.1fs / %d attempts — "
+                "proceeding without serialization (DDL is idempotent + SAVEPOINT-wrapped)",
+                lock_key, elapsed, attempts,
+            )
+            return False
+        await asyncio.sleep(delay)
+        elapsed += delay
+        delay = min(delay * 2, 2.0)
+
+
 async def ensure_storage_bootstrap(engine: AsyncEngine) -> None:
     """Seed azure-primary + seaweedfs-local + system_config, install triggers,
     assert sanity. Idempotent and safe to call from every service.
 
-    Serialized via pg_advisory_lock(9042042) — when many services boot
-    concurrently, each tries to run the same CREATE OR REPLACE FUNCTION /
-    CREATE TRIGGER DDL. Without the lock, two services racing the
-    CREATE FUNCTION hit pg_proc_proname_args_nsp_index unique violation,
-    which aborts the whole transaction and turns every subsequent stmt
-    into InFailedSQLTransactionError. The advisory lock is what the
-    storage_toggle_worker already does for its own bootstrap (key 9042042);
-    sharing the same key keeps the system serialized end-to-end.
+    Lock semantics:
+      * Uses key 9_042_043 (NOT 9_042_042). 9_042_042 is reserved by
+        storage_toggle_worker for its singleton-leader election, which
+        holds the lock for the worker's entire lifetime. Sharing that
+        key would wedge every service's init_db until the toggle worker
+        restarts.
+      * Acquires via pg_try_advisory_lock with bounded backoff (max 5s),
+        so a stuck holder can never block startup forever. If we can't
+        get the lock, we proceed anyway — the DDL is all idempotent
+        (CREATE OR REPLACE, DO $$ EXCEPTION duplicate_object NULL,
+        SAVEPOINT-wrapped) so concurrent runs are safe.
     """
-    BOOTSTRAP_LOCK_KEY = 9042042
+    BOOTSTRAP_LOCK_KEY = 9_042_043
+    # 5s is plenty: even a heavy bootstrap finishes in <2s; if we can't get
+    # the lock in 5s, something is wedged and we're better off running the
+    # idempotent DDL ourselves than waiting forever.
+    LOCK_DEADLINE_S = float(os.getenv("STORAGE_BOOTSTRAP_LOCK_DEADLINE_S", "5"))
     async with engine.begin() as conn:
-        # Acquire advisory lock first — pg_advisory_lock blocks until granted.
-        # Session-scoped: released on connect close OR by the explicit unlock
-        # in the finally block at the end of this function.
-        await conn.execute(text(f"SELECT pg_advisory_lock({BOOTSTRAP_LOCK_KEY})"))
+        have_lock = await _try_acquire_bootstrap_lock(
+            conn, BOOTSTRAP_LOCK_KEY, LOCK_DEADLINE_S,
+        )
 
-        # Wrap each DDL in its own SAVEPOINT so a stmt-level failure (rare,
-        # since we serialize with the lock above — but possible across PG
-        # versions for IF NOT EXISTS edge cases) doesn't abort the whole
-        # transaction and bring down the downstream seed.
+        # Wrap each DDL in its own SAVEPOINT so a stmt-level failure (the
+        # CREATE FUNCTION pg_proc_proname_args_nsp_index race we're
+        # guarding against, plus any IF NOT EXISTS edge cases) doesn't
+        # abort the whole transaction and bring down the downstream seed.
+        # This makes the bootstrap correct even when we couldn't acquire
+        # the advisory lock — concurrent racers just both succeed via
+        # CREATE OR REPLACE, or one loses the unique-index race and gets
+        # rolled back to its savepoint.
         for stmt in _NOTIFY_TRIGGER_STATEMENTS:
             sp_name = f"sp_bootstrap_{abs(hash(stmt)) % (10**8)}"
             try:
@@ -243,7 +296,13 @@ async def ensure_storage_bootstrap(engine: AsyncEngine) -> None:
         )
         r = row.first()
         if not r or r.active_backend_id is None or r.enabled_count == 0:
-            await conn.execute(text(f"SELECT pg_advisory_unlock({BOOTSTRAP_LOCK_KEY})"))
+            if have_lock:
+                try:
+                    await conn.execute(
+                        text(f"SELECT pg_advisory_unlock({BOOTSTRAP_LOCK_KEY})"),
+                    )
+                except Exception:
+                    pass
             raise RuntimeError(
                 "[storage-bootstrap] invariant failed: "
                 "system_config singleton or enabled backends missing after seed"
@@ -252,7 +311,10 @@ async def ensure_storage_bootstrap(engine: AsyncEngine) -> None:
         # Release the advisory lock before the txn commits, so the next
         # racing waiter unblocks immediately rather than waiting for the
         # session/connection to close.
-        await conn.execute(text(f"SELECT pg_advisory_unlock({BOOTSTRAP_LOCK_KEY})"))
+        if have_lock:
+            await conn.execute(
+                text(f"SELECT pg_advisory_unlock({BOOTSTRAP_LOCK_KEY})"),
+            )
 
     log.info("[storage-bootstrap] seed + triggers + invariants OK")
 
