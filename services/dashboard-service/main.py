@@ -482,6 +482,16 @@ async def get_protection_status(
     protected = sum(item["protectedCount"] for item in bucket_values.values())
     percentage = round(protected / total * 100, 2) if total > 0 else 0
 
+    # TEMP DEBUG — verify GROUP BY is returning the types/counts we expect.
+    # Remove once Overview vs Tab parity is confirmed. The keys come back as
+    # enum members; str() them so the JSON is human-readable.
+    _debug = {
+        "service_key": service_key,
+        "tenantId": tenantId,
+        "totals_by_type": {str(getattr(k, "value", k)): v for k, v in totals_by_type.items()},
+        "bucket_groupsAndTeams_members": [str(getattr(m, "value", m)) for m in PROTECTION_BUCKETS["groupsAndTeams"]],
+        "bucket_entraId_members": [str(getattr(m, "value", m)) for m in PROTECTION_BUCKETS["entraId"]],
+    }
     return {
         "users": bucket_values["users"],
         "sharedMailboxes": bucket_values["sharedMailboxes"],
@@ -491,6 +501,7 @@ async def get_protection_status(
         "entraId": bucket_values["entraId"],
         "powerPlatform": bucket_values["powerPlatform"],
         "percentage": percentage,
+        "_debug": _debug,
     }
 
 
