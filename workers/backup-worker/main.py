@@ -190,6 +190,28 @@ _CHAT_THREAD_DRAIN_FRESHNESS_S = int(
 )
 
 
+def _parse_iso_to_dt(s: Optional[str]) -> Optional[datetime]:
+    """Parse a Graph ISO-8601 timestamp into a tz-aware ``datetime``.
+
+    asyncpg refuses to bind string values into TIMESTAMPTZ columns even when
+    the SQL has ``CAST(:x AS TIMESTAMPTZ)`` — the type check happens before
+    the cast runs. Convert here so every helper that hits ``chat_threads``
+    or ``chat_thread_messages`` passes a real datetime to the driver.
+
+    Returns ``None`` on empty input or unparseable strings — the SQL uses
+    ``COALESCE`` / ``CAST(:x AS TIMESTAMPTZ)`` patterns that tolerate NULL.
+    """
+    if s is None or s == "":
+        return None
+    if isinstance(s, datetime):
+        return s
+    try:
+        # Python 3.11+ accepts trailing 'Z'; older versions need the swap.
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
 async def _claim_or_load_chat_thread(
     *,
     tenant_id: str,
@@ -257,7 +279,7 @@ async def _claim_or_load_chat_thread(
                 "tid": tenant_id, "cid": chat_id, "ct": chat_type,
                 "tp": chat_topic,
                 "mn": json.dumps(member_names_json) if member_names_json else None,
-                "lu": last_updated_at_iso,
+                "lu": _parse_iso_to_dt(last_updated_at_iso),
             },
         )).first()
         await s.commit()
@@ -401,19 +423,29 @@ async def _bulk_upsert_chat_thread_messages(
                 rows.append({
                     "tid": thread_id,
                     "ext": str(mid),
-                    "cdt": m.get("createdDateTime"),
-                    "ldt": m.get("lastModifiedDateTime"),
+                    "cdt": _parse_iso_to_dt(m.get("createdDateTime")),
+                    "ldt": _parse_iso_to_dt(m.get("lastModifiedDateTime")),
                     "fuid": (frm.get("id") or "")[:128],
                     "fdn": (frm.get("displayName") or "")[:256],
                     "bc": body.get("content"),
                     "bct": (body.get("contentType") or "")[:16] or None,
-                    "ddt": m.get("deletedDateTime"),
+                    "ddt": _parse_iso_to_dt(m.get("deletedDateTime")),
                     "raw": json.dumps(m, default=str),
                     "ch": _fast_hash_hex(payload_bytes),
                     "sz": len(payload_bytes),
                 })
             if not rows:
                 continue
+            # PG rejects ON CONFLICT DO UPDATE when the same conflict
+            # target appears twice in a single statement
+            # (CardinalityViolationError). Graph occasionally returns the
+            # same message_external_id more than once inside one /messages
+            # page (edits / system re-emits). Dedup by ext, last-wins so
+            # the most-recent payload sticks.
+            _seen: Dict[str, int] = {}
+            for _i, _r in enumerate(rows):
+                _seen[_r["ext"]] = _i
+            rows = [rows[i] for i in _seen.values()]
             # Multi-row VALUES (...) statement.
             values_clause = ", ".join(
                 f"(:tid_{i}, :ext_{i}, CAST(:cdt_{i} AS TIMESTAMPTZ), "
