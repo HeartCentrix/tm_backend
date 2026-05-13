@@ -12186,11 +12186,15 @@ class BackupWorker:
         # row whose parent_resource_id points at it. Status filter mirrors
         # the read path (COMPLETED, PARTIAL, PENDING_DELETION — anything
         # that still has live snapshot_items rows backing it).
+        # cast(:rid AS uuid), not :rid::uuid — asyncpg rewrites :rid to $1
+        # and the adjacent `::uuid` postgres-cast confuses its parser into
+        # "syntax error at or near :". cast(...) is parse-safe and behaves
+        # identically.
         subtree_sum = (await session.execute(text("""
             WITH targets AS (
-                SELECT :rid::uuid AS leaf
+                SELECT cast(:rid AS uuid) AS leaf
                 UNION ALL
-                SELECT id FROM resources WHERE parent_resource_id = :rid::uuid
+                SELECT id FROM resources WHERE parent_resource_id = cast(:rid AS uuid)
             )
             SELECT COALESCE(SUM(s.bytes_added), 0)
             FROM targets t
