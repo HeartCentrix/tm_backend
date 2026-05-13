@@ -25,13 +25,26 @@ class Settings:
 
         self.DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
         # Pool sizing: 2+2 was producing TooManyConnectionsError on
-        # resource_service when backup workers concurrently fanned out
-        # resource lookups. 5+5 gives ~10 max per service — 27 services ×
-        # 10 = 270, still under typical postgres max_connections (Railway
-        # ships with ~500, on-prem default 100 is easy to raise). Heavy
-        # deployments override via env var.
-        self.DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
-        self.DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "5"))
+        # Defaults sized for production backup workers: 32 concurrent
+        # OneDrive file uploads × per-upload snapshot_items inserts means
+        # a pool ≪ 32 serializes the worker on asyncpg.acquire(). Old
+        # default (5+5) silently capped a 4-replica deployment to
+        # ~40 concurrent DB ops total — the smoking gun behind the
+        # "slow during ingest" symptom Railway exhibited.
+        #
+        # 30+20 covers steady-state + burst (FILE_VERSION batch flush,
+        # chat-message bulk inserts). Per-replica × replica-count must
+        # stay under postgres max_connections; calibrate via env when
+        # going beyond 6-8 worker replicas, or front PG with PgBouncer
+        # (transaction-mode) and treat pool size as in-flight transaction
+        # slots instead of backend conns.
+        #
+        # Heads-up: previous comment claimed Railway PG ships with ~500
+        # max_connections — measured value on Railway Pro is 100. Bump
+        # POSTGRES_MAX_CONNECTIONS on the PG service (or use PgBouncer)
+        # before raising these defaults further.
+        self.DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "30"))
+        self.DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
         self.DB_POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
         self.DB_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
         self.DB_POOL_USE_LIFO = os.getenv("DB_POOL_USE_LIFO", "true").lower() in ("true", "1", "yes")
@@ -121,7 +134,14 @@ class Settings:
         self.ONPREM_S3_REGION = os.getenv("ONPREM_S3_REGION", "us-east-1")
         self.ONPREM_S3_VERIFY_TLS = os.getenv("ONPREM_S3_VERIFY_TLS", "true").lower() in ("true", "1", "yes")
         self.ONPREM_S3_CA_BUNDLE = os.getenv("ONPREM_S3_CA_BUNDLE", "") or None
-        self.ONPREM_UPLOAD_CONCURRENCY = int(os.getenv("ONPREM_UPLOAD_CONCURRENCY", "8"))
+        # S3 multipart parts in flight per file upload. 16 keeps the
+        # per-file throughput ceiling well above realistic Graph download
+        # rates (8 MB chunk × 16 / 5 ms RTT ≈ 25 GB/s); RAM per upload is
+        # bounded by chunk_size × concurrency = 8 MB × 16 = 128 MB, fits
+        # under ONEDRIVE_HUGE_FILE_RAM_BUDGET_GIB. Old default of 8
+        # silently capped Seaweed/S3 ingest at half what the upstream
+        # ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY=8 could feed it.
+        self.ONPREM_UPLOAD_CONCURRENCY = int(os.getenv("ONPREM_UPLOAD_CONCURRENCY", "16"))
         self.ONPREM_MULTIPART_THRESHOLD_MB = int(os.getenv("ONPREM_MULTIPART_THRESHOLD_MB", "100"))
         self.ONPREM_RETRY_MAX = int(os.getenv("ONPREM_RETRY_MAX", "3"))
 
@@ -349,10 +369,17 @@ class Settings:
         self.GRAPH_HARDENING_ENABLED = os.getenv(
             "GRAPH_HARDENING_ENABLED", "true"
         ).lower() in ("true", "1", "yes")
-        # Per-(app, tenant) sustained rate cap. Half of OneDrive's published
-        # 5 rps floor so we're invisible to any tenant admin's throttle alerts.
+        # Per-(app, tenant) sustained rate cap. Microsoft Graph's per-app
+        # per-tenant ceiling is ~200 req/s before throttling; 8 rps stays
+        # well clear of admin alerts AND leaves headroom for short bursts
+        # that the multi-app rotator can absorb. Old default 2.5 used
+        # only ~1% of the per-app budget — fine for a single tenant, but
+        # the multi-tenant + multi-resource scaling we built for is
+        # gated by this token-bucket. Override down for skittish tenant
+        # admins; up to 20-30 for trusted prod tenants where you've
+        # measured 429 rates and have headroom.
         self.GRAPH_APP_PACE_REQS_PER_SEC = float(
-            os.getenv("GRAPH_APP_PACE_REQS_PER_SEC", "2.5")
+            os.getenv("GRAPH_APP_PACE_REQS_PER_SEC", "8.0")
         )
         # Per-stream (= per concurrent backup) sustained rate cap.
         self.GRAPH_STREAM_PACE_REQS_PER_SEC = float(

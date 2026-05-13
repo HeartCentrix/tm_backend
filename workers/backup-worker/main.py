@@ -1869,8 +1869,27 @@ class BackupWorker:
                 print(f"[{self.worker_id}] Could not mark snapshot FAILED: {fail_exc}")
 
             try:
+                # Bulk-parent awareness: under the fan-out path each per-
+                # resource handler shares a parent Job with N-1 siblings.
+                # Flipping that parent to FAILED here on one bad child
+                # would mask 17 successful siblings and trip Activity to
+                # "Failed" prematurely. Instead, leave the parent in
+                # RUNNING and let the finalizer aggregate; only the last
+                # sibling's finalizer (the one that brings terminal_count
+                # to expected_count) actually flips the parent — to
+                # COMPLETED, FAILED, or PARTIAL depending on the spread.
                 async with async_session_factory() as s:
-                    await self.update_job_status(s, job_id, JobStatus.FAILED, {"error": str(e)[:2000]})
+                    parent = await s.get(Job, job_id)
+                    is_bulk_parent = bool(
+                        parent and parent.batch_resource_ids
+                        and len(parent.batch_resource_ids) > 0
+                    )
+                if is_bulk_parent:
+                    async with async_session_factory() as s:
+                        await self._finalize_bulk_parent_if_complete(s, job_id)
+                else:
+                    async with async_session_factory() as s:
+                        await self.update_job_status(s, job_id, JobStatus.FAILED, {"error": str(e)[:2000]})
             except Exception as job_exc:
                 print(f"[{self.worker_id}] Could not mark job FAILED: {job_exc}")
 
@@ -1909,14 +1928,35 @@ class BackupWorker:
         async with async_session_factory() as s:
             await self.complete_snapshot(s, snapshot, result)
 
-        # Safety reaper — catches any sibling snapshot left IN_PROGRESS by
-        # a fire-and-forget background task inside the handler (e.g. the
-        # USER_CHATS hosted-content / chat-attachment phase) before we
-        # flip the job to COMPLETED. See _reap_orphan_snapshots_for_job.
-        await self._reap_orphan_snapshots_for_job(job_id, "single-backup finalize")
+        # Safety reaper — catches any fire-and-forget background task
+        # inside THIS resource's handler (e.g. the USER_CHATS hosted-
+        # content / chat-attachment phase) that left a fragment
+        # IN_PROGRESS. Scope the reap to *this resource_id*; without
+        # the filter a per-resource handler under bulk fan-out would
+        # reap its siblings' actively-running snapshots and falsely
+        # flip them to PARTIAL.
+        await self._reap_orphan_snapshots_for_job(
+            job_id, "single-backup finalize",
+            resource_id_filter=str(resource.id),
+        )
 
+        # Bulk-parent awareness on success: identical reasoning to the
+        # failure path above — under fan-out the parent Job has N-1
+        # siblings still running, so directly flipping it to COMPLETED
+        # here would lie to Activity. Use the finalizer to flip only
+        # when every child has terminalised.
         async with async_session_factory() as s:
-            await self.update_job_status(s, job_id, JobStatus.COMPLETED, result)
+            parent = await s.get(Job, job_id)
+            is_bulk_parent = bool(
+                parent and parent.batch_resource_ids
+                and len(parent.batch_resource_ids) > 0
+            )
+        if is_bulk_parent:
+            async with async_session_factory() as s:
+                await self._finalize_bulk_parent_if_complete(s, job_id)
+        else:
+            async with async_session_factory() as s:
+                await self.update_job_status(s, job_id, JobStatus.COMPLETED, result)
 
         async with async_session_factory() as s:
             await self.update_resource_backup_info(s, resource, job_id, snapshot.id, result)
@@ -1944,7 +1984,29 @@ class BackupWorker:
     # ==================== Mass Backup (Parallel) ====================
 
     async def _process_mass_backup(self, job_id: uuid.UUID, message: Dict, resource_ids: List[str]):
-        """Process mass backup with full parallelism"""
+        """Pick up a bulk Job and either FAN OUT per-resource messages
+        back to the queues (default, scales horizontally with replicas)
+        or fall through to the legacy in-process iterate path (set
+        ``BACKUP_FANOUT_ENABLED=false`` to revert).
+
+        Why fan-out: prior to this change, a bulk-trigger click for
+        N resources became one fat RabbitMQ message; the worker that
+        grabbed it processed all N resources inside a single Python
+        process, so 4 replicas → 1 active replica, 3 idle, no
+        horizontal scaling. Verified live on Railway (msgs=2,
+        consumers=4, unacked=2). Fan-out re-publishes N per-resource
+        messages, each picked up by any free replica via the standard
+        single-resource handler path that SLA-scheduled backups
+        already exercise. Coordinator (this function) does ~5s of
+        DB+publish work and exits, freeing the replica for real work.
+
+        The bulk Job row stays as the single coordinator. Per-resource
+        Snapshot rows get ``job_id = bulk_job.id`` so existing
+        ``_job_rollup_bulk`` (job-service/main.py:298) derives
+        live progress from the children. ``_finalize_bulk_parent_if_complete``
+        (added in this commit) flips the parent terminal when the
+        LAST child snapshot settles.
+        """
         async with async_session_factory() as session:
             job = await session.get(Job, job_id)
             if not job:
@@ -1983,13 +2045,35 @@ class BackupWorker:
         if not resources:
             return
 
+        # ============================================================
+        # FAN-OUT PATH (default).
+        # ============================================================
+        fanout_enabled = os.environ.get(
+            "BACKUP_FANOUT_ENABLED", "true",
+        ).lower() in ("1", "true", "yes", "on")
+
+        if fanout_enabled and settings.RABBITMQ_ENABLED:
+            await self._fanout_bulk_to_per_resource(
+                job_id, message, resources,
+            )
+            return
+
+        # ============================================================
+        # LEGACY PATH (BACKUP_FANOUT_ENABLED=false).
+        # Kept as a one-env-flip rollback for the fan-out work — every
+        # line below this comment is exactly the behavior that shipped
+        # before fan-out. Do not edit without also editing
+        # _fanout_bulk_to_per_resource, or the rollback escape hatch
+        # diverges from production.
+        # ============================================================
+
         # Group by tenant + resource type for parallel processing
         groups: Dict[str, List[Resource]] = {}
         for r in resources:
             key = f"{r.tenant_id}:{r.type.value}"
             groups.setdefault(key, []).append(r)
 
-        print(f"[{self.worker_id}] Mass backup: {len(resources)} resources in {len(groups)} groups")
+        print(f"[{self.worker_id}] Mass backup (legacy in-process): {len(resources)} resources in {len(groups)} groups")
 
         # Process groups in parallel (workload parallelism)
         semaphore = asyncio.Semaphore(settings.WORKLOAD_CONCURRENCY)
@@ -2066,6 +2150,163 @@ class BackupWorker:
             })
 
         print(f"[{self.worker_id}] Mass backup done: {len(resources)-failed}/{len(resources)} succeeded")
+
+    async def _fanout_bulk_to_per_resource(
+        self,
+        job_id: uuid.UUID,
+        message: Dict,
+        resources: List[Resource],
+    ) -> None:
+        """Fan out one bulk Job into N per-resource RMQ messages.
+
+        Replaces the legacy local-iterate inside _process_mass_backup.
+        Steps:
+          1. G2 in-flight dedup — drop any resource that already has
+             an IN_PROGRESS snapshot under any Job in the last hour.
+             Defends against trigger-storm races + SLA-tick overlap.
+          2. Per-resource routing via pick_backup_queue() — heavy
+             types (OneDrive/SharePoint/PowerBI) → backup.heavy,
+             everything else → backup.urgent (or whatever queue the
+             bulk message originally landed on).
+          3. Chunked async publish (200 per gather) — 20k publishes
+             for a 5k-user trigger finish in ~3-5s without blocking
+             the RMQ connection.
+          4. Bump parent Job to progress_pct=10 (fan-out done).
+             Children will drive the rest of the progress via
+             ``_job_rollup_bulk`` at read time.
+
+        Failure modes:
+          * G2 query fails: log and fall through with no dedup (safe;
+            duplicates filtered by per-resource handler's
+            create_snapshot idempotency check).
+          * Publish fails for some messages: tracked, logged; the
+            bulk message gets rejected/requeued by the consumer loop.
+            On redelivery, G2 dedup catches the already-in-flight
+            resources so we don't double-publish.
+        """
+        from shared.export_routing import pick_backup_queue
+        from shared.message_bus import create_backup_message
+
+        if not resources:
+            return
+
+        # G2: per-resource dedup against any in-flight snapshot.
+        # Window matches the stale-sweep horizon (30 min idle threshold
+        # + 30 min safety = 1h) so genuinely-dead workers get
+        # rescheduled on the next click after the sweep reaps them.
+        skip_resource_ids: set = set()
+        try:
+            requested_ids = [str(r.id) for r in resources]
+            async with async_session_factory() as session:
+                rows = (await session.execute(
+                    text("""
+                        SELECT DISTINCT resource_id
+                        FROM tm_vault.snapshots
+                        WHERE resource_id = ANY(:rids)
+                          AND status = 'IN_PROGRESS'
+                          AND started_at > NOW() - INTERVAL '1 hour'
+                    """),
+                    {"rids": requested_ids},
+                )).all()
+            skip_resource_ids = {str(r[0]) for r in rows}
+        except Exception as exc:
+            # Best-effort dedup. The downstream per-resource handler's
+            # create_snapshot still de-dupes via the partial unique
+            # index, so the worst case here is one wasted message hop.
+            print(f"[{self.worker_id}] [FANOUT] G2 dedup query failed (non-fatal): {exc}")
+
+        to_publish: List[tuple] = []  # (queue, msg, resource_id)
+        full_backup = bool(message.get("forceFullBackup") or message.get("type") == "FULL")
+        priority = int(message.get("priority", 5) or 5)
+        for r in resources:
+            rid = str(r.id)
+            if rid in skip_resource_ids:
+                continue
+            rtype = r.type.value if hasattr(r.type, "value") else str(r.type)
+            # drive_bytes_estimate routes whales to backup.heavy.
+            # pick_backup_queue ignores tiny default value for
+            # non-drive types — they fall through to default_queue.
+            drive_bytes = int((r.extra_data or {}).get("drive_quota_used", 0))
+            queue = pick_backup_queue(
+                drive_bytes_estimate=drive_bytes,
+                resource_type=rtype,
+                default_queue=message.get("queue") or "backup.urgent",
+            )
+            msg = create_backup_message(
+                job_id=str(job_id),
+                resource_id=rid,
+                tenant_id=str(r.tenant_id),
+                full_backup=full_backup,
+            )
+            # Carry forward originator metadata so the per-resource
+            # handler audits + cancel-cleanup paths still see context.
+            if message.get("snapshotLabel"):
+                msg["snapshotLabel"] = message["snapshotLabel"]
+            if message.get("triggeredBy"):
+                msg["triggeredBy"] = message["triggeredBy"]
+            msg["parentBulkJobId"] = str(job_id)
+            to_publish.append((queue, msg, rid))
+
+        already = len(resources) - len(to_publish)
+        print(
+            f"[{self.worker_id}] [FANOUT] job={job_id} "
+            f"resources={len(resources)} publishing={len(to_publish)} "
+            f"already_in_flight={already}"
+        )
+
+        # Chunked publish — 200 per gather keeps RMQ channel within
+        # the aio-pika windowed publish budget. asyncio.gather makes
+        # them concurrent; aio-pika's send-confirm is per-publish.
+        sent = 0
+        failed = 0
+        CHUNK = int(os.environ.get("BACKUP_FANOUT_PUBLISH_CHUNK", "200"))
+        for i in range(0, len(to_publish), CHUNK):
+            batch = to_publish[i:i + CHUNK]
+            results = await asyncio.gather(
+                *[
+                    message_bus.publish(q, m, priority=priority)
+                    for (q, m, _rid) in batch
+                ],
+                return_exceptions=True,
+            )
+            for res in results:
+                if isinstance(res, Exception):
+                    failed += 1
+                else:
+                    sent += 1
+
+        if failed:
+            # Some publishes failed. The bulk message will be rejected
+            # by the outer consumer loop's exception path, requeued
+            # via RMQ, and on retry G2 dedup will skip the resources
+            # that successfully published the first time around.
+            print(
+                f"[{self.worker_id}] [FANOUT] partial publish: "
+                f"sent={sent} failed={failed}/{len(to_publish)} — "
+                f"bulk message will requeue for the failures"
+            )
+            raise RuntimeError(
+                f"fanout publish failed for {failed}/{len(to_publish)} resources"
+            )
+
+        # All published. Bump parent progress to 10% so the UI
+        # reflects "fan-out done, children running" instead of the
+        # 5% it sat at since intake. Real progress takes over via
+        # _job_rollup_bulk's snapshot-derived percentage.
+        try:
+            async with async_session_factory() as session:
+                job = await session.get(Job, job_id)
+                if job and job.progress_pct is not None and job.progress_pct < 10:
+                    job.progress_pct = 10
+                    await session.commit()
+        except Exception as exc:
+            print(f"[{self.worker_id}] [FANOUT] progress bump failed (non-fatal): {exc}")
+
+        print(
+            f"[{self.worker_id}] [FANOUT] job={job_id} → "
+            f"{sent} per-resource messages on queues; "
+            f"finalizer fires when all children settle"
+        )
 
     # ==================== Resource Group Backup ====================
 
@@ -3832,11 +4073,39 @@ class BackupWorker:
                         # thin pointer rows from the messages A already
                         # persisted in chat_thread_messages.
                         _ct_info = chat_meta.get(cid) or {}
+                        # CHAT NAME RESOLUTION — persistence policy.
+                        #
+                        # ``chat_threads.chat_topic`` must hold ONLY the real
+                        # Graph-provided topic (string from Microsoft Graph
+                        # ``chat.topic``), never the synthetic fallback
+                        # displayName we build at line ~3491. The display-
+                        # name ladder above produces things like
+                        # ``"Group Chat (19:044e5)"`` or
+                        # ``"1-on-1 Chat (19:247fe)"`` when both ``topic``
+                        # and member resolution come back empty — writing
+                        # those to ``chat_topic`` POISONS the row: every
+                        # subsequent snapshot-service read returns the
+                        # hex-truncated string forever (snapshot-service
+                        # reads chat_topic verbatim).
+                        #
+                        # Rule: pass only the real ``topic`` field. If that
+                        # is None/empty, store None — snapshot-service has
+                        # its own read-time fallback ladder that composes
+                        # a name from member-names or message authors and
+                        # auto-recovers when member resolution succeeds
+                        # later. Member names are still passed separately
+                        # so the thread row carries them for read-time
+                        # composition.
+                        _raw_topic = _ct_info.get("topic")
+                        if isinstance(_raw_topic, str) and _raw_topic.strip():
+                            _persist_topic = _raw_topic.strip()
+                        else:
+                            _persist_topic = None
                         _claim = await _claim_or_load_chat_thread(
                             tenant_id=str(tenant.id),
                             chat_id=cid,
                             chat_type=_ct_info.get("chatType"),
-                            chat_topic=_ct_info.get("displayName") or _ct_info.get("topic"),
+                            chat_topic=_persist_topic,
                             member_names=(_ct_info.get("memberNames") or []),
                             last_updated_at_iso=chat_last_updated_map.get(cid),
                         )
@@ -7277,11 +7546,17 @@ class BackupWorker:
             )
 
             # Capture historical file versions — afi keeps every version. We cap
-            # at MAX_FILE_VERSIONS (default 5) to bound storage. Only runs on
-            # newly-streamed files; skip-already-present files keep their prior
-            # snapshot's versions.
+            # at MAX_FILE_VERSIONS (default 3) to bound storage. Only runs on
+            # newly-streamed files AND only on Office filename extensions
+            # (VERSIONABLE_EXTS); other binary types either don't produce
+            # server-side versions or do so too rarely to justify the
+            # per-file /versions Graph call.
             #
             # Three-layer fast path (most → least expensive skip):
+            #
+            #   Layer 0 (NEW): filename extension not in VERSIONABLE_EXTS
+            #     → skip the whole version block; saves an entire Graph
+            #       round-trip per non-Office file.
             #
             #   Layer 1: fileSystemInfo.createdDateTime == lastModifiedDateTime
             #     → file has never been edited → no prior versions possible.
@@ -7297,7 +7572,7 @@ class BackupWorker:
             created_at = fs_info.get("createdDateTime") or file_item.get("createdDateTime")
             modified_at = fs_info.get("lastModifiedDateTime") or file_item.get("lastModifiedDateTime")
             never_edited = bool(created_at) and created_at == modified_at
-            if not never_edited:
+            if not never_edited and self._is_versionable_file(file_name):
                 # Lazy-load per-snapshot prior state. Cached on the snapshot
                 # object so all files for this resource share two indexed SQL
                 # queries (not 2*N).
@@ -7458,10 +7733,44 @@ class BackupWorker:
             await session.execute(stmt)
             await session.commit()
 
-    # Maximum prior versions to capture per file. 5 = the 5 most recent
+    # Maximum prior versions to capture per file. 3 = the 3 most recent
     # historical versions (current version is captured separately as the live
     # FILE row). Override per-deployment via env var; expose per-policy later.
-    MAX_FILE_VERSIONS = int(os.environ.get("MAX_FILE_VERSIONS", "5"))
+    MAX_FILE_VERSIONS = int(os.environ.get("MAX_FILE_VERSIONS", "3"))
+
+    # Office file extensions that have meaningful version history in Graph.
+    # Other binary types (PDFs, images, archives, video, code…) either don't
+    # produce server-side autosave versions or produce them so rarely that
+    # paying the per-file /versions Graph call is wasted budget. Override
+    # via VERSIONABLE_EXTS="docx,xlsx,pptx,..." (comma-sep, no dots) if a
+    # tenant needs a wider net.
+    _DEFAULT_VERSIONABLE_EXTS = (
+        "docx,doc,docm,dotx,dotm,"
+        "xlsx,xls,xlsm,xlsb,xltx,xltm,"
+        "pptx,ppt,pptm,potx,potm,ppsx,"
+        "vsdx,vsd,vsdm,vstx,vstm,"
+        "loop,one,onetoc2,"
+        "rtf,odt,ods,odp"
+    )
+    VERSIONABLE_EXTS = frozenset(
+        e.strip().lower().lstrip(".")
+        for e in os.environ.get("VERSIONABLE_EXTS", _DEFAULT_VERSIONABLE_EXTS).split(",")
+        if e.strip()
+    )
+
+    @classmethod
+    def _is_versionable_file(cls, file_name: Optional[str]) -> bool:
+        """True iff file_name's extension is in the Office allowlist.
+
+        Driving the version-capture decision off filename (not MIME) matches
+        how OneDrive itself decides whether to autosave version history.
+        """
+        if not file_name:
+            return False
+        i = file_name.rfind(".")
+        if i < 0 or i == len(file_name) - 1:
+            return False
+        return file_name[i + 1 :].lower() in cls.VERSIONABLE_EXTS
 
     # ─── Version-capture tunables ───────────────────────────────────────────
     # Defaults chosen so the worst-case memory footprint fits comfortably in
@@ -12817,7 +13126,10 @@ class BackupWorker:
         )
         await session.commit()
 
-    async def _reap_orphan_snapshots_for_job(self, job_id, reason: str) -> int:
+    async def _reap_orphan_snapshots_for_job(
+        self, job_id, reason: str,
+        resource_id_filter: Optional[str] = None,
+    ) -> int:
         """Close out any snapshot still `IN_PROGRESS` for this job.
 
         Called from both single- and mass-backup finalize paths right
@@ -12841,17 +13153,37 @@ class BackupWorker:
 
         We flip to PARTIAL with bytes_total/item_count derived directly
         from the snapshot_items actually written so the numbers don't
-        lie. Returns the count of rows we reaped."""
+        lie. Returns the count of rows we reaped.
+
+        ``resource_id_filter`` scopes the reap to one resource. Under
+        the bulk fan-out path each per-resource handler shares a parent
+        job_id with siblings, so a blanket job-wide reap from inside
+        one handler would prematurely flip its peers' active snapshots
+        to PARTIAL. Pass the handler's own resource_id and the reap
+        only touches that handler's own loose ends; siblings keep
+        running."""
         try:
             async with async_session_factory() as session:
-                rows = (await session.execute(
-                    text("""
-                        SELECT s.id
-                        FROM snapshots s
-                        WHERE s.job_id = :jid AND s.status = 'IN_PROGRESS'
-                    """),
-                    {"jid": job_id},
-                )).all()
+                if resource_id_filter is not None:
+                    rows = (await session.execute(
+                        text("""
+                            SELECT s.id
+                            FROM snapshots s
+                            WHERE s.job_id = :jid
+                              AND s.resource_id = :rid
+                              AND s.status = 'IN_PROGRESS'
+                        """),
+                        {"jid": job_id, "rid": resource_id_filter},
+                    )).all()
+                else:
+                    rows = (await session.execute(
+                        text("""
+                            SELECT s.id
+                            FROM snapshots s
+                            WHERE s.job_id = :jid AND s.status = 'IN_PROGRESS'
+                        """),
+                        {"jid": job_id},
+                    )).all()
                 if not rows:
                     return 0
                 reaped = 0
@@ -13646,7 +13978,18 @@ class BackupWorker:
         on snapshot_items (external_id) keep dupes out. Only create
         a fresh snapshot when no prior one exists for this exact
         (job_id, resource_id) pair.
+
+        Race-safety: the partial unique index
+        ``ix_snapshots_job_resource_inprogress`` (see shared/models.py
+        Snapshot.__table_args__) is the database-side guarantee that
+        only one IN_PROGRESS row can exist per (job_id, resource_id).
+        Under bulk fan-out two workers can race the initial SELECT
+        and both attempt an INSERT; the loser hits IntegrityError →
+        we re-SELECT to return the row the winner just committed.
+        Without this, fan-out redelivery would crash the loser worker
+        and requeue the message, costing a 5-retry DLQ trip per race.
         """
+        from sqlalchemy.exc import IntegrityError as _IntegrityError
         async with async_session_factory() as session:
             existing = await session.execute(
                 select(Snapshot).where(
@@ -13670,8 +14013,36 @@ class BackupWorker:
                 extra_data=extra_data or {},
             )
             session.add(snapshot)
-            await session.commit()
-            return snapshot
+            try:
+                await session.commit()
+                return snapshot
+            except _IntegrityError:
+                await session.rollback()
+                # Race: a sibling worker just committed an IN_PROGRESS
+                # row for this (job_id, resource_id). Re-SELECT and
+                # return theirs — the handler will resume against the
+                # winning snapshot id.
+                rerun = await session.execute(
+                    select(Snapshot).where(
+                        Snapshot.job_id == job_id,
+                        Snapshot.resource_id == resource.id,
+                        Snapshot.status == SnapshotStatus.IN_PROGRESS,
+                    ).limit(1),
+                )
+                winner = rerun.scalar_one_or_none()
+                if winner is None:
+                    # Index violation but no IN_PROGRESS row visible —
+                    # could be a partial-index edge (status was just
+                    # flipped) or a different constraint. Re-raise so
+                    # RMQ retry path takes over rather than silently
+                    # masking the error.
+                    raise
+                print(
+                    f"[{self.worker_id}] create_snapshot race lost for "
+                    f"({job_id}, {resource.id}) — resuming against "
+                    f"winner snapshot id={winner.id}"
+                )
+                return winner
 
     async def fail_snapshot(self, session: AsyncSession, snapshot: Snapshot, error: Exception):
         """Mark snapshot as FAILED with error details so it leaves IN_PROGRESS state."""
@@ -13696,6 +14067,123 @@ class BackupWorker:
             if status == JobStatus.COMPLETED:
                 job.progress_pct = 100
             await session.commit()
+
+    async def _finalize_bulk_parent_if_complete(
+        self, session: AsyncSession, job_id: uuid.UUID,
+    ) -> Optional[str]:
+        """Flip a bulk parent Job to terminal status iff ALL of its
+        child snapshots have reached terminal state.
+
+        The fan-out path (``_process_mass_backup``) re-publishes per-
+        resource messages back to the queues. The bulk Job stays
+        RUNNING during that drain. Each per-resource handler calls
+        this at the end of its own work; the LAST handler to finish
+        (where ``terminal_count >= expected_count``) is the one whose
+        UPDATE actually fires and flips the parent — earlier callers
+        see the row still has live siblings and short-circuit.
+
+        Idempotent under concurrent calls thanks to the `WHERE
+        j.status NOT IN (terminal)` guard — once flipped, no
+        subsequent finalizer can re-flip.
+
+        ``expected_count`` = ``array_length(batch_resource_ids, 1)``.
+        For legacy single-resource Jobs (where ``batch_resource_ids``
+        is NULL) the bulk path was never used, so this helper is a
+        no-op and the caller falls back to the legacy
+        ``update_job_status`` flip. Returns the terminal status the
+        parent landed in ('COMPLETED' or 'FAILED') if we flipped,
+        else None.
+
+        Terminal-status mapping — only the two values the
+        ``jobstatus`` enum actually has (COMPLETED, FAILED). The
+        codebase has never had a Job-level PARTIAL. Snapshots CAN
+        be PARTIAL (snapshot-level outcome of a single resource),
+        but the bulk Job rolls up to: COMPLETED if any child made
+        progress (counts.completed > 0 or counts.partial > 0);
+        FAILED only when every single child failed. Operators see
+        the per-resource breakdown via the snapshots table — Job
+        status is the coarse outcome."""
+        try:
+            row = (await session.execute(
+                text("""
+                    WITH expected AS (
+                        SELECT COALESCE(array_length(batch_resource_ids, 1), 0) AS n,
+                               status::text AS j_status,
+                               id
+                        FROM jobs WHERE id = :jid
+                    ),
+                    counts AS (
+                        SELECT
+                          COUNT(*) FILTER (
+                              WHERE status IN ('COMPLETED','FAILED','PARTIAL')
+                          ) AS terminal,
+                          COUNT(*) FILTER (WHERE status = 'FAILED') AS failed,
+                          COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
+                          COUNT(*) FILTER (WHERE status = 'PARTIAL') AS partial,
+                          COALESCE(SUM(item_count) FILTER (
+                              WHERE status IN ('COMPLETED','PARTIAL')), 0) AS items,
+                          COALESCE(SUM(bytes_added) FILTER (
+                              WHERE status IN ('COMPLETED','PARTIAL')), 0) AS bytes
+                        FROM snapshots WHERE job_id = :jid
+                    )
+                    UPDATE jobs j SET
+                        status = (CASE
+                            WHEN c.terminal < e.n THEN j.status
+                            WHEN c.completed = 0 AND c.partial = 0 THEN 'FAILED'::jobstatus
+                            ELSE 'COMPLETED'::jobstatus
+                        END),
+                        completed_at = (CASE
+                            WHEN c.terminal = e.n THEN NOW()
+                            ELSE j.completed_at
+                        END),
+                        progress_pct = GREATEST(
+                            COALESCE(j.progress_pct, 0),
+                            LEAST(99, (100 * c.terminal / NULLIF(e.n, 0))::int)
+                        ),
+                        items_processed = c.items,
+                        bytes_processed = c.bytes,
+                        result = COALESCE(j.result, '{}'::json)::jsonb || jsonb_build_object(
+                            'snapshots_total', e.n,
+                            'snapshots_completed', c.completed,
+                            'snapshots_failed', c.failed,
+                            'snapshots_partial', c.partial,
+                            'items_processed', c.items,
+                            'bytes_processed', c.bytes
+                        )
+                    FROM counts c, expected e
+                    WHERE j.id = :jid
+                      AND e.n > 0
+                      AND j.status NOT IN (
+                          'COMPLETED'::jobstatus, 'FAILED'::jobstatus,
+                          'CANCELLED'::jobstatus, 'CANCELLING'::jobstatus
+                      )
+                    RETURNING j.status::text AS new_status, c.terminal, e.n
+                """),
+                {"jid": job_id},
+            )).first()
+            await session.commit()
+            if row is None:
+                return None
+            new_status = row.new_status if hasattr(row, "new_status") else row[0]
+            terminal = row.terminal if hasattr(row, "terminal") else row[1]
+            expected = row.n if hasattr(row, "n") else row[2]
+            if int(terminal) >= int(expected) and new_status in (
+                "COMPLETED", "FAILED",
+            ):
+                print(
+                    f"[{self.worker_id}] [FANOUT/FINALIZE] job={job_id} "
+                    f"→ {new_status} ({terminal}/{expected} children terminal)"
+                )
+                return new_status
+            return None
+        except Exception as exc:
+            # Finalizer is a best-effort flip — failures are caught by
+            # the periodic stale-sweep in backup-scheduler.
+            print(
+                f"[{self.worker_id}] [FANOUT/FINALIZE] best-effort flip "
+                f"failed for job={job_id}: {exc}",
+            )
+            return None
 
     def chunk_list(self, lst: list, size: int):
         for i in range(0, len(lst), size):

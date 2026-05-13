@@ -3,7 +3,8 @@ import uuid
 from datetime import datetime, timezone
 from sqlalchemy import (
     Column, String, DateTime, Boolean, Integer, BigInteger,
-    Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func, LargeBinary
+    Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func, LargeBinary,
+    Index, text as sql_text,
 )
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import relationship
@@ -498,6 +499,23 @@ class Snapshot(Base):
     # NOT NULL enforced after backfill migration.
     backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
     created_at = Column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        # Per-resource single-claim guarantee for the fan-out path. When a
+        # bulk Job fans out 5k per-resource messages, RMQ may redeliver a
+        # message after a worker crash; without this index two workers could
+        # both INSERT IN_PROGRESS rows for the same (job_id, resource_id)
+        # and we'd double the work + double-bill blob storage. The partial
+        # WHERE clause lets historical terminal-state snapshots coexist
+        # (multiple COMPLETED rows over time for the same resource is the
+        # normal case for retention), only the *active* claim is unique.
+        Index(
+            "ix_snapshots_job_resource_inprogress",
+            "job_id", "resource_id",
+            unique=True,
+            postgresql_where=sql_text("status = 'IN_PROGRESS'"),
+        ),
+    )
 
 
 class SnapshotItem(Base):

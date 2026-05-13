@@ -521,6 +521,100 @@ async def startup():
                                 f"[backup-scheduler] stale_sweep retry failed for "
                                 f"snapshot={_snap_id}: {inner}"
                             )
+
+            # Bulk-parent finalizer backstop. Each per-resource handler
+            # under the fan-out path opportunistically tries to flip
+            # its bulk parent Job terminal via
+            # ``_finalize_bulk_parent_if_complete``. If every sibling
+            # finalizer happened to be CANCELLING or hit a transient
+            # race, the parent can sit RUNNING forever even though all
+            # its children settled. This pass catches that.
+            #
+            # Same CTE as the worker's finalizer, but applied to every
+            # RUNNING bulk Job in one shot. Idempotent: the WHERE
+            # ``j.status NOT IN (terminal)`` guard makes repeated
+            # invocations harmless.
+            try:
+                async with async_session_factory() as session:
+                    flip_rows = (await session.execute(text("""
+                        WITH bulk_jobs AS (
+                            SELECT id,
+                                   COALESCE(array_length(batch_resource_ids, 1), 0) AS n
+                            FROM jobs
+                            WHERE status NOT IN (
+                                'COMPLETED'::jobstatus, 'FAILED'::jobstatus,
+                                'CANCELLED'::jobstatus, 'CANCELLING'::jobstatus
+                            )
+                              AND batch_resource_ids IS NOT NULL
+                              AND array_length(batch_resource_ids, 1) > 0
+                        ),
+                        counts AS (
+                            SELECT
+                                s.job_id,
+                                COUNT(*) FILTER (
+                                    WHERE s.status IN (
+                                        'COMPLETED','FAILED','PARTIAL'
+                                    )
+                                ) AS terminal,
+                                COUNT(*) FILTER (WHERE s.status='FAILED') AS failed,
+                                COUNT(*) FILTER (WHERE s.status='COMPLETED') AS completed,
+                                COUNT(*) FILTER (WHERE s.status='PARTIAL') AS partial,
+                                COALESCE(SUM(s.item_count) FILTER (
+                                    WHERE s.status IN ('COMPLETED','PARTIAL')
+                                ), 0) AS items,
+                                COALESCE(SUM(s.bytes_added) FILTER (
+                                    WHERE s.status IN ('COMPLETED','PARTIAL')
+                                ), 0) AS bytes
+                            FROM snapshots s
+                            JOIN bulk_jobs bj ON s.job_id = bj.id
+                            GROUP BY s.job_id
+                        )
+                        UPDATE jobs j SET
+                            -- Terminal-status mapping matches jobstatus
+                            -- enum (COMPLETED / FAILED only — no PARTIAL
+                            -- at the Job level). Mixed-outcome bulks
+                            -- flip to COMPLETED with c.failed in result;
+                            -- only an all-failed bulk lands at FAILED.
+                            status = (CASE
+                                WHEN c.completed = 0 AND c.partial = 0
+                                    THEN 'FAILED'::jobstatus
+                                ELSE 'COMPLETED'::jobstatus
+                            END),
+                            completed_at = NOW(),
+                            progress_pct = 100,
+                            items_processed = c.items,
+                            bytes_processed = c.bytes,
+                            result = COALESCE(j.result, '{}'::json)::jsonb
+                                     || jsonb_build_object(
+                                        'finalized_by', 'stale_sweep',
+                                        'snapshots_total', bj.n,
+                                        'snapshots_completed', c.completed,
+                                        'snapshots_failed', c.failed,
+                                        'snapshots_partial', c.partial,
+                                        'items_processed', c.items,
+                                        'bytes_processed', c.bytes
+                                     )
+                        FROM counts c, bulk_jobs bj
+                        WHERE j.id = bj.id
+                          AND j.id = c.job_id
+                          AND c.terminal >= bj.n
+                          AND j.status NOT IN (
+                              'COMPLETED'::jobstatus, 'FAILED'::jobstatus,
+                              'CANCELLED'::jobstatus, 'CANCELLING'::jobstatus
+                          )
+                        RETURNING j.id, j.status::text
+                    """))).fetchall()
+                    await session.commit()
+                    if flip_rows:
+                        print(
+                            f"[backup-scheduler] bulk_parent_finalize: "
+                            f"flipped {len(flip_rows)} stuck bulk Jobs "
+                            f"({[r[1] for r in flip_rows[:5]]}{'...' if len(flip_rows) > 5 else ''})"
+                        )
+            except Exception as bulk_exc:
+                print(
+                    f"[backup-scheduler] bulk_parent_finalize failed: {bulk_exc}",
+                )
         except Exception as exc:
             print(f"[backup-scheduler] stale_snapshot_sweep failed: {exc}")
 

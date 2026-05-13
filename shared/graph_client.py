@@ -3743,70 +3743,203 @@ class GraphClient:
         disk_threshold_mb: int = 256,
         chunk_mb: int = 16,
     ) -> Tuple[Optional[bytes], Optional[str], int]:
-        """Three-tier version content fetch.
+        """Three-tier version content fetch with policy-driven 429/503 retry.
 
         - size ≤ inline_buffer_mb  → single GET into memory, return (bytes, None, size)
         - size ≤ disk_threshold_mb → chunked streaming into memory, return (bytes, None, size)
         - else                     → streaming download to disk-temp, return (None, path, size)
 
         Caller is responsible for cleaning up the disk-temp path if returned.
-        On any network failure raises the underlying httpx exception so the
-        outer per-version best-effort try/except can log and continue.
+
+        Throttle handling: routes through the same per-app pacing bucket +
+        multi-app throttle marker as the rest of GraphClient. On 429/503
+        the worker sleeps for the policy-decided Retry-After and retries
+        from the start of whichever tier was active — re-issuing a single
+        idempotent GET, not duplicating bytes. On cumulative-cap exhaustion
+        raises GraphRetryExhaustedError so the caller's best-effort
+        try/except can log and move to the next version.
         """
+        from shared.config import settings as s
+        from shared.multi_app_manager import multi_app_manager
+
         url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/versions/{version_id}/content"
-        token = await self._get_token()
-        headers = {"Authorization": f"Bearer {token}"}
         inline_cap = inline_buffer_mb * 1024 * 1024
         disk_cap = disk_threshold_mb * 1024 * 1024
         chunk_bytes = max(chunk_mb * 1024 * 1024, 1024 * 1024)
+        policy = self._policy
 
         async with self._http_session() as client:
-            # Tier 1 — small files: single non-streaming GET, simplest path.
-            if size_hint and size_hint <= inline_cap:
-                resp = await client.get(url, headers=headers)
-                resp.raise_for_status()
-                return resp.content, None, len(resp.content)
+            while True:
+                prio = self._effective_priority()
+                await policy.stream_bucket.acquire(priority=prio)
+                await multi_app_manager.acquire_app_token(self.client_id, priority=prio)
+                token = await self._get_token()
+                headers = {"Authorization": f"Bearer {token}"}
 
-            # Tier 2/3 — stream the response. Decide memory-vs-disk based on
-            # actual content-length once response headers arrive (size_hint
-            # may be stale or 0 for unknown sizes).
-            async with client.stream("GET", url, headers=headers) as resp:
-                resp.raise_for_status()
-                cl_header = resp.headers.get("Content-Length")
-                actual_size = int(cl_header) if cl_header and cl_header.isdigit() else (size_hint or 0)
-                if actual_size and actual_size <= disk_cap:
-                    # Tier 2 — buffer in memory, chunked.
-                    buf = bytearray()
-                    async for chunk in resp.aiter_bytes(chunk_size=chunk_bytes):
-                        buf.extend(chunk)
-                    return bytes(buf), None, len(buf)
-                # Tier 3 — spill to disk, bounded RAM.
-                import tempfile
-                fd, tmp_path = tempfile.mkstemp(prefix="ver_", suffix=".bin")
-                total = 0
                 try:
-                    with os.fdopen(fd, "wb") as fh:
-                        async for chunk in resp.aiter_bytes(chunk_size=chunk_bytes):
-                            fh.write(chunk)
-                            total += len(chunk)
-                    return None, tmp_path, total
-                except BaseException:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                    raise
+                    # Tier 1 — small files: single non-streaming GET, simplest path.
+                    if size_hint and size_hint <= inline_cap:
+                        resp = await client.get(url, headers=headers)
+                        if resp.status_code in (429, 503):
+                            action = policy.decide(
+                                status_code=resp.status_code,
+                                retry_after=resp.headers.get("Retry-After"),
+                            )
+                            if action.exhausted:
+                                raise GraphRetryExhaustedError(
+                                    f"version content cap hit on {url[:80]}: {action.reason}"
+                                )
+                            multi_app_manager.mark_throttled(
+                                self.client_id, int(action.sleep_seconds),
+                            )
+                            print(f"[GraphClient/version] {resp.status_code} on "
+                                  f"{url[:80]} — {action.reason}")
+                            await asyncio.sleep(action.sleep_seconds)
+                            if s.GRAPH_POST_THROTTLE_BRAKE_MS > 0:
+                                await asyncio.sleep(s.GRAPH_POST_THROTTLE_BRAKE_MS / 1000.0)
+                            continue
+                        resp.raise_for_status()
+                        policy.reset_on_success()
+                        try:
+                            _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
+                            multi_app_manager.mark_success(self.client_id, _lat_ms)
+                        except Exception:
+                            pass
+                        return resp.content, None, len(resp.content)
+
+                    # Tier 2/3 — stream the response. Decide memory-vs-disk based
+                    # on actual content-length once response headers arrive
+                    # (size_hint may be stale or 0 for unknown sizes).
+                    async with client.stream("GET", url, headers=headers) as resp:
+                        if resp.status_code in (429, 503):
+                            action = policy.decide(
+                                status_code=resp.status_code,
+                                retry_after=resp.headers.get("Retry-After"),
+                            )
+                            if action.exhausted:
+                                raise GraphRetryExhaustedError(
+                                    f"version content cap hit on {url[:80]}: {action.reason}"
+                                )
+                            multi_app_manager.mark_throttled(
+                                self.client_id, int(action.sleep_seconds),
+                            )
+                            print(f"[GraphClient/version] {resp.status_code} on "
+                                  f"{url[:80]} — {action.reason}")
+                            # Drain so the connection can be reused.
+                            try:
+                                await resp.aread()
+                            except Exception:
+                                pass
+                            await asyncio.sleep(action.sleep_seconds)
+                            if s.GRAPH_POST_THROTTLE_BRAKE_MS > 0:
+                                await asyncio.sleep(s.GRAPH_POST_THROTTLE_BRAKE_MS / 1000.0)
+                            continue
+                        resp.raise_for_status()
+                        policy.reset_on_success()
+                        try:
+                            _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
+                            multi_app_manager.mark_success(self.client_id, _lat_ms)
+                        except Exception:
+                            pass
+                        cl_header = resp.headers.get("Content-Length")
+                        actual_size = int(cl_header) if cl_header and cl_header.isdigit() else (size_hint or 0)
+                        if actual_size and actual_size <= disk_cap:
+                            # Tier 2 — buffer in memory, chunked.
+                            buf = bytearray()
+                            async for chunk in resp.aiter_bytes(chunk_size=chunk_bytes):
+                                buf.extend(chunk)
+                            return bytes(buf), None, len(buf)
+                        # Tier 3 — spill to disk, bounded RAM.
+                        import tempfile
+                        fd, tmp_path = tempfile.mkstemp(prefix="ver_", suffix=".bin")
+                        total = 0
+                        try:
+                            with os.fdopen(fd, "wb") as fh:
+                                async for chunk in resp.aiter_bytes(chunk_size=chunk_bytes):
+                                    fh.write(chunk)
+                                    total += len(chunk)
+                            return None, tmp_path, total
+                        except BaseException:
+                            try:
+                                os.unlink(tmp_path)
+                            except OSError:
+                                pass
+                            raise
+                except (httpx.ReadTimeout, httpx.ConnectTimeout,
+                        httpx.RemoteProtocolError) as exc:
+                    action = policy.decide_transient_error()
+                    if action.exhausted:
+                        raise GraphRetryExhaustedError(
+                            f"version content transient cap hit on {url[:80]}: "
+                            f"{type(exc).__name__}"
+                        )
+                    print(f"[GraphClient/version] transient {type(exc).__name__} "
+                          f"on {url[:80]}; sleep {action.sleep_seconds:.1f}s")
+                    await asyncio.sleep(action.sleep_seconds)
+                    continue
 
     async def get_file_version_content(
         self, drive_id: str, item_id: str, version_id: str
     ) -> bytes:
-        """Download the binary content of a specific historical version."""
+        """Download the binary content of a specific historical version.
+
+        Same 429/503 Retry-After handling as stream_file_version_3tier, so a
+        throttled tenant won't burn this call on the first attempt.
+        """
+        from shared.config import settings as s
+        from shared.multi_app_manager import multi_app_manager
+
         url = f"{self.GRAPH_URL}/drives/{drive_id}/items/{item_id}/versions/{version_id}/content"
-        token = await self._get_token()
+        policy = self._policy
+
         async with self._http_session() as client:
-            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
-            resp.raise_for_status()
-            return resp.content
+            while True:
+                prio = self._effective_priority()
+                await policy.stream_bucket.acquire(priority=prio)
+                await multi_app_manager.acquire_app_token(self.client_id, priority=prio)
+                token = await self._get_token()
+                try:
+                    resp = await client.get(
+                        url, headers={"Authorization": f"Bearer {token}"},
+                    )
+                except (httpx.ReadTimeout, httpx.ConnectTimeout,
+                        httpx.RemoteProtocolError) as exc:
+                    action = policy.decide_transient_error()
+                    if action.exhausted:
+                        raise GraphRetryExhaustedError(
+                            f"version content transient cap hit on {url[:80]}: "
+                            f"{type(exc).__name__}"
+                        )
+                    print(f"[GraphClient/version] transient {type(exc).__name__} "
+                          f"on {url[:80]}; sleep {action.sleep_seconds:.1f}s")
+                    await asyncio.sleep(action.sleep_seconds)
+                    continue
+                if resp.status_code in (429, 503):
+                    action = policy.decide(
+                        status_code=resp.status_code,
+                        retry_after=resp.headers.get("Retry-After"),
+                    )
+                    if action.exhausted:
+                        raise GraphRetryExhaustedError(
+                            f"version content cap hit on {url[:80]}: {action.reason}"
+                        )
+                    multi_app_manager.mark_throttled(
+                        self.client_id, int(action.sleep_seconds),
+                    )
+                    print(f"[GraphClient/version] {resp.status_code} on "
+                          f"{url[:80]} — {action.reason}")
+                    await asyncio.sleep(action.sleep_seconds)
+                    if s.GRAPH_POST_THROTTLE_BRAKE_MS > 0:
+                        await asyncio.sleep(s.GRAPH_POST_THROTTLE_BRAKE_MS / 1000.0)
+                    continue
+                resp.raise_for_status()
+                policy.reset_on_success()
+                try:
+                    _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
+                    multi_app_manager.mark_success(self.client_id, _lat_ms)
+                except Exception:
+                    pass
+                return resp.content
 
     # ── File / item permissions ─────────────────────────────────────────────
     # Graph's `permissions` collection on a drive item lists every grant —
