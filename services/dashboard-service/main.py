@@ -10,7 +10,10 @@ from fastapi import FastAPI, Depends, Query, HTTPException
 from sqlalchemy import select, func, text, and_, or_
 
 from shared.database import get_db, close_db, AsyncSession, engine
-from shared.models import Resource, Job, JobType, JobStatus, Snapshot, SnapshotItem, SnapshotStatus, ResourceType, ResourceStatus, Tenant, TenantType
+from shared.models import (
+    Resource, Job, JobType, JobStatus, Snapshot, SnapshotItem, SnapshotStatus,
+    ResourceType, ResourceStatus, Tenant, TenantType, UI_HIDDEN_TYPES,
+)
 
 log = logging.getLogger("dashboard-service")
 

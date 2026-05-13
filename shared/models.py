@@ -95,6 +95,32 @@ class ResourceType(str, enum.Enum):
     USER_CHATS = "USER_CHATS"
 
 
+# Resource types hidden from UI listing endpoints by default. Shared between
+# resource-service (filters /by-type and /resources listings) and
+# dashboard-service (filters the Protection Status GROUP BY) so the
+# Overview cards and the underlying tab lists always agree on the same
+# universe of rows. A caller that genuinely needs hidden rows can opt in via
+# ?includeHidden=true on the listing endpoints.
+#
+# Why each is hidden:
+#   TEAMS_CHAT_EXPORT — backup-scheduler-internal per-user shard that carries
+#       the Graph delta token for the whole-user chat export; not a
+#       user-facing entity (TEAMS_CHAT rows are).
+#   USER_MAIL / USER_ONEDRIVE / USER_CONTACTS / USER_CALENDAR / USER_CHATS —
+#       Tier 2 per-content-category children under an ENTRA_USER parent.
+#       The parent row already rolls up their storage_bytes and last-backup
+#       timestamps, so surfacing them in Protection creates five dupes per
+#       user each needing their own SLA — which isn't how protection works.
+#   TEAMS_CHANNEL — duplicates an M365_GROUP row for the same Team (same
+#       external_id). M365_GROUP backup fans out into channels + group
+#       mailbox + team site, so the TEAMS_CHANNEL row is redundant.
+UI_HIDDEN_TYPES: set[str] = {
+    "TEAMS_CHAT_EXPORT",
+    "USER_MAIL", "USER_ONEDRIVE", "USER_CONTACTS", "USER_CALENDAR", "USER_CHATS",
+    "TEAMS_CHANNEL",
+}
+
+
 class ResourceStatus(str, enum.Enum):
     DISCOVERED = "DISCOVERED"
     ACTIVE = "ACTIVE"
