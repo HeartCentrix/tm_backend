@@ -7009,6 +7009,10 @@ class BackupWorker:
         # Use a single-row UPSERT instead so the second writer is a no-op
         # (the row is already correct — same external_id, same blob_path).
         from sqlalchemy.dialects.postgresql import insert as _pg_insert
+        # IMPORTANT: pg_insert(SnapshotItem.__table__) uses DB column names,
+        # not ORM attribute names. SnapshotItem.extra_data maps to the DB
+        # column "metadata" — using "extra_data" here triggers CompileError:
+        # "Unconsumed column names: extra_data" and every OneDrive file fails.
         row = {
             "snapshot_id": snapshot.id,
             "tenant_id": tenant.id,
@@ -7019,7 +7023,7 @@ class BackupWorker:
             "content_hash": content_hash if content_hash else None,
             "content_size": content_size,
             "blob_path": blob_path,
-            "extra_data": {"structured": metadata},
+            "metadata": {"structured": metadata},
             "content_checksum": content_hash if content_hash else None,
         }
         stmt = _pg_insert(SnapshotItem.__table__).values(**row).on_conflict_do_nothing(
