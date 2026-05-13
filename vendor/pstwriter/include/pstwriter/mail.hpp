@@ -60,6 +60,13 @@ struct MailPcBuildContext {
     // Round L+: message's own NID — used to populate PR_LtpRowId on
     // the message PC (matching row's LtpRowId for identity check).
     Nid messageNid  {0u};
+
+    // M12.11+: parent folder's NID — used by contact PCs to populate
+    // PR_LTP_PARENT_NID (0x0E2F). Scanpst's "Failed to add row to the
+    // FLT" check appears to require this on contact PCs even though
+    // libpff/drag-from-mount tolerate its absence. Mail PCs leave it
+    // zero (M12 attempts on mail showed no scanpst delta).
+    Nid parentFolderNid {0u};
 };
 
 struct MailPcSubnode {
@@ -188,6 +195,23 @@ struct M7FolderSchema {
     // PidTagPstHiddenCount / PidTagPstHiddenUnread (0x6635 / 0x6636).
     uint32_t pstHiddenCount       {0u};
     uint32_t pstHiddenUnreadCount {0u};
+
+    // M12.15: explicit PR_ATTR_HIDDEN (0x10F4). When `emitAttrHidden` is
+    // true, emit the Boolean property with `attrHiddenValue`; otherwise
+    // omit. REF (real-Outlook contacts.pst, 2026-05-13) emits this on
+    // user-visible contact folders (= False) and on the 7 hidden system
+    // sub-folders under Contacts (= True). Special root-level folders
+    // (IPM Subtree, Root, Deleted Items) omit it entirely.
+    bool emitAttrHidden  {false};
+    bool attrHiddenValue {false};
+
+    // M12.15: force-emit PR_PstHiddenCount/PstHiddenUnread (0x6635/0x6636)
+    // even when both values are 0. Without this, the existing
+    // "non-zero only" path leaves them off the PC, which then disagrees
+    // with the IPM Subtree Hierarchy TC row's CEB bits 11/12 — REF sets
+    // those bits on user contact folder rows so the matching PC tags
+    // must be present even with value 0.
+    bool emitPstHiddenZero {false};
 };
 
 // Pre-computed UTF-16-LE bytes for the three Outlook container classes.

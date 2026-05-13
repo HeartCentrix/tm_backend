@@ -295,14 +295,25 @@ PcResult buildFolderPcExtended(const M7FolderSchema& schema,
     props.push_back({ 0x7C0Fu, PropType::Int32,
                       designClassBytes.data(), 4u, PropStorageHint::Auto });
 
-    // PR_PstHiddenCount / PR_PstHiddenUnreadCount: only emit when non-zero
-    // (matches real-Outlook-PST behaviour).
-    if (schema.pstHiddenCount != 0u)
+    // PR_PstHiddenCount / PR_PstHiddenUnreadCount: emit when non-zero, OR
+    // when the caller has set `emitPstHiddenZero` (M12.15: REF carries
+    // both tags with value 0 on user-visible contact folders so the IPM
+    // Subtree Hierarchy TC row's CEB bits 11/12 line up with the PC).
+    if (schema.pstHiddenCount != 0u || schema.emitPstHiddenZero)
         props.push_back({ 0x6635u, PropType::Int32,
                           hiddenCountBytes.data(), 4u, PropStorageHint::Auto });
-    if (schema.pstHiddenUnreadCount != 0u)
+    if (schema.pstHiddenUnreadCount != 0u || schema.emitPstHiddenZero)
         props.push_back({ 0x6636u, PropType::Int32,
                           hiddenUnreadBytes.data(), 4u, PropStorageHint::Auto });
+
+    // M12.15: explicit PR_ATTR_HIDDEN (0x10F4) — emit when caller opts in.
+    array<uint8_t, 1> attrHiddenBytes{
+        static_cast<uint8_t>(schema.attrHiddenValue ? 1u : 0u)
+    };
+    if (schema.emitAttrHidden) {
+        props.push_back({ 0x10F4u, PropType::Boolean,
+                          attrHiddenBytes.data(), 1u, PropStorageHint::Auto });
+    }
 
     return buildPropertyContext(props.data(), props.size(), firstSubnodeNid);
 }
@@ -379,6 +390,10 @@ TcResult buildFolderHierarchyTc(const HierarchyTcRow* rows, size_t rowCount)
         detail::writeU32(dst, 12, src.contentCount);
         // Bytes 16..19: ContentUnreadCount
         detail::writeU32(dst, 16, src.contentUnreadCount);
+        // Bytes 44..47: PstHiddenCount (col 0x6635, iBit 11)
+        detail::writeU32(dst, 44, src.pstHiddenCount);
+        // Bytes 48..51: PstHiddenUnread (col 0x6636, iBit 12)
+        detail::writeU32(dst, 48, src.pstHiddenUnreadCount);
         // Byte  52:     Subfolders
         dst[52] = src.hasSubfolders ? 1u : 0u;
 
@@ -419,6 +434,15 @@ TcResult buildFolderHierarchyTc(const HierarchyTcRow* rows, size_t rowCount)
                                         src.containerClassUtf16le,
                                         src.containerClassSize });
             setCebBit(ceb, 10);
+        }
+
+        // M12.15: claim PstHiddenCount / PstHiddenUnread cells when caller
+        // opts in (REF sets these on the user contacts folder row with
+        // value 0; the child folder's PC must emit the matching tags via
+        // schema.emitPstHiddenZero so the row/PC pair stays consistent).
+        if (src.emitPstHidden) {
+            setCebBit(ceb, 11);
+            setCebBit(ceb, 12);
         }
 
         tcRows[r].rowId       = src.rowId.value;
@@ -766,6 +790,10 @@ constexpr NamedPropEntry kNamedProps[] = {
     { 0x8082u, kLidEmail1AddressType,            kPsetidAddressWGuid     },
     { 0x8083u, kLidEmail1EmailAddress,           kPsetidAddressWGuid     },
     { 0x8084u, kLidEmail1OriginalDisplayName,    kPsetidAddressWGuid     },
+    { 0x8007u, kLidContactItemData,              kPsetidAddressWGuid     },
+    { 0x8028u, kLidAbProviderEmailList,          kPsetidAddressWGuid     },
+    { 0x8029u, kLidAbProviderArrayType,          kPsetidAddressWGuid     },
+    { 0x8085u, kLidEmail1OriginalEntryId,        kPsetidAddressWGuid     },
 };
 constexpr size_t kNamedPropsCount =
     sizeof(kNamedProps) / sizeof(kNamedProps[0]);

@@ -45,6 +45,46 @@ PcResult buildContactFolderPc(const M7FolderSchema& schema,
                                  kContainerClassContact.size());
 }
 
+// ============================================================================
+// M12.15 — anatomy of a "real" Outlook contacts folder.
+//
+// REF (Outlook-exported contacts.pst, 2026-05-13) shows the user-visible
+// Contacts folder (NID 0x8082) carries 7 hidden child folders, each with
+// a specific PR_CONTAINER_CLASS sub-class. These are part of the
+// "standard contacts anatomy" Outlook creates whenever a mailbox is
+// initialised; without them, the Import wizard appears to silently
+// classify our user-named folder as a non-default contacts folder and
+// skip the import even though drag-from-mount works.
+//
+// Layout: { display name, container class }. CCs are UTF-16-LE so we
+// store the literal C-string and convert at use time.
+struct ContactSubfolderSpec {
+    const char* displayName;
+    const char* containerClass;
+};
+static constexpr ContactSubfolderSpec kContactSubfolders[] = {
+    // Order matches REF byte-diff. Display names matching {GUID} pattern
+    // are Outlook-generated identifiers for the MOC (Microsoft Office
+    // Communicator / Skype for Business) presence integration folders;
+    // we reuse REF's literal GUID values for byte-similarity.
+    { "Recipient Cache",
+      "IPF.Contact.RecipientCache" },
+    { "{06967759-274D-40B2-A3EB-D7F9E73727D7}",
+      "IPF.Contact.MOC.QuickContacts" },
+    { "{A9E2BC46-B3A0-4243-B315-60D991004455}",
+      "IPF.Contact.MOC.ImContactList" },
+    { "Companies",
+      "IPF.Contact.Company" },
+    { "GAL Contacts",
+      "IPF.Contact.GalContacts" },
+    { "Organizational Contacts",
+      "IPF.Contact.OrganizationalContacts" },
+    { "PeopleCentricConversation Buddies",
+      "IPF.Contact.PeopleCentricConversationBuddies" },
+};
+static constexpr size_t kContactSubfolderCount =
+    sizeof(kContactSubfolders) / sizeof(kContactSubfolders[0]);
+
 namespace {
 
 // ----------------------------------------------------------------------------
@@ -66,6 +106,14 @@ constexpr uint16_t kCreationTime            = 0x3007u;
 constexpr uint16_t kLastModificationTime    = 0x3008u;
 constexpr uint16_t kInternetCpid            = 0x3FDEu;   // 65001 = UTF-8
 constexpr uint16_t kMessageLocaleId         = 0x3FF1u;   // 1033 = en-US
+constexpr uint16_t kBody                    = 0x1000u;   // PR_BODY (empty for contacts)
+constexpr uint16_t kCreatorName             = 0x3FFAu;   // PR_CREATOR_NAME
+constexpr uint16_t kCreatorSimpleDisplay    = 0x4038u;   // PR_CREATOR_SIMPLE_DISP_NAME
+constexpr uint16_t kLastModSimpleDisplay    = 0x4039u;   // PR_LAST_MOD_SIMPLE_DISP_NAME
+constexpr uint16_t kMessageCodepage         = 0x3FFDu;   // PR_MESSAGE_CODEPAGE (1252)
+constexpr uint16_t kLtpRowId                = 0x67F2u;   // PidTagLtpRowId (= contact NID)
+constexpr uint16_t kLtpRowVer               = 0x67F3u;   // PidTagLtpRowVer
+constexpr uint16_t kLtpParentNid            = 0x0E2Fu;   // PidTagLtpParentNid (= folder NID)
 
 // Personal-info props
 constexpr uint16_t kDisplayName             = 0x3001u;
@@ -178,6 +226,29 @@ public:
         addProp(tag, PropType::Binary, ptr, size);
     }
 
+    // MvInt32 storage: ulCount (4B) + ulCount × 4B int32 values.
+    void addMvInt32(uint16_t tag, const std::vector<int32_t>& values)
+    {
+        vector<uint8_t> payload;
+        payload.reserve(4 + values.size() * 4);
+        const uint32_t count = static_cast<uint32_t>(values.size());
+        payload.push_back(uint8_t(count));
+        payload.push_back(uint8_t(count >> 8));
+        payload.push_back(uint8_t(count >> 16));
+        payload.push_back(uint8_t(count >> 24));
+        for (int32_t v : values) {
+            uint32_t u = static_cast<uint32_t>(v);
+            payload.push_back(uint8_t(u));
+            payload.push_back(uint8_t(u >> 8));
+            payload.push_back(uint8_t(u >> 16));
+            payload.push_back(uint8_t(u >> 24));
+        }
+        const uint8_t* ptr  = payload.data();
+        const size_t   size = payload.size();
+        bufs_.emplace_back(std::move(payload));
+        addProp(tag, PropType::MvInt32, ptr, size);
+    }
+
     const vector<PcProperty>& props() const noexcept { return props_; }
 
 private:
@@ -277,11 +348,11 @@ MailPcResult buildContactPc(const graph::GraphContact& c,
 
     // PR_SUBJECT for contacts uses the [MS-OXCMSG] §3.3.3.1 normalized-
     // subject format: 2 UTF-16 code units `U+0001 U+0001` followed by
-    // the subject text. Outlook-exported contacts.pst byte-diff (this
-    // file's reference) shows exactly that layout (`\x01\x01Akshat
-    // Verma`). Without the prefix, Outlook treats the subject as
-    // malformed and may hide the contact from the People view even
-    // though the message lands in the destination Contacts folder.
+    // the subject text. Verified by byte-diff against a fresh
+    // Outlook-exported contacts.pst (2026-05-13) — REF emits exactly
+    // this layout. M12.8 briefly stripped the wrapper on a spec-reading
+    // hunch; reverted in M12.9 once a true Outlook reference was
+    // available to diff against.
     {
         auto subjectUtf16 = graph::utf8ToUtf16le(displayName);
         std::vector<uint8_t> prefixed;
@@ -319,6 +390,60 @@ MailPcResult buildContactPc(const graph::GraphContact& c,
     // canonically carry the US-ASCII codepage.
     pb.addInt32  (pid_contact::kInternetCpid,   20127u);
     pb.addInt32  (pid_contact::kMessageLocaleId, 1033u);      // en-US
+
+    // M12.9 (2026-05-13) — additional envelope properties Outlook's
+    // Import wizard requires to actually copy the contact into the
+    // destination mailbox. The user's import-wizard run showed the
+    // wizard completing "successfully" but the destination mailbox
+    // had no contact (verified via Outlook Search). Drag-from-mount
+    // worked, so the bytes are reachable, but the wizard runs a
+    // stricter contact-recognition path that silently skips items
+    // missing these fields. Byte-diff against a fresh Outlook-
+    // exported contacts.pst (2026-05-13) shows REF carries:
+    //   * 0x1000 PR_BODY = ""        — empty Unicode body
+    //   * 0x3FFA PR_CREATOR_NAME      = displayName
+    //   * 0x3FFD PR_MESSAGE_CODEPAGE  = 1252 (Windows-1252)
+    //   * 0x4038 PR_CREATOR_SIMPLE_DISPLAY_NAME = displayName
+    //   * 0x4039 PR_LAST_MODIFIER_SIMPLE_DISPLAY_NAME = displayName
+    pb.addUnicodeString(pid_contact::kBody, std::string());
+    pb.addUnicodeString(pid_contact::kCreatorName,           displayName);
+    pb.addInt32        (pid_contact::kMessageCodepage,       1252u);
+    pb.addUnicodeString(pid_contact::kCreatorSimpleDisplay,  displayName);
+    pb.addUnicodeString(pid_contact::kLastModSimpleDisplay,  displayName);
+
+    // M12.10 (2026-05-13) — PR_LtpRowId / PR_LtpRowVer.
+    //
+    // The folder's Contents TC ALWAYS sets CEB bits 0 (LtpRowId @ 0x67F2)
+    // and 1 (LtpRowVer @ 0x67F3) on every row. scanpst then checks each
+    // CEB-set column against the message PC and flags
+    //   !!Contents Table for <folder>, row doesn't match sub-object
+    //   Failed to add row to the FLT
+    // when the PC lacks the tag the row claims. M12.7 contact PCs were
+    // missing both tags but somehow flew under scanpst's radar; M12.9's
+    // larger PC tripped a stricter validation path and the row mismatch
+    // surfaced. Without "add to FLT" succeeding, Outlook's Import wizard
+    // refuses to copy the contact into the destination mailbox even
+    // though drag-from-mount still works (drag bypasses the FLT check).
+    //
+    // Value of PR_LtpRowId on the PC MUST equal the row's LtpRowId, which
+    // is the contact's own NID. ctx.messageNid is plumbed from
+    // writeM8Pst (set per-contact before buildContactPc runs).
+    if (ctx.messageNid.value != 0u) {
+        pb.addInt32(pid_contact::kLtpRowId,  ctx.messageNid.value);
+        pb.addInt32(pid_contact::kLtpRowVer, 0u);
+    }
+
+    // M12.11 — PR_LTP_PARENT_NID. M12.4 tried =0 and triggered libpff's
+    // "treat as orphan" routing; M12.5 reverted by omitting entirely.
+    // Setting it to the actual parent folder NID (passed via ctx) is
+    // what the spec actually calls for and what scanpst's FLT-add
+    // validator likely checks. Real Outlook contacts.pst byte-diff
+    // shows 0x0E2F = 7 (a small int with non-spec semantics, possibly a
+    // row index); using the parent folder NID instead is the
+    // spec-conformant interpretation.
+    if (ctx.parentFolderNid.value != 0u) {
+        pb.addInt32(pid_contact::kLtpParentNid, ctx.parentFolderNid.value);
+    }
 
     // M12.5 — REVERTED M12.4's "Outlook-canonical envelope" block.
     // The PR_LTP_PARENT_NID=0 emission caused libpff (and presumably
@@ -367,6 +492,51 @@ MailPcResult buildContactPc(const graph::GraphContact& c,
     // card / sort order.
     if (!displayName.empty()) {
         pb.addUnicodeString(kLidFileUnder, displayName);
+    }
+
+    // M12.12 — PidLidContactItemData (dispid 0x8007 under PSETID_Address,
+    // local 0x800A). REF (Outlook-exported contacts.pst) carries this
+    // 6-element MvInt32 array on every IPM.Contact; Outlook's Import
+    // wizard uses it as the "this is a complete contact item, copy it"
+    // marker. Without it, our items pass scanpst (no FLT failure on the
+    // clean PST) but are silently dropped by the wizard — the user's GEHU
+    // import doesn't land the contact and search returns nothing.
+    //
+    // Per [MS-OXOCNTC] §2.2.1.6.1: each int32 in the array stores the
+    // contact-data-field index for one of the displayed contact fields
+    // (Display Name / 2nd value / Email / Phone / Address etc.). Value
+    // 0 = "no field bound to this slot", which is valid for a minimal
+    // contact carrying just an email + name.
+    pb.addMvInt32(kLidContactItemData, {0, 0, 0, 0, 0, 0});
+
+    // M12.13 — bind Email1 to the contact via the AddressBookProvider
+    // family + Email1OriginalEntryId. M12.12 (PidLidContactItemData only)
+    // didn't make the contact land in the destination mailbox: scanpst
+    // showed the row passing on a clean PST, but the Import wizard still
+    // silently dropped it. REF carries all three of these props; without
+    // them Outlook treats Email1 as "slot exists but no entry bound" and
+    // discards the item as having no usable contact data.
+    if (!c.emailAddresses.empty()
+        && !c.emailAddresses.front().address.empty()) {
+        const auto& addr = c.emailAddresses.front().address;
+        const auto& nm   = c.emailAddresses.front().name;
+        const std::string& displayForEmail = nm.empty() ? displayName : nm;
+
+        // AddressBookProviderEmailList: 1-element array containing the
+        // single email slot index (4 = Email 1). REF carries this on
+        // every contact with at least one email address.
+        pb.addMvInt32(kLidAbProviderEmailList, {4});
+
+        // AddressBookProviderArrayType: bitmask of which email slots are
+        // populated. Bit 0 set (= 0x1) means "Email 1 only".
+        pb.addInt32(kLidAbProviderArrayType, 0x00000001u);
+
+        // Email1OriginalEntryId: OneOff EntryID for the email address.
+        // Outlook treats this as the contact's "primary email entry" and
+        // generates the People-view click-through from it. Without it,
+        // Email1 has no resolvable destination.
+        auto eid = graph::makeOneOffEntryId(displayForEmail, addr);
+        pb.addBinary(kLidEmail1OriginalEntryId, std::move(eid));
     }
     if (!c.emailAddresses.empty()) {
         const auto& addr = c.emailAddresses.front().address;
@@ -497,7 +667,12 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
 
         // Storage for per-folder UTF-16-LE buffers (must outlive schema).
         vector<vector<uint8_t>> folderBufStore;
-        folderBufStore.reserve(config.folders.size() * 2);
+        // M12.15: 2 buffers per user folder (name + CC) plus 14 per user
+        // folder for the 7 hidden contacts-anatomy sub-folders
+        // (kContactSubfolderCount × 2). Reserving up front keeps refs
+        // returned by .back() valid through the section-4 push storm.
+        folderBufStore.reserve(
+            config.folders.size() * (2 + kContactSubfolderCount * 2));
 
         const Nid kDummySub{0x00000041u};
 
@@ -557,6 +732,13 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
         // ============================================================
         // 3. Allocate user-folder NIDs + sibling-table NIDs.
         // ============================================================
+        struct SubfolderRecord {
+            Nid             folderNid;
+            Nid             hierarchyNid;
+            Nid             contentsNid;
+            Nid             faiNid;
+            const ContactSubfolderSpec* spec;
+        };
         struct FolderRecord {
             const M8ContactFolder* src;
             Nid                    folderNid;
@@ -564,6 +746,13 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             Nid                    contentsNid;
             Nid                    faiNid;
             uint32_t               contentCount {0u};
+            // M12.15: 7 hidden child folders matching REF's contacts anatomy.
+            vector<SubfolderRecord> subs;
+            // M12.15: index into folderBufStore where this folder's
+            // displayName/containerClass UTF-16-LE buffers live. Section 4
+            // appends sub-folder buffers AFTER these, so we can no longer
+            // assume `2*i` lands on the user folder's pair in section 5.
+            size_t                 bufIdx {0u};
         };
         vector<FolderRecord> folderRecs;
         folderRecs.reserve(config.folders.size());
@@ -580,6 +769,25 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             alloc.registerExternal(rec.contentsNid);
             alloc.registerExternal(rec.faiNid);
             rec.contentCount = static_cast<uint32_t>(f.contacts.size());
+
+            // M12.15: pre-allocate 7 hidden sub-folder NIDs + their
+            // sibling-table NIDs. Order matches kContactSubfolders[]
+            // so REF's row order in the Hierarchy TC is preserved.
+            rec.subs.reserve(kContactSubfolderCount);
+            for (size_t i = 0; i < kContactSubfolderCount; ++i) {
+                SubfolderRecord sf;
+                sf.folderNid    = alloc.allocate(NidType::NormalFolder);
+                const uint32_t sfIdx = sf.folderNid.index();
+                sf.hierarchyNid = Nid(NidType::HierarchyTable,     sfIdx);
+                sf.contentsNid  = Nid(NidType::ContentsTable,      sfIdx);
+                sf.faiNid       = Nid(NidType::AssocContentsTable, sfIdx);
+                alloc.registerExternal(sf.hierarchyNid);
+                alloc.registerExternal(sf.contentsNid);
+                alloc.registerExternal(sf.faiNid);
+                sf.spec = &kContactSubfolders[i];
+                rec.subs.push_back(sf);
+            }
+
             folderRecs.push_back(rec);
         }
 
@@ -610,6 +818,7 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
         // 4. Per folder: PC + sibling tables.
         // ============================================================
         for (auto& rec : folderRecs) {
+            rec.bufIdx = folderBufStore.size();
             folderBufStore.push_back(u16le(rec.src->displayName));
             const auto& nameBuf = folderBufStore.back();
             folderBufStore.push_back(u16le(rec.src->containerClass));
@@ -625,16 +834,53 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             schema.displayNameSize       = nameBuf.size();
             schema.contentCount          = rec.contentCount;
             schema.contentUnreadCount    = 0u;
-            schema.hasSubfolders         = false;
+            // M12.15: the user Contacts folder MUST advertise
+            // hasSubfolders=true so the Import wizard walks its Hierarchy
+            // TC and finds the 7 hidden contacts-anatomy sub-folders.
+            schema.hasSubfolders         = true;
+            // M12.15: REF emits PR_ATTR_HIDDEN=False explicitly on user
+            // contact folders, plus PR_PstHiddenCount/Unread = 0 so the
+            // IPM Subtree row's CEB bits 11/12 (which we also set below)
+            // have matching PC tags.
+            schema.emitAttrHidden        = true;
+            schema.attrHiddenValue       = false;
+            schema.emitPstHiddenZero     = true;
 
             auto pc = buildContactFolderPc(schema, kDummySub);
             scheduleNode(rec.folderNid, rec.src->parentNid, std::move(pc.hnBytes));
 
-            // Hierarchy TC: contacts folder has no children → 0 rows.
+            // M12.15: build the user folder's Hierarchy TC with 7 rows
+            // — one per hidden contacts-anatomy sub-folder. Sub-folder
+            // display-name + container-class buffers go into
+            // folderBufStore so the raw pointers stay valid until
+            // buildFolderHierarchyTc returns.
+            const size_t subBufBase = folderBufStore.size();
+            for (const auto& sf : rec.subs) {
+                folderBufStore.push_back(u16le(sf.spec->displayName));
+                folderBufStore.push_back(u16le(sf.spec->containerClass));
+            }
+            vector<HierarchyTcRow> subHier;
+            subHier.reserve(rec.subs.size());
+            for (size_t si = 0; si < rec.subs.size(); ++si) {
+                const auto& sf      = rec.subs[si];
+                const auto& nBuf    = folderBufStore[subBufBase + 2*si];
+                const auto& cBuf    = folderBufStore[subBufBase + 2*si + 1];
+                HierarchyTcRow row{};
+                row.rowId                 = sf.folderNid;
+                row.displayNameUtf16le    = nBuf.data();
+                row.displayNameSize       = nBuf.size();
+                row.containerClassUtf16le = cBuf.empty() ? nullptr : cBuf.data();
+                row.containerClassSize    = cBuf.size();
+                row.contentCount          = 0u;
+                row.contentUnreadCount    = 0u;
+                row.hasSubfolders         = false;
+                subHier.push_back(row);
+            }
             // Sibling-table NBTENTRYs carry nidParent = 0 per
             // [MS-PST] §3.12 (Aspose oracle, see KNOWN_UNVERIFIED M11-D).
             scheduleNode(rec.hierarchyNid, Nid{0u},
-                         buildFolderHierarchyTc(nullptr, 0).hnBytes);
+                         buildFolderHierarchyTc(subHier.data(),
+                                                subHier.size()).hnBytes);
 
             // Per-folder Contents TC: one populated row per contact the
             // folder owns. Outlook's Contacts view enumerates this TC
@@ -765,6 +1011,41 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
 
             scheduleNode(rec.faiNid, Nid{0u},
                          buildFolderFaiContentsTc().hnBytes);
+
+            // M12.15: schedule the 7 hidden contacts-anatomy sub-folders.
+            // Each sub-folder gets its own folder PC (with
+            // PR_ATTR_HIDDEN=True + container class like
+            // "IPF.Contact.RecipientCache") plus the 3 mandatory sibling
+            // tables (Hierarchy / Contents / FAI Contents), all empty
+            // (these folders are containers for Outlook-internal state
+            // that we leave un-populated — REF often leaves them empty
+            // too on a freshly-exported contacts.pst).
+            for (size_t si = 0; si < rec.subs.size(); ++si) {
+                const auto& sf      = rec.subs[si];
+                const auto& sfName  = folderBufStore[subBufBase + 2*si];
+                const auto& sfCC    = folderBufStore[subBufBase + 2*si + 1];
+
+                M7FolderSchema sfSchema{};
+                sfSchema.displayNameUtf16le = sfName.data();
+                sfSchema.displayNameSize    = sfName.size();
+                sfSchema.contentCount       = 0u;
+                sfSchema.contentUnreadCount = 0u;
+                sfSchema.hasSubfolders      = false;
+                // All 7 are hidden infrastructure folders.
+                sfSchema.emitAttrHidden     = true;
+                sfSchema.attrHiddenValue    = true;
+
+                auto sfPc = buildFolderPcExtended(sfSchema, kDummySub,
+                                                  sfCC.data(), sfCC.size());
+                scheduleNode(sf.folderNid, rec.folderNid,
+                             std::move(sfPc.hnBytes));
+                scheduleNode(sf.hierarchyNid, Nid{0u},
+                             buildFolderHierarchyTc(nullptr, 0).hnBytes);
+                scheduleNode(sf.contentsNid, Nid{0u},
+                             buildFolderContentsTc().hnBytes);
+                scheduleNode(sf.faiNid, Nid{0u},
+                             buildFolderFaiContentsTc().hnBytes);
+            }
         }
 
         // ============================================================
@@ -801,18 +1082,34 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
             // "Hierarchy Table for 8022, row doesn't match sub-object"
             // was raised because the row had CEB-cleared containerClass
             // while the PC carried "IPF.Contact" — mismatch.
+            //
+            // M12.15 — section 4 expanded each user contact folder to
+            // carry 7 hidden contacts-anatomy sub-folders + emits
+            // PR_PstHiddenCount/Unread = 0 on the folder PC. The
+            // matching row must therefore advertise hasSubfolders=TRUE
+            // (so the wizard walks the user folder's Hierarchy TC) and
+            // claim CEB bits 11/12 via emitPstHidden so row/PC tags
+            // stay aligned.
+            //
+            // NOTE: section 4 pushes sub-folder buffers into
+            // folderBufStore between user-folder pairs, so the legacy
+            // `2*i` math no longer lands on the user folder's name/CC.
+            // FolderRecord.bufIdx records the actual position.
             for (size_t i = 0; i < folderRecs.size(); ++i) {
                 HierarchyTcRow row{};
                 row.rowId                 = folderRecs[i].folderNid;
-                const auto& nameBuf       = folderBufStore[2 * i];
-                const auto& ccBuf         = folderBufStore[2 * i + 1];
+                const auto& nameBuf       = folderBufStore[folderRecs[i].bufIdx];
+                const auto& ccBuf         = folderBufStore[folderRecs[i].bufIdx + 1];
                 row.displayNameUtf16le    = nameBuf.data();
                 row.displayNameSize       = nameBuf.size();
                 row.containerClassUtf16le = ccBuf.empty() ? nullptr : ccBuf.data();
                 row.containerClassSize    = ccBuf.size();
                 row.contentCount          = folderRecs[i].contentCount;
                 row.contentUnreadCount    = 0u;
-                row.hasSubfolders         = false;
+                row.hasSubfolders         = true;          // M12.15: anatomy children present
+                row.emitPstHidden         = true;          // M12.15: bits 11/12 with value 0
+                row.pstHiddenCount        = 0u;
+                row.pstHiddenUnreadCount  = 0u;
                 ipmHier.push_back(row);
             }
             const HierarchyTcRow* rowsPtr = ipmHier.empty() ? nullptr : ipmHier.data();
@@ -828,7 +1125,9 @@ WriteResult writeM8Pst(const M8PstConfig& config) noexcept
         for (auto& cr : contactRecs) {
             MailPcBuildContext ctx;
             ctx.providerUid  = config.providerUid;
-            ctx.subnodeStart = Nid{(cr.contactNid.value & ~uint32_t{0x1Fu}) + 0x10000u + 0x1u};
+            ctx.subnodeStart    = Nid{(cr.contactNid.value & ~uint32_t{0x1Fu}) + 0x10000u + 0x1u};
+            ctx.messageNid      = cr.contactNid;          // M12.10: PC's PR_LtpRowId must match row's
+            ctx.parentFolderNid = cr.folder->folderNid;   // M12.11: PC's PR_LtpParentNid
 
             MailPcResult pc = buildContactPc(*cr.src, ctx);
             scheduleNode(cr.contactNid, cr.folder->folderNid, std::move(pc.hnBytes));
