@@ -269,6 +269,97 @@ async def health():
     return {"status": "ok", "service": "job"}
 
 
+async def _job_rollup_bulk(db: AsyncSession, job_ids: List[UUID]) -> Dict[str, Dict]:
+    """Derive live progress / item / byte rollups from the snapshots table.
+
+    Source of truth: ``snapshots``. The Job row's own progress_pct and
+    items_processed columns are NOT maintained per-snapshot — they get
+    written once at start (5%) and once at terminal (100%), with stale
+    group-level pings in between. Reading from them gives the operator
+    a stuck-at-35% experience even when every child snapshot is done
+    (observed Railway 2026-05-13 on job ad2868bd-…).
+
+    This helper aggregates COMPLETED/FAILED/IN_PROGRESS snapshots for
+    each job_id in one SQL round-trip (covered by the existing
+    snapshots(job_id) index). Empty rollup is returned for job_ids
+    with no child snapshots (QUEUED, or single-snapshot already
+    deleted).
+    """
+    if not job_ids:
+        return {}
+    rows = (await db.execute(text("""
+        SELECT
+            job_id,
+            COUNT(*)                                       AS total,
+            COUNT(*) FILTER (WHERE status='COMPLETED')     AS done,
+            COUNT(*) FILTER (WHERE status='FAILED')        AS failed,
+            COUNT(*) FILTER (WHERE status='IN_PROGRESS')   AS inflight,
+            COALESCE(SUM(item_count)  FILTER (WHERE status IN ('COMPLETED','PARTIAL')), 0) AS items,
+            COALESCE(SUM(bytes_added) FILTER (WHERE status IN ('COMPLETED','PARTIAL')), 0) AS bytes
+        FROM snapshots
+        WHERE job_id = ANY(:jids)
+        GROUP BY job_id
+    """), {"jids": [str(j) for j in job_ids]})).fetchall()
+    out: Dict[str, Dict] = {}
+    for r in rows:
+        total = int(r.total or 0)
+        terminal = int(r.done or 0) + int(r.failed or 0)
+        progress = int(round(100.0 * terminal / total)) if total else 0
+        out[str(r.job_id)] = {
+            "progress": progress,
+            "items": int(r.items or 0),
+            "bytes": int(r.bytes or 0),
+            "snapshots_total": total,
+            "snapshots_completed": int(r.done or 0),
+            "snapshots_failed": int(r.failed or 0),
+            "snapshots_in_progress": int(r.inflight or 0),
+        }
+    return out
+
+
+def _project_job_progress(job: "Job", roll: Optional[Dict]) -> int:
+    """Apply the same terminal-state policy used by the UI: COMPLETED
+    pegs to 100, CANCELLED preserves prior, otherwise we use the live
+    rollup. Without this a COMPLETED job whose snapshots were retention-
+    pruned would show 0%.
+    """
+    status = job.status.value if hasattr(job.status, "value") else str(job.status)
+    if status == "COMPLETED":
+        return 100
+    if status == "FAILED":
+        # Best of: rollup (if there are some completed snapshots, surface
+        # the partial-success %), else fall back to stored column.
+        if roll and roll.get("snapshots_total"):
+            return roll["progress"]
+        return job.progress_pct or 0
+    if status == "CANCELLED":
+        return job.progress_pct or 0
+    if roll:
+        return roll["progress"]
+    return job.progress_pct or 0
+
+
+def _build_job_response(job: "Job", roll: Optional[Dict]) -> JobResponse:
+    return JobResponse(
+        id=str(job.id),
+        type=job.type.value if hasattr(job.type, "value") else str(job.type),
+        status=job.status.value if hasattr(job.status, "value") else str(job.status),
+        progress=_project_job_progress(job, roll),
+        resourceId=str(job.resource_id) if job.resource_id else None,
+        tenantId=str(job.tenant_id) if job.tenant_id else None,
+        createdAt=job.created_at.isoformat() if job.created_at else "",
+        updatedAt=job.updated_at.isoformat() if job.updated_at else "",
+        completedAt=job.completed_at.isoformat() if job.completed_at else None,
+        errorMessage=job.error_message,
+        itemsProcessed=(roll or {}).get("items"),
+        bytesProcessed=(roll or {}).get("bytes"),
+        snapshotsTotal=(roll or {}).get("snapshots_total"),
+        snapshotsCompleted=(roll or {}).get("snapshots_completed"),
+        snapshotsFailed=(roll or {}).get("snapshots_failed"),
+        snapshotsInProgress=(roll or {}).get("snapshots_in_progress"),
+    )
+
+
 @app.get("/api/v1/jobs")
 async def list_jobs(
     page: int = Query(1, ge=1),
@@ -285,27 +376,17 @@ async def list_jobs(
         filters.append(Job.status == status)
     if type:
         filters.append(Job.type == type)
-    
+
     total = (await db.execute(select(func.count(Job.id)).where(*filters))).scalar() or 0
     stmt = select(Job).where(*filters).order_by(Job.created_at.desc()).offset((page-1)*size).limit(size)
     result = await db.execute(stmt)
     jobs = result.scalars().all()
-    
+
+    # Single bulk rollup query covers every job on this page.
+    rollups = await _job_rollup_bulk(db, [j.id for j in jobs])
+
     return JobListResponse(
-        content=[
-            JobResponse(
-                id=str(j.id), type=j.type.value if hasattr(j.type, 'value') else str(j.type),
-                status=j.status.value if hasattr(j.status, 'value') else str(j.status),
-                progress=j.progress_pct or 0,
-                resourceId=str(j.resource_id) if j.resource_id else None,
-                tenantId=str(j.tenant_id) if j.tenant_id else None,
-                createdAt=j.created_at.isoformat() if j.created_at else "",
-                updatedAt=j.updated_at.isoformat() if j.updated_at else "",
-                completedAt=j.completed_at.isoformat() if j.completed_at else None,
-                errorMessage=j.error_message,
-            )
-            for j in jobs
-        ],
+        content=[_build_job_response(j, rollups.get(str(j.id))) for j in jobs],
         totalPages=max(1, (total + size - 1) // size),
         totalElements=total,
         size=size, number=page,
@@ -321,17 +402,8 @@ async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return JobResponse(
-        id=str(job.id), type=job.type.value if hasattr(job.type, 'value') else str(job.type),
-        status=job.status.value if hasattr(job.status, 'value') else str(job.status),
-        progress=job.progress_pct or 0,
-        resourceId=str(job.resource_id) if job.resource_id else None,
-        tenantId=str(job.tenant_id) if job.tenant_id else None,
-        createdAt=job.created_at.isoformat() if job.created_at else "",
-        updatedAt=job.updated_at.isoformat() if job.updated_at else "",
-        completedAt=job.completed_at.isoformat() if job.completed_at else None,
-        errorMessage=job.error_message,
-    )
+    rollups = await _job_rollup_bulk(db, [job.id])
+    return _build_job_response(job, rollups.get(str(job.id)))
 
 
 @app.get("/api/v1/jobs/{job_id}/progress")
@@ -625,20 +697,17 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
         resource_type = resource.type.value if hasattr(resource.type, 'value') else str(resource.type)
         routing_key = AZURE_WORKLOAD_QUEUES.get(resource_type, "backup.urgent")
 
-        # Heavy-pool routing: oversized OneDrive drives go to backup.heavy so
-        # a single 500 GB drive can't block the shared backup.normal queue.
-        # Non-OneDrive types keep their existing routing (urgent / Azure queues).
-        if resource_type == "USER_ONEDRIVE":
-            from shared.export_routing import pick_backup_queue
-            drive_bytes_estimate = int((resource.extra_data or {}).get("drive_quota_used", 0))
-            routing_key = pick_backup_queue(
-                drive_bytes_estimate=drive_bytes_estimate,
-                resource_type=resource_type,
-                # Preserve user-initiated urgency for below-threshold
-                # drives; previously this leaked into BACKUP_WORKER_QUEUE
-                # (scheduled-backup queue), delaying interactive backups.
-                default_queue=routing_key,
-            )
+        # Heavy-pool routing: file-content workloads (OneDrive / SharePoint /
+        # Power BI) always route to the dedicated heavy pool so a single big
+        # drive can't block MAILBOX/ENTRA work on the shared lanes. Light
+        # types keep their existing trigger-path queue (urgent / Azure queues).
+        from shared.export_routing import pick_backup_queue
+        drive_bytes_estimate = int((resource.extra_data or {}).get("drive_quota_used", 0))
+        routing_key = pick_backup_queue(
+            drive_bytes_estimate=drive_bytes_estimate,
+            resource_type=resource_type,
+            default_queue=routing_key,
+        )
 
         msg = create_backup_message(
             job_id=str(job.id), resource_id=request.resourceId,

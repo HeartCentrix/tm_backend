@@ -767,10 +767,17 @@ async def _raise_if_job_cancelled(job_id) -> None:
 
 
 async def _update_job_pct(job_id, pct: int) -> None:
-    """Write live `jobs.progress_pct` on a short-lived session so the
-    Protection / Activity UI can animate during long M365 backups. Best-
-    effort — a DB hiccup never interrupts the running backup. Matches
-    the Azure worker's `handlers._progress.update_job_pct` pattern."""
+    """Write live `jobs.progress_pct` on a short-lived session.
+
+    LEGACY: the authoritative progress is now derived at read time in
+    job-service (``_job_rollup_bulk``) from the snapshots table, so this
+    column write is **best-effort cosmetic only** — UI never reads it for
+    RUNNING jobs (see services/job-service/main.py:_project_job_progress).
+    Kept so terminal states and a coarse "X% of resource-groups done"
+    signal remain available to anyone querying the column directly
+    (Grafana, ad-hoc DB inspection). At 5K-user scale this write can
+    contend with the rollup query; if that becomes hot, delete the call
+    sites — UI correctness no longer depends on them."""
     if job_id is None:
         return
     try:
@@ -1225,12 +1232,42 @@ class BackupWorker:
         # chat backup's getAllMessages can take 10+ min. Prefetch=1 forces
         # round-robin across replicas so one slow chat can't starve the others.
         # Higher-throughput queues stay generous since their items are smaller.
-        queues = [
-            ("backup.urgent", 1),
-            ("backup.high", 5),
-            (self._backup_queue_name, 20),
-            ("backup.low", 50),
-        ]
+        #
+        # BACKUP_WORKER_DEDICATED_ONLY=true → this replica ONLY consumes
+        # self._backup_queue_name (its dedicated lane). Used by the heavy
+        # pool so it can't steal backup.urgent/high/low away from the light
+        # pool. With both pools sharing those queues, RabbitMQ delivers to
+        # whichever consumer subscribed first (heavy at boot), so the light
+        # pool sits idle while heavy serializes its prefetch buffer through
+        # 100 in-app slots — observed end-to-end on Railway. Setting the
+        # flag splits the pools cleanly: routing decisions (heavy types vs
+        # urgent) happen at publish-time (see shared/export_routing.py).
+        #
+        # Default: auto-true when this worker IS the heavy pool (its queue
+        # equals BACKUP_HEAVY_QUEUE / backup.heavy). The light pool still
+        # multiplexes urgent/high/normal/low. The env var still works as
+        # an explicit override either way.
+        _is_heavy_replica = (
+            self._backup_queue_name
+            == os.getenv("BACKUP_HEAVY_QUEUE", "backup.heavy")
+        )
+        _default_dedicated = "true" if _is_heavy_replica else "false"
+        dedicated_only = os.getenv(
+            "BACKUP_WORKER_DEDICATED_ONLY", _default_dedicated
+        ).lower() in ("true", "1", "yes")
+        if dedicated_only:
+            queues = [(self._backup_queue_name, 20)]
+            print(
+                f"[{self.worker_id}] BACKUP_WORKER_DEDICATED_ONLY=true — "
+                f"consuming ONLY {self._backup_queue_name}"
+            )
+        else:
+            queues = [
+                ("backup.urgent", 1),
+                ("backup.high", 5),
+                (self._backup_queue_name, 20),
+                ("backup.low", 50),
+            ]
 
         tasks = []
         for queue_name, prefetch in queues:
@@ -6322,13 +6359,17 @@ class BackupWorker:
         # of those running at once, total peak is
         # `file_concurrency × segment_concurrency × segment_size`. To
         # keep a 400 TiB-class enterprise worker from OOMing we cap the
-        # parallel-range concurrency globally so the product stays
-        # bounded regardless of what the operator sets individually.
-        # Default 4 GiB (up from 2). With segment_concurrency now at 8
-        # and 64 MB per segment, peak per-huge-file is 512 MB → 4 GiB
-        # budget admits 8 huge files in flight simultaneously, vs 4 at
-        # the prior 2 GiB / 4-concurrency config. Cap still bounded by
-        # ONEDRIVE_BACKUP_FILE_CONCURRENCY upstream.
+        # parallel-range concurrency *globally per worker* so the
+        # product stays bounded regardless of what the operator sets
+        # individually AND regardless of how many OneDrive resources
+        # are draining concurrently in this worker process.
+        #
+        # Default 4 GiB (up from 2). Observed on Railway 2026-05-13:
+        # the prior per-call semaphore let 9 concurrent OneDrives each
+        # reserve 4 GiB → RSS spiked to 34 GiB. Hoisting to worker scope
+        # caps the whole worker at the configured budget, so 9
+        # concurrent drains share one 4 GiB pool, queueing huge-file
+        # segments fairly across resources.
         huge_file_budget_gib = int(os.getenv(
             "ONEDRIVE_HUGE_FILE_RAM_BUDGET_GIB", "4",
         ))
@@ -6341,7 +6382,21 @@ class BackupWorker:
                 ),
             ),
         )
-        huge_sem = asyncio.Semaphore(max_huge_files_inflight)
+        # Lazy-init worker-scoped singleton. Stored on the BackupWorker
+        # instance so each worker process has exactly one, shared by
+        # every parallel _backup_files_parallel call. The init also
+        # records the chosen capacity so subsequent calls don't expand
+        # the budget mid-run when an env var is hot-reloaded.
+        if getattr(self, "_huge_sem", None) is None:
+            self._huge_sem = asyncio.Semaphore(max_huge_files_inflight)
+            self._huge_sem_capacity = max_huge_files_inflight
+            print(
+                f"[{self.worker_id}] huge-file global semaphore: "
+                f"{max_huge_files_inflight} concurrent huge files "
+                f"(budget={huge_file_budget_gib} GiB, "
+                f"per-file peak={segment_concurrency * segment_size // (1024 * 1024)} MiB)"
+            )
+        huge_sem = self._huge_sem
 
         # ---- incremental flush infrastructure ----
         # Peak in-memory footprint of `updates` is capped by flushing
@@ -6738,6 +6793,12 @@ class BackupWorker:
                         self.backup_single_file(resource, tenant, snapshot, f, graph_client, job_id)
                         for f in items
                     ]
+                    # Note: snapshot liveness during this gather is observable
+                    # via snapshot_items.created_at — every successfully
+                    # backed-up file inserts a row. The backup-scheduler
+                    # stale-sweep checks MAX(snapshot_items.created_at) as the
+                    # heartbeat signal so a live-but-quiet drain (steady file
+                    # uploads) is never mistaken for an orphan.
                     file_results = await asyncio.gather(*file_tasks, return_exceptions=True)
 
                     server_copy_ok = 0
@@ -6792,25 +6853,52 @@ class BackupWorker:
                         resource.extra_data["delta_token"] = new_delta
 
                     total_success = server_copy_ok + streaming_ok
+
+                    # Reconcile with what actually landed in snapshot_items. The
+                    # in-memory ``total_success`` / ``res_bytes`` counters drift
+                    # from reality whenever a parallel UPSERT loses to its
+                    # twin (delta replay surfaces the same file twice, or a
+                    # version row arrives via a separate code path). The
+                    # winning task's row is in PG, but the loser's accumulator
+                    # bump is dropped. Net result before this reconcile:
+                    # `bytes_total=0` on COMPLETED OneDrive snapshots even
+                    # though tens of MB of files are persisted.
+                    # The DB is the source of truth — query it.
+                    async with async_session_factory() as _rs:
+                        _row = (await _rs.execute(
+                            select(
+                                func.count(SnapshotItem.id),
+                                func.coalesce(func.sum(SnapshotItem.content_size), 0),
+                            ).where(SnapshotItem.snapshot_id == snapshot.id)
+                        )).one()
+                        actual_items = int(_row[0] or 0)
+                        actual_bytes = int(_row[1] or 0)
+                    if actual_items != total_success or actual_bytes != res_bytes:
+                        print(
+                            f"[{self.worker_id}] [RECONCILE] snapshot={snapshot.id} "
+                            f"accumulator items={total_success} bytes={res_bytes} → "
+                            f"db items={actual_items} bytes={actual_bytes}"
+                        )
+
                     async with async_session_factory() as sess:
                         await sess.merge(resource)
                         await sess.commit()
 
                         # Update resource backup info (storage_bytes, last_backup_*)
                         await self.update_resource_backup_info(sess, resource, job_id, snapshot.id, {
-                            "item_count": total_success,
-                            "bytes_added": res_bytes,
+                            "item_count": actual_items,
+                            "bytes_added": actual_bytes,
                         })
 
                     await self._emit_backup_audit(
                         "BACKUP_COMPLETED", "SUCCESS",
                         tenant, resource, snapshot, job_id,
                         details={
-                            "item_count": total_success,
-                            "bytes_added": res_bytes,
+                            "item_count": actual_items,
+                            "bytes_added": actual_bytes,
                         },
                     )
-                    return {"item_count": total_success, "bytes_added": res_bytes}
+                    return {"item_count": actual_items, "bytes_added": actual_bytes}
                 except Exception as e:
                     print(f"[{self.worker_id}] File backup failed for {resource.id}: {e}")
                     await self._emit_backup_audit(
@@ -7073,7 +7161,7 @@ class BackupWorker:
         # Skip index 0 (the current version, already captured) — capture at most
         # MAX_FILE_VERSIONS older entries.
         prior = versions[1 : 1 + self.MAX_FILE_VERSIONS]
-        items_to_insert: List[SnapshotItem] = []
+        rows_to_insert: List[dict] = []
         total_bytes = 0
 
         for v in prior:
@@ -7113,16 +7201,20 @@ class BackupWorker:
                 continue
             blob_path = upload_result.get("blob_path", blob_path)
             total_bytes += len(content_bytes)
-            items_to_insert.append(SnapshotItem(
-                snapshot_id=snapshot.id, tenant_id=tenant.id,
-                external_id=f"{file_id}::v::{version_id}",
-                item_type="FILE_VERSION",
-                name=file_name,
-                content_hash=content_hash,
-                content_size=len(content_bytes),
-                blob_path=blob_path,
-                content_checksum=content_hash,
-                extra_data={
+            # IMPORTANT: building row dicts (not ORM objects) so we can
+            # use pg_insert(...).on_conflict_do_nothing() below. Use DB
+            # column names — SnapshotItem.extra_data maps to "metadata".
+            rows_to_insert.append({
+                "snapshot_id": snapshot.id,
+                "tenant_id": tenant.id,
+                "external_id": f"{file_id}::v::{version_id}",
+                "item_type": "FILE_VERSION",
+                "name": file_name,
+                "content_hash": content_hash,
+                "content_size": len(content_bytes),
+                "blob_path": blob_path,
+                "content_checksum": content_hash,
+                "metadata": {
                     "parent_item_id": file_id,
                     "drive_id": drive_id,
                     "version_id": version_id,
@@ -7130,13 +7222,25 @@ class BackupWorker:
                     "current_file_etag": current_etag,
                     "size": v_size,
                 },
-            ))
+            })
 
-        if items_to_insert:
+        if rows_to_insert:
+            # UPSERT semantics: on the second backup run, the same file
+            # version row already exists — bulk add_all() would raise
+            # UniqueViolation on uq_snapshot_items_snap_ext_type and
+            # poison the whole batch (every other version in the same
+            # commit gets rolled back). on_conflict_do_nothing lets the
+            # incremental be a true no-op for unchanged versions. The
+            # row's blob_path / content_hash are content-derived, so
+            # re-using the existing row is correctness-preserving.
+            from sqlalchemy.dialects.postgresql import insert as _pg_insert
+            stmt = _pg_insert(SnapshotItem.__table__).values(rows_to_insert).on_conflict_do_nothing(
+                index_elements=["snapshot_id", "external_id", "item_type"],
+            )
             async with async_session_factory() as session:
-                session.add_all(items_to_insert)
+                await session.execute(stmt)
                 await session.commit()
-        return len(items_to_insert), total_bytes
+        return len(rows_to_insert), total_bytes
 
     async def _parallel_range_stream_to_backend(
         self,
@@ -8447,10 +8551,9 @@ class BackupWorker:
     ) -> Tuple[int, int]:
         """Mirror of _backup_message_attachments for calendar events."""
         sem = asyncio.Semaphore(8)
-        all_items: List[SnapshotItem] = []
         total_bytes = 0
 
-        async def process_one_event(ev: Dict[str, Any]) -> Tuple[List[SnapshotItem], int]:
+        async def process_one_event(ev: Dict[str, Any]) -> Tuple[List[dict], int]:
             event_id = ev.get("id")
             if not event_id:
                 return [], 0
@@ -8463,7 +8566,7 @@ class BackupWorker:
                     print(f"[{self.worker_id}]   [EVENT ATT LIST FAIL] event {event_id}: {type(e).__name__}: {e}")
                     return [], 0
 
-            local_items: List[SnapshotItem] = []
+            local_items: List[dict] = []
             local_bytes = 0
             for att in attachments:
                 att_id = att.get("id")
@@ -8508,16 +8611,17 @@ class BackupWorker:
                         continue
                     local_bytes += len(content_bytes)
 
-                local_items.append(SnapshotItem(
-                    snapshot_id=snapshot.id, tenant_id=tenant.id,
-                    external_id=f"{event_id}::{att_id}",
-                    item_type="EVENT_ATTACHMENT",
-                    name=att_name,
-                    content_hash=content_hash,
-                    content_size=len(content_bytes) if content_bytes else att_size,
-                    blob_path=blob_path,
-                    content_checksum=content_hash,
-                    extra_data={
+                local_items.append({
+                    "snapshot_id": snapshot.id,
+                    "tenant_id": tenant.id,
+                    "external_id": f"{event_id}::{att_id}",
+                    "item_type": "EVENT_ATTACHMENT",
+                    "name": att_name,
+                    "content_hash": content_hash,
+                    "content_size": len(content_bytes) if content_bytes else att_size,
+                    "blob_path": blob_path,
+                    "content_checksum": content_hash,
+                    "metadata": {
                         "parent_item_id": event_id,
                         "attachment_kind": att_kind,
                         "content_type": att.get("contentType"),
@@ -8525,24 +8629,33 @@ class BackupWorker:
                         "content_id": att.get("contentId") or att.get("contentID"),
                         "source_url": att.get("sourceUrl"),
                     },
-                ))
+                })
             return local_items, local_bytes
 
         results = await asyncio.gather(
             *[process_one_event(e) for e in events_with_attachments],
             return_exceptions=True,
         )
+        all_rows: List[dict] = []
         for r in results:
             if isinstance(r, tuple):
                 items, b = r
-                all_items.extend(items)
+                all_rows.extend(items)
                 total_bytes += b
 
-        if all_items:
+        if all_rows:
+            # Same UPSERT semantics as _backup_message_attachments: keep
+            # rows from prior successful commits intact, skip duplicate
+            # (snapshot, external_id, item_type) tuples without poisoning
+            # the whole batch.
+            from sqlalchemy.dialects.postgresql import insert as _pg_insert
+            stmt = _pg_insert(SnapshotItem.__table__).values(all_rows).on_conflict_do_nothing(
+                index_elements=["snapshot_id", "external_id", "item_type"],
+            )
             async with async_session_factory() as session:
-                session.add_all(all_items)
+                await session.execute(stmt)
                 await session.commit()
-        return len(all_items), total_bytes
+        return len(all_rows), total_bytes
 
     async def _backup_teams_resource(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
                                      graph_client: GraphClient, job_id: uuid.UUID) -> Dict:
@@ -11206,10 +11319,9 @@ class BackupWorker:
         Bounded concurrency keeps us under Graph throttling — each message
         round-trip + N attachment downloads can add up fast on big inboxes."""
         sem = asyncio.Semaphore(8)
-        all_items: List[SnapshotItem] = []
         total_bytes = 0
 
-        async def process_one_message(msg: Dict[str, Any]) -> Tuple[List[SnapshotItem], int]:
+        async def process_one_message(msg: Dict[str, Any]) -> Tuple[List[dict], int]:
             msg_id = msg.get("id")
             if not msg_id:
                 return [], 0
@@ -11222,7 +11334,7 @@ class BackupWorker:
                     print(f"[{self.worker_id}]   [ATTACHMENT LIST FAIL] msg {msg_id}: {type(e).__name__}: {e}")
                     return [], 0
 
-            local_items: List[SnapshotItem] = []
+            local_items: List[dict] = []
             local_bytes = 0
             for att in attachments:
                 att_id = att.get("id")
@@ -11280,17 +11392,21 @@ class BackupWorker:
                 # content at all (just a URL). afi flags both as restorable
                 # references — we do the same.
 
-                local_items.append(SnapshotItem(
-                    snapshot_id=snapshot.id, tenant_id=tenant.id,
-                    external_id=f"{msg_id}::{att_id}",
-                    item_type="EMAIL_ATTACHMENT",
-                    name=att_name,
-                    folder_path=msg.get("parentFolderName"),
-                    content_hash=content_hash,
-                    content_size=len(content_bytes) if content_bytes else att_size,
-                    blob_path=blob_path,
-                    content_checksum=content_hash,
-                    extra_data={
+                local_items.append({
+                    "snapshot_id": snapshot.id,
+                    "tenant_id": tenant.id,
+                    "external_id": f"{msg_id}::{att_id}",
+                    "item_type": "EMAIL_ATTACHMENT",
+                    "name": att_name,
+                    "folder_path": msg.get("parentFolderName"),
+                    "content_hash": content_hash,
+                    "content_size": len(content_bytes) if content_bytes else att_size,
+                    "blob_path": blob_path,
+                    "content_checksum": content_hash,
+                    # DB column name is "metadata" — SnapshotItem.extra_data
+                    # is the ORM alias. pg_insert(...).values() requires the
+                    # DB column name.
+                    "metadata": {
                         "parent_item_id": msg_id,
                         "attachment_kind": att_kind,
                         "content_type": att.get("contentType"),
@@ -11298,24 +11414,38 @@ class BackupWorker:
                         "content_id": att.get("contentId") or att.get("contentID"),
                         "source_url": att.get("sourceUrl"),  # referenceAttachment
                     },
-                ))
+                })
             return local_items, local_bytes
 
         results = await asyncio.gather(
             *[process_one_message(m) for m in messages_with_attachments],
             return_exceptions=True,
         )
+        all_rows: List[dict] = []
         for r in results:
             if isinstance(r, tuple):
                 items, b = r
-                all_items.extend(items)
+                all_rows.extend(items)
                 total_bytes += b
 
-        if all_items:
+        if all_rows:
+            # UPSERT-or-skip semantics: incremental backups re-encounter the
+            # same (snapshot, external_id, item_type) tuples on flagged
+            # messages whose attachments were already captured in this
+            # snapshot. session.add_all() raises UniqueViolation on
+            # uq_snapshot_items_snap_ext_type and rolls back the whole
+            # commit — losing every attachment from every other message in
+            # the batch (observed Railway 2026-05-13 on Vinay Chauhan).
+            # on_conflict_do_nothing keeps already-persisted rows intact
+            # and silently skips the duplicate insert.
+            from sqlalchemy.dialects.postgresql import insert as _pg_insert
+            stmt = _pg_insert(SnapshotItem.__table__).values(all_rows).on_conflict_do_nothing(
+                index_elements=["snapshot_id", "external_id", "item_type"],
+            )
             async with async_session_factory() as session:
-                session.add_all(all_items)
+                await session.execute(stmt)
                 await session.commit()
-        return len(all_items), total_bytes
+        return len(all_rows), total_bytes
 
     async def backup_onedrive(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                               tenant: Tenant, message: Dict) -> Dict:
@@ -12029,51 +12159,60 @@ class BackupWorker:
                                           job_id: uuid.UUID, snapshot_id: uuid.UUID,
                                           result: Dict = None):
         """Update resource with last backup information — uses targeted UPDATE
-        to avoid overwriting extra_data (delta_token) set by complete_snapshot."""
+        to avoid overwriting extra_data (delta_token) set by complete_snapshot.
+
+        storage_bytes is derived as the SUM of ``bytes_added`` across every
+        retained snapshot in the resource's subtree (self + Tier-2 children
+        linked via parent_resource_id). This mirrors *exactly* the
+        aggregation that ``services/resource-service/main.py`` performs at
+        read time in ``/resources/by-type`` (line ~587-614) and
+        ``/storage-summary``. The two sides MUST match or the Resources
+        page and the Activity dashboard disagree.
+
+        Why subtree-sum and not "latest snapshot bytes_total":
+          * Incremental snapshots store ``bytes_added`` = the delta only,
+            so latest-snapshot-only collapsed a 16 MB mailbox to 12 KB
+            after the first incremental (observed in Railway 2026-05-13).
+          * Retention worker deletes old snapshots — sum across surviving
+            rows is the only retention-safe semantic. Latest-snapshot is
+            not retention-aware.
+          * Subtree-aware so an ENTRA_USER parent's storage_bytes rolls
+            up MAILBOX + ONEDRIVE + USER_CHATS + USER_CALENDAR +
+            USER_CONTACTS in one number — matches the Users-page card.
+        """
         from sqlalchemy import update as sa_update
-        
-        # storage_bytes = "current size of all backed-up data on this
-        # resource". Two failure modes the prior accumulator hit:
-        #   1. bytes_added == bytes_total in most paths (the snapshot
-        #      reports its full size as 'added'), so re-running a backup
-        #      added the WHOLE content again. After 4 runs of a 1.5 GB
-        #      OneDrive, storage_bytes wedged at 6 GB.
-        #   2. Failed snapshots that didn't roll back the previous
-        #      addition left the counter inflated.
-        #
-        # Fix: re-derive from the latest COMPLETED snapshot for this
-        # resource. Each snapshot's bytes_total reflects the full content
-        # captured (newest-wins sibling-union semantics) so the latest
-        # snapshot's bytes_total IS the current backed-up size — exactly
-        # what the UI labels as "Backup size". One SQL hop, no drift.
-        from sqlalchemy import desc as _desc, select as sa_select
-        latest_completed = (await session.execute(
-            sa_select(Snapshot.bytes_total)
-            .where(
-                Snapshot.resource_id == resource.id,
-                Snapshot.status == SnapshotStatus.COMPLETED,
-                Snapshot.bytes_total > 0,
+
+        # Subtree sum: parent (the resource itself) + every Tier-2 child
+        # row whose parent_resource_id points at it. Status filter mirrors
+        # the read path (COMPLETED, PARTIAL, PENDING_DELETION — anything
+        # that still has live snapshot_items rows backing it).
+        subtree_sum = (await session.execute(text("""
+            WITH targets AS (
+                SELECT :rid::uuid AS leaf
+                UNION ALL
+                SELECT id FROM resources WHERE parent_resource_id = :rid::uuid
             )
-            .order_by(_desc(Snapshot.created_at))
-            .limit(1)
-        )).scalar_one_or_none()
+            SELECT COALESCE(SUM(s.bytes_added), 0)
+            FROM targets t
+            JOIN snapshots s ON s.resource_id = t.leaf
+            WHERE s.status IN ('COMPLETED', 'PARTIAL', 'PENDING_DELETION')
+        """), {"rid": str(resource.id)})).scalar()
         prev = resource.storage_bytes or 0
-        if latest_completed is not None:
-            storage_bytes = int(latest_completed)
-        elif result and isinstance(result, dict) and int(result.get("bytes_added") or 0) > 0:
-            # Defense-in-depth: handlers that call update_resource_backup_info
-            # before complete_snapshot lands (or whose snapshot ends up PARTIAL
-            # via the orphan reaper) would otherwise leave storage_bytes
-            # untouched. Trust the result dict's bytes_added — it's the same
-            # number we'd have read once the snapshot flipped to COMPLETED.
-            storage_bytes = int(result["bytes_added"])
-        else:
-            # No completed content-bearing snapshot yet — keep prior value.
-            storage_bytes = prev
+        storage_bytes = int(subtree_sum or 0)
+
+        # Final defense-in-depth: if the subtree sum is zero but this run
+        # reported bytes_added > 0 (handler ran before complete_snapshot
+        # landed in the same txn — rare race), trust the in-hand result so
+        # we don't transiently zero out a healthy resource.
+        if storage_bytes == 0 and result and isinstance(result, dict):
+            rb = int(result.get("bytes_added") or 0)
+            if rb > 0:
+                storage_bytes = rb
+
         if result:
             print(
                 f"[{self.worker_id}] storage_bytes for {resource.id}: "
-                f"{prev} -> {storage_bytes} (latest snapshot bytes_total)"
+                f"{prev} -> {storage_bytes} (subtree sum across retained snapshots)"
             )
         
         new_status = ResourceStatus.ACTIVE if resource.status == ResourceStatus.DISCOVERED else resource.status

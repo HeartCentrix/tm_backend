@@ -28,27 +28,37 @@ def pick_export_queue(total_bytes: int = 0, include_attachments: bool = True) ->
     return "restore.normal"
 
 
+# Always-heavy resource types: file-content workloads dominated by binary bytes.
+# These bypass the normal pool entirely so MAILBOX / ENTRA / chat snapshots on
+# the shared lanes don't starve behind a single 80 GB OneDrive. Type-based gate
+# (not byte-threshold) because an in-progress OneDrive of unknown size still
+# needs the heavy pool — we can't measure it until the worker calls into Graph.
+_HEAVY_BACKUP_TYPES = {
+    "USER_ONEDRIVE",
+    "ONEDRIVE",
+    "SHAREPOINT_SITE",
+    "POWER_BI",
+}
+
+
 def pick_backup_queue(
     *,
-    drive_bytes_estimate: int,
+    drive_bytes_estimate: int = 0,
     resource_type: str,
     default_queue: Optional[str] = None,
 ) -> str:
-    """Return the RabbitMQ queue for a backup job. OneDrive drives above
-    BACKUP_HEAVY_THRESHOLD_BYTES go to the dedicated heavy pool so regular
-    backup-worker replicas aren't blocked by a single monster drive.
+    """Return the RabbitMQ queue for a backup job.
 
-    ``default_queue`` lets the caller preserve the queue semantics of the
-    trigger path (e.g. "backup.urgent" for user-initiated backups) while
-    still opting in to heavy routing for oversized OneDrive drives. When
-    omitted, falls back to the scheduler queue (``BACKUP_WORKER_QUEUE``)
-    for back-compat with existing callers."""
+    Heavy resource types (OneDrive / SharePoint / Power BI) always go to the
+    dedicated heavy pool so the regular backup-worker replicas stay free for
+    quick MAILBOX / ENTRA / USER_* work. Other types use ``default_queue``
+    (or ``BACKUP_WORKER_QUEUE`` if omitted) so the trigger path's queue
+    semantics (e.g. "backup.urgent" for user-initiated backups) are kept.
+    """
     fallback = default_queue or settings.BACKUP_WORKER_QUEUE
     if not settings.BACKUP_HEAVY_ENABLED:
         return fallback
-    if resource_type != "USER_ONEDRIVE":
-        return fallback
-    if drive_bytes_estimate >= settings.BACKUP_HEAVY_THRESHOLD_BYTES:
+    if resource_type in _HEAVY_BACKUP_TYPES:
         return settings.BACKUP_HEAVY_QUEUE
     return fallback
 

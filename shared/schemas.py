@@ -247,6 +247,16 @@ class JobResponse(BaseModel):
     updatedAt: str
     completedAt: Optional[str] = None
     errorMessage: Optional[str] = None
+    # Derived live rollup from the snapshots table. The Job row's own
+    # progress_pct / items_processed columns are write-once at terminal
+    # state and not authoritative — these fields are computed on read so
+    # they never disagree with reality.
+    itemsProcessed: Optional[int] = None
+    bytesProcessed: Optional[int] = None
+    snapshotsTotal: Optional[int] = None
+    snapshotsCompleted: Optional[int] = None
+    snapshotsFailed: Optional[int] = None
+    snapshotsInProgress: Optional[int] = None
 
 
 class JobListResponse(BaseModel):

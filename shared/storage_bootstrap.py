@@ -123,14 +123,41 @@ def _seaweed_config() -> dict:
 
 async def ensure_storage_bootstrap(engine: AsyncEngine) -> None:
     """Seed azure-primary + seaweedfs-local + system_config, install triggers,
-    assert sanity. Idempotent and safe to call from every service."""
+    assert sanity. Idempotent and safe to call from every service.
+
+    Serialized via pg_advisory_lock(9042042) — when many services boot
+    concurrently, each tries to run the same CREATE OR REPLACE FUNCTION /
+    CREATE TRIGGER DDL. Without the lock, two services racing the
+    CREATE FUNCTION hit pg_proc_proname_args_nsp_index unique violation,
+    which aborts the whole transaction and turns every subsequent stmt
+    into InFailedSQLTransactionError. The advisory lock is what the
+    storage_toggle_worker already does for its own bootstrap (key 9042042);
+    sharing the same key keeps the system serialized end-to-end.
+    """
+    BOOTSTRAP_LOCK_KEY = 9042042
     async with engine.begin() as conn:
-        # Triggers first — installed independently so a seed row failure
-        # downstream can't roll them back.
+        # Acquire advisory lock first — pg_advisory_lock blocks until granted.
+        # Session-scoped: released on connect close OR by the explicit unlock
+        # in the finally block at the end of this function.
+        await conn.execute(text(f"SELECT pg_advisory_lock({BOOTSTRAP_LOCK_KEY})"))
+
+        # Wrap each DDL in its own SAVEPOINT so a stmt-level failure (rare,
+        # since we serialize with the lock above — but possible across PG
+        # versions for IF NOT EXISTS edge cases) doesn't abort the whole
+        # transaction and bring down the downstream seed.
         for stmt in _NOTIFY_TRIGGER_STATEMENTS:
+            sp_name = f"sp_bootstrap_{abs(hash(stmt)) % (10**8)}"
             try:
+                await conn.execute(text(f"SAVEPOINT {sp_name}"))
                 await conn.execute(text(stmt))
+                await conn.execute(text(f"RELEASE SAVEPOINT {sp_name}"))
             except Exception as exc:
+                # Roll back to savepoint so the outer transaction stays alive
+                # for the seed rows + invariant check below.
+                try:
+                    await conn.execute(text(f"ROLLBACK TO SAVEPOINT {sp_name}"))
+                except Exception:
+                    pass
                 log.warning(
                     "[storage-bootstrap] trigger stmt failed: %s (%s...)",
                     exc, stmt[:60],
@@ -216,10 +243,16 @@ async def ensure_storage_bootstrap(engine: AsyncEngine) -> None:
         )
         r = row.first()
         if not r or r.active_backend_id is None or r.enabled_count == 0:
+            await conn.execute(text(f"SELECT pg_advisory_unlock({BOOTSTRAP_LOCK_KEY})"))
             raise RuntimeError(
                 "[storage-bootstrap] invariant failed: "
                 "system_config singleton or enabled backends missing after seed"
             )
+
+        # Release the advisory lock before the txn commits, so the next
+        # racing waiter unblocks immediately rather than waiting for the
+        # session/connection to close.
+        await conn.execute(text(f"SELECT pg_advisory_unlock({BOOTSTRAP_LOCK_KEY})"))
 
     log.info("[storage-bootstrap] seed + triggers + invariants OK")
 
