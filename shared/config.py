@@ -24,8 +24,14 @@ class Settings:
             self.DB_PASSWORD = os.getenv("DB_PASSWORD")
 
         self.DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
-        self.DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "2"))
-        self.DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "2"))
+        # Pool sizing: 2+2 was producing TooManyConnectionsError on
+        # resource_service when backup workers concurrently fanned out
+        # resource lookups. 5+5 gives ~10 max per service — 27 services ×
+        # 10 = 270, still under typical postgres max_connections (Railway
+        # ships with ~500, on-prem default 100 is easy to raise). Heavy
+        # deployments override via env var.
+        self.DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
+        self.DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "5"))
         self.DB_POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
         self.DB_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
         self.DB_POOL_USE_LIFO = os.getenv("DB_POOL_USE_LIFO", "true").lower() in ("true", "1", "yes")
@@ -303,8 +309,14 @@ class Settings:
             "ONEDRIVE_LARGE_FILE_SEGMENT_BYTES",
             str(64 * 1024 * 1024),
         ))
+        # Default bumped from 4 to 8 — single-TCP from Graph CDN caps
+        # around 50-100 MB/s, so 8 concurrent Range fetches per huge
+        # file scale to ~600 MB/s of effective bandwidth on enterprise
+        # links. Peak RAM per file = segment_concurrency * segment_size
+        # = 8 * 64 MB = 512 MB, still bounded by the global huge-file
+        # RAM budget below.
         self.ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY = int(os.getenv(
-            "ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY", "4",
+            "ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY", "8",
         ))
 
         # ── Heavy backup pool ──

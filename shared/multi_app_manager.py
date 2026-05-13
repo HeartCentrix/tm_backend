@@ -1,16 +1,53 @@
 """Multi-App Registration Manager for Microsoft Graph API
 Distributes requests across multiple app registrations to avoid throttling.
+
 """
 import time
 import threading
 import hashlib
+from collections import deque
 from typing import Dict, List, Optional
 from shared.config import settings
 from shared.graph_ratelimit import AsyncTokenBucket
 
 
+# Circuit breaker tuning. Documented inline so an SRE can dial these
+# at runtime via env without re-reading the algorithm.
+#
+# 429_WINDOW_S × 429_THRESHOLD: count 429s in this sliding window;
+# crossing the threshold escalates the ban instead of honoring just
+# Retry-After.
+_WINDOW_S = float(__import__("os").getenv("GRAPH_APP_429_WINDOW_S", "60"))
+_WINDOW_429_THRESHOLD = int(__import__("os").getenv("GRAPH_APP_429_THRESHOLD", "3"))
+
+# Escalating ban ladder (seconds). Each consecutive triggering window
+# moves one step up. Resets after RECOVERY_SUCCESS_COUNT consecutive
+# successes — see mark_success.
+_BAN_LADDER = [
+    int(x) for x in
+    (__import__("os").getenv("GRAPH_APP_BAN_LADDER", "5,30,300,1800")).split(",")
+]
+_PROBATION_OK_COUNT = int(__import__("os").getenv("GRAPH_APP_PROBATION_OK", "3"))
+_RECOVERY_SUCCESS_COUNT = int(__import__("os").getenv("GRAPH_APP_RESET_AFTER_OK", "50"))
+
+# Adaptive rate: multiplicative decrease on 429, additive increase on
+# sustained quiet. Floor prevents rate dropping to zero on persistent
+# throttling — at the floor we just lean on Retry-After delays.
+_RATE_DECREASE_FACTOR = float(__import__("os").getenv("GRAPH_APP_RATE_DEC", "0.5"))
+_RATE_INCREASE_FACTOR = float(__import__("os").getenv("GRAPH_APP_RATE_INC", "1.5"))
+_RATE_RECOVERY_QUIET_S = float(__import__("os").getenv("GRAPH_APP_RATE_RECOVER_S", "30"))
+_RATE_FLOOR = float(__import__("os").getenv("GRAPH_APP_RATE_FLOOR", "0.25"))
+
+
 class AppRegistry:
-    """Tracks usage of a single Graph app registration"""
+    """Tracks usage of a single Graph app registration with adaptive
+    health state. State transitions:
+
+        HEALTHY ──429──► THROTTLED (timed ban)
+        THROTTLED ──ban expires──► PROBATION (limited admission)
+        PROBATION ──N successes──► HEALTHY
+        PROBATION ──429──► THROTTLED (escalated ban)
+    """
     def __init__(self, app: dict):
         self.index = app["index"]
         self.client_id = app["client_id"]
@@ -22,26 +59,82 @@ class AppRegistry:
         # Per-app token bucket — aggregate rate cap per (app, tenant).
         # Gates every Graph call so no single app blows past
         # GRAPH_APP_PACE_REQS_PER_SEC regardless of how many streams
-        # pile on. rate=0 disables pacing (kill switch).
+        # pile on. rate=0 disables pacing (kill switch). Adaptive
+        # rate-adjust below mutates self.bucket._rate at runtime.
         self.bucket = AsyncTokenBucket(
             rate_per_sec=settings.GRAPH_APP_PACE_REQS_PER_SEC,
             capacity=1,
         )
+        # Adaptive-throttling state. All written under MultiAppManager._lock.
+        self._original_rate: float = float(settings.GRAPH_APP_PACE_REQS_PER_SEC)
+        self._recent_429s: deque = deque(maxlen=64)
+        self._consecutive_bans: int = 0
+        self._probation_remaining: int = 0
+        self._last_success_at: float = 0.0
+        self._success_streak: int = 0
+        self._last_latency_ms: float = 0.0
 
     @property
     def is_throttled(self) -> bool:
         return time.time() < self.throttled_until
 
     @property
+    def in_probation(self) -> bool:
+        """True if app is out of ban but hasn't yet proven N successes."""
+        return self._probation_remaining > 0 and not self.is_throttled
+
+    @property
+    def is_admissible(self) -> bool:
+        """Admissibility check for round-robin. Probation apps ARE
+        admissible — they just get fewer slots. Throttled apps aren't."""
+        return not self.is_throttled
+
+    @property
     def load_score(self) -> float:
-        """Lower score = less loaded = better choice"""
+        """Lower = better choice for next request. Weighted by:
+        - hard fail: throttled → inf
+        - soft penalty: probation → +200 (deprioritized but available)
+        - recent-error penalty: count of 429s in last window × 50
+        - latency penalty: last response time / 100ms
+        - utilization: total request count
+        """
         if self.is_throttled:
-            return float('inf')
-        return self.request_count
+            return float("inf")
+        now = time.time()
+        recent_429 = sum(1 for ts in self._recent_429s if now - ts < _WINDOW_S)
+        score = float(self.request_count)
+        score += recent_429 * 50.0
+        score += min(self._last_latency_ms / 100.0, 10.0)
+        if self.in_probation:
+            score += 200.0
+        return score
+
+    def health(self) -> dict:
+        """Inspectable snapshot for ops / dashboards."""
+        now = time.time()
+        return {
+            "index": self.index,
+            "client_id": self.client_id,
+            "is_throttled": self.is_throttled,
+            "throttled_until": self.throttled_until,
+            "throttle_remaining_s": max(0.0, self.throttled_until - now),
+            "in_probation": self.in_probation,
+            "probation_remaining": self._probation_remaining,
+            "consecutive_bans": self._consecutive_bans,
+            "rate_per_sec": self.bucket._rate,
+            "rate_original": self._original_rate,
+            "recent_429s_in_window": sum(
+                1 for ts in self._recent_429s if now - ts < _WINDOW_S
+            ),
+            "success_streak": self._success_streak,
+            "last_latency_ms": self._last_latency_ms,
+            "request_count": self.request_count,
+        }
 
 
 class MultiAppManager:
-    """Manages multiple Graph app registrations with round-robin + load balancing"""
+    """Manages multiple Graph app registrations with round-robin + load
+    balancing + adaptive circuit breaker."""
 
     def __init__(self):
         self.apps: List[AppRegistry] = [
@@ -59,7 +152,13 @@ class MultiAppManager:
 
     def get_next_app(self) -> AppRegistry:
         """Get the next app using round-robin with throttling awareness.
-        Thread-safe via lock for use across threads and async contexts."""
+
+        Round-robin admits HEALTHY apps first; PROBATION apps are tried
+        only when no healthy app exists in this rotation pass; THROTTLED
+        apps are skipped entirely. Falls back to least-loaded across
+        admissible apps when nothing is fresh. Triggers lazy rate
+        recovery during selection so we don't need a separate ticker.
+        """
         if len(self.apps) == 1:
             app = self.apps[0]
             app.request_count += 1
@@ -67,7 +166,17 @@ class MultiAppManager:
             return app
 
         with self._lock:
-            # Try round-robin first, skipping throttled apps
+            self._recover_rates_locked()
+            # Pass 1: prefer healthy non-probation apps in round-robin
+            for _ in range(len(self.apps)):
+                app = self.apps[self._current_index % len(self.apps)]
+                self._current_index += 1
+                if not app.is_throttled and not app.in_probation:
+                    app.request_count += 1
+                    app.last_request_time = time.time()
+                    return app
+            # Pass 2: accept probationary apps (still better than
+            # throttled ones — natural traffic acts as the probe)
             for _ in range(len(self.apps)):
                 app = self.apps[self._current_index % len(self.apps)]
                 self._current_index += 1
@@ -75,30 +184,94 @@ class MultiAppManager:
                     app.request_count += 1
                     app.last_request_time = time.time()
                     return app
-
-            # All apps throttled, return least loaded
+            # All apps throttled → least-loaded fallback. Caller will
+            # still hit the Retry-After sleep on its own.
             return min(self.apps, key=lambda a: a.load_score)
 
     def get_app_by_client_id(self, client_id: str) -> Optional[AppRegistry]:
-        """Get specific app by client_id"""
         return self._app_map.get(client_id)
 
     def mark_throttled(self, client_id: str, retry_after_seconds: int):
-        """Mark an app as throttled (thread-safe)"""
+        """Called by graph_client after a 429/503. Window-counts
+        recent 429s; if threshold crossed, escalates the ban via the
+        ladder and halves the per-app rate (multiplicative decrease).
+        Otherwise honors Retry-After only."""
         with self._lock:
             app = self._app_map.get(client_id)
-            if app:
-                app.throttled_until = time.time() + retry_after_seconds
+            if not app:
+                return
+            now = time.time()
+            app._recent_429s.append(now)
+            app._success_streak = 0
+
+            window_count = sum(
+                1 for ts in app._recent_429s if now - ts < _WINDOW_S
+            )
+            if window_count >= _WINDOW_429_THRESHOLD:
+                # Escalate. Step into ban ladder; honor server Retry-
+                # After as a FLOOR (don't return faster than server
+                # asked even if our ladder is lower).
+                ladder_idx = min(app._consecutive_bans, len(_BAN_LADDER) - 1)
+                ladder_ban = float(_BAN_LADDER[ladder_idx])
+                effective_ban = max(ladder_ban, float(retry_after_seconds))
+                app._consecutive_bans += 1
+                # Multiplicative decrease — halve rate, floor at _RATE_FLOOR.
+                new_rate = max(_RATE_FLOOR, app.bucket._rate * _RATE_DECREASE_FACTOR)
+                app.bucket._rate = new_rate
+            else:
+                # Single 429 — trust server hint, don't escalate
+                effective_ban = float(retry_after_seconds)
+            app.throttled_until = now + effective_ban
+            # Schedule probation when ban expires: N successes required
+            # before fully re-admitting.
+            app._probation_remaining = _PROBATION_OK_COUNT
+
+    def mark_success(self, client_id: str, latency_ms: float = 0.0):
+        """Called by graph_client after a 2xx response. Drives
+        probation exit + additive-increase rate recovery + escalation
+        reset after sustained success."""
+        with self._lock:
+            app = self._app_map.get(client_id)
+            if not app:
+                return
+            now = time.time()
+            app._last_success_at = now
+            app._last_latency_ms = latency_ms
+            app._success_streak += 1
+            if app._probation_remaining > 0:
+                app._probation_remaining -= 1
+            # Reset consecutive-ban escalation after a long success run
+            if app._success_streak >= _RECOVERY_SUCCESS_COUNT:
+                app._consecutive_bans = 0
+
+    def _recover_rates_locked(self):
+        """Caller MUST hold _lock. Additive-increase: any app that
+        has been free of 429s for _RATE_RECOVERY_QUIET_S grows its
+        rate by _RATE_INCREASE_FACTOR (capped at the original)."""
+        now = time.time()
+        for app in self.apps:
+            if app.is_throttled or app.bucket._rate >= app._original_rate:
+                continue
+            quiet_for = now - (app._recent_429s[-1] if app._recent_429s else 0)
+            if quiet_for >= _RATE_RECOVERY_QUIET_S:
+                new_rate = min(
+                    app._original_rate,
+                    app.bucket._rate * _RATE_INCREASE_FACTOR,
+                )
+                if new_rate > app.bucket._rate:
+                    app.bucket._rate = new_rate
 
     def reset_throttle(self, client_id: str):
-        """Reset throttle state for an app (thread-safe)"""
+        """Reset throttle state for an app (thread-safe)."""
         with self._lock:
             app = self._app_map.get(client_id)
             if app:
                 app.throttled_until = 0.0
+                app._probation_remaining = 0
+                app._consecutive_bans = 0
+                app.bucket._rate = app._original_rate
 
     def is_app_throttled(self, client_id: str) -> bool:
-        """Public throttle-check by client_id for sticky-rotation callers."""
         app = self._app_map.get(client_id)
         return bool(app and app.is_throttled)
 
@@ -121,17 +294,9 @@ class MultiAppManager:
         await app.bucket.acquire(cost, priority=priority)
 
     def get_stats(self) -> List[dict]:
-        """Get usage stats for all apps"""
-        return [
-            {
-                "index": app.index,
-                "client_id": app.client_id,
-                "request_count": app.request_count,
-                "is_throttled": app.is_throttled,
-                "throttled_until": app.throttled_until,
-            }
-            for app in self.apps
-        ]
+        """Full inspectable health snapshot — used by /admin/graph-health
+        endpoint (if wired) and ops dashboards."""
+        return [app.health() for app in self.apps]
 
 
 # Global instance

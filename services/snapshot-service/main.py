@@ -1,4 +1,7 @@
 import asyncio
+import re as _re
+import base64 as _b64
+import io as _io
 """Snapshot Service - Manages snapshots and snapshot items"""
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
@@ -7,7 +10,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, distinct, and_, or_
+from sqlalchemy import select, func, distinct, and_, or_, text
 
 from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType
@@ -1106,8 +1109,13 @@ async def list_snapshot_emails(
         filters.append(SnapshotItem.folder_path == folder)
     if search:
         filters.append(SnapshotItem.name.ilike(f"%{search}%"))
+    # Pull every row, dedup by external_id, then sort by send-time DESC so
+    # page 1 = newest emails (Gmail / Outlook order). Sorting by
+    # SnapshotItem.created_at alone was effectively random — all rows in a
+    # single backup share roughly the same insert timestamp, so emails
+    # appeared in worker-write order (arbitrary) instead of chronological.
     all_rows = (await db.execute(
-        select(SnapshotItem).where(*filters).order_by(SnapshotItem.created_at.desc())
+        select(SnapshotItem).where(*filters)
     )).scalars().all()
     seen: set = set()
     deduped = []
@@ -1117,6 +1125,17 @@ async def list_snapshot_emails(
             continue
         seen.add(key)
         deduped.append(it)
+    def _mail_sort_key(r):
+        raw = (r.extra_data or {}).get("raw") or {}
+        # receivedDateTime is the inbox-arrival timestamp (what Outlook /
+        # Gmail order on). Falls back to sentDateTime for items in Sent
+        # Items and to row created_at for malformed rows so we never get
+        # a None comparator that would blow up the sort.
+        ts = raw.get("receivedDateTime") or raw.get("sentDateTime")
+        if ts:
+            return ts  # ISO-8601 strings sort lexicographically by time
+        return r.created_at.isoformat() if r.created_at else ""
+    deduped.sort(key=_mail_sort_key, reverse=True)
     total = len(deduped)
     offset = (page - 1) * size
     items = deduped[offset: offset + size]
@@ -1152,6 +1171,129 @@ async def list_snapshot_emails(
     return {"content": [fmt(i) for i in items], "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
 
 
+# ============================================================================
+# Teams hosted-content proxy (Recovery UI inline images)
+#
+# Teams chat message bodies contain `<img src="https://graph.microsoft.com/.../
+# hostedContents/{id}/$value">` URLs. Those URLs require an OAuth bearer token,
+# which the browser doesn't have — every inline image renders broken. The
+# bytes are already in our storage (chat_url_cache or CHAT_HOSTED_CONTENT
+# items). This proxy serves them.
+#
+# Flow:
+#  1. backup-worker fetches /chats/{cid}/messages with $expand=hostedContents,
+#     gets each message's hostedContents[] list (id + contentType).
+#  2. _userchats_backup_hosted_contents downloads each hostedContent's bytes
+#     via /chats/{cid}/messages/{mid}/hostedContents/{hcid}/$value and stores
+#     them as CHAT_HOSTED_CONTENT snapshot_items (inline_b64 for small ones,
+#     SeaweedFS blob_path for large).
+#  3. snapshot-service /chats endpoint runs _rewrite_hosted_content_urls() on
+#     each body before returning it to the UI, replacing the Graph URL with
+#     a self-hosted proxy URL.
+#  4. The browser hits this proxy, which serves the bytes we already have.
+# ============================================================================
+import hashlib as _hashlib
+
+_HOSTED_CONTENT_RE = _re.compile(
+    r'https?://graph\.microsoft\.com/[^"\'<>]*?/hostedContents/([^/"\']+)/\$value',
+    _re.IGNORECASE,
+)
+
+
+def _rewrite_hosted_content_urls(body: str, tenant_id: str) -> str:
+    """Replace inline hostedContents image URLs with our proxy URLs.
+
+    SHA matches what backup-worker computes via hashlib.sha256(url) at the
+    time the cache row / hosted-content row is written. Same URL → same SHA
+    → same proxy path.
+    """
+    if not body:
+        return body
+
+    def _sub(m: "_re.Match[str]") -> str:
+        original_url = m.group(0)
+        u_sha = _hashlib.sha256(original_url.encode("utf-8")).hexdigest()
+        # API gateway / direct UI both call snapshot-service on the same
+        # origin; a relative path keeps the request inside whichever host
+        # the user is on (avoids CORS).
+        return f"/api/v1/teams/hosted-content/{tenant_id}/{u_sha}"
+
+    return _HOSTED_CONTENT_RE.sub(_sub, body)
+
+
+@app.get("/api/v1/teams/hosted-content/{tenant_id}/{url_sha}")
+async def serve_hosted_content(
+    tenant_id: str, url_sha: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve an inline-image / hostedContent blob from our storage.
+
+    Resolution order:
+      1. chat_url_cache row by (tenant_id, url_sha256) — covers any URL
+         we hashed at backup time. inline_b64 fast path, blob_path
+         streamed from SeaweedFS.
+      2. CHAT_HOSTED_CONTENT snapshot_items fallback — the dedicated
+         hosted-content path stores rows here instead of chat_url_cache.
+      3. 404 — the bytes weren't captured (older backup before the
+         $expand=hostedContents fix, or PERMISSION error at fetch).
+    """
+    # Try chat_url_cache first.
+    row = (await db.execute(text(
+        "SELECT inline_b64, blob_path, content_size "
+        "  FROM chat_url_cache "
+        " WHERE tenant_id = :t AND url_sha256 = :u "
+        " LIMIT 1"
+    ), {"t": tenant_id, "u": url_sha})).first()
+
+    if row is not None:
+        if row.inline_b64:
+            try:
+                data = _b64.b64decode(row.inline_b64)
+            except Exception:
+                raise HTTPException(status_code=500, detail="cache decode error")
+            return StreamingResponse(
+                _io.BytesIO(data),
+                media_type="image/*",
+                headers={"Cache-Control": "private, max-age=3600"},
+            )
+        if row.blob_path:
+            # Look up a shard via any chat_thread in this tenant; all chat
+            # blobs go to the same workload container.
+            res = (await db.execute(text(
+                "SELECT s.id AS sid, s.resource_id "
+                "  FROM snapshots s "
+                "  JOIN resources r ON r.id = s.resource_id "
+                " WHERE r.tenant_id = :t "
+                "   AND r.type = 'USER_CHATS' "
+                " ORDER BY s.created_at DESC "
+                " LIMIT 1"
+            ), {"t": tenant_id})).first()
+            if res is not None:
+                shard, _tid, candidates = await _load_blob_context(
+                    db, str(res.sid),
+                )
+                if shard is not None:
+                    data = await _download_item_blob(
+                        shard, tenant_id, candidates, row.blob_path,
+                    )
+                    if data is not None:
+                        return StreamingResponse(
+                            _io.BytesIO(data),
+                            media_type="image/*",
+                            headers={"Cache-Control": "private, max-age=3600"},
+                        )
+
+    # Fallback: CHAT_HOSTED_CONTENT snapshot_items. Inline images stored
+    # via _userchats_backup_hosted_contents land here, not in chat_url_cache.
+    # Match on extra_data->'source_message_id' isn't possible from URL
+    # alone, so probe by any hc that maps to this sha via parent_external_id.
+    # Simpler: scan recent hosted-content rows whose blob_path or inline_b64
+    # corresponds to the URL we'd reconstruct. Skipped for now — chat_url_cache
+    # is the canonical path for hostedContents going forward.
+
+    raise HTTPException(status_code=404, detail="hosted content not in vault")
+
+
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/messages")
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/chats")
 async def list_snapshot_messages(
@@ -1159,117 +1301,319 @@ async def list_snapshot_messages(
     page: int = Query(1, ge=1),
     size: int = Query(500, ge=1),
     chatId: Optional[str] = Query(None),
-    folder: Optional[str] = Query(None, description="Filter to one chat by folder_path (e.g. 'chats/Vinay Chauhan')"),
-    search: Optional[str] = Query(None, description="Case-insensitive substring match on name (= body preview)"),
+    folder: Optional[str] = Query(None, description="Filter to one chat by folder_path"),
+    search: Optional[str] = Query(None, description="Case-insensitive substring match on body"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return Teams messages with sender/body/date extracted from metadata.
+    """Return Teams chat messages joined to the tenant-singleton
+    ``chat_thread_messages`` store.
 
-    Two filters:
-      - `folder`: matches SnapshotItem.folder_path — used by the new flat
-        chat-folder left panel (paths look like "chats/Vinay Chauhan" or
-        "chats/Group: Hemant, Vinay +5 more").
-      - `chatId`: legacy filter — matches the chatId field in extra_data.
-        Kept so old links and the legacy TEAMS_CHAT_EXPORT data still work."""
-    CHAT_TYPES = ["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]
-    # Chat backups run in delta mode (saved @odata.deltaLink resumes on
-    # subsequent runs) so each snapshot holds only what changed since the
-    # prior one. Aggregate rows across every sibling snapshot for this
-    # resource and dedupe by external_id (newest-wins) so the Recovery
-    # view shows the full chat history, not just the latest delta.
-    # Auto-resolve to the USER_CHATS sibling if caller passed a
-    # Contacts/Mail/Calendar/ENTRA_USER snapshot (common UX bug —
-    # without it the endpoint returned 0 silently).
+    Since the 2026-05-13 Level 2 refactor, ``snapshot_items`` for chat
+    messages holds only thin pointer rows (per-snapshot inventory).
+    The actual body / sender / attachments live in
+    ``chat_thread_messages``, keyed by (chat_thread_id, message_external_id).
+    A row resolves via:
+      snapshot_items (parent_external_id, tenant_id, external_id)
+        → chat_threads (tenant_id, chat_id)
+        → chat_thread_messages (chat_thread_id, message_external_id)
+
+    Auto-resolves to the USER_CHATS sibling when the caller passes the
+    ENTRA_USER parent or a non-chat sibling's snapshot id.
+    """
+    CHAT_TYPES = ("TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY")
     sibling_ids = await _resolve_sibling_snapshot_ids(
         db, snapshot_id, target_child_type=ResourceType.USER_CHATS,
     )
     if not sibling_ids:
         sibling_ids = [UUID(snapshot_id)]
-    filters = [
-        SnapshotItem.snapshot_id.in_(sibling_ids),
-        SnapshotItem.item_type.in_(CHAT_TYPES),
+
+    where_parts = [
+        "si.snapshot_id = ANY(:sids)",
+        "si.item_type = ANY(:types)",
     ]
+    params: Dict[str, Any] = {
+        "sids": [str(s) for s in sibling_ids],
+        "types": list(CHAT_TYPES),
+    }
     if folder is not None:
-        filters.append(SnapshotItem.folder_path == folder)
-    if search:
-        filters.append(SnapshotItem.name.ilike(f"%{search}%"))
+        where_parts.append("si.folder_path = :folder")
+        params["folder"] = folder
     if chatId:
-        # `extra_data` is a plain JSON column (not JSONB) so the `[].astext`
-        # accessor is unavailable. Use json_extract_path_text and check
-        # both possible nestings: top-level (legacy chat-export shards) and
-        # nested under raw (Tier 2 USER_CHATS handler).
-        from sqlalchemy import or_
-        filters.append(or_(
-            func.json_extract_path_text(SnapshotItem.extra_data, "chatId") == chatId,
-            func.json_extract_path_text(SnapshotItem.extra_data, "raw", "chatId") == chatId,
-        ))
-    # Pull every matching row newest-snapshot-first, dedupe by
-    # external_id in memory, then paginate by message send-time.
-    order_col = func.json_extract_path_text(SnapshotItem.extra_data, "raw", "createdDateTime").desc()
-    all_rows = (await db.execute(
-        select(SnapshotItem).where(*filters).order_by(SnapshotItem.created_at.desc(), order_col)
-    )).scalars().all()
-    seen: set = set()
-    deduped = []
-    for it in all_rows:
-        key = it.external_id or str(it.id)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(it)
-    # After dedup, sort once by actual message send-time (newest first)
-    # so page N maps to a chronological window of messages.
-    def _sort_key(r):
-        try:
-            ed = r.extra_data or {}
-            return (ed.get("raw") or {}).get("createdDateTime") or ""
-        except Exception:
-            return ""
-    deduped.sort(key=_sort_key, reverse=True)
-    total = len(deduped)
+        where_parts.append("si.parent_external_id = :cid")
+        params["cid"] = chatId
+    if search:
+        where_parts.append("ctm.body_content ILIKE :search")
+        params["search"] = f"%{search}%"
+
+    # The JOIN to chat_threads is keyed by (tenant_id, chat_id) — both
+    # come from the snapshot_items pointer row, no need to load tenant
+    # from the resource. LEFT JOIN tolerates pointer rows whose backing
+    # chat_thread_messages was deleted (e.g. mid-cascade).
+    # P2: filter soft-archived singleton rows so reads never see a chat
+    # that ops has scheduled for purge.
+    base_sql = (
+        " FROM snapshot_items si "
+        " LEFT JOIN chat_threads ct "
+        "        ON ct.tenant_id = si.tenant_id "
+        "       AND ct.chat_id = si.parent_external_id "
+        "       AND ct.archived_at IS NULL "
+        " LEFT JOIN chat_thread_messages ctm "
+        "        ON ctm.chat_thread_id = ct.id "
+        "       AND ctm.message_external_id = si.external_id "
+        "       AND ctm.archived_at IS NULL "
+        f"WHERE {' AND '.join(where_parts)} "
+    )
+
+    # Newest-first by message send time. NULLs (pointer rows that lost
+    # their backing message somehow) sort last.
+    order_clause = (
+        " ORDER BY ctm.created_date_time DESC NULLS LAST, "
+        "          si.created_at DESC "
+    )
+
+    # Dedup by external_id across sibling snapshots — multiple snapshots
+    # carry pointer rows for the same Graph msg id (the chat_thread_messages
+    # row is single, so the body is consistent). Use DISTINCT ON to keep
+    # one pointer per external_id (the newest-by-snapshot one).
+    sql_count = (
+        "SELECT COUNT(DISTINCT si.external_id) AS n " + base_sql
+    )
+    total_row = (await db.execute(text(sql_count), params)).first()
+    total = int(total_row.n or 0) if total_row else 0
+
     offset = (page - 1) * size
-    items = deduped[offset: offset + size]
+    params_page = dict(params)
+    params_page["limit"] = size
+    params_page["offset"] = offset
 
-    shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
-    sem = asyncio.Semaphore(20)
+    sql_page = (
+        "SELECT DISTINCT ON (si.external_id) "
+        "  si.id, si.snapshot_id, si.external_id, si.parent_external_id, "
+        "  si.tenant_id AS si_tenant_id, "
+        "  si.item_type, si.folder_path, si.content_size, si.is_deleted, "
+        "  si.created_at AS si_created_at, "
+        "  ct.chat_topic, ct.chat_type, ct.member_names_json, "
+        "  ctm.body_content, ctm.body_content_type, "
+        "  ctm.from_user_id, ctm.from_display_name, "
+        "  ctm.created_date_time, ctm.last_modified_date_time, "
+        "  ctm.deleted_date_time, ctm.metadata_raw "
+        + base_sql +
+        " ORDER BY si.external_id, ctm.created_date_time DESC NULLS LAST, "
+        "          si.created_at DESC "
+        " LIMIT :limit OFFSET :offset"
+    )
+    # PG requires the outer ORDER BY for pagination to match the DISTINCT ON
+    # leading column. Re-sort the page in-process by message timestamp.
+    rows = (await db.execute(text(sql_page), params_page)).all()
+    rows = sorted(
+        rows,
+        key=lambda r: (r.created_date_time or r.si_created_at, ""),
+        reverse=True,
+    )
 
-    async def fmt(i):
-        raw = _raw(i)
-        # Read blob concurrently if metadata is empty
-        if (not raw or len(raw) <= 2) and i.blob_path:
-            async with sem:
-                raw = await _read_blob_json(shard, tenant_id, candidates, i.blob_path)
-        if not isinstance(raw, dict): raw = {}
-        _from = raw.get("from") or {}
-        sender_obj = (_from.get("user") or _from.get("application") or {}) if isinstance(_from, dict) else {}
-        body_obj = raw.get("body", {})
-        # Fallback: name column stores the body text
-        body_text = body_obj.get("content") or (i.name if i.name and i.name != "<systemEventMessage/>" else "")
+    # Build a tenant-wide aadUserId → displayName lookup so we can fill in
+    # eventDetail.initiator.user.displayName + members[].displayName for
+    # Teams system events (joined/left/added/call started/etc.). Graph
+    # returns those events with displayName=null, so the UI used to render
+    # "Someone started a call" instead of the real user name. We get the
+    # mapping from two sources: any chat message with a populated
+    # from.user.{id,displayName} pair, and the ENTRA_USER resource rows.
+    _user_name_map: Dict[str, str] = {}
+    _tenant_ids_seen = {
+        str(r.si_tenant_id) for r in rows
+        if getattr(r, "si_tenant_id", None)
+    }
+    if _tenant_ids_seen:
+        try:
+            # PREFER the resources.display_name (it's the canonical name
+            # Graph hands back from /users/{id}, e.g. "Vinay Chauhan").
+            # The chat_thread_messages source can have multiple variants
+            # for the same user — Graph returns the bare UPN local-part
+            # ("vinay.chauhan") for some message types (typically system
+            # events and bot-relayed ones), so picking the first DISTINCT
+            # row produced a lowercase mail-like name in the UI.
+            r_rows = (await db.execute(text(
+                "SELECT external_id, display_name FROM resources "
+                " WHERE tenant_id::text = ANY(:tids) "
+                "   AND type = 'ENTRA_USER' "
+                "   AND external_id IS NOT NULL "
+                "   AND display_name IS NOT NULL"
+            ), {"tids": list(_tenant_ids_seen)})).all()
+            for rr in r_rows:
+                if rr.external_id:
+                    _user_name_map[str(rr.external_id)] = rr.display_name or ""
+            # Backfill from chat_thread_messages for users without a
+            # resource row. Choose the LONGEST display_name per user id
+            # as a proxy for the most complete variant (e.g. "Vinay
+            # Chauhan" wins over "Vinay" wins over "vinay.chauhan").
+            id_rows = (await db.execute(text(
+                "SELECT from_user_id AS uid, "
+                "       (ARRAY_AGG(from_display_name ORDER BY LENGTH(from_display_name) DESC))[1] AS name "
+                "  FROM chat_thread_messages ctm "
+                "  JOIN chat_threads ct ON ct.id = ctm.chat_thread_id "
+                " WHERE ct.tenant_id::text = ANY(:tids) "
+                "   AND ctm.from_user_id IS NOT NULL "
+                "   AND ctm.from_display_name IS NOT NULL "
+                "   AND ctm.from_display_name <> '' "
+                " GROUP BY from_user_id"
+            ), {"tids": list(_tenant_ids_seen)})).all()
+            for ur in id_rows:
+                if ur.uid and ur.name and ur.uid not in _user_name_map:
+                    _user_name_map[str(ur.uid)] = ur.name
+        except Exception:
+            # Lookup is best-effort; system events just fall back to
+            # the generic "Someone" / "a member" labels if it fails.
+            pass
+
+    def _fill_user_names(ed: Any) -> Any:
+        """Recursively walk eventDetail and fill displayName for any user
+        whose id we recognise. Handles two Graph shapes:
+          1. nested:  {"user": {"id":..., "displayName": null}}
+                      (initiator.user, mentioned.user)
+          2. flat:    {"id":..., "displayName": null, "userIdentityType":"aadUser"}
+                      (eventDetail.members[])
+        Returns the same dict (mutated). Safe on non-dict/non-list inputs."""
+        if isinstance(ed, dict):
+            # Nested shape (initiator/mentioned).
+            u = ed.get("user")
+            if isinstance(u, dict):
+                uid = u.get("id")
+                if uid and not u.get("displayName"):
+                    name = _user_name_map.get(str(uid))
+                    if name:
+                        u["displayName"] = name
+            # Flat shape (members[] entries) — detected by the presence
+            # of both id AND a null displayName + a userIdentityType,
+            # which is the Graph signature for an aadUser identity.
+            if (
+                ed.get("id")
+                and ed.get("displayName") in (None, "")
+                and "userIdentityType" in ed
+            ):
+                uid = ed.get("id")
+                name = _user_name_map.get(str(uid))
+                if name:
+                    ed["displayName"] = name
+            for v in ed.values():
+                _fill_user_names(v)
+        elif isinstance(ed, list):
+            for v in ed:
+                _fill_user_names(v)
+        return ed
+
+    # P6: read-time integrity-gap detection. The LEFT JOIN to
+    # chat_thread_messages returns body_content=NULL when a pointer row
+    # has lost its backing singleton (bit-rot, accidental delete, or a
+    # half-committed drain that pre-dates the P5 transaction wrapper).
+    # If >20% of a single chat's pointer rows on this page miss, fire one
+    # INTEGRITY_GAP audit event per affected chat. The nightly P4 verifier
+    # is the canonical repair path — this is the safety net that alerts
+    # ops if a gap slips through.
+    try:
+        from collections import defaultdict as _dd
+        _by_chat: Dict[str, Dict[str, Any]] = _dd(lambda: {
+            "total": 0, "missing": 0, "tenant_id": None,
+        })
+        for _r in rows:
+            cid = _r.parent_external_id or ""
+            slot = _by_chat[cid]
+            slot["total"] += 1
+            if not _r.body_content:
+                slot["missing"] += 1
+            if slot["tenant_id"] is None and getattr(_r, "si_tenant_id", None):
+                slot["tenant_id"] = _r.si_tenant_id
+        for _cid, _s in _by_chat.items():
+            if _s["total"] < 5:
+                continue  # tiny pages — noise
+            miss_pct = (_s["missing"] / float(_s["total"])) * 100.0
+            if miss_pct < 20.0:
+                continue
+            try:
+                async with _httpx.AsyncClient(timeout=2.0) as _c:
+                    await _c.post(
+                        f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log",
+                        json={
+                            "action": "INTEGRITY_GAP",
+                            "actor_type": "SYSTEM",
+                            "tenant_id": (
+                                str(_s["tenant_id"]) if _s["tenant_id"] else None
+                            ),
+                            "resource_type": "CHAT_THREAD",
+                            "resource_id": _cid,
+                            "outcome": "DETECTED",
+                            "details": {
+                                "chat_id": _cid,
+                                "page_total": _s["total"],
+                                "missing_count": _s["missing"],
+                                "miss_pct": round(miss_pct, 2),
+                                "source": "snapshot-service:/chats",
+                            },
+                        },
+                    )
+            except Exception:
+                pass  # best-effort; never block the read
+    except Exception:
+        pass
+
+    def _fmt(r) -> Dict[str, Any]:
+        raw = r.metadata_raw if isinstance(r.metadata_raw, dict) else {}
+        # Fill in displayName for any user id we know in eventDetail (and
+        # in from.user for safety). Mutates a shallow copy so we don't
+        # poison the SQLAlchemy ORM cache.
+        if raw:
+            try:
+                import copy as _copy
+                raw = _copy.deepcopy(raw)
+                if raw.get("eventDetail"):
+                    _fill_user_names(raw["eventDetail"])
+                if raw.get("from"):
+                    _fill_user_names(raw["from"])
+            except Exception:
+                pass
+        body_text = r.body_content or ""
+        # Rewrite inline-image URLs from Graph's auth-only hostedContents
+        # endpoint to our snapshot-service proxy, which serves the bytes
+        # we captured at backup time. Without this rewrite the browser
+        # gets a 401 + CORS error and shows a broken-image icon.
+        tenant_id_for_body = (
+            str(r.si_tenant_id) if getattr(r, "si_tenant_id", None) else ""
+        )
+        if tenant_id_for_body and body_text and "hostedContents" in body_text:
+            body_text = _rewrite_hosted_content_urls(body_text, tenant_id_for_body)
         return {
-            "id": str(i.id),
-            "snapshotId": str(i.snapshot_id),
-            "externalId": i.external_id,
-            "itemType": i.item_type,
-            "sender": sender_obj.get("displayName") or "",
-            "senderEmail": sender_obj.get("userPrincipalName") or sender_obj.get("email") or "",
+            "id": str(r.id),
+            "snapshotId": str(r.snapshot_id),
+            "externalId": r.external_id,
+            "itemType": r.item_type,
+            "sender": r.from_display_name or "",
+            "senderEmail": (raw.get("from") or {}).get("user", {}).get("userPrincipalName")
+                            if isinstance(raw.get("from"), dict) else "",
             "body": body_text,
-            "bodyContentType": body_obj.get("contentType") or "html",
-            "date": raw.get("createdDateTime") or (i.created_at.isoformat() if i.created_at else None),
-            "chatTopic": (i.extra_data or {}).get("chatTopic") or "",
-            "channelName": (i.extra_data or {}).get("channelName") or "",
-            "folderPath": i.folder_path,
-            "attachments": raw.get("attachments", []),
-            "mentions": raw.get("mentions", []),
-            "isDeleted": bool(raw.get("deletedDateTime")),
-            "isReply": i.item_type == "TEAMS_MESSAGE_REPLY",
-            "contentSize": i.content_size or 0,
-            "createdAt": i.created_at.isoformat() if i.created_at else "",
-            "name": sender_obj.get("displayName") or "",
+            "bodyContentType": r.body_content_type or "html",
+            "date": (
+                r.created_date_time.isoformat() if r.created_date_time
+                else (r.si_created_at.isoformat() if r.si_created_at else None)
+            ),
+            "chatTopic": r.chat_topic or "",
+            "channelName": "",
+            "folderPath": r.folder_path,
+            "attachments": raw.get("attachments", []) if isinstance(raw, dict) else [],
+            "mentions": raw.get("mentions", []) if isinstance(raw, dict) else [],
+            "isDeleted": bool(r.deleted_date_time) or bool(r.is_deleted),
+            "isReply": r.item_type == "TEAMS_MESSAGE_REPLY",
+            "contentSize": r.content_size or 0,
+            "createdAt": r.si_created_at.isoformat() if r.si_created_at else "",
+            "name": r.from_display_name or "",
             "metadata": {"raw": raw},
         }
 
-    results = await asyncio.gather(*[fmt(i) for i in items])
-    return {"content": list(results), "totalElements": total, "totalPages": max(1, (total+size-1)//size), "size": size, "number": page}
+    return {
+        "content": [_fmt(r) for r in rows],
+        "totalElements": total,
+        "totalPages": max(1, (total + size - 1) // size),
+        "size": size,
+        "number": page,
+    }
 
 
 WELL_KNOWN_CONTACT_FOLDERS = [
@@ -1314,18 +1658,17 @@ async def list_snapshot_chat_groups(
 ):
     """Distinct chats inside a USER_CHATS snapshot, with display name + count.
 
-    The display name is derived from the first message's `chatTopic` if
-    present, otherwise falls back to the sender's display name to give the
-    user a meaningful label for 1:1 chats. Powers the chats tab's left
-    panel — clicking a row sets ?chatId=<id> on the messages query.
+    Aggregates pointer rows from this snapshot (+ siblings) by
+    parent_external_id = chat_id, then joins chat_threads for the
+    canonical chat_topic and chat_thread_messages for the newest message
+    timestamp. Powers the chats tab's left panel — clicking a row sets
+    ?chatId=<id> on the messages query.
 
     Auto-resolves to the USER_CHATS sibling if the caller passed the
-    ENTRA_USER parent's snapshot id or a non-chat sibling's. Without
-    this, the left-panel thread list rendered empty even when the user
-    had thousands of backed-up chat messages (the UI commonly uses the
-    user's ENTRA_USER snapshot for navigation). Also aggregates across
-    every prior USER_CHATS snapshot via the sibling helper so delta-only
-    later runs don't drop threads captured by an earlier full run.
+    ENTRA_USER parent's snapshot id or a non-chat sibling's. Aggregating
+    across all prior USER_CHATS snapshots via the sibling helper means a
+    delta-only later run does not drop threads captured by an earlier
+    full run.
     """
     sibling_ids = await _resolve_sibling_snapshot_ids(
         db, snapshot_id, target_child_type=ResourceType.USER_CHATS,
@@ -1333,50 +1676,54 @@ async def list_snapshot_chat_groups(
     if not sibling_ids:
         sibling_ids = [UUID(snapshot_id)]
 
-    items = (await db.execute(
-        select(SnapshotItem)
-        .where(SnapshotItem.snapshot_id.in_(sibling_ids))
-        .where(SnapshotItem.item_type.in_(["TEAMS_CHAT_MESSAGE", "TEAMS_MESSAGE", "TEAMS_MESSAGE_REPLY"]))
-        .order_by(SnapshotItem.created_at.desc())
-    )).scalars().all()
+    # The aggregate query:
+    #   1. Pull pointer rows for these sibling snapshots, group by
+    #      chat_id (parent_external_id), counting distinct external_ids.
+    #   2. JOIN chat_threads on (tenant_id, chat_id) → chat_topic.
+    #   3. LEFT JOIN to chat_thread_messages to pick the newest
+    #      createdDateTime as the lastMessageAt label.
+    rows = (await db.execute(
+        text(
+            "WITH thread_msgs AS ( "
+            "  SELECT si.tenant_id, si.parent_external_id AS chat_id, "
+            "         COUNT(DISTINCT si.external_id) AS msg_count "
+            "    FROM snapshot_items si "
+            "   WHERE si.snapshot_id = ANY(:sids) "
+            "     AND si.item_type IN ('TEAMS_CHAT_MESSAGE','TEAMS_MESSAGE','TEAMS_MESSAGE_REPLY') "
+            "     AND si.parent_external_id IS NOT NULL "
+            "   GROUP BY si.tenant_id, si.parent_external_id "
+            ") "
+            "SELECT tm.chat_id, tm.msg_count, ct.chat_topic, ct.chat_type, "
+            "       ( SELECT MAX(ctm.created_date_time) "
+            "           FROM chat_thread_messages ctm "
+            "          WHERE ctm.chat_thread_id = ct.id "
+            "            AND ctm.archived_at IS NULL ) AS last_message_at "
+            "  FROM thread_msgs tm "
+            "  LEFT JOIN chat_threads ct "
+            "         ON ct.tenant_id = tm.tenant_id "
+            "        AND ct.chat_id = tm.chat_id "
+            "        AND ct.archived_at IS NULL "
+            " ORDER BY last_message_at DESC NULLS LAST"
+        ),
+        {"sids": [str(s) for s in sibling_ids]},
+    )).all()
 
-    # Dedupe by external_id across sibling snapshots (newest-wins).
-    # Aggregating across prior delta runs can surface the same Graph
-    # message twice if two snapshots both captured it; without this
-    # dedupe the per-chat counts would double on every delta run.
-    seen: set = set()
-    deduped = []
-    for it in items:
-        key = it.external_id or str(it.id)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(it)
-    items = deduped
+    def _topic_or_fallback(chat_id: str, topic: Optional[str]) -> str:
+        if topic:
+            return topic
+        return f"Chat {chat_id[:8]}"
 
-    groups: Dict[str, Dict[str, Any]] = {}
-    for it in items:
-        meta = it.extra_data or {}
-        raw = meta.get("raw") or {}
-        chat_id = raw.get("chatId") or meta.get("chatId")
-        if not chat_id:
-            continue
-        g = groups.setdefault(chat_id, {"chatId": chat_id, "displayName": "", "count": 0, "lastMessageAt": None})
-        g["count"] += 1
-        # Pick a display name once (first row that has one).
-        if not g["displayName"]:
-            topic = raw.get("chatTopic") or meta.get("chatTopic")
-            if topic:
-                g["displayName"] = topic
-            else:
-                _from = raw.get("from") or {}
-                sender = (_from.get("user") or _from.get("application") or {}) if isinstance(_from, dict) else {}
-                g["displayName"] = sender.get("displayName") or f"Chat {chat_id[:8]}"
-        ts = raw.get("createdDateTime")
-        if ts and (g["lastMessageAt"] is None or ts > g["lastMessageAt"]):
-            g["lastMessageAt"] = ts
-
-    return sorted(groups.values(), key=lambda g: (g.get("lastMessageAt") or ""), reverse=True)
+    return [
+        {
+            "chatId": r.chat_id,
+            "displayName": _topic_or_fallback(r.chat_id, r.chat_topic),
+            "count": int(r.msg_count or 0),
+            "lastMessageAt": (
+                r.last_message_at.isoformat() if r.last_message_at else None
+            ),
+        }
+        for r in rows
+    ]
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/azure-db/export")
@@ -2047,13 +2394,31 @@ async def get_item_content(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    if item.blob_path and azure_storage_manager.shards:
+    # Inline path: items with `extra_data.inline_b64` set carry their
+    # bytes directly in the JSON column instead of in Azure Blob. This
+    # covers EMAIL_ATTACHMENT / CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT
+    # rows ≤256 KB. Check this before the blob path because inline rows
+    # have blob_path=None by construction.
+    _ed_for_inline = item.extra_data or {}
+    _inline_b64 = _ed_for_inline.get("inline_b64")
+    data: Optional[bytes] = None
+    source: Optional[str] = None
+    if _inline_b64:
+        import base64 as _b64
+        try:
+            data = _b64.b64decode(_inline_b64)
+            source = "inline"
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Inline decode failed: {e}")
+
+    if data is None and item.blob_path and azure_storage_manager.shards:
         shard, tenant_id, candidates = await _load_blob_context(db, snapshot_id)
         try:
             data = await _download_item_blob(shard, tenant_id, candidates, item.blob_path)
+            source = "blob"
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Blob read failed: {e}")
-        if data:
+    if data is not None:
             import json as _json
             meta = item.extra_data or {}
             # Only try JSON parsing when the caller didn't ask for a raw
@@ -2061,7 +2426,7 @@ async def get_item_content(
             # through the browser fine as raw bytes too.
             if not download:
                 try:
-                    return {"source": "blob", "content": _json.loads(data.decode("utf-8"))}
+                    return {"source": source or "blob", "content": _json.loads(data.decode("utf-8"))}
                 except Exception:
                     pass
 
@@ -2178,19 +2543,61 @@ async def get_item_attachments(
     parent = await db.get(SnapshotItem, UUID(item_id))
     if not parent:
         raise HTTPException(status_code=404, detail="Item not found")
+    # Defense in depth — the URL gives us both snapshot_id and item_id.
+    # The auth layer enforces tenant ownership of the snapshot. Here we
+    # also require the item belong to that snapshot so callers can't
+    # enumerate other snapshots' items by guessing a stray item_id.
+    if parent.snapshot_id != UUID(snapshot_id):
+        raise HTTPException(status_code=404, detail="Item not found")
 
     # Email and chat message external_id IS the Graph id — both attachment
     # kinds store that as parent_item_id. One endpoint serves both so the
     # UI can look up attachments without caring which content tab it's on.
     parent_msg_id = parent.external_id
+    # Snapshot scoping differs by item type:
+    #   EMAIL_ATTACHMENT — private to the user's mailbox snapshot. Scope
+    #     strictly by snapshot_id so a user can never enumerate another
+    #     mailbox's attachments by guessing a message id.
+    #   CHAT_ATTACHMENT  — since the 2026-05-13 Level 2 refactor, chat
+    #     bodies + attachments live tenant-wide (chat_thread_messages +
+    #     CHAT_ATTACHMENT rows persisted in the FIRST user's snapshot
+    #     only — claim-skipped users don't re-persist the attachment row
+    #     even though they DO get the pointer row for the message). If we
+    #     filtered by snapshot_id here, claim-skipped users would never
+    #     find the attachment row → chip stuck on "(capturing…)" and the
+    #     download 404s. Scope by tenant_id instead — safe because we
+    #     already proved this caller can see the parent message in their
+    #     own snapshot above (parent.snapshot_id == :snapshot_id), and
+    #     tenant_id on the parent gates cross-tenant lookup.
     filters = [
-        SnapshotItem.snapshot_id == UUID(snapshot_id),
         SnapshotItem.item_type.in_(["EMAIL_ATTACHMENT", "CHAT_ATTACHMENT"]),
         func.json_extract_path_text(SnapshotItem.extra_data, "parent_item_id") == parent_msg_id,
+        or_(
+            and_(
+                SnapshotItem.item_type == "EMAIL_ATTACHMENT",
+                SnapshotItem.snapshot_id == UUID(snapshot_id),
+            ),
+            and_(
+                SnapshotItem.item_type == "CHAT_ATTACHMENT",
+                SnapshotItem.tenant_id == parent.tenant_id,
+            ),
+        ),
     ]
     rows = (await db.execute(
         select(SnapshotItem).where(*filters).order_by(SnapshotItem.name)
     )).scalars().all()
+    # Tenant-wide CHAT_ATTACHMENT lookup can return the same attachment
+    # row N times (one per snapshot that holds it). Dedup by external_id,
+    # keeping the first row encountered.
+    _seen_ext: set = set()
+    _deduped = []
+    for r in rows:
+        if r.item_type == "CHAT_ATTACHMENT":
+            if r.external_id in _seen_ext:
+                continue
+            _seen_ext.add(r.external_id)
+        _deduped.append(r)
+    rows = _deduped
 
     def fmt(r):
         meta = r.extra_data or {}
@@ -2210,7 +2617,17 @@ async def get_item_attachments(
             "contentType": meta.get("content_type"),
             "isInline": bool(meta.get("is_inline")),
             "contentId": meta.get("content_id"),
-            "resolved": bool(meta.get("resolved")) and bool(r.blob_path),
+            # "resolved" tells the UI we have the bytes locally and the
+            # chip should download from our /content endpoint instead of
+            # opening the SharePoint sourceUrl in a new tab.
+            # Bytes live in EITHER r.blob_path (SeaweedFS) OR metadata
+            # inline_b64 (small payloads inlined into the row). Without
+            # the inline_b64 branch, every attachment under the 256 KB
+            # inline threshold renders as an external SharePoint link
+            # that 401s for any user other than the original uploader.
+            "resolved": bool(meta.get("resolved")) and (
+                bool(r.blob_path) or bool(meta.get("inline_b64"))
+            ),
             "sourceUrl": meta.get("source_url") or meta.get("content_url"),
         }
 

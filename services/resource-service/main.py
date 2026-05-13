@@ -15,7 +15,7 @@ from shared.config import settings
 from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import (
     Resource, SlaPolicy, ResourceType, ResourceStatus, Tenant, TenantType,
-    SlaExclusion, ResourceGroup, GroupPolicyAssignment,
+    SlaExclusion, ResourceGroup, GroupPolicyAssignment, UI_HIDDEN_TYPES,
 )
 from shared.schemas import (
     ResourceResponse, ResourceListResponse, UserResourceResponse,
@@ -39,29 +39,9 @@ async def lifespan(app: FastAPI):
     await close_db()
 
 
-# Resource types hidden from UI listing endpoints by default.
-# Caller can still opt in via ?includeHidden=true.
-# TEAMS_CHAT_EXPORT is a backup-scheduler-internal per-user shard that carries the
-# Graph delta token for the whole-user chat export; TEAMS_CHAT rows remain the
-# user-facing entity.
-# USER_MAIL / USER_ONEDRIVE / USER_CONTACTS / USER_CALENDAR / USER_CHATS are
-# Tier 2 per-content-category children under an ENTRA_USER parent. The parent
-# row already rolls up their storage_bytes and last-backup timestamps, so
-# surfacing them in Protection creates five dupes per user (Mail, OneDrive,
-# Calendar, Contacts, Chats) each needing their own SLA policy — which isn't
-# how protection actually works. Recovery reads them via snapshots, not the
-# resource listing, so hiding them here is safe.
-UI_HIDDEN_TYPES: set[str] = {
-    "TEAMS_CHAT_EXPORT",
-    "USER_MAIL", "USER_ONEDRIVE", "USER_CONTACTS", "USER_CALENDAR", "USER_CHATS",
-    # TEAMS_CHANNEL rows duplicate an M365_GROUP row for the same team —
-    # same external_id on both. The M365_GROUP backup now fans out into
-    # channels + group mailbox + team site, so the TEAMS_CHANNEL row is
-    # redundant and only clutters the listing. Hide by default; callers
-    # that genuinely need the standalone channel view can opt in via
-    # includeHidden=true.
-    "TEAMS_CHANNEL",
-}
+# UI_HIDDEN_TYPES now lives in shared.models so dashboard-service can apply
+# the same exclusion to its Protection Status GROUP BY. See that module for
+# the per-type rationale.
 
 
 def format_bytes(bytes_val: int) -> str:

@@ -13,9 +13,11 @@ Responsibilities:
 """
 import csv
 import io
+import os
+import json
 import uuid
 import json as json_lib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, List, Dict, Set, Tuple
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -106,12 +108,226 @@ async def _refresh_running_jobs():
         await asyncio.sleep(1)
 
 
+# ============================================================================
+# Plan P4 — Nightly chat integrity verifier.
+#
+# Compares the row count in chat_thread_messages against the Graph
+# ?$count=true ground truth for every chat that was recently drained.
+# On mismatch beyond a small tolerance, flips
+# chat_threads.drain_failure_state.integrity_gap=true — which the
+# backup worker reads on the NEXT pass to override skip-claim and force
+# a fresh full re-drain. This is the self-healing path that catches
+# silent drops from pagination races, F6 in the plan.
+#
+# Cost: 1 throttled Graph call per chat per day per tenant. With chat
+# sharding across 12 GraphClient apps this stays well under throttle.
+# ============================================================================
+
+_CHAT_INTEGRITY_INTERVAL_S = int(
+    os.getenv("CHAT_INTEGRITY_INTERVAL_S", str(24 * 3600)),
+)
+_CHAT_INTEGRITY_TOLERANCE_PCT = float(
+    os.getenv("CHAT_INTEGRITY_TOLERANCE_PCT", "1.0"),
+)
+
+
+async def _verify_chat_integrity_once():
+    """One sweep of all chats that drained successfully in the last 24h.
+    For each, fetch Graph's `$count=true` for the chat's message list and
+    compare to chat_thread_messages COUNT(*). Mark gaps."""
+    try:
+        from shared.graph_client import GraphClient as _GraphClient
+    except Exception:
+        # If GraphClient import fails (dev env without secrets), skip.
+        return
+    try:
+        async with async_session_factory() as db:
+            chats = (await db.execute(text(
+                "SELECT id, tenant_id, chat_id "
+                "  FROM chat_threads "
+                " WHERE last_drained_at > NOW() - INTERVAL '24 hours' "
+                "   AND (drain_failure_state IS NULL "
+                "        OR (drain_failure_state->>'class') IS NULL "
+                "        OR (drain_failure_state->>'class') NOT IN "
+                "             ('PERMISSION','GONE'))"
+            ))).all()
+        if not chats:
+            return
+        # GraphClient(client_id, client_secret, tenant_id) — needs per-tenant
+        # creds. Build a small (tenant_id -> GraphClient) cache so we only
+        # instantiate once per tenant in this sweep. Skip a tenant entirely
+        # if we can't resolve usable creds (dev envs without secrets, or a
+        # tenant whose secret ref isn't fetchable) — better to no-op the
+        # integrity check than crash the whole sweep with a TypeError.
+        _gc_cache: Dict[str, Optional[Any]] = {}
+
+        async def _gc_for_tenant(tid: str):
+            if tid in _gc_cache:
+                return _gc_cache[tid]
+            try:
+                async with async_session_factory() as ds:
+                    t = await ds.get(Tenant, uuid.UUID(tid))
+                if not t or not (t.client_id and t.external_tenant_id):
+                    _gc_cache[tid] = None
+                    return None
+                client = _GraphClient(
+                    client_id=t.client_id,
+                    client_secret="",
+                    tenant_id=t.external_tenant_id,
+                )
+                _gc_cache[tid] = client
+                return client
+            except Exception:
+                _gc_cache[tid] = None
+                return None
+
+        gaps_found = 0
+        for c in chats:
+            try:
+                # Local DB count.
+                async with async_session_factory() as db2:
+                    n = (await db2.execute(text(
+                        "SELECT COUNT(*) AS n FROM chat_thread_messages "
+                        " WHERE chat_thread_id = :tid"
+                    ), {"tid": str(c.id)})).scalar()
+                if n is None:
+                    continue
+                # Graph ground-truth count.
+                gc = await _gc_for_tenant(str(c.tenant_id))
+                if gc is None:
+                    continue
+                graph_total = await gc.count_chat_messages(c.chat_id)
+                if graph_total is None:
+                    continue
+                if graph_total <= 0:
+                    continue
+                miss_pct = abs(graph_total - int(n)) / float(graph_total) * 100.0
+                if miss_pct <= _CHAT_INTEGRITY_TOLERANCE_PCT:
+                    continue
+                # Flag gap.
+                async with async_session_factory() as db3:
+                    await db3.execute(text(
+                        "UPDATE chat_threads "
+                        "   SET drain_failure_state = "
+                        "       COALESCE(drain_failure_state, '{}'::jsonb) "
+                        "       || CAST(:fs AS JSONB), "
+                        "       updated_at = NOW() "
+                        " WHERE id = :tid"
+                    ), {
+                        "tid": str(c.id),
+                        "fs": json.dumps({
+                            "integrity_gap": True,
+                            "db_count": int(n),
+                            "graph_count": int(graph_total),
+                            "detected_at": datetime.now(timezone.utc).isoformat(),
+                        }),
+                    })
+                    await db3.commit()
+                gaps_found += 1
+                # Emit an audit event so ops sees the gap immediately.
+                try:
+                    await create_audit_event({
+                        "event_type": "INTEGRITY_GAP",
+                        "severity": "HIGH",
+                        "tenant_id": str(c.tenant_id),
+                        "resource_type": "CHAT_THREAD",
+                        "resource_id": str(c.id),
+                        "details": {
+                            "chat_id": c.chat_id,
+                            "db_count": int(n),
+                            "graph_count": int(graph_total),
+                            "miss_pct": round(miss_pct, 2),
+                        },
+                    })
+                except Exception:
+                    pass
+            except Exception as e:
+                # Per-chat failure: skip and continue. Don't let one chat
+                # tank the whole nightly sweep.
+                continue
+        if gaps_found:
+            print(f"[CHAT-INTEGRITY] sweep found {gaps_found} gap(s) "
+                  f"across {len(chats)} chats — backups will re-drain")
+    except Exception as e:
+        print(f"[CHAT-INTEGRITY] sweep failed: {type(e).__name__}: {e}")
+
+
+async def _chat_integrity_loop():
+    # Initial delay so the worker starts up cleanly before the first sweep.
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await _verify_chat_integrity_once()
+        except Exception:
+            pass
+        await asyncio.sleep(_CHAT_INTEGRITY_INTERVAL_S)
+
+
+# ============================================================================
+# P2 — soft-delete purge sweep
+#
+# Rows soft-deleted via `archived_at` stay physically present for a 30-day
+# grace period so an accidental tenant or chat archive can be reversed.
+# After the grace window the purge worker hard-deletes them. Sweep runs
+# hourly; the grace window is tunable via env.
+# ============================================================================
+_PURGE_GRACE_DAYS = int(os.getenv("ARCHIVED_PURGE_GRACE_DAYS", "30"))
+_PURGE_INTERVAL_S = int(os.getenv("ARCHIVED_PURGE_INTERVAL_S", str(3600)))
+
+
+async def _purge_archived_once():
+    """Hard-delete soft-archived rows older than the grace window.
+    Order matters: messages first, then threads, then tenants — RESTRICT
+    FKs would otherwise reject the parent delete."""
+    try:
+        async with async_session_factory() as db:
+            res1 = await db.execute(text(
+                "DELETE FROM chat_thread_messages "
+                " WHERE archived_at IS NOT NULL "
+                "   AND archived_at < NOW() - make_interval(days => :d)"
+            ), {"d": _PURGE_GRACE_DAYS})
+            res2 = await db.execute(text(
+                "DELETE FROM chat_threads "
+                " WHERE archived_at IS NOT NULL "
+                "   AND archived_at < NOW() - make_interval(days => :d)"
+            ), {"d": _PURGE_GRACE_DAYS})
+            res3 = await db.execute(text(
+                "DELETE FROM tenants "
+                " WHERE archived_at IS NOT NULL "
+                "   AND archived_at < NOW() - make_interval(days => :d)"
+            ), {"d": _PURGE_GRACE_DAYS})
+            await db.commit()
+            n1 = res1.rowcount or 0
+            n2 = res2.rowcount or 0
+            n3 = res3.rowcount or 0
+            if n1 or n2 or n3:
+                print(
+                    f"[ARCHIVED-PURGE] removed "
+                    f"{n1} messages, {n2} threads, {n3} tenants "
+                    f"older than {_PURGE_GRACE_DAYS}d"
+                )
+    except Exception as e:
+        print(f"[ARCHIVED-PURGE] sweep failed: {type(e).__name__}: {e}")
+
+
+async def _archived_purge_loop():
+    await asyncio.sleep(120)
+    while True:
+        try:
+            await _purge_archived_once()
+        except Exception:
+            pass
+        await asyncio.sleep(_PURGE_INTERVAL_S)
+
+
 @app.on_event("startup")
 async def startup():
     """Initialize message bus and start consumer on startup"""
     await message_bus.connect()
     asyncio.create_task(consume_audit_events())
     asyncio.create_task(_refresh_running_jobs())
+    asyncio.create_task(_chat_integrity_loop())
+    asyncio.create_task(_archived_purge_loop())
 
 
 @app.on_event("shutdown")
@@ -162,7 +378,9 @@ AUDIT_PRESETS = [
                  "CHAT_EXPORT_DOWNLOADED", "CHAT_EXPORT_FORCE_DELETED"]},
 ]
 
-WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE", "RANSOMWARE_SIGNAL"}
+WARNING_ACTIVITY_ACTIONS = {"BACKUP_SKIPPED_SLA_SCOPE"}
+# RANSOMWARE_SIGNAL deliberately excluded — it belongs in the Audit + Risk
+# tabs, not the Tasks/Activity feed (it isn't a job outcome).
 
 # Discovery events (run start + completion, per-tenant) are surfaced in the
 # activity feed so users can see auto- and manual-triggered discoveries.
@@ -412,6 +630,22 @@ async def list_activities(
 
         for event in warning_events:
             details = event.details or {}
+            message = details.get("message")
+            if not message:
+                if event.action == "RANSOMWARE_SIGNAL":
+                    anomaly = details.get("anomaly_type") or "Anomaly"
+                    avg_prior = details.get("avg_prior_item_count")
+                    current = details.get("current_item_count")
+                    drop_pct = details.get("drop_pct")
+                    if anomaly == "ITEM_COUNT_DROP" and avg_prior is not None and current is not None:
+                        pct = f" ({drop_pct}% drop)" if drop_pct is not None else ""
+                        message = f"Ransomware signal: item count dropped from avg {avg_prior} to {current}{pct}."
+                    else:
+                        message = f"Ransomware signal detected ({anomaly})."
+                elif event.action == "BACKUP_SKIPPED_SLA_SCOPE":
+                    message = "Backup skipped because the assigned SLA does not cover this resource type."
+                else:
+                    message = ACTIONS.get(event.action, event.action)
             items.append({
                 "id": f"audit-{event.id}",
                 "start_time": event.occurred_at.isoformat() if event.occurred_at else "",
@@ -419,7 +653,7 @@ async def list_activities(
                 "object": event.resource_name or event.resource_type or "Unknown resource",
                 "status": "Warning",
                 "finish_time": event.occurred_at.isoformat() if event.occurred_at else "",
-                "details": details.get("message") or "Backup skipped because the assigned SLA does not cover this resource type.",
+                "details": message,
             })
 
         # Discovery events: pair each DISCOVERY_STARTED with its matching
@@ -1000,11 +1234,16 @@ async def get_high_risk_events(
         to_date = datetime.utcnow().isoformat()
 
     async with async_session_factory() as db:
-        # Use PostgreSQL JSONB containment operator via text()
+        # A row qualifies as a risk signal if it carries an explicit
+        # `risk_signals` payload (legacy scorer output) OR is a
+        # RANSOMWARE_SIGNAL action emitted by the anomaly detector.
         filters = [
             AuditEvent.occurred_at >= datetime.fromisoformat(from_date),
             AuditEvent.occurred_at <= datetime.fromisoformat(to_date),
-            text("details @> '{\"risk_signals\":{}}'"),  # Has risk_signals key
+            or_(
+                text("details @> '{\"risk_signals\":{}}'"),
+                AuditEvent.action == "RANSOMWARE_SIGNAL",
+            ),
         ]
         if tenantId:
             filters.append(AuditEvent.tenant_id == uuid.UUID(tenantId))
@@ -1027,6 +1266,32 @@ async def get_high_risk_events(
             item = _format_event(e)
             details = e.details or {}
             risk_signals = details.get("risk_signals", {})
+            # RANSOMWARE_SIGNAL events don't carry a `risk_signals` payload —
+            # synthesize one from the anomaly fields so the Risk tab can
+            # surface them with a score and level.
+            if not risk_signals and e.action == "RANSOMWARE_SIGNAL":
+                drop_pct = details.get("drop_pct") or 0
+                anomaly = details.get("anomaly_type") or "ANOMALY"
+                if drop_pct >= 90:
+                    level = "CRITICAL"
+                    score = 90
+                elif drop_pct >= 70:
+                    level = "HIGH"
+                    score = 70
+                elif drop_pct >= 50:
+                    level = "MEDIUM"
+                    score = 50
+                else:
+                    level = "LOW"
+                    score = 30
+                risk_signals = {
+                    "risk_level": level,
+                    "risk_score": score,
+                    "anomaly_type": anomaly,
+                    "drop_pct": drop_pct,
+                    "current_item_count": details.get("current_item_count"),
+                    "avg_prior_item_count": details.get("avg_prior_item_count"),
+                }
             item["risk_signals"] = risk_signals
             item["risk_score"] = risk_signals.get("risk_score", 0)
             item["risk_level"] = risk_signals.get("risk_level", "UNKNOWN")

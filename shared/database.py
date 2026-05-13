@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from time import monotonic
 from typing import AsyncGenerator
 
@@ -45,6 +46,11 @@ REQUIRED_TABLES = (
     "storage_backends",
     "system_config",
     "storage_toggle_events",
+    # Cross-user chat dedup (2026-05-13). Required so the worker waits for
+    # init_db before issuing its first INSERT…ON CONFLICT drain claim.
+    "chat_url_cache",
+    "chat_threads",
+    "chat_thread_messages",
 )
 
 REQUIRED_COLUMNS = {
@@ -79,7 +85,16 @@ engine = create_async_engine(
     max_overflow=settings.DB_MAX_OVERFLOW,
     pool_timeout=settings.DB_POOL_TIMEOUT,
     pool_recycle=settings.DB_POOL_RECYCLE,
-    connect_args={"server_settings": {"search_path": SEARCH_PATH}},
+    # statement_cache_size=0 prevents asyncpg's prepared-statement cache from
+    # outliving a schema change. Without this, a tenant-wipe / DROP SCHEMA
+    # leaves dashboard_service holding cached statement plans with stale
+    # enum OIDs, producing `cache lookup failed for type 119228`. The cache
+    # is a 5-15% throughput win on hot paths; correctness matters more during
+    # demos/dev. Heavy-load prod can override by setting STATEMENT_CACHE_SIZE>0.
+    connect_args={
+        "server_settings": {"search_path": SEARCH_PATH},
+        "statement_cache_size": int(os.getenv("STATEMENT_CACHE_SIZE", "0")),
+    },
 )
 
 async_session_factory = async_sessionmaker(
@@ -328,6 +343,7 @@ async def init_db() -> None:
             azure_refresh_token_updated_at TIMESTAMP,
             azure_subscriptions_cached JSON DEFAULT '[]',
             azure_sql_servers_configured JSON DEFAULT '[]',
+            archived_at TIMESTAMPTZ,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -777,6 +793,61 @@ async def init_db() -> None:
             retried_job_count INTEGER
         )
         """,
+        # Cross-user chat dedup (2026-05-13). See shared.models docstrings for
+        # the full design notes.
+        """
+        CREATE TABLE IF NOT EXISTS chat_url_cache (
+            tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            url_sha256 CHAR(64) NOT NULL,
+            drive_item_id VARCHAR(256),
+            content_hash CHAR(64),
+            blob_path TEXT,
+            content_size BIGINT,
+            inline_b64 TEXT,
+            unreachable BOOLEAN NOT NULL DEFAULT FALSE,
+            first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (tenant_id, url_sha256)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS chat_threads (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+            chat_id VARCHAR(256) NOT NULL,
+            chat_type VARCHAR(32),
+            chat_topic TEXT,
+            member_names_json JSONB,
+            last_updated_at TIMESTAMPTZ,
+            last_drained_at TIMESTAMPTZ,
+            drain_cursor TEXT,
+            drain_failure_state JSONB,
+            archived_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (tenant_id, chat_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS chat_thread_messages (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            chat_thread_id UUID NOT NULL REFERENCES chat_threads(id) ON DELETE RESTRICT,
+            message_external_id VARCHAR(256) NOT NULL,
+            created_date_time TIMESTAMPTZ,
+            last_modified_date_time TIMESTAMPTZ,
+            from_user_id VARCHAR(128),
+            from_display_name VARCHAR(256),
+            body_content TEXT,
+            body_content_type VARCHAR(16),
+            deleted_date_time TIMESTAMPTZ,
+            metadata_raw JSONB,
+            content_hash CHAR(64),
+            content_size BIGINT,
+            archived_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (chat_thread_id, message_external_id)
+        )
+        """,
     ]
 
     index_statements = [
@@ -845,9 +916,26 @@ async def init_db() -> None:
         # idx_jobs_tenant_type_status is intentionally NOT here — it depends
         # on jobs.status having already been converted from VARCHAR to the
         # jobstatus enum. It's created in post_alter_index_statements below.
+        # Cross-user chat dedup — read-side filter on last_used_at + drain-claim
+        # freshness check both want this index.
+        "CREATE INDEX IF NOT EXISTS ix_chat_url_cache_last_used "
+        "ON chat_url_cache (tenant_id, last_used_at)",
+        "CREATE INDEX IF NOT EXISTS ix_chat_threads_tenant "
+        "ON chat_threads (tenant_id, last_drained_at)",
+        # Hot read path: hydrate a chat thread newest-first.
+        "CREATE INDEX IF NOT EXISTS ix_chat_thread_messages_thread_time "
+        "ON chat_thread_messages (chat_thread_id, created_date_time DESC)",
     ]
 
     add_column_statements = [
+        # P2: soft-delete columns on tenants + chat_thread tables. A
+        # tenant or chat marked with archived_at is invisible to read
+        # paths but physically present until the 30-day purge worker
+        # collects it. RESTRICT FKs (DDL above) prevent accidental
+        # cascade deletes from wiping chat singletons.
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
+        "ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
+        "ALTER TABLE chat_thread_messages ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
         # Chat export v1 — link CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT rows to
         # their parent message without scanning the metadata JSONB.
         "ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS parent_external_id VARCHAR;",

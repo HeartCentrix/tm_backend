@@ -1,4 +1,6 @@
 """Dashboard Service - Aggregated metrics and statistics"""
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 from uuid import UUID
@@ -8,7 +10,60 @@ from fastapi import FastAPI, Depends, Query, HTTPException
 from sqlalchemy import select, func, text, and_, or_
 
 from shared.database import get_db, close_db, AsyncSession, engine
-from shared.models import Resource, Job, JobType, JobStatus, Snapshot, SnapshotItem, SnapshotStatus, ResourceType, ResourceStatus, Tenant, TenantType
+from shared.models import (
+    Resource, Job, JobType, JobStatus, Snapshot, SnapshotItem, SnapshotStatus,
+    ResourceType, ResourceStatus, Tenant, TenantType, UI_HIDDEN_TYPES,
+)
+
+log = logging.getLogger("dashboard-service")
+
+
+async def _wait_for_db(timeout_total_s: int = 120) -> None:
+    """Ping the DB with exponential backoff so the lifespan startup can
+    survive Railway's internal-DNS / Postgres cold-start race.
+
+    Observed Railway 2026-05-13: dashboard-service crashed in a restart
+    loop because asyncpg's default connect timeout (10s) raced PG coming
+    online, the lifespan ``SELECT 1`` ping raised TimeoutError, and
+    Uvicorn exited. Without a retry the only recovery was a manual
+    redeploy. Other services in this repo (tenant_service, job_service,
+    audit_service, etc.) all retry their startup checks for the same
+    reason; dashboard was the outlier.
+
+    Retries 1s → 2s → 4s → 8s → 8s … up to ``timeout_total_s`` wall.
+    Each individual attempt is capped at 10s by asyncpg's default, so
+    a "stuck DB" scenario can't hold a single attempt forever. Logs
+    every failed attempt for visibility into how flaky the dep is.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_total_s
+    delay = 1.0
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            if attempt > 1:
+                log.warning(
+                    "[startup] DB reachable after %d attempt(s)", attempt,
+                )
+            return
+        except Exception as exc:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                log.error(
+                    "[startup] DB unreachable after %ds (%d attempts): %s — "
+                    "exiting so Railway can restart the container",
+                    timeout_total_s, attempt, exc,
+                )
+                raise
+            log.warning(
+                "[startup] DB ping attempt %d failed (%s: %s); "
+                "retrying in %.1fs (deadline in %.0fs)",
+                attempt, type(exc).__name__, exc, delay, remaining,
+            )
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, 8.0)
 
 
 @asynccontextmanager
@@ -16,8 +71,7 @@ async def lifespan(app: FastAPI):
     # Dashboard is read-only and should not run heavyweight schema migration logic
     # during startup. That path can block on application traffic from other services
     # and leave the container stuck in "Waiting for application startup".
-    async with engine.connect() as conn:
-        await conn.execute(text("SELECT 1"))
+    await _wait_for_db()
     yield
     await close_db()
 
@@ -25,14 +79,34 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Dashboard Service", version="1.0.0", lifespan=lifespan)
 
 
+# Per-user content types — kept for M365_RESOURCE_TYPES below (service-level
+# rollups need to know which row types carry per-user backup bytes). The
+# Protection Status "Users" card no longer counts these; it counts ENTRA_USER
+# rows directly so the card's total equals the Users tab list exactly.
+USER_CONTENT_TYPES = {
+    ResourceType.MAILBOX,
+    ResourceType.ONEDRIVE,
+    ResourceType.USER_MAIL,
+    ResourceType.USER_ONEDRIVE,
+    ResourceType.USER_CONTACTS,
+    ResourceType.USER_CALENDAR,
+    ResourceType.USER_CHATS,
+}
+
+# Each bucket's type set MUST exactly mirror the corresponding tab in
+# tm_vault/src/services/resource.ts:M365_TAB_TYPE_MAP. The denominator of
+# every Protection Status card has to equal the count shown when the operator
+# clicks into that tab — anything else is a lie. SharePoint additionally
+# applies the same group-name-collision exclusion that
+# /api/v1/resources/by-type?type=SHAREPOINT_SITE applies (handled below).
 PROTECTION_BUCKETS = {
-    "users": {ResourceType.MAILBOX, ResourceType.ONEDRIVE},
+    "users": {ResourceType.ENTRA_USER},
     "sharedMailboxes": {ResourceType.SHARED_MAILBOX},
     "rooms": {ResourceType.ROOM_MAILBOX},
     "sharepointSites": {ResourceType.SHAREPOINT_SITE},
-    "groupsAndTeams": {ResourceType.TEAMS_CHANNEL, ResourceType.TEAMS_CHAT, ResourceType.ENTRA_GROUP, ResourceType.DYNAMIC_GROUP},
-    "entraId": {ResourceType.ENTRA_USER, ResourceType.ENTRA_APP, ResourceType.ENTRA_DEVICE, ResourceType.ENTRA_SERVICE_PRINCIPAL},
-    "powerPlatform": {ResourceType.POWER_BI, ResourceType.POWER_APPS, ResourceType.POWER_AUTOMATE, ResourceType.POWER_DLP},
+    "groupsAndTeams": {ResourceType.ENTRA_GROUP, ResourceType.M365_GROUP, ResourceType.TEAMS_CHANNEL},
+    "entraId": {ResourceType.ENTRA_DIRECTORY},
+    "powerPlatform": {ResourceType.POWER_BI, ResourceType.POWER_APPS, ResourceType.POWER_AUTOMATE},
 }
 
 AZURE_PROTECTION_BUCKETS = {
@@ -51,6 +125,15 @@ M365_RESOURCE_TYPES = {
     ResourceType.TEAMS_CHAT,
     ResourceType.ENTRA_USER,
     ResourceType.ENTRA_GROUP,
+    # Unified (modern) M365 group — distinct row type from ENTRA_GROUP and
+    # required here so the Protection Status m365 filter doesn't silently
+    # drop the 7 M365_GROUP rows. Without this entry, Groups & Teams card
+    # reads 4 (ENTRA_GROUP only) when the Tab shows 11 (both types).
+    ResourceType.M365_GROUP,
+    # Per-tenant "Azure Active Directory" singleton — the Entra ID card on
+    # Overview needs to count this one row. Missing here previously caused
+    # the card to read 0/0 even though the Tab list shows 1.
+    ResourceType.ENTRA_DIRECTORY,
     ResourceType.ENTRA_APP,
     ResourceType.ENTRA_DEVICE,
     ResourceType.ENTRA_SERVICE_PRINCIPAL,
@@ -331,6 +414,14 @@ async def get_protection_status(
         filters.append(Resource.tenant_id == UUID(tenantId))
     if service_resource_types:
         filters.append(Resource.type.in_(service_resource_types))
+    # Mirror resource-service's UI_HIDDEN_TYPES filter so the Overview card
+    # universe matches the tab list universe exactly. Without this, a hidden
+    # type (e.g. TEAMS_CHANNEL — redundant with its M365_GROUP twin) inflates
+    # the Groups & Teams total here even though /by-type hides those rows.
+    # The Tab shows 11; previously this query summed 15 because TEAMS_CHANNEL
+    # rows still got counted. See shared.models.UI_HIDDEN_TYPES for per-type
+    # rationale.
+    filters.append(Resource.type.notin_(UI_HIDDEN_TYPES))
 
     stmt = (
         select(
@@ -369,6 +460,44 @@ async def get_protection_status(
         }
 
     bucket_values = {name: bucket_item(name, PROTECTION_BUCKETS) for name in PROTECTION_BUCKETS}
+
+    # SharePoint sites: the Sites tab hides sites whose name collides with an
+    # M365 group / Entra group / Teams channel (the admin API surfaces the
+    # group's display name as the site title, so a single Team appears as
+    # both a SP site row AND a Groups & Teams row otherwise). The Overview
+    # card must hide the same rows or the denominator inflates above what
+    # the operator can actually click into. The exclusion below MUST stay
+    # in sync with resource-service /api/v1/resources/by-type's
+    # sp_exclude_clause — a future change to the rule has to touch both.
+    sp_params = {}
+    sp_tenant_clause = ""
+    if tenantId:
+        sp_tenant_clause = "AND r.tenant_id = :tenant_id"
+        sp_params["tenant_id"] = str(UUID(tenantId))
+    sp_total_row = (await db.execute(text(f"""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE r.sla_policy_id IS NOT NULL) AS protected_count
+        FROM resources r
+        WHERE r.type = 'SHAREPOINT_SITE'
+          AND r.status IN ('DISCOVERED', 'ACTIVE')
+          {sp_tenant_clause}
+          AND NOT EXISTS (
+            SELECT 1 FROM resources g
+            WHERE g.tenant_id = r.tenant_id
+              AND g.type IN ('M365_GROUP', 'ENTRA_GROUP', 'TEAMS_CHANNEL')
+              AND LOWER(g.display_name) = LOWER(r.display_name)
+              AND (
+                    COALESCE(r.email, '') = ''
+                 OR LOWER(COALESCE(g.email, '')) = LOWER(COALESCE(r.email, ''))
+              )
+          )
+    """), sp_params)).first()
+    bucket_values["sharepointSites"] = {
+        "total": int(sp_total_row.total or 0),
+        "protectedCount": int(sp_total_row.protected_count or 0),
+    }
+
     total = sum(item["total"] for item in bucket_values.values())
     protected = sum(item["protectedCount"] for item in bucket_values.values())
     percentage = round(protected / total * 100, 2) if total > 0 else 0

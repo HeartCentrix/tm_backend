@@ -242,9 +242,47 @@ async def reindex_snapshots(
 async def index_snapshot_item(item: SnapshotItem, db: AsyncSession):
     """Index a single snapshot item for full-text search"""
     try:
-        metadata = item.metadata or {}
-        raw_data = metadata.get("raw", {})
-        structured = metadata.get("structured", {})
+        # SnapshotItem ORM aliases the JSON column to `extra_data` (the DB
+        # column is named ``metadata``); use the attribute the ORM exposes.
+        metadata = getattr(item, "extra_data", None) or {}
+        raw_data = metadata.get("raw", {}) if isinstance(metadata, dict) else {}
+        structured = metadata.get("structured", {}) if isinstance(metadata, dict) else {}
+
+        # Chat messages have an empty extra_data on snapshot_items since
+        # the 2026-05-13 Level 2 refactor; the body / sender / payload
+        # live in chat_thread_messages. Hydrate them so search continues
+        # to index chat content.
+        if item.item_type in ("TEAMS_CHAT_MESSAGE",) and not raw_data:
+            try:
+                row = (await db.execute(text(
+                    "SELECT ctm.body_content, ctm.from_display_name, "
+                    "       ctm.metadata_raw "
+                    "  FROM chat_thread_messages ctm "
+                    "  JOIN chat_threads ct ON ct.id = ctm.chat_thread_id "
+                    " WHERE ct.tenant_id = :tid "
+                    "   AND ct.chat_id = :cid "
+                    "   AND ctm.message_external_id = :ext "
+                    "   AND ct.archived_at IS NULL "
+                    "   AND ctm.archived_at IS NULL "
+                    " LIMIT 1"
+                ), {
+                    "tid": str(item.tenant_id),
+                    "cid": item.parent_external_id,
+                    "ext": item.external_id,
+                })).first()
+                if row is not None:
+                    raw_data = row.metadata_raw if isinstance(row.metadata_raw, dict) else {}
+                    raw_data.setdefault("body", {})
+                    if row.body_content:
+                        raw_data["body"]["content"] = row.body_content
+                    if row.from_display_name:
+                        raw_data.setdefault("from", {}).setdefault("user", {})[
+                            "displayName"
+                        ] = row.from_display_name
+            except Exception as _e:
+                # Search index is best-effort — a JOIN miss falls back to
+                # indexing whatever's already in raw_data (name/folder_path).
+                print(f"[SEARCH] chat-body JOIN failed for item {item.id}: {_e}")
 
         # Build searchable text content
         search_text = build_search_text(item, raw_data, structured)

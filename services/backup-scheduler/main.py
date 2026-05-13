@@ -417,11 +417,31 @@ async def startup():
                     WITH counts AS (
                         SELECT s.id,
                                s.started_at,
+                               s.resource_id,
+                               s.tenant_id,
                                (SELECT count(*) FROM snapshot_items si
-                                WHERE si.snapshot_id = s.id) AS n_items
+                                WHERE si.snapshot_id = s.id) AS n_items,
+                               (SELECT MAX(si.created_at) FROM snapshot_items si
+                                WHERE si.snapshot_id = s.id) AS last_item_at
                         FROM snapshots s
                         WHERE s.status = 'IN_PROGRESS'
-                          AND s.started_at < NOW() - INTERVAL '30 minutes'
+                          -- Liveness check: a snapshot is alive if its
+                          -- most-recent snapshot_items row was inserted
+                          -- recently. OneDrive / SharePoint / Power BI
+                          -- handlers insert one row per file/asset, so a
+                          -- live drain keeps this watermark moving even
+                          -- when no other Snapshot field changes. Falls
+                          -- back to started_at for the not-yet-written-
+                          -- anything-case (genuinely orphaned at start).
+                          -- 30 min is generous: even an 80 GB file streams
+                          -- at ≥45 MB/s on Azure Front Door, so a single
+                          -- file in flight without ANY siblings persisting
+                          -- in 30 min is genuinely stuck.
+                          AND COALESCE(
+                                (SELECT MAX(si.created_at) FROM snapshot_items si
+                                 WHERE si.snapshot_id = s.id),
+                                s.started_at
+                              ) < NOW() - INTERVAL '30 minutes'
                     )
                     UPDATE snapshots s SET
                         status = (CASE WHEN c.n_items > 0 THEN 'COMPLETED'
@@ -438,15 +458,67 @@ async def startup():
                                         'handler orphaned by worker restart')
                     FROM counts c
                     WHERE s.id = c.id
-                    RETURNING s.id
+                    RETURNING s.id, s.status::text, s.resource_id, s.tenant_id
                 """))
                 rows = result.fetchall()
                 await session.commit()
+                failed_rows = [r for r in rows if r[1] == "FAILED"]
                 if rows:
                     print(
                         f"[backup-scheduler] stale_snapshot_sweep: "
-                        f"closed {len(rows)} orphaned IN_PROGRESS rows",
+                        f"closed {len(rows)} orphaned IN_PROGRESS rows "
+                        f"({len(failed_rows)} FAILED → enqueue retry)",
                     )
+
+            # Resumable: a sweep-FAILED snapshot has zero persisted items —
+            # the handler died before writing anything useful. Enqueue a
+            # retry message so the operator never has to re-trigger by hand.
+            # Sweep-COMPLETED rows already have data, no retry needed.
+            if failed_rows and settings.RABBITMQ_ENABLED:
+                from shared.message_bus import (
+                    message_bus as _mb,
+                    create_backup_message as _mk,
+                )
+                try:
+                    from shared.export_routing import pick_backup_queue
+                except Exception:
+                    pick_backup_queue = None
+                async with async_session_factory() as session:
+                    for _snap_id, _status, _rid, _tid in failed_rows:
+                        try:
+                            res = await session.get(Resource, _rid)
+                            if not res:
+                                continue
+                            rtype = (
+                                res.type.value
+                                if hasattr(res.type, "value") else str(res.type)
+                            )
+                            q = "backup.normal"
+                            if pick_backup_queue:
+                                try:
+                                    q = pick_backup_queue(
+                                        resource_type=rtype,
+                                        default_queue="backup.normal",
+                                    )
+                                except Exception:
+                                    pass
+                            msg = _mk(
+                                job_id=str(uuid.uuid4()),
+                                resource_id=str(_rid),
+                                tenant_id=str(_tid),
+                                full_backup=False,
+                            )
+                            msg["retry_of_snapshot"] = str(_snap_id)
+                            await _mb.publish(q, msg, priority=3)
+                            print(
+                                f"[backup-scheduler] stale_sweep retry: "
+                                f"snapshot={_snap_id} type={rtype} → {q}"
+                            )
+                        except Exception as inner:
+                            print(
+                                f"[backup-scheduler] stale_sweep retry failed for "
+                                f"snapshot={_snap_id}: {inner}"
+                            )
         except Exception as exc:
             print(f"[backup-scheduler] stale_snapshot_sweep failed: {exc}")
 
@@ -537,6 +609,81 @@ async def startup():
 
     scheduler.add_job(
         _reconcile_stuck_queued_jobs, "interval", minutes=3,
+    )
+
+    # Stuck-RUNNING job reaper — fixes the "all snapshots COMPLETED
+    # but job stays RUNNING forever" failure mode.
+    #
+    # The worker's `_process_mass_backup` flow is: kick off per-group
+    # tasks → asyncio.gather → update_job_status(COMPLETED). If the
+    # worker dies between "all snapshots got written to DB" and "job
+    # row flips to COMPLETED", the job stays at RUNNING / partial-pct
+    # forever. RabbitMQ may redeliver the message, but the existing
+    # handler unconditionally sets status=RUNNING + progress_pct=5
+    # and starts the whole job over — wasting all the work the
+    # snapshots already capture.
+    #
+    # Triggers when (1) job has been RUNNING with no updates for
+    # >5 min AND (2) every resource in batch_resource_ids has a
+    # terminal-status snapshot for THIS job. Idempotent: the WHERE
+    # clause filters out already-COMPLETED jobs, so re-runs are
+    # safe.
+    async def _reap_stuck_running_jobs():
+        try:
+            async with async_session_factory() as session:
+                result = await session.execute(text("""
+                    WITH terminal_per_job AS (
+                        SELECT j.id AS job_id,
+                               cardinality(j.batch_resource_ids) AS n_resources,
+                               (SELECT count(*) FROM snapshots s
+                                WHERE s.job_id = j.id
+                                  AND s.status IN ('COMPLETED','FAILED','PARTIAL')) AS n_terminal,
+                               (SELECT count(*) FROM snapshots s
+                                WHERE s.job_id = j.id
+                                  AND s.status = 'COMPLETED') AS n_completed,
+                               (SELECT COALESCE(SUM(s.item_count), 0) FROM snapshots s
+                                WHERE s.job_id = j.id) AS items_total,
+                               (SELECT COALESCE(SUM(s.bytes_total), 0) FROM snapshots s
+                                WHERE s.job_id = j.id) AS bytes_total
+                        FROM jobs j
+                        WHERE j.status = 'RUNNING'
+                          AND j.type = 'BACKUP'
+                          AND j.updated_at < NOW() - INTERVAL '5 minutes'
+                          AND cardinality(j.batch_resource_ids) > 0
+                    )
+                    UPDATE jobs j SET
+                        status = 'COMPLETED'::jobstatus,
+                        progress_pct = 100,
+                        completed_at = NOW(),
+                        updated_at = NOW(),
+                        result = COALESCE(j.result::jsonb, '{}'::jsonb)
+                                 || jsonb_build_object(
+                                    'reaped_by', 'stuck_running_reaper',
+                                    'total', t.n_resources,
+                                    'completed', t.n_completed,
+                                    'failed', t.n_resources - t.n_completed,
+                                    'item_count', t.items_total,
+                                    'bytes_added', t.bytes_total
+                                 )
+                    FROM terminal_per_job t
+                    WHERE j.id = t.job_id
+                      AND t.n_terminal >= t.n_resources
+                    RETURNING j.id
+                """))
+                rows = result.fetchall()
+                await session.commit()
+                if rows:
+                    print(
+                        f"[backup-scheduler] stuck_running_reaper: "
+                        f"finalized {len(rows)} jobs whose snapshots "
+                        f"all completed but worker died before the "
+                        f"job-level update"
+                    )
+        except Exception as exc:
+            print(f"[backup-scheduler] stuck_running_reaper failed: {exc}")
+
+    scheduler.add_job(
+        _reap_stuck_running_jobs, "interval", minutes=2,
     )
 
     # Task 26: Delete orphaned export ZIPs older than 1 day (3am UTC daily).
@@ -905,9 +1052,21 @@ async def dispatch_policy_backups(policy_id: str):
             except ValueError:
                 pass
 
-            group_queue = azure_queue or ("backup.high" if policy.frequency == "THREE_DAILY" else "backup.normal")
+            base_queue = "backup.high" if policy.frequency == "THREE_DAILY" else "backup.normal"
             if azure_queue:
+                group_queue = azure_queue
                 print(f"[SCHEDULER] Azure workload {resource_type} → queue {azure_queue} (not backup.*)")
+            else:
+                # Heavy-pool routing for file-content workloads — keeps shared
+                # backup.high / backup.normal lanes free for MAILBOX / ENTRA /
+                # USER_* work so a single 500 GB drive can't starve them.
+                from shared.export_routing import pick_backup_queue
+                group_queue = pick_backup_queue(
+                    resource_type=resource_type,
+                    default_queue=base_queue,
+                )
+                if group_queue != base_queue:
+                    print(f"[SCHEDULER] Heavy workload {resource_type} → queue {group_queue}")
 
             # Split into batches
             for i in range(0, len(group_resources), BATCH_SIZE):
@@ -1678,9 +1837,18 @@ async def retry_failed_snapshots():
                 if not resource:
                     continue
 
-                # Pick the queue based on workload — Azure goes to its own queue.
+                # Pick the queue based on workload — Azure to its own queue,
+                # heavy file-content workloads to backup.heavy, rest to normal.
                 resource_type = resource.type.value if hasattr(resource.type, "value") else str(resource.type)
-                queue = AZURE_WORKLOAD_QUEUES.get(resource.type, "backup.normal")
+                azure_q = AZURE_WORKLOAD_QUEUES.get(resource.type)
+                if azure_q:
+                    queue = azure_q
+                else:
+                    from shared.export_routing import pick_backup_queue
+                    queue = pick_backup_queue(
+                        resource_type=resource_type,
+                        default_queue="backup.normal",
+                    )
                 payload = {
                     "jobId": str(uuid.uuid4()),
                     "resourceId": str(resource.id),
