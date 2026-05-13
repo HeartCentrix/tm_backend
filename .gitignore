@@ -14,7 +14,7 @@ build/
 macbook_down.sh
 macbook_up.sh
 macbook_wipe.sh
-
+build-docker/
 *.whl
 *.pyc
 *.pyo
