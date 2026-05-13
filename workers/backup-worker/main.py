@@ -176,6 +176,345 @@ async def _bulk_upsert_snapshot_items(
     return total
 
 
+# ==================== chat_threads helpers (cross-user dedup) ====================
+#
+# These helpers implement the tenant-singleton chat-thread store (see
+# shared/models.py ChatThread / ChatThreadMessage). The unit of dedup
+# is (tenant_id, chat_id): User B's USER_CHATS run for a chat that User A
+# just drained within the freshness window short-circuits and reuses
+# A's messages, writing only thin pointer rows into snapshot_items for
+# B's snapshot.
+
+_CHAT_THREAD_DRAIN_FRESHNESS_S = int(
+    os.getenv("CHAT_THREAD_DRAIN_FRESHNESS_S", "25200"),
+)
+
+
+def _parse_iso_to_dt(s: Optional[str]) -> Optional[datetime]:
+    """Parse a Graph ISO-8601 timestamp into a tz-aware ``datetime``.
+
+    asyncpg refuses to bind string values into TIMESTAMPTZ columns even when
+    the SQL has ``CAST(:x AS TIMESTAMPTZ)`` — the type check happens before
+    the cast runs. Convert here so every helper that hits ``chat_threads``
+    or ``chat_thread_messages`` passes a real datetime to the driver.
+
+    Returns ``None`` on empty input or unparseable strings — the SQL uses
+    ``COALESCE`` / ``CAST(:x AS TIMESTAMPTZ)`` patterns that tolerate NULL.
+    """
+    if s is None or s == "":
+        return None
+    if isinstance(s, datetime):
+        return s
+    try:
+        # Python 3.11+ accepts trailing 'Z'; older versions need the swap.
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+async def _claim_or_load_chat_thread(
+    *,
+    tenant_id: str,
+    chat_id: str,
+    chat_type: Optional[str],
+    chat_topic: Optional[str],
+    member_names: Optional[List[str]],
+    last_updated_at_iso: Optional[str],
+) -> Dict[str, Any]:
+    """Atomically claim (tenant_id, chat_id) for drain or detect that a
+    concurrent / recent backup already drained it.
+
+    Uses ``INSERT … ON CONFLICT DO UPDATE … RETURNING (xmax = 0) AS inserted``
+    so we get per-row mutual exclusion without an explicit FOR UPDATE.
+    Multiple worker pods racing on the same chat: only one wins the claim;
+    the rest see ``last_drained_at`` inside the freshness window and skip.
+
+    Returns a dict with:
+      * ``thread_id``         — chat_threads.id (UUID str). Always present.
+      * ``claimed``           — True iff caller should drain. False = reuse
+                                existing chat_thread_messages.
+      * ``drain_cursor``      — last successful drain cursor (max
+                                lastModifiedDateTime). May be None.
+      * ``last_updated_at``   — last known chat.lastUpdatedDateTime
+                                from a prior drain.
+      * ``drain_failure_state`` — failure record from a prior backup or {}.
+    """
+    member_names_json = list(member_names or [])
+    # Two-step in one statement: SELECT the prior row inside a WITH CTE so we
+    # see the value of last_updated_at BEFORE the UPSERT overwrites it, then
+    # do the UPSERT and JOIN them back together in the outer SELECT. PG
+    # documents that the SELECT inside a data-modifying CTE observes the
+    # pre-modification snapshot — exactly what we need to detect "this row
+    # already existed with an older Graph timestamp."
+    async with async_session_factory() as s:
+        row = (await s.execute(
+            text(
+                "WITH prior AS ( "
+                "  SELECT last_updated_at AS prior_lu "
+                "    FROM chat_threads "
+                "   WHERE tenant_id = :tid AND chat_id = :cid "
+                "), "
+                "upserted AS ( "
+                "  INSERT INTO chat_threads "
+                "    (tenant_id, chat_id, chat_type, chat_topic, member_names_json, "
+                "     last_updated_at, last_drained_at, created_at, updated_at) "
+                "  VALUES "
+                "    (:tid, :cid, :ct, :tp, CAST(:mn AS JSONB), "
+                "     CAST(:lu AS TIMESTAMPTZ), NULL, NOW(), NOW()) "
+                "  ON CONFLICT (tenant_id, chat_id) DO UPDATE SET "
+                "    chat_type         = COALESCE(EXCLUDED.chat_type, chat_threads.chat_type), "
+                "    chat_topic        = COALESCE(EXCLUDED.chat_topic, chat_threads.chat_topic), "
+                "    member_names_json = COALESCE(EXCLUDED.member_names_json, chat_threads.member_names_json), "
+                "    last_updated_at   = COALESCE(EXCLUDED.last_updated_at, chat_threads.last_updated_at), "
+                "    updated_at        = NOW() "
+                "  RETURNING id, drain_cursor, last_updated_at, drain_failure_state, "
+                "            last_drained_at, (xmax = 0) AS inserted "
+                ") "
+                "SELECT u.id, u.drain_cursor, u.last_updated_at, u.drain_failure_state, "
+                "       u.last_drained_at, u.inserted, p.prior_lu "
+                "  FROM upserted u "
+                "  LEFT JOIN prior p ON TRUE"
+            ),
+            {
+                "tid": tenant_id, "cid": chat_id, "ct": chat_type,
+                "tp": chat_topic,
+                "mn": json.dumps(member_names_json) if member_names_json else None,
+                "lu": _parse_iso_to_dt(last_updated_at_iso),
+            },
+        )).first()
+        await s.commit()
+
+        if row is None:
+            # ON CONFLICT path returned no row — shouldn't happen, but
+            # if it does we fail-open to "claim" so we still drain.
+            return {
+                "thread_id": None, "claimed": True,
+                "drain_cursor": None, "last_updated_at": None,
+                "drain_failure_state": {},
+            }
+
+        thread_id = str(row.id)
+        prior_drain_cursor = row.drain_cursor
+        prior_last_updated_at = (
+            row.last_updated_at.isoformat() if row.last_updated_at else None
+        )
+        prior_failure = row.drain_failure_state or {}
+        last_drained_at = row.last_drained_at
+
+        # Determine claim outcome.
+        #
+        #   1. Fresh row (inserted=True) or no prior drain  → claim. Always.
+        #   2. Activity-aware override — Graph just told us this chat's
+        #      lastUpdatedDateTime is strictly newer than what we drained
+        #      against. Claim regardless of freshness window: an incremental
+        #      re-drain (cursor-based) picks up only the new messages and is
+        #      cheap. This is the durability guarantee — without it, a
+        #      message that arrives mid-batch is invisible to every snapshot
+        #      taken inside the freshness window.
+        #   3. Stale last_drained_at (age > freshness window) → claim. Plain
+        #      time-based re-drain.
+        #   4. Otherwise → skip + reuse another backup's recently-drained
+        #      messages.
+        claimed: bool
+        if row.inserted or last_drained_at is None:
+            claimed = True
+        else:
+            prior_lu = row.prior_lu
+            new_lu = row.last_updated_at  # what we just stamped in via UPSERT
+            has_new_activity = bool(
+                new_lu is not None
+                and prior_lu is not None
+                and new_lu > prior_lu
+            )
+            age_s = (datetime.utcnow().replace(tzinfo=None) -
+                     last_drained_at.replace(tzinfo=None)).total_seconds()
+            claimed = (
+                has_new_activity
+                or age_s > _CHAT_THREAD_DRAIN_FRESHNESS_S
+            )
+        return {
+            "thread_id": thread_id,
+            "claimed": claimed,
+            "drain_cursor": prior_drain_cursor,
+            "last_updated_at": prior_last_updated_at,
+            "drain_failure_state": prior_failure if isinstance(prior_failure, dict) else {},
+        }
+
+
+async def _mark_chat_thread_drained(
+    *,
+    thread_id: str,
+    drain_cursor: Optional[str],
+    failure_state: Optional[Dict[str, Any]],
+) -> None:
+    """End-of-drain checkpoint. Bumps ``last_drained_at`` to NOW() and
+    stores the new cursor + failure state.
+
+    Argument semantics:
+      * ``drain_cursor=None``     → leave drain_cursor untouched.
+      * ``drain_cursor='2026…'``  → store as new cursor.
+      * ``failure_state=None``    → leave drain_failure_state untouched.
+      * ``failure_state={}``      → clear (success after a prior failure).
+      * ``failure_state={...}``   → record this failure.
+    """
+    if not thread_id:
+        return
+    # Build the UPDATE dynamically so "leave untouched" really means
+    # the column isn't in the SET clause — distinct from setting to NULL.
+    set_parts = ["last_drained_at = NOW()", "updated_at = NOW()"]
+    params: Dict[str, Any] = {"tid": thread_id}
+    if drain_cursor is not None:
+        set_parts.append("drain_cursor = :dc")
+        params["dc"] = drain_cursor
+    if failure_state is not None:
+        set_parts.append("drain_failure_state = CAST(:fs AS JSONB)")
+        params["fs"] = json.dumps(failure_state)
+    try:
+        async with async_session_factory() as s:
+            await s.execute(
+                text(
+                    "UPDATE chat_threads SET " + ", ".join(set_parts) +
+                    " WHERE id = :tid"
+                ),
+                params,
+            )
+            await s.commit()
+    except Exception as e:
+        # Cursor/failure-state persistence is advisory — a DB hiccup
+        # here just means the next backup re-drains the same range.
+        # Idempotency comes from UNIQUE(chat_thread_id, message_external_id)
+        # on chat_thread_messages, so re-drain is safe.
+        logger.warning(
+            "_mark_chat_thread_drained failed thread=%s: %s",
+            thread_id, e,
+        )
+
+
+_CHAT_THREAD_MSG_BULK_CHUNK = 500
+
+
+async def _bulk_upsert_chat_thread_messages(
+    *,
+    thread_id: str,
+    msgs: List[Dict[str, Any]],
+) -> int:
+    """UPSERT into chat_thread_messages keyed by
+    (chat_thread_id, message_external_id). Returns the number of rows
+    attempted.
+
+    ON CONFLICT DO UPDATE keeps lastModifiedDateTime / body fresh —
+    re-drains of the same chat by a later backup pick up edits without
+    needing to wipe the prior row.
+    """
+    if not msgs or not thread_id:
+        return 0
+    async with async_session_factory() as s:
+        total = 0
+        for i in range(0, len(msgs), _CHAT_THREAD_MSG_BULK_CHUNK):
+            chunk = msgs[i:i + _CHAT_THREAD_MSG_BULK_CHUNK]
+            rows = []
+            for m in chunk:
+                mid = m.get("id")
+                if not mid:
+                    continue
+                body = (m.get("body") or {})
+                frm = (m.get("from") or {}).get("user") or {}
+                payload_bytes = _json_dumps_bytes(m)
+                rows.append({
+                    "tid": thread_id,
+                    "ext": str(mid),
+                    "cdt": _parse_iso_to_dt(m.get("createdDateTime")),
+                    "ldt": _parse_iso_to_dt(m.get("lastModifiedDateTime")),
+                    "fuid": (frm.get("id") or "")[:128],
+                    "fdn": (frm.get("displayName") or "")[:256],
+                    "bc": body.get("content"),
+                    "bct": (body.get("contentType") or "")[:16] or None,
+                    "ddt": _parse_iso_to_dt(m.get("deletedDateTime")),
+                    "raw": json.dumps(m, default=str),
+                    "ch": _fast_hash_hex(payload_bytes),
+                    "sz": len(payload_bytes),
+                })
+            if not rows:
+                continue
+            # PG rejects ON CONFLICT DO UPDATE when the same conflict
+            # target appears twice in a single statement
+            # (CardinalityViolationError). Graph occasionally returns the
+            # same message_external_id more than once inside one /messages
+            # page (edits / system re-emits). Dedup by ext, last-wins so
+            # the most-recent payload sticks.
+            _seen: Dict[str, int] = {}
+            for _i, _r in enumerate(rows):
+                _seen[_r["ext"]] = _i
+            rows = [rows[i] for i in _seen.values()]
+            # Multi-row VALUES (...) statement.
+            values_clause = ", ".join(
+                f"(:tid_{i}, :ext_{i}, CAST(:cdt_{i} AS TIMESTAMPTZ), "
+                f" CAST(:ldt_{i} AS TIMESTAMPTZ), :fuid_{i}, :fdn_{i}, "
+                f" :bc_{i}, :bct_{i}, CAST(:ddt_{i} AS TIMESTAMPTZ), "
+                f" CAST(:raw_{i} AS JSONB), :ch_{i}, :sz_{i})"
+                for i in range(len(rows))
+            )
+            params: Dict[str, Any] = {}
+            for i, r in enumerate(rows):
+                for k, v in r.items():
+                    params[f"{k}_{i}"] = v
+            await s.execute(
+                text(
+                    "INSERT INTO chat_thread_messages "
+                    "(chat_thread_id, message_external_id, created_date_time, "
+                    " last_modified_date_time, from_user_id, from_display_name, "
+                    " body_content, body_content_type, deleted_date_time, "
+                    " metadata_raw, content_hash, content_size) "
+                    f"VALUES {values_clause} "
+                    "ON CONFLICT (chat_thread_id, message_external_id) DO UPDATE SET "
+                    "  created_date_time       = EXCLUDED.created_date_time, "
+                    "  last_modified_date_time = EXCLUDED.last_modified_date_time, "
+                    "  from_user_id            = EXCLUDED.from_user_id, "
+                    "  from_display_name       = EXCLUDED.from_display_name, "
+                    "  body_content            = EXCLUDED.body_content, "
+                    "  body_content_type       = EXCLUDED.body_content_type, "
+                    "  deleted_date_time       = EXCLUDED.deleted_date_time, "
+                    "  metadata_raw            = EXCLUDED.metadata_raw, "
+                    "  content_hash            = EXCLUDED.content_hash, "
+                    "  content_size            = EXCLUDED.content_size"
+                ),
+                params,
+            )
+            total += len(rows)
+        await s.commit()
+        return total
+
+
+async def _load_chat_thread_messages_for_pointer(
+    *,
+    thread_id: str,
+) -> List[Dict[str, Any]]:
+    """Read minimal fields needed to emit thin snapshot_items pointer rows
+    for a snapshot that did not drain this chat itself (claim lost or
+    skipped-by-activity). Used by both the cross-user skip path and the
+    drain-skip path."""
+    if not thread_id:
+        return []
+    async with async_session_factory() as s:
+        rows = (await s.execute(
+            text(
+                "SELECT message_external_id, body_content, content_size, content_hash "
+                "  FROM chat_thread_messages "
+                " WHERE chat_thread_id = :tid"
+            ),
+            {"tid": thread_id},
+        )).all()
+        return [
+            {
+                "external_id": r.message_external_id,
+                "body_content": r.body_content,
+                "content_size": r.content_size or 0,
+                "content_hash": r.content_hash,
+            }
+            for r in rows
+        ]
+
+
 async def _is_job_cancelled(job_id) -> bool:
     """Cheap best-effort cancel-check. Long-running handlers poll this at
     heartbeat boundaries so a DB-level CANCELLED job stops pulling Graph
@@ -282,6 +621,51 @@ from shared.entra_fingerprint import fingerprint_object as _entra_fp
 logger = logging.getLogger(__name__)
 
 
+class _CachedAttachmentResult:
+    """Return type of ``_fetch_url_deduped``.
+
+    Two flavors:
+
+      * **Cache miss (fresh fetch)** — ``bytes_`` is the downloaded payload;
+        every other field is ``None``. The caller hashes the bytes and runs
+        them through the inline-or-blob upload path as before.
+
+      * **Cache hit** — ``bytes_`` is ``None`` and ``content_hash`` is set;
+        either ``blob_path`` (large content already in storage) or
+        ``inline_b64`` (small content kept inline) carries the payload
+        descriptor. The caller skips hash + upload entirely and stamps the
+        SnapshotItem with the cached descriptor — saving the Graph
+        ``/shares`` resolve, the CDN download, and the storage write.
+
+    ``unreachable=True`` mirrors a permanent 4xx from a prior backup so
+    later backups don't re-try the broken URL.
+    """
+    __slots__ = ("bytes_", "content_hash", "blob_path", "inline_b64",
+                 "content_size", "unreachable")
+
+    def __init__(
+        self,
+        bytes_: Optional[bytes] = None,
+        content_hash: Optional[str] = None,
+        blob_path: Optional[str] = None,
+        inline_b64: Optional[str] = None,
+        content_size: int = 0,
+        unreachable: bool = False,
+    ) -> None:
+        self.bytes_ = bytes_
+        self.content_hash = content_hash
+        self.blob_path = blob_path
+        self.inline_b64 = inline_b64
+        self.content_size = content_size
+        self.unreachable = unreachable
+
+    @property
+    def is_cache_hit(self) -> bool:
+        return self.bytes_ is None and (
+            self.blob_path is not None or self.inline_b64 is not None
+        )
+
+
 class _ChatAttDedup:
     """Snapshot-wide dedup state for chat-attachment capture.
 
@@ -291,6 +675,9 @@ class _ChatAttDedup:
     hashed 6× before content-hash dedup finally collapses the upload.
     Sharing one instance across every per-chat kick within one USER_CHATS
     run cuts the redundant Graph round-trips and CDN egress.
+
+    ``tenant_url_cache_*`` track the persisted (cross-snapshot, cross-user)
+    URL cache layered on top — see ``chat_url_cache`` in shared/models.py.
 
     Memory note: ``url_cache`` retains resolved bytes for as long as ANY
     chat still references that URL. Bounded by ``unique_urls × avg_size``
@@ -304,11 +691,12 @@ class _ChatAttDedup:
         "url_cache", "url_tasks",
         "driveitem_tasks", "driveitem_lock", "di_dedup_hits",
         "hash_upload_tasks", "hash_upload_lock", "hash_stats",
+        "tenant_url_cache_stats",
     )
 
     def __init__(self) -> None:
-        self.url_cache: Dict[str, Optional[bytes]] = {}
-        self.url_tasks: Dict[str, "asyncio.Task[Optional[bytes]]"] = {}
+        self.url_cache: Dict[str, "_CachedAttachmentResult"] = {}
+        self.url_tasks: Dict[str, "asyncio.Task[_CachedAttachmentResult]"] = {}
         self.driveitem_tasks: Dict[str, "asyncio.Future[Optional[bytes]]"] = {}
         self.driveitem_lock = asyncio.Lock()
         self.di_dedup_hits: Dict[str, int] = {"n": 0}
@@ -316,6 +704,13 @@ class _ChatAttDedup:
         self.hash_upload_lock = asyncio.Lock()
         self.hash_stats: Dict[str, int] = {
             "in_phase_hits": 0, "db_hits": 0, "uploads": 0,
+        }
+        # Counters for the persisted chat_url_cache layer:
+        #   hits             — cached URL re-used (skipped resolve + download)
+        #   unreachable_skip — cached URL was known-broken; skipped silently
+        #   miss_writes      — fresh fetch that wrote a new cache row
+        self.tenant_url_cache_stats: Dict[str, int] = {
+            "hits": 0, "unreachable_skip": 0, "miss_writes": 0,
         }
 
 
@@ -2795,16 +3190,21 @@ class BackupWorker:
                                     f"{type(_e).__name__}: {_e}"
                                 )
 
-                    async def _stream_persist_chat_items(
+                    def _build_chat_pointer_rows(
                         cid: str,
-                        msgs: List[Dict[str, Any]],
-                    ) -> Tuple[int, int]:
-                        """Bucket and bulk-insert one chat's messages.
-                        Returns (items_written, bytes_written)."""
-                        if not msgs:
-                            return 0, 0
-                        rows: List[Dict[str, Any]] = []
-                        local_bytes = 0
+                        msgs_or_pointers: List[Dict[str, Any]],
+                        *,
+                        full_messages: bool,
+                    ) -> Tuple[List[Dict[str, Any]], int]:
+                        """Shape thin pointer rows into snapshot_items for one
+                        chat. Two callers:
+                          * Drain path (full_messages=True) — iterates raw
+                            Graph message dicts; computes a content hash
+                            from the message bytes for stats.
+                          * Skip-claim path (full_messages=False) — iterates
+                            pre-loaded {external_id, content_size, content_hash}
+                            entries pulled from chat_thread_messages.
+                        """
                         info = chat_meta.get(cid) or {
                             "displayName": f"Chat {cid[:8]}",
                             "chatType": "unknown",
@@ -2815,45 +3215,110 @@ class BackupWorker:
                         }
                         display = info["displayName"]
                         folder = f"chats/{display}"
-                        for m in msgs:
-                            chat_id = m.get("chatId") or (
-                                m.get("channelIdentity") or {}
-                            ).get("channelId") or cid
-                            m["_chat_folder_path"] = folder
-                            m["chatId"] = chat_id
-                            body_str = (m.get("body") or {}).get("content") or ""
-                            ext = {
-                                "raw": m,
-                                "chatId": chat_id,
-                                "chatTopic": display,
-                                "chatType": info["chatType"],
-                                "memberNames": info["memberNames"],
-                                "memberCount": info["memberCount"],
-                                "exportedVia": user_id,
-                            }
-                            body = _json_dumps_bytes(ext["raw"])
-                            local_bytes += len(body)
-                            rows.append({
-                                "id": uuid.uuid4(),
-                                "snapshot_id": snapshot.id,
-                                "tenant_id": tenant.id,
-                                "external_id": str(
-                                    m.get("id") or uuid.uuid4(),
-                                ),
-                                "item_type": "TEAMS_CHAT_MESSAGE",
-                                "name": (body_str[:120] or "(empty)"),
-                                "folder_path": folder,
-                                "content_size": len(body),
-                                "content_hash": _fast_hash_hex(body),
-                                "extra_data": ext,
-                                "content_checksum": None,
-                            })
+                        rows: List[Dict[str, Any]] = []
+                        local_bytes = 0
+                        if full_messages:
+                            for m in msgs_or_pointers:
+                                chat_id = m.get("chatId") or (
+                                    m.get("channelIdentity") or {}
+                                ).get("channelId") or cid
+                                # Mutate the dict in-place so the
+                                # attachment/hostedContent passes that
+                                # consume it next see the canonical
+                                # folder_path / chatId.
+                                m["_chat_folder_path"] = folder
+                                m["chatId"] = chat_id
+                                body_str = (m.get("body") or {}).get("content") or ""
+                                body_bytes = _json_dumps_bytes(m)
+                                local_bytes += len(body_bytes)
+                                rows.append({
+                                    "id": uuid.uuid4(),
+                                    "snapshot_id": snapshot.id,
+                                    "tenant_id": tenant.id,
+                                    "external_id": str(
+                                        m.get("id") or uuid.uuid4(),
+                                    ),
+                                    "parent_external_id": chat_id,
+                                    "item_type": "TEAMS_CHAT_MESSAGE",
+                                    "name": (body_str[:120] or "(empty)"),
+                                    "folder_path": folder,
+                                    "content_size": len(body_bytes),
+                                    "content_hash": _fast_hash_hex(body_bytes),
+                                    # Empty extra_data — the full message body
+                                    # lives in chat_thread_messages.metadata_raw
+                                    # and is hydrated by the snapshot service
+                                    # at read time. Keeps snapshot_items rows
+                                    # small enough that the (snap, ext, type)
+                                    # unique index stays cheap on heavy
+                                    # tenants.
+                                    "extra_data": {},
+                                    "content_checksum": None,
+                                })
+                        else:
+                            for p in msgs_or_pointers:
+                                ext = p.get("external_id")
+                                if not ext:
+                                    continue
+                                local_bytes += p.get("content_size") or 0
+                                rows.append({
+                                    "id": uuid.uuid4(),
+                                    "snapshot_id": snapshot.id,
+                                    "tenant_id": tenant.id,
+                                    "external_id": str(ext),
+                                    "parent_external_id": cid,
+                                    "item_type": "TEAMS_CHAT_MESSAGE",
+                                    "name": (
+                                        (p.get("body_content") or "")[:120]
+                                        or "(empty)"
+                                    ),
+                                    "folder_path": folder,
+                                    "content_size": p.get("content_size") or 0,
+                                    "content_hash": p.get("content_hash"),
+                                    "extra_data": {},
+                                    "content_checksum": None,
+                                })
+                        return rows, local_bytes
+
+                    async def _stream_persist_chat_items(
+                        cid: str,
+                        msgs: List[Dict[str, Any]],
+                        *,
+                        chat_thread_id: Optional[str] = None,
+                    ) -> Tuple[int, int]:
+                        """Persist one chat's drained messages.
+
+                        Two writes:
+                          1. Bulk UPSERT into chat_thread_messages (the canonical
+                             store, keyed by (chat_thread_id, message_external_id)).
+                          2. Thin pointer rows into snapshot_items for THIS
+                             snapshot (so per-snapshot reads still work).
+
+                        Returns (items_written, bytes_written).
+                        """
+                        if not msgs:
+                            return 0, 0
+                        # Phase 1: write the canonical message store.
+                        if chat_thread_id:
+                            try:
+                                await _bulk_upsert_chat_thread_messages(
+                                    thread_id=chat_thread_id, msgs=msgs,
+                                )
+                            except Exception as e:
+                                # chat_thread_messages is durable; if we lose
+                                # this write we can't pretend we wrote pointers
+                                # for messages that don't exist anywhere.
+                                raise
+                        # Phase 2: thin pointer rows for this snapshot.
+                        rows, local_bytes = _build_chat_pointer_rows(
+                            cid, msgs, full_messages=True,
+                        )
                         async with async_session_factory() as _sess:
                             await _bulk_upsert_snapshot_items(_sess, rows)
                         return len(rows), local_bytes
 
                     async def _drain_one_chat(cid: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
                         nonlocal _chat_fanout_cancelled
+                        nonlocal _persisted_total, _persisted_bytes
                         """Drain a single chat's messages. Returns
                         (cid, messages, new_cursor).
 
@@ -2881,7 +3346,68 @@ class BackupWorker:
                         # at the next page boundary (see below).
                         if _chat_fanout_cancelled:
                             return cid, [], None
-                        saved_cursor = existing_tokens.get(cid)
+
+                        # ── Cross-user drain claim (Level 2) ──
+                        # Tenant-singleton chat_threads row: this backup
+                        # competes with concurrent backups of OTHER USERS
+                        # in the same tenant for the right to actually hit
+                        # Graph. If User A drained this chat 5s ago, B's
+                        # claim "loses" → skip Graph entirely and write
+                        # thin pointer rows from the messages A already
+                        # persisted in chat_thread_messages.
+                        _ct_info = chat_meta.get(cid) or {}
+                        _claim = await _claim_or_load_chat_thread(
+                            tenant_id=str(tenant.id),
+                            chat_id=cid,
+                            chat_type=_ct_info.get("chatType"),
+                            chat_topic=_ct_info.get("displayName") or _ct_info.get("topic"),
+                            member_names=(_ct_info.get("memberNames") or []),
+                            last_updated_at_iso=chat_last_updated_map.get(cid),
+                        )
+                        thread_id = _claim["thread_id"]
+                        # Cursor + failure state are now sourced from
+                        # chat_threads (tenant-singleton) — they survive
+                        # across users and across worker restarts.
+                        saved_cursor = _claim["drain_cursor"]
+                        _thread_failure_state = (
+                            _claim["drain_failure_state"] or {}
+                        )
+
+                        if not _claim["claimed"]:
+                            # Another backup just drained this chat. Reuse
+                            # the messages they persisted and write thin
+                            # pointer rows for THIS snapshot only.
+                            try:
+                                _pointers = await _load_chat_thread_messages_for_pointer(
+                                    thread_id=thread_id,
+                                )
+                                if _pointers:
+                                    _rows, _bytes = _build_chat_pointer_rows(
+                                        cid, _pointers, full_messages=False,
+                                    )
+                                    async with async_session_factory() as _ps:
+                                        await _bulk_upsert_snapshot_items(_ps, _rows)
+                                    _persisted_total += len(_rows)
+                                    _persisted_bytes += _bytes
+                            except Exception as _se:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"chat {cid[:8]} pointer-write on "
+                                    f"skip-claim failed: "
+                                    f"{type(_se).__name__}: {_se}"
+                                )
+                            _progress["chats_done"] += 1
+                            if _progress["chats_done"] % cancel_check_every == 0:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"{user_label}: "
+                                    f"{_progress['chats_done']}/"
+                                    f"{len(chat_ids_to_drain)} chats, "
+                                    f"{_progress['msgs']} msgs so far "
+                                    f"[CHAT-CLAIM] chat={cid[:8]} "
+                                    f"claimed=false (concurrent/recent drain)"
+                                )
+                            return cid, [], saved_cursor
 
                         # Per-chat failure record drives smart-skip. The naive
                         # alternatives are both broken: "always retry" wastes
@@ -2902,7 +3428,7 @@ class BackupWorker:
                         # The fingerprint + class are written into the failure
                         # record so subsequent runs can make this decision
                         # without any state outside Postgres.
-                        _prior_failure = existing_failures.get(cid) or {}
+                        _prior_failure = _thread_failure_state
                         _prior_count = int(_prior_failure.get("count", 0) or 0)
                         _prior_class = _prior_failure.get("error_class")
                         _prior_fp = _prior_failure.get(
@@ -2934,6 +3460,14 @@ class BackupWorker:
                                 _should_skip_failed = True
                                 _skip_reason = "chat no longer in list"
                         if _should_skip_failed:
+                            # Bump last_drained_at so concurrent / future
+                            # backups don't re-acquire the claim and
+                            # re-discover the same permission/gone error.
+                            await _mark_chat_thread_drained(
+                                thread_id=thread_id,
+                                drain_cursor=None,
+                                failure_state=_prior_failure or None,
+                            )
                             _progress["chats_done"] += 1
                             if _progress["chats_done"] % cancel_check_every == 0:
                                 print(
@@ -2945,7 +3479,7 @@ class BackupWorker:
                                     f"(smart-skip chat {cid[:8]} — "
                                     f"{_prior_class}: {_skip_reason})"
                                 )
-                            return cid, [], existing_tokens.get(cid)
+                            return cid, [], saved_cursor
 
                         # ── Chat-level drain skip (primary incremental win) ──
                         # Graph $filter=lastModifiedDateTime gt X on
@@ -2965,6 +3499,39 @@ class BackupWorker:
                         ):
                             chat_lu = chat_last_updated_map.get(cid)
                             if chat_lu and chat_lu <= saved_cursor:
+                                # The chat genuinely had no activity since the
+                                # cursor — but we still need to write pointer
+                                # rows for THIS snapshot (the cross-user skip
+                                # path is separate; here we won the claim and
+                                # owe a per-snapshot inventory). Reuse the
+                                # messages already persisted in chat_thread_
+                                # messages.
+                                try:
+                                    _pts = await _load_chat_thread_messages_for_pointer(
+                                        thread_id=thread_id,
+                                    )
+                                    if _pts:
+                                        _rows, _bytes = _build_chat_pointer_rows(
+                                            cid, _pts, full_messages=False,
+                                        )
+                                        async with async_session_factory() as _ps:
+                                            await _bulk_upsert_snapshot_items(_ps, _rows)
+                                        _persisted_total += len(_rows)
+                                        _persisted_bytes += _bytes
+                                except Exception as _pe:
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"chat {cid[:8]} skip-by-activity "
+                                        f"pointer-write failed: "
+                                        f"{type(_pe).__name__}: {_pe}"
+                                    )
+                                # Bump last_drained_at to renew freshness for
+                                # other concurrent backups.
+                                await _mark_chat_thread_drained(
+                                    thread_id=thread_id,
+                                    drain_cursor=saved_cursor,
+                                    failure_state=None,
+                                )
                                 _progress["chats_done"] += 1
                                 if _progress["chats_done"] % cancel_check_every == 0:
                                     print(
@@ -3177,8 +3744,8 @@ class BackupWorker:
                             try:
                                 n, b = await _stream_persist_chat_items(
                                     cid, msgs_local,
+                                    chat_thread_id=thread_id,
                                 )
-                                nonlocal _persisted_total, _persisted_bytes
                                 _persisted_total += n
                                 _persisted_bytes += b
                                 # Live item_count bump on the snapshot
@@ -3227,47 +3794,41 @@ class BackupWorker:
                                     f"{persist_err}"
                                 )
 
-                            # Resume checkpoint: persist THIS chat's
-                            # delta cursor (max lastModifiedDateTime)
-                            # to the resource right now, before draining
-                            # the next chat. If the worker dies, the
-                            # next session reads chat_delta_tokens[cid]
-                            # and queries Graph with
-                            # `lastModifiedDateTime gt <stamp>` — so
+                            # Resume checkpoint: write THIS chat's drain
+                            # cursor + last_drained_at into chat_threads
+                            # right now, before draining the next chat.
+                            # If the worker dies, the next session reads
+                            # chat_threads.drain_cursor and queries Graph
+                            # with `lastModifiedDateTime gt <stamp>` — so
                             # this chat skips straight to "what's new"
                             # instead of re-pulling everything. Chats
-                            # that haven't checkpointed yet (or whose
-                            # persist failed above) get a full re-drain,
-                            # which is idempotent thanks to the UNIQUE
-                            # (snapshot_id, external_id, item_type)
-                            # constraint on TEAMS_CHAT_MESSAGE rows.
+                            # that haven't checkpointed yet get a full
+                            # re-drain, which is idempotent thanks to
+                            # UNIQUE (chat_thread_id, message_external_id)
+                            # on chat_thread_messages.
                             #
-                            # Skip the checkpoint entirely when drain
-                            # failed mid-flight — advancing the cursor
-                            # past a partial drain permanently drops
-                            # everything after the failure point.
-                            if max_stamp and drain_succeeded:
-                                try:
-                                    async with async_session_factory() as _ck:
-                                        _r = await _ck.get(Resource, resource.id)
-                                        if _r is not None:
-                                            _ed = dict(_r.extra_data or {})
-                                            _toks = dict(_ed.get("chat_delta_tokens") or {})
-                                            _toks[cid] = max_stamp
-                                            _ed["chat_delta_tokens"] = _toks
-                                            _r.extra_data = _ed
-                                            await _ck.commit()
-                                except Exception as _ck_err:
-                                    # Advisory checkpoint — a DB hiccup
-                                    # here must not abort the drain.
-                                    # The end-of-drain merge below will
-                                    # catch up if this single write
-                                    # missed.
-                                    print(
-                                        f"[{self.worker_id}] [USER_CHATS] "
-                                        f"chat {cid[:8]} per-chat token "
-                                        f"checkpoint failed: {_ck_err}"
-                                    )
+                            # Skip the cursor advancement when drain
+                            # failed mid-flight (max_stamp is set but
+                            # drain_succeeded=False) — but DO bump
+                            # last_drained_at + failure state so other
+                            # backups see freshness + know why this
+                            # chat failed.
+                            try:
+                                await _mark_chat_thread_drained(
+                                    thread_id=thread_id,
+                                    drain_cursor=(
+                                        max_stamp if drain_succeeded else None
+                                    ),
+                                    failure_state=new_failures.get(cid),
+                                )
+                            except Exception as _ck_err:
+                                # Advisory checkpoint — a DB hiccup here
+                                # must not abort the drain.
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"chat {cid[:8]} chat_threads "
+                                    f"checkpoint failed: {_ck_err}"
+                                )
 
                         # Fire hostedContent fetch for this chat's msgs
                         # as a background task — runs in parallel with
@@ -3312,8 +3873,12 @@ class BackupWorker:
                         # transient failures (1-2 misses) reset the counter
                         # and don't accumulate toward the permanent-skip
                         # threshold over months of incrementals.
-                        if drain_succeeded and cid in existing_failures:
-                            new_failures[cid] = None
+                        if drain_succeeded and _thread_failure_state:
+                            # Clearing failure state means writing an
+                            # empty dict (not None) so chat_threads
+                            # stores {} rather than leaving the old
+                            # JSON behind.
+                            new_failures[cid] = {}
                         # Return None as the new cursor when the drain
                         # failed so the end-of-drain merge does not write
                         # new_tokens[cid]; existing saved_cursor stays
@@ -3462,42 +4027,21 @@ class BackupWorker:
                             f"{type(_re).__name__}: {_re}"
                         )
 
-                    # Persist per-chat delta tokens so subsequent runs only
-                    # pull new messages per-chat. Merge with existing map
-                    # so a failed chat doesn't wipe tokens we still hold
-                    # for others.
+                    # Per-chat drain cursors + failure state now live in
+                    # chat_threads (tenant-singleton). Each _drain_one_chat
+                    # call already wrote its own row via
+                    # _mark_chat_thread_drained, so there's nothing to merge
+                    # at the resource level for those two fields anymore.
                     #
-                    # Also persist chat_meta_cache + chat_skip_baseline_at
-                    # so the next incremental can reuse member/display-name
-                    # metadata for chats whose lastUpdatedDateTime is at-or-
-                    # before the baseline (see Layer A skip block above).
+                    # We still persist chat_meta_cache + chat_skip_baseline_at
+                    # on the Resource: those are per-user state (UI display
+                    # name, baseline timestamp) and don't belong in the
+                    # tenant-singleton chat_threads row.
                     try:
                         async with async_session_factory() as _s:
                             r = await _s.get(Resource, resource.id)
                             if r is not None:
                                 ed = dict(r.extra_data or {})
-                                if new_tokens:
-                                    merged = dict(
-                                        ed.get("chat_delta_tokens") or {},
-                                    )
-                                    merged.update(new_tokens)
-                                    ed["chat_delta_tokens"] = merged
-                                # Merge per-chat drain-failure state. Successes
-                                # clear stale records (entry=None → pop), new
-                                # failures increment the counter. Chats that
-                                # hit MAX_DRAIN_FAILURES stay in this dict so
-                                # the next backup's skip-check fires before
-                                # any HTTP call.
-                                if new_failures:
-                                    _merged_fails = dict(
-                                        ed.get("chat_drain_failures") or {},
-                                    )
-                                    for _cid, _state in new_failures.items():
-                                        if _state is None:
-                                            _merged_fails.pop(_cid, None)
-                                        else:
-                                            _merged_fails[_cid] = _state
-                                    ed["chat_drain_failures"] = _merged_fails
                                 # Replace cache wholesale with what we saw
                                 # this run — drops entries for chats the
                                 # user has left.
@@ -3511,7 +4055,7 @@ class BackupWorker:
                                 r.extra_data = ed
                                 await _s.commit()
                     except Exception as _e:
-                        print(f"[{self.worker_id}] [USER_CHATS] delta/meta persist failed: {_e}")
+                        print(f"[{self.worker_id}] [USER_CHATS] meta persist failed: {_e}")
 
                     # Folder-path normalization: rewrite stale folder_path /
                     # chatTopic for any historical items whose chat's display
@@ -4652,16 +5196,140 @@ class BackupWorker:
                     fut.set_exception(e)
                 raise
 
-        async def _fetch_url_deduped(url: str, context_label: str) -> Optional[bytes]:
-            """Fetch a share URL with separated resolve + download
-            phases. First caller creates the task; subsequent callers
-            await the same task. Result cached for the rest of the
-            phase."""
+        tenant_id_str = str(tenant.id)
+        url_cache_ttl_days = int(os.getenv("CHAT_URL_CACHE_TTL_DAYS", "30"))
+        tenant_cache_stats = att_dedup.tenant_url_cache_stats
+
+        async def _lookup_tenant_url_cache(
+            url_sha: str,
+        ) -> Optional["_CachedAttachmentResult"]:
+            """Read-side: returns a cache hit, the special unreachable
+            sentinel, or None if the row is missing / expired.
+
+            Single ``UPDATE … RETURNING`` so the lookup + last_used_at
+            bump are one roundtrip. Errors against the cache table
+            never abort the fetch — we fall through to the live Graph
+            + CDN path and the caller is none the wiser.
+            """
+            try:
+                async with async_session_factory() as s:
+                    row = (await s.execute(
+                        text(
+                            "UPDATE chat_url_cache "
+                            "   SET last_used_at = NOW() "
+                            " WHERE tenant_id = :t AND url_sha256 = :u "
+                            "   AND last_used_at > NOW() - (:d || ' days')::interval "
+                            "RETURNING drive_item_id, content_hash, blob_path, "
+                            "          content_size, inline_b64, unreachable"
+                        ),
+                        {"t": tenant_id_str, "u": url_sha, "d": str(url_cache_ttl_days)},
+                    )).first()
+                    await s.commit()
+                    if row is None:
+                        return None
+                    if row.unreachable:
+                        return _CachedAttachmentResult(unreachable=True)
+                    if not row.content_hash or (not row.blob_path and not row.inline_b64):
+                        # Partial / corrupt row — treat as miss.
+                        return None
+                    return _CachedAttachmentResult(
+                        content_hash=row.content_hash,
+                        blob_path=row.blob_path,
+                        inline_b64=row.inline_b64,
+                        content_size=row.content_size or 0,
+                    )
+            except Exception as e:
+                print(
+                    f"[{self.worker_id}] [CHAT-ATT] tenant_url_cache "
+                    f"lookup error: {type(e).__name__}: {e}"
+                )
+                return None
+
+        async def _write_tenant_url_cache(
+            url_sha: str,
+            *,
+            drive_item_id: Optional[str],
+            content_hash: Optional[str],
+            blob_path: Optional[str],
+            content_size: int,
+            inline_b64: Optional[str],
+            unreachable: bool,
+        ) -> None:
+            try:
+                async with async_session_factory() as s:
+                    await s.execute(
+                        text(
+                            "INSERT INTO chat_url_cache "
+                            "(tenant_id, url_sha256, drive_item_id, content_hash, "
+                            " blob_path, content_size, inline_b64, unreachable, "
+                            " first_seen_at, last_used_at) "
+                            "VALUES (:t, :u, :di, :ch, :bp, :sz, :ib, :un, "
+                            "        NOW(), NOW()) "
+                            "ON CONFLICT (tenant_id, url_sha256) DO UPDATE SET "
+                            "  drive_item_id = COALESCE(EXCLUDED.drive_item_id, "
+                            "                           chat_url_cache.drive_item_id), "
+                            "  content_hash  = COALESCE(EXCLUDED.content_hash, "
+                            "                           chat_url_cache.content_hash), "
+                            "  blob_path     = COALESCE(EXCLUDED.blob_path, "
+                            "                           chat_url_cache.blob_path), "
+                            "  content_size  = COALESCE(EXCLUDED.content_size, "
+                            "                           chat_url_cache.content_size), "
+                            "  inline_b64    = COALESCE(EXCLUDED.inline_b64, "
+                            "                           chat_url_cache.inline_b64), "
+                            "  unreachable   = EXCLUDED.unreachable, "
+                            "  last_used_at  = NOW()"
+                        ),
+                        {
+                            "t": tenant_id_str, "u": url_sha,
+                            "di": drive_item_id, "ch": content_hash,
+                            "bp": blob_path, "sz": content_size,
+                            "ib": inline_b64, "un": unreachable,
+                        },
+                    )
+                    await s.commit()
+                    tenant_cache_stats["miss_writes"] += 1
+            except Exception as e:
+                # Cache writes are best-effort — a failure here just means
+                # the next backup pays the resolve/download cost again.
+                print(
+                    f"[{self.worker_id}] [CHAT-ATT] tenant_url_cache "
+                    f"write error: {type(e).__name__}: {e}"
+                )
+
+        async def _fetch_url_deduped(
+            url: str, context_label: str,
+        ) -> "_CachedAttachmentResult":
+            """Fetch a share URL with separated resolve + download phases.
+
+            Layered caches (cheapest first):
+              1. ``url_cache`` (in-memory, snapshot-wide) — fully resolved
+                 bytes or cached descriptor for the rest of the run.
+              2. ``chat_url_cache`` (PG, tenant-scoped, cross-snapshot) —
+                 ``(drive_item_id, content_hash, blob_path, inline_b64)``
+                 from a prior backup. Hit skips both Graph resolve AND
+                 the CDN download.
+              3. Live Graph resolve + driveItem-id dedup + CDN download.
+
+            Returns a ``_CachedAttachmentResult``; the caller branches on
+            ``is_cache_hit`` to either reuse the cached descriptor or
+            run the hash + upload path on the freshly downloaded bytes.
+            """
             if url in url_cache:
                 return url_cache[url]
             if url not in url_tasks:
-                async def _go(u: str, ctx: str) -> Optional[bytes]:
-                    # Phase 1: resolve under Graph-resolve semaphore
+                async def _go(u: str, ctx: str) -> "_CachedAttachmentResult":
+                    u_sha = hashlib.sha256(u.encode("utf-8")).hexdigest()
+
+                    # Layer 2: persisted tenant cache.
+                    cached = await _lookup_tenant_url_cache(u_sha)
+                    if cached is not None:
+                        if cached.unreachable:
+                            tenant_cache_stats["unreachable_skip"] += 1
+                        else:
+                            tenant_cache_stats["hits"] += 1
+                        return cached
+
+                    # Layer 3: live Graph resolve.
                     try:
                         async with resolve_sem:
                             drive_item = await graph_client.resolve_share_to_drive_item(u)
@@ -4671,17 +5339,24 @@ class BackupWorker:
                             f"resolve fail {ctx}: "
                             f"{type(e).__name__}: {e}"
                         )
-                        return None
+                        return _CachedAttachmentResult()
                     if drive_item is None:
-                        return None
+                        # Permanent: resolve_share_to_drive_item only
+                        # returns None for "known-broken" (403/404/410).
+                        # Stamp the cache so future backups skip it.
+                        await _write_tenant_url_cache(
+                            u_sha, drive_item_id=None, content_hash=None,
+                            blob_path=None, content_size=0, inline_b64=None,
+                            unreachable=True,
+                        )
+                        return _CachedAttachmentResult(unreachable=True)
                     if not drive_item.get("@microsoft.graph.downloadUrl"):
-                        return None
-                    # Phase 2: download bytes — but first check the
-                    # driveItem.id dedup map. If another caller is
-                    # already downloading the same underlying file
-                    # (different sharing URL, same driveItem), join
-                    # their future instead of re-downloading.
+                        return _CachedAttachmentResult()
                     di_id = drive_item.get("id")
+                    # Layer 3b: driveItem.id-keyed in-process dedup (a
+                    # forwarded SP file produces many sharing URLs but
+                    # one underlying file).
+                    bytes_result: Optional[bytes] = None
                     if di_id:
                         async with driveitem_lock:
                             fut = driveitem_tasks.get(di_id)
@@ -4694,45 +5369,48 @@ class BackupWorker:
                         if not creator:
                             di_dedup_hits["n"] += 1
                             try:
-                                return await fut
+                                bytes_result = await fut
                             except Exception:
-                                return None
-                        # Creator path: do the actual download, publish.
+                                bytes_result = None
+                        else:
+                            try:
+                                async with download_sem:
+                                    bytes_result = await graph_client.download_drive_item_bytes(
+                                        drive_item, source_url_for_cache=u,
+                                    )
+                                fut.set_result(bytes_result)
+                            except Exception as e:
+                                if not fut.done():
+                                    fut.set_exception(e)
+                                print(
+                                    f"[{self.worker_id}] [CHAT-ATT] "
+                                    f"download fail {ctx}: "
+                                    f"{type(e).__name__}: {e}"
+                                )
+                                bytes_result = None
+                    else:
                         try:
                             async with download_sem:
                                 bytes_result = await graph_client.download_drive_item_bytes(
                                     drive_item, source_url_for_cache=u,
                                 )
-                            fut.set_result(bytes_result)
-                            return bytes_result
                         except Exception as e:
-                            if not fut.done():
-                                fut.set_exception(e)
                             print(
                                 f"[{self.worker_id}] [CHAT-ATT] "
                                 f"download fail {ctx}: "
                                 f"{type(e).__name__}: {e}"
                             )
-                            return None
-                    # No driveItem.id (unexpected — Graph always
-                    # returns one) — fall through to plain download.
-                    try:
-                        async with download_sem:
-                            return await graph_client.download_drive_item_bytes(
-                                drive_item, source_url_for_cache=u,
-                            )
-                    except Exception as e:
-                        print(
-                            f"[{self.worker_id}] [CHAT-ATT] "
-                            f"download fail {ctx}: "
-                            f"{type(e).__name__}: {e}"
-                        )
-                        return None
+                            bytes_result = None
+
+                    return _CachedAttachmentResult(
+                        bytes_=bytes_result,
+                        content_size=(len(bytes_result) if bytes_result else 0),
+                    )
                 url_tasks[url] = asyncio.create_task(_go(url, context_label))
             try:
                 result = await url_tasks[url]
             except Exception:
-                result = None
+                result = _CachedAttachmentResult()
             url_cache[url] = result
             return result
 
@@ -4749,23 +5427,22 @@ class BackupWorker:
             content_url = att.get("contentUrl")
             raw_content = att.get("content")  # JSON for pointers / cards
 
-            content_bytes: Optional[bytes] = None
-            resolved = False
+            fetched: Optional[_CachedAttachmentResult] = None
 
             if ct in REFERENCE_TYPES and content_url:
-                content_bytes = await _fetch_url_deduped(
+                fetched = await _fetch_url_deduped(
                     content_url, f"{name} on {msg_id}",
                 )
             elif ct in POINTER_TYPES or ct.startswith("application/vnd.microsoft.card"):
                 # Metadata-only: UI pointer or card. `content` is JSON
                 # describing the target; preserve it so the UI can
                 # render the citation / card without Graph.
-                content_bytes = None
+                fetched = None
             else:
                 # Unknown contentType — try the URL if provided, else
                 # leave as metadata.
                 if content_url:
-                    content_bytes = await _fetch_url_deduped(
+                    fetched = await _fetch_url_deduped(
                         content_url, f"{name} on {msg_id}",
                     )
 
@@ -4774,8 +5451,22 @@ class BackupWorker:
             size = 0
             bytes_added = 0
             inline_b64: Optional[str] = None
+            resolved = False
 
-            if content_bytes is not None:
+            if fetched is not None and fetched.is_cache_hit:
+                # Layer-2 cache hit: reuse the prior backup's hash +
+                # blob_path / inline_b64. No bytes were transferred —
+                # we never hashed locally and there is nothing new to
+                # upload. Just stamp the SnapshotItem with the cached
+                # descriptor. ``bytes_added`` stays 0 because no fresh
+                # bytes hit storage on this run.
+                content_hash = fetched.content_hash
+                size = fetched.content_size
+                blob_path = fetched.blob_path
+                inline_b64 = fetched.inline_b64
+                resolved = True
+            elif fetched is not None and fetched.bytes_ is not None:
+                content_bytes = fetched.bytes_
                 content_hash = hashlib.sha256(content_bytes).hexdigest()
                 size = len(content_bytes)
 
@@ -4814,6 +5505,21 @@ class BackupWorker:
                         )
                         blob_path = None
                         content_hash = None
+
+                # Write back to the persisted cache so the next backup
+                # of any user in this tenant skips both resolve AND
+                # download. Only successful resolutions are stored.
+                if content_hash is not None and content_url:
+                    u_sha = hashlib.sha256(content_url.encode("utf-8")).hexdigest()
+                    await _write_tenant_url_cache(
+                        u_sha,
+                        drive_item_id=None,
+                        content_hash=content_hash,
+                        blob_path=blob_path,
+                        content_size=size,
+                        inline_b64=inline_b64,
+                        unreachable=False,
+                    )
 
             item = SnapshotItem(
                 id=uuid.uuid4(),
@@ -4940,7 +5646,10 @@ class BackupWorker:
                 f"[uploads≈{new_uploads}, "
                 f"db_dedup≈{new_db_hits}, "
                 f"in_phase_dedup≈{new_phase_hits}, "
-                f"di_dedup≈{new_di_hits}] "
+                f"di_dedup≈{new_di_hits}, "
+                f"tenant_url_cache_hits≈{tenant_cache_stats['hits']}, "
+                f"tenant_url_cache_unreach_skip≈{tenant_cache_stats['unreachable_skip']}, "
+                f"tenant_url_cache_writes≈{tenant_cache_stats['miss_writes']}] "
                 f"shared-cache: {len(url_cache)} urls, "
                 f"{len(driveitem_tasks)} driveItems, "
                 f"{len(hash_upload_tasks)} hashes"
