@@ -186,7 +186,7 @@ async def _bulk_upsert_snapshot_items(
 # B's snapshot.
 
 _CHAT_THREAD_DRAIN_FRESHNESS_S = int(
-    os.getenv("CHAT_THREAD_DRAIN_FRESHNESS_S", "30"),
+    os.getenv("CHAT_THREAD_DRAIN_FRESHNESS_S", "25200"),
 )
 
 
