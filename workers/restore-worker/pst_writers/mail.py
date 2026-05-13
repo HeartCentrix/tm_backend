@@ -47,6 +47,46 @@ class MailPstWriter(PstWriterBase):
     # folder name to "Inbox" for mail; this string is informational only.
     standard_folder_type = "Inbox"
 
+    # Bytes the PC header + recipients + small Graph metadata occupy in the
+    # heap-on-node before anything spills to a subnode. Tuned conservatively
+    # — actual mail with no body still fits in one block. Used only when we
+    # have a Graph dict to inspect; the base-class fallback (content_size
+    # of the raw Graph JSON) over-counts because it includes envelope JSON
+    # bytes that land inline in the PC and consume zero subnode blocks.
+    _PC_ENVELOPE_BYTES = 4 * 1024
+
+    def _estimate_item_size(self, item, graph_obj) -> int:
+        """Bytes the pstwriter will materialise per mail.
+
+        Only body text/HTML + attachment payloads actually drive subnode
+        block consumption — headers, recipients, ConversationIndex,
+        importance flags etc. all live inline in the PC. Counting the
+        whole Graph JSON envelope (the base-class default) over-estimates
+        by a factor of 5-10× for HTML-heavy mail and produces unnecessary
+        chunk splits (e.g. a 39-mail Deleted Items folder fanning out to
+        5 PSTs when 1-2 would suffice).
+        """
+        if not isinstance(graph_obj, dict):
+            # No Graph payload to inspect — fall back to the base estimate
+            # so unusual code paths (raw bytes only) still get a sensible
+            # number.
+            return super()._estimate_item_size(item, graph_obj)
+
+        body = graph_obj.get("body") or {}
+        body_content = body.get("content") if isinstance(body, dict) else None
+        body_bytes = len(body_content.encode("utf-8")) \
+            if isinstance(body_content, str) else 0
+
+        att_bytes = 0
+        for a in graph_obj.get("attachments") or []:
+            if isinstance(a, dict):
+                try:
+                    att_bytes += int(a.get("size") or 0)
+                except (TypeError, ValueError):
+                    pass
+
+        return self._PC_ENVELOPE_BYTES + body_bytes + att_bytes
+
     async def _collect_graph_item(self, item, shard, source_container: str):
         """Return the Graph message JSON for this item with attachment
         bytes inlined as base64. ``None`` when the body cannot be located."""
