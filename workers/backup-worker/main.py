@@ -602,7 +602,9 @@ async def _copy_chat_attachment_rows_to_snapshot(
                 "  indexed_at, backend_id, created_at"
                 ") "
                 "SELECT gen_random_uuid(), :tsid, :tid, src.item_type, "
-                "       src.external_id, src.parent_external_id, src.name, "
+                "       src.external_id, "
+                "       COALESCE(src.parent_external_id, split_part(src.external_id, '::', 1)), "
+                "       src.name, "
                 "       src.folder_path, src.content_hash, "
                 "       src.content_checksum, src.content_size, "
                 "       src.blob_path, src.encryption_key_id, "
@@ -612,7 +614,7 @@ async def _copy_chat_attachment_rows_to_snapshot(
                 "  FROM snapshot_items src "
                 " WHERE src.tenant_id = :tid "
                 "   AND src.item_type IN ('CHAT_ATTACHMENT', 'CHAT_HOSTED_CONTENT') "
-                "   AND src.parent_external_id IN ( "
+                "   AND COALESCE(src.parent_external_id, split_part(src.external_id, '::', 1)) IN ( "
                 "         SELECT m.message_external_id "
                 "           FROM chat_thread_messages m "
                 "           JOIN chat_threads t ON t.id = m.chat_thread_id "
@@ -5709,6 +5711,12 @@ class BackupWorker:
                 snapshot_id=snapshot.id,
                 tenant_id=tenant.id,
                 external_id=f"{msg_id}::{att_id}",
+                # Populate parent_external_id with the message id so P8's
+                # claim-skip back-fill JOIN can find these rows by chat. The
+                # legacy code stored the linkage only in extra_data.parent_item_id,
+                # which silently broke cross-snapshot attachment back-fill
+                # and produced first-drainer / second-drainer size asymmetry.
+                parent_external_id=msg_id,
                 item_type="CHAT_ATTACHMENT",
                 name=(name or "")[:255],
                 folder_path=folder_path,
@@ -6873,21 +6881,32 @@ class BackupWorker:
             except Exception as pe:
                 print(f"[{self.worker_id}]   [PERMS WARN] {file_name}: {type(pe).__name__}: {pe}")
 
-        snapshot_item = SnapshotItem(
-            snapshot_id=snapshot.id,
-            tenant_id=tenant.id,
-            external_id=file_id,
-            item_type="FILE",
-            name=file_name,
-            folder_path=file_item.get("parentReference", {}).get("path"),
-            content_hash=content_hash if content_hash else None,
-            content_size=content_size,
-            blob_path=blob_path,
-            extra_data={"structured": metadata},
-            content_checksum=content_hash if content_hash else None,
+        # SharePoint delta pages can return the same file twice (when a file
+        # appears in multiple drives that the same site exposes, or when a
+        # version transition emits the live row on consecutive pages). Two
+        # concurrent _backup_file_one_drive calls then race the INSERT and the
+        # loser hits uq_snapshot_items_snap_ext_type → spurious "FILE FAIL".
+        # Use a single-row UPSERT instead so the second writer is a no-op
+        # (the row is already correct — same external_id, same blob_path).
+        from sqlalchemy.dialects.postgresql import insert as _pg_insert
+        row = {
+            "snapshot_id": snapshot.id,
+            "tenant_id": tenant.id,
+            "external_id": file_id,
+            "item_type": "FILE",
+            "name": file_name,
+            "folder_path": file_item.get("parentReference", {}).get("path"),
+            "content_hash": content_hash if content_hash else None,
+            "content_size": content_size,
+            "blob_path": blob_path,
+            "extra_data": {"structured": metadata},
+            "content_checksum": content_hash if content_hash else None,
+        }
+        stmt = _pg_insert(SnapshotItem.__table__).values(**row).on_conflict_do_nothing(
+            index_elements=["snapshot_id", "external_id", "item_type"],
         )
         async with async_session_factory() as session:
-            session.add(snapshot_item)
+            await session.execute(stmt)
             await session.commit()
 
     # Maximum prior versions to capture per file. 5 = the 5 most recent
@@ -7583,13 +7602,19 @@ class BackupWorker:
                                 f"{resource.external_id}/mailFolders/"
                                 f"{fid}/messages/delta"
                             )
-                            params = {"$top": "50", "$select": mbx_select}
+                            # $top=999 is Graph's max for /messages and matches the
+                            # USER_MAIL v2 path. The legacy $top=50 produced 20× more
+                            # round-trips per mailbox and capped Vinay's 7,277-msg
+                            # drain at ~6 msg/s. Larger pages let the per-stream
+                            # rate limiter (GRAPH_STREAM_PACE_REQS_PER_SEC) cover
+                            # ~999 msg/s of theoretical headroom instead of 50.
+                            params = {"$top": "999", "$select": mbx_select}
                         else:
                             url = (
                                 f"{graph_client.GRAPH_URL}/users/"
                                 f"{resource.external_id}/messages"
                             )
-                            params = {"$top": "50", "$select": mbx_select}
+                            params = {"$top": "999", "$select": mbx_select}
 
                         folder_path = (folder_tree.get(fid) if fid else "") or ""
                         folder_msgs: List[Dict[str, Any]] = []

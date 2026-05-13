@@ -24,8 +24,14 @@ class Settings:
             self.DB_PASSWORD = os.getenv("DB_PASSWORD")
 
         self.DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
-        self.DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "2"))
-        self.DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "2"))
+        # Pool sizing: 2+2 was producing TooManyConnectionsError on
+        # resource_service when backup workers concurrently fanned out
+        # resource lookups. 5+5 gives ~10 max per service — 27 services ×
+        # 10 = 270, still under typical postgres max_connections (Railway
+        # ships with ~500, on-prem default 100 is easy to raise). Heavy
+        # deployments override via env var.
+        self.DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
+        self.DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "5"))
         self.DB_POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
         self.DB_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
         self.DB_POOL_USE_LIFO = os.getenv("DB_POOL_USE_LIFO", "true").lower() in ("true", "1", "yes")
