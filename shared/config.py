@@ -89,18 +89,47 @@ class Settings:
         # the SPA and the API are on sibling subdomains.
         self.COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN", "") or None
 
-        # Railway provides REDIS_URL; fall back to individual vars
+        # Railway provides REDIS_URL; fall back to individual vars.
+        # Critical: REDIS_URL on Railway carries the auth password —
+        # earlier code parsed host/port/db but dropped the password,
+        # causing every Redis op on Railway to crash with
+        # `AuthenticationError: Authentication required`. The chat-
+        # export-worker hit it first (no try/except around the
+        # `progress.publish` call); auth-service silently swallowed
+        # the same error in a dev-mode fallback. Save the password
+        # separately and expose a `REDIS_URL_FULL` property that
+        # callers can hand directly to `Redis.from_url(...)`.
         railway_redis_url = os.getenv("REDIS_URL")
         if railway_redis_url:
             parsed = urlparse(railway_redis_url)
             self.REDIS_HOST = parsed.hostname or "localhost"
             self.REDIS_PORT = parsed.port or 6379
             self.REDIS_DB = int((parsed.path.lstrip("/") or "0"))
+            self.REDIS_PASSWORD = parsed.password or os.getenv("REDIS_PASSWORD", "") or ""
+            self.REDIS_USERNAME = parsed.username or os.getenv("REDIS_USERNAME", "") or ""
         else:
             self.REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
             self.REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
             self.REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+            self.REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "") or ""
+            self.REDIS_USERNAME = os.getenv("REDIS_USERNAME", "") or ""
         self.REDIS_ENABLED = os.getenv("REDIS_ENABLED", "false").lower() in ("true", "1", "yes")
+        # Single source of truth for any caller that hands a URL to
+        # redis-py (Redis.from_url / aioredis.from_url). Encodes the
+        # password with quote() so URL-unsafe characters in Railway-
+        # generated credentials (e.g. '/', '+', '=') don't break
+        # parsing. Username is normally empty on Railway managed
+        # Redis (default user, password-only auth).
+        from urllib.parse import quote as _q
+        if self.REDIS_PASSWORD:
+            _auth = (
+                f"{_q(self.REDIS_USERNAME, safe='')}:" if self.REDIS_USERNAME else ":"
+            ) + f"{_q(self.REDIS_PASSWORD, safe='')}@"
+        else:
+            _auth = ""
+        self.REDIS_URL_FULL = (
+            f"redis://{_auth}{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+        )
 
         # Railway provides RABBITMQ_URL or AMQP_URL; fall back to individual vars
         railway_rabbitmq_url = os.getenv("RABBITMQ_URL") or os.getenv("AMQP_URL")

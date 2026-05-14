@@ -7,8 +7,11 @@ _redis: Redis | None = None
 
 
 def _redis_url() -> str:
-    # shared.config.Settings exposes REDIS_HOST/PORT/DB (no unified redis_url attr).
-    return f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
+    # Always use settings.REDIS_URL_FULL — it carries the Railway auth
+    # password parsed from REDIS_URL. The earlier host/port/db-only
+    # form silently dropped auth, causing every publish() to crash
+    # the worker with `AuthenticationError: Authentication required`.
+    return settings.REDIS_URL_FULL
 
 
 async def _r() -> Redis:

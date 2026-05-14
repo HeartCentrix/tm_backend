@@ -387,7 +387,7 @@ async def datasource_callback(
         try:
             import redis.asyncio as aioredis
             redis_client = aioredis.from_url(
-                f"redis://{app_settings.REDIS_HOST}:{app_settings.REDIS_PORT}/{app_settings.REDIS_DB}",
+                app_settings.REDIS_URL_FULL,
                 decode_responses=True,
             )
             expected_state = await redis_client.get(f"oauth_state:{current_user['id']}")

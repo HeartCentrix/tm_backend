@@ -418,8 +418,7 @@ async def status_or_sse(
         return _job_snapshot(job)
 
     async def event_stream():
-        redis_url = f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
-        r = Redis.from_url(redis_url)
+        r = Redis.from_url(settings.REDIS_URL_FULL)
         ps = r.pubsub()
         channel = f"chat_export:progress:{job_id}"
         await ps.subscribe(channel)
