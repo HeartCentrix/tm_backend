@@ -73,6 +73,37 @@ class MessageBus:
                     "backup.onedrive_partition",
                     routing_key="backup.onedrive_partition",
                 )
+                # USER_CHATS per-shard partition queue — same shape as
+                # OneDrive's but the shards carry chat-id allowlists.
+                # Workers re-enter the USER_CHATS coordinator pipeline
+                # with a `chat_ids_filter` scoping the drain to the
+                # shard's chats. Separate queue (vs reusing
+                # backup.onedrive_partition) so per-lane prefetch can
+                # differ — chat shards are I/O-light, OneDrive shards
+                # are I/O-heavy.
+                await self._declare_queue(
+                    "backup.chats_partition",
+                    routing_key="backup.chats_partition",
+                )
+                # Phase 3.2: Mail folder partition queue. Shards carry a
+                # `folder_ids: [...]` allowlist; workers re-enter the
+                # mailbox handler scoped to those folders. Covers all
+                # four mailbox resource types (USER_MAIL, MAILBOX,
+                # SHARED_MAILBOX, ROOM_MAILBOX) — they share the same
+                # `backup_mailbox` handler.
+                await self._declare_queue(
+                    "backup.mail_partition",
+                    routing_key="backup.mail_partition",
+                )
+                # Phase 3.3: SharePoint drive partition queue. Shards
+                # carry a `drive_ids: [...]` allowlist for one site;
+                # workers re-enter `backup_sharepoint` scoped to those
+                # drives. SharePoint lists (non-doc libraries) stay
+                # single-replica for now.
+                await self._declare_queue(
+                    "backup.sharepoint_partition",
+                    routing_key="backup.sharepoint_partition",
+                )
                 await self._declare_queue("restore.urgent", routing_key="restore.urgent")
                 await self._declare_queue("restore.normal", routing_key="restore.normal")
                 await self._declare_queue("restore.low", routing_key="restore.low")
@@ -203,6 +234,98 @@ def create_backup_message(job_id: str, resource_id: str, tenant_id: str, full_ba
         "tenantId": tenant_id,
         "type": "FULL" if full_backup else "INCREMENTAL",
         "priority": 1 if full_backup else 5,
+        "createdAt": datetime.utcnow().isoformat(),
+    }
+
+
+def create_chats_partition_message(
+    *,
+    partition_id: str,
+    snapshot_id: str,
+    job_id: str,
+    tenant_id: str,
+    resource_id: str,
+    chat_ids: list,
+) -> dict:
+    """Envelope for one shard of a partitioned USER_CHATS snapshot.
+
+    Consumed by `_process_chats_partition_message` in backup-worker.
+    The consumer atomically claims the snapshot_partitions row, then
+    re-enters the existing USER_CHATS coordinator pipeline (via the
+    same `_backup_user_content_parallel` path) with `chat_ids_filter`
+    scoping its drain to this shard's chats. Reusing the existing
+    pipeline avoids re-implementing the complex chat metadata +
+    member resolution + drain logic.
+    """
+    return {
+        "messageType": "BACKUP_CHATS_PARTITION",
+        "partitionId": partition_id,
+        "snapshotId": snapshot_id,
+        "jobId": job_id,
+        "tenantId": tenant_id,
+        "resourceId": resource_id,
+        "chatIds": chat_ids,
+        "createdAt": datetime.utcnow().isoformat(),
+    }
+
+
+def create_mail_partition_message(
+    *,
+    partition_id: str,
+    snapshot_id: str,
+    job_id: str,
+    tenant_id: str,
+    resource_id: str,
+    folder_ids: list,
+    resource_type: str = "USER_MAIL",
+) -> dict:
+    """Envelope for one shard of a partitioned mailbox snapshot.
+
+    Covers all four mailbox resource types (USER_MAIL, MAILBOX,
+    SHARED_MAILBOX, ROOM_MAILBOX) — they share the same handler. The
+    consumer atomically claims the snapshot_partitions row, then runs
+    the existing per-folder drain over `folder_ids` only. Per-folder
+    delta tokens are written to `mail_folder_delta` (atomic per-row;
+    no RMW race across shards).
+    """
+    return {
+        "messageType": "BACKUP_MAIL_PARTITION",
+        "partitionId": partition_id,
+        "snapshotId": snapshot_id,
+        "jobId": job_id,
+        "tenantId": tenant_id,
+        "resourceId": resource_id,
+        "folderIds": folder_ids,
+        "resourceType": resource_type,
+        "createdAt": datetime.utcnow().isoformat(),
+    }
+
+
+def create_sharepoint_partition_message(
+    *,
+    partition_id: str,
+    snapshot_id: str,
+    job_id: str,
+    tenant_id: str,
+    resource_id: str,
+    drive_ids: list,
+    site_id: str,
+) -> dict:
+    """Envelope for one shard of a partitioned SharePoint site snapshot.
+
+    The consumer atomically claims the snapshot_partitions row, then
+    drains only the drives in `drive_ids`. Per-drive delta tokens are
+    written to `sharepoint_drive_delta` (atomic per-row; no RMW race).
+    """
+    return {
+        "messageType": "BACKUP_SHAREPOINT_PARTITION",
+        "partitionId": partition_id,
+        "snapshotId": snapshot_id,
+        "jobId": job_id,
+        "tenantId": tenant_id,
+        "resourceId": resource_id,
+        "driveIds": drive_ids,
+        "siteId": site_id,
         "createdAt": datetime.utcnow().isoformat(),
     }
 

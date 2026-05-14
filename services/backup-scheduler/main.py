@@ -616,25 +616,78 @@ async def startup():
                     f"[backup-scheduler] bulk_parent_finalize failed: {bulk_exc}",
                 )
 
-            # OneDrive partition stale-sweep — mirrors the snapshot
-            # sweep above but for `snapshot_partitions`. A partition
-            # consumer that died mid-shard leaves its row IN_PROGRESS;
-            # without this sweep the parent Snapshot can never flip
-            # terminal (the partition finalizer waits for ALL shards
-            # to be terminal). Same 30-min idle horizon as the
-            # snapshot sweep so ops semantics are consistent.
+            # Partition stale-sweep — mirrors the snapshot sweep above
+            # but for `snapshot_partitions`. A partition consumer that
+            # died mid-shard leaves its row IN_PROGRESS; without this
+            # sweep the parent Snapshot can never flip terminal (the
+            # partition finalizer waits for ALL shards to be terminal).
+            # Same 30-min idle horizon as the snapshot sweep so ops
+            # semantics are consistent.
+            #
+            # Resilience hardening (Phase 2.4):
+            #  - Increment `retry_count` on every reset.
+            #  - When retry_count crosses PARTITION_MAX_RETRIES, mark
+            #    the row FAILED instead of re-queuing — caps redelivery
+            #    storms on a partition that's fundamentally broken.
+            #  - Before re-publishing, check the parent Job status. If
+            #    CANCELLING/CANCELLED, mark the row FAILED quietly so
+            #    we don't resurrect work the user explicitly stopped.
             try:
                 stale_min = int(
                     os.getenv("ONEDRIVE_PARTITION_STALE_SWEEP_MIN", "30")
                 )
+                max_retries = int(
+                    os.getenv("PARTITION_MAX_RETRIES", "5")
+                )
+
+                # Step 1: fail any row that's already at retry_count >=
+                # PARTITION_MAX_RETRIES and stuck IN_PROGRESS past the
+                # horizon. Done first so we don't bump retry_count for
+                # rows we're about to terminate.
+                async with async_session_factory() as session:
+                    failed_rows = (await session.execute(
+                        text(
+                            """
+                            UPDATE snapshot_partitions
+                               SET status        = 'FAILED',
+                                   completed_at  = NOW(),
+                                   failure_state = COALESCE(
+                                       failure_state, '{}'::json
+                                   )::jsonb || jsonb_build_object(
+                                       'reason', 'max_retries_exceeded',
+                                       'retry_count', retry_count,
+                                       'stale_sweep_at', NOW()
+                                   )
+                             WHERE status = 'IN_PROGRESS'
+                               AND started_at IS NOT NULL
+                               AND started_at < NOW()
+                                                - (:stale * INTERVAL '1 minute')
+                               AND retry_count >= :max_r
+                         RETURNING id, snapshot_id
+                            """
+                        ),
+                        {"stale": stale_min, "max_r": max_retries},
+                    )).fetchall()
+                    await session.commit()
+                if failed_rows:
+                    print(
+                        f"[backup-scheduler] partition_sweep: "
+                        f"{len(failed_rows)} partitions exceeded "
+                        f"max_retries={max_retries} — marked FAILED"
+                    )
+
+                # Step 2: reset still-eligible stuck rows back to QUEUED
+                # and bump retry_count. Stamp the eligible job_id so we
+                # can cancel-guard before re-publish.
                 async with async_session_factory() as session:
                     stuck_rows = (await session.execute(
                         text(
                             """
                             UPDATE snapshot_partitions
-                               SET status      = 'QUEUED',
-                                   worker_id   = NULL,
-                                   started_at  = NULL,
+                               SET status        = 'QUEUED',
+                                   worker_id     = NULL,
+                                   started_at    = NULL,
+                                   retry_count   = retry_count + 1,
                                    failure_state = COALESCE(
                                        failure_state, '{}'::json
                                    )::jsonb || jsonb_build_object(
@@ -645,11 +698,13 @@ async def startup():
                                AND started_at IS NOT NULL
                                AND started_at < NOW()
                                                 - (:stale * INTERVAL '1 minute')
+                               AND retry_count < :max_r
                          RETURNING id, snapshot_id, job_id, tenant_id,
-                                   resource_id, drive_id
+                                   resource_id, drive_id, partition_type,
+                                   retry_count, payload
                             """
                         ),
-                        {"stale": stale_min},
+                        {"stale": stale_min, "max_r": max_retries},
                     )).fetchall()
                     await session.commit()
                 if stuck_rows:
@@ -658,33 +713,170 @@ async def startup():
                         f"{len(stuck_rows)} IN_PROGRESS partitions to "
                         f"QUEUED (idle > {stale_min} min)"
                     )
-                    # Re-publish so a healthy worker picks them up
-                    # without waiting for the next coordinator run.
+
+                    # Cancel-guard: jobs in CANCELLING/CANCELLED state
+                    # should NOT resurrect partitions. Fetch the set of
+                    # cancelled job_ids in one query, then split.
+                    job_ids = {str(r[2]) for r in stuck_rows if r[2]}
+                    cancelled_jobs: set = set()
+                    if job_ids:
+                        async with async_session_factory() as session:
+                            cancelled_jobs = {
+                                str(r[0]) for r in (await session.execute(
+                                    text(
+                                        """
+                                        SELECT id FROM jobs
+                                         WHERE id::text = ANY(:ids)
+                                           AND status IN (
+                                               'CANCELLING'::jobstatus,
+                                               'CANCELLED'::jobstatus
+                                           )
+                                        """
+                                    ),
+                                    {"ids": list(job_ids)},
+                                )).fetchall()
+                            }
+
+                    # Mark any reset partition whose parent job was
+                    # cancelled as FAILED without re-publishing.
+                    cancelled_part_ids = [
+                        str(r[0]) for r in stuck_rows
+                        if str(r[2]) in cancelled_jobs
+                    ]
+                    if cancelled_part_ids:
+                        async with async_session_factory() as session:
+                            await session.execute(
+                                text(
+                                    """
+                                    UPDATE snapshot_partitions
+                                       SET status       = 'FAILED',
+                                           completed_at = NOW(),
+                                           failure_state = COALESCE(
+                                               failure_state, '{}'::json
+                                           )::jsonb || jsonb_build_object(
+                                               'reason', 'job_cancelled_during_sweep'
+                                           )
+                                     WHERE id::text = ANY(:ids)
+                                    """
+                                ),
+                                {"ids": cancelled_part_ids},
+                            )
+                            await session.commit()
+                        print(
+                            f"[backup-scheduler] partition_sweep: "
+                            f"{len(cancelled_part_ids)} partitions had "
+                            f"cancelled parent job — marked FAILED, "
+                            f"skipping re-publish"
+                        )
+
+                    # Re-publish only the partitions whose parent job
+                    # is still alive. Partition_type drives the queue:
+                    # ONEDRIVE_FILES → backup.onedrive_partition,
+                    # CHATS → backup.chats_partition (Phase 2.3),
+                    # MAIL_FOLDERS → backup.mail_partition (Phase 3.2),
+                    # SHAREPOINT_DRIVES → backup.sharepoint_partition
+                    # (Phase 3.3 — Tier-1).
                     if settings.RABBITMQ_ENABLED:
                         from shared.message_bus import (
                             message_bus as _mb,
-                            create_onedrive_partition_message as _mkp,
+                            create_onedrive_partition_message as _mk_od,
+                            create_chats_partition_message as _mk_chats,
+                            create_mail_partition_message as _mk_mail,
+                            create_sharepoint_partition_message as _mk_sp,
                         )
-                        for _pid, _sid, _jid, _tid, _rid, _drv in stuck_rows:
+                        import json as _json_re
+                        for row_re in stuck_rows:
+                            (_pid, _sid, _jid, _tid, _rid, _drv,
+                             _ptype, _rcnt, _payload) = row_re
+                            if str(_jid) in cancelled_jobs:
+                                continue
+                            ptype = str(_ptype or "ONEDRIVE_FILES")
+                            # Payload arrives as dict (JSON column) on
+                            # asyncpg; defensively handle JSON-string
+                            # fallback for older driver paths.
+                            payload_obj = _payload or {}
+                            if isinstance(payload_obj, str):
+                                try:
+                                    payload_obj = _json_re.loads(payload_obj)
+                                except Exception:
+                                    payload_obj = {}
                             try:
-                                msg = _mkp(
-                                    partition_id=str(_pid),
-                                    snapshot_id=str(_sid),
-                                    job_id=str(_jid),
-                                    tenant_id=str(_tid),
-                                    resource_id=str(_rid),
-                                    drive_id=str(_drv),
-                                )
-                                await _mb.publish(
-                                    "backup.onedrive_partition",
-                                    msg,
-                                    priority=3,
-                                )
+                                if ptype == "ONEDRIVE_FILES":
+                                    msg = _mk_od(
+                                        partition_id=str(_pid),
+                                        snapshot_id=str(_sid),
+                                        job_id=str(_jid),
+                                        tenant_id=str(_tid),
+                                        resource_id=str(_rid),
+                                        drive_id=str(_drv) if _drv else "",
+                                    )
+                                    await _mb.publish(
+                                        "backup.onedrive_partition",
+                                        msg, priority=3,
+                                    )
+                                elif ptype == "CHATS":
+                                    msg = _mk_chats(
+                                        partition_id=str(_pid),
+                                        snapshot_id=str(_sid),
+                                        job_id=str(_jid),
+                                        tenant_id=str(_tid),
+                                        resource_id=str(_rid),
+                                        chat_ids=list(
+                                            payload_obj.get("chat_ids") or []
+                                        ),
+                                    )
+                                    await _mb.publish(
+                                        "backup.chats_partition",
+                                        msg, priority=3,
+                                    )
+                                elif ptype == "MAIL_FOLDERS":
+                                    msg = _mk_mail(
+                                        partition_id=str(_pid),
+                                        snapshot_id=str(_sid),
+                                        job_id=str(_jid),
+                                        tenant_id=str(_tid),
+                                        resource_id=str(_rid),
+                                        folder_ids=list(
+                                            payload_obj.get("folder_ids") or []
+                                        ),
+                                        resource_type=str(
+                                            payload_obj.get("resource_type")
+                                            or "USER_MAIL"
+                                        ),
+                                    )
+                                    await _mb.publish(
+                                        "backup.mail_partition",
+                                        msg, priority=3,
+                                    )
+                                elif ptype == "SHAREPOINT_DRIVES":
+                                    msg = _mk_sp(
+                                        partition_id=str(_pid),
+                                        snapshot_id=str(_sid),
+                                        job_id=str(_jid),
+                                        tenant_id=str(_tid),
+                                        resource_id=str(_rid),
+                                        drive_ids=list(
+                                            payload_obj.get("drive_ids") or []
+                                        ),
+                                        site_id=str(
+                                            payload_obj.get("site_id") or ""
+                                        ),
+                                    )
+                                    await _mb.publish(
+                                        "backup.sharepoint_partition",
+                                        msg, priority=3,
+                                    )
+                                else:
+                                    # Unknown partition_type — leave
+                                    # QUEUED with the bumped retry_count;
+                                    # PARTITION_MAX_RETRIES eventually
+                                    # DLQs it.
+                                    continue
                             except Exception as pub_exc:
                                 print(
                                     f"[backup-scheduler] partition_sweep "
-                                    f"re-publish failed (partition={_pid}): "
-                                    f"{pub_exc}"
+                                    f"re-publish failed (partition={_pid}, "
+                                    f"type={ptype}): {pub_exc}"
                                 )
             except Exception as part_exc:
                 print(

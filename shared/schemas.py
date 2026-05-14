@@ -314,6 +314,12 @@ class SnapshotResponse(BaseModel):
     type: str
     itemCount: int
     jobId: Optional[str] = None
+    # Cross-replica partition rollup. Populated only for snapshots
+    # that were partitioned (OneDrive/Chats/Mail/SharePoint shards).
+    # `null` for non-partitioned snapshots — backward compatible.
+    # Backend-only contract: ops/audit consumers read it; the UI
+    # treats it as opaque.
+    partitions: Optional[dict] = None
 
 
 class SnapshotItemResponse(BaseModel):

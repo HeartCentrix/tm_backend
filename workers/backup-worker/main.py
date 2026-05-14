@@ -25,7 +25,7 @@ import os
 import tempfile
 from datetime import datetime, timedelta, timezone
 import time
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Set, Tuple
 
 
 # orjson is ~5-10× faster than stdlib json for payload-heavy paths like
@@ -1434,10 +1434,20 @@ class BackupWorker:
         self._onedrive_backup_semaphore = asyncio.Semaphore(
             settings.MAX_CONCURRENT_ONEDRIVE_BACKUPS_PER_WORKER
         )
+        # Per-tenant fairness across partitions. Without this a tenant
+        # whose drive split into 4 shards can grab every partition slot
+        # on a replica, leaving sibling tenants' shards waiting in the
+        # queue. Lazily allocated; one Semaphore per tenant_id.
+        self._tenant_backup_semaphores: Dict[str, asyncio.Semaphore] = {}
+        self._tenant_sem_lock = asyncio.Lock()
         # Which normal-priority queue this instance consumes. Default
         # replicas read backup.normal; backup-worker-heavy sets
         # BACKUP_WORKER_QUEUE=backup.heavy via compose env.
         self._backup_queue_name = settings.BACKUP_WORKER_QUEUE
+        # Worker region stamp — observability for multi-region setups.
+        # Defaults to "default" for single-region deployments so the
+        # column never goes NULL.
+        self._worker_region = os.getenv("WORKER_REGION", "default")
 
     async def initialize(self):
         await message_bus.connect()
@@ -1510,6 +1520,17 @@ class BackupWorker:
         # remaining queued shards across the rest of the pool.
         if settings.ONEDRIVE_PARTITION_ENABLED:
             queues.append(("backup.onedrive_partition", 2))
+        # Chats partition lane — I/O-light, higher prefetch is fine.
+        if getattr(settings, "CHATS_PARTITION_ENABLED", False):
+            queues.append(("backup.chats_partition", 4))
+        # Mail partition lane — many small folder drains per shard.
+        # Prefetch=2 mirrors OneDrive: a shard can fan out to ~20+
+        # folder drains inside, so one in-flight is plenty.
+        if getattr(settings, "MAIL_PARTITION_ENABLED", False):
+            queues.append(("backup.mail_partition", 2))
+        # SharePoint partition lane — drive shards are I/O-heavy.
+        if getattr(settings, "SP_PARTITION_ENABLED", False):
+            queues.append(("backup.sharepoint_partition", 2))
 
         tasks = []
         for queue_name, prefetch in queues:
@@ -1671,6 +1692,193 @@ class BackupWorker:
         except Exception as audit_err:
             print(f"[{self.worker_id}] [AuditLogger] lifecycle emit failed: {audit_err}")
 
+    async def _load_mail_folder_deltas(
+        self, resource_id: uuid.UUID,
+    ) -> Dict[str, str]:
+        """Read all per-folder delta tokens for one mailbox resource.
+
+        Replaces the JSON-dict read from
+        `resource.extra_data["mail_delta_tokens_by_folder"]` with a
+        single SELECT against the new `mail_folder_delta` table.
+        Returns `{folder_id: delta_token}` — same shape as the old
+        dict so call sites don't need to change. Empty dict if the
+        resource has no rows yet (first run / pre-migration).
+        """
+        try:
+            async with async_session_factory() as session:
+                rows = (await session.execute(
+                    text(
+                        """
+                        SELECT folder_id, delta_token
+                          FROM mail_folder_delta
+                         WHERE resource_id = :rid
+                        """
+                    ),
+                    {"rid": str(resource_id)},
+                )).fetchall()
+            return {str(r[0]): str(r[1]) for r in rows if r[1]}
+        except Exception as e:
+            # Table may not exist on a stale deploy; fail open with
+            # an empty dict so the caller falls back to extra_data.
+            print(
+                f"[{self.worker_id}] [mail_delta] load failed for "
+                f"resource={resource_id}: {type(e).__name__}: {e}"
+            )
+            return {}
+
+    async def _upsert_mail_folder_delta(
+        self, resource_id: uuid.UUID, folder_id: str, delta_token: str,
+    ) -> None:
+        """Atomic per-row UPSERT of one folder's delta token.
+
+        Replaces the unsafe Read-Modify-Write on the JSON dict in
+        `resource.extra_data`. Two concurrent folder drains finishing
+        at the same time used to clobber each other; with this row
+        being the only thing they touch, PG's row lock makes the two
+        writes commute.
+        """
+        try:
+            async with async_session_factory() as session:
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO mail_folder_delta
+                            (resource_id, folder_id, delta_token, updated_at)
+                        VALUES (:rid, :fid, :tok, NOW())
+                        ON CONFLICT (resource_id, folder_id) DO UPDATE
+                           SET delta_token = EXCLUDED.delta_token,
+                               updated_at  = NOW()
+                        """
+                    ),
+                    {"rid": str(resource_id), "fid": folder_id,
+                     "tok": delta_token},
+                )
+                await session.commit()
+        except Exception as e:
+            # Don't fail the snapshot over the delta-token persist.
+            # The legacy extra_data write still happens; this row is
+            # the authoritative read path going forward.
+            print(
+                f"[{self.worker_id}] [mail_delta] upsert failed "
+                f"(resource={resource_id}, folder={folder_id[:8] if folder_id else 'NA'}): "
+                f"{type(e).__name__}: {e}"
+            )
+
+    async def _load_sharepoint_drive_deltas(
+        self, resource_id: uuid.UUID,
+    ) -> Dict[str, str]:
+        """SharePoint counterpart of `_load_mail_folder_deltas`.
+        Returns `{drive_id: delta_token}` for one site resource.
+        """
+        try:
+            async with async_session_factory() as session:
+                rows = (await session.execute(
+                    text(
+                        """
+                        SELECT drive_id, delta_token
+                          FROM sharepoint_drive_delta
+                         WHERE resource_id = :rid
+                        """
+                    ),
+                    {"rid": str(resource_id)},
+                )).fetchall()
+            return {str(r[0]): str(r[1]) for r in rows if r[1]}
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [sp_drive_delta] load failed for "
+                f"resource={resource_id}: {type(e).__name__}: {e}"
+            )
+            return {}
+
+    async def _upsert_sharepoint_drive_delta(
+        self, resource_id: uuid.UUID, drive_id: str, delta_token: str,
+    ) -> None:
+        """SharePoint counterpart of `_upsert_mail_folder_delta`."""
+        try:
+            async with async_session_factory() as session:
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO sharepoint_drive_delta
+                            (resource_id, drive_id, delta_token, updated_at)
+                        VALUES (:rid, :did, :tok, NOW())
+                        ON CONFLICT (resource_id, drive_id) DO UPDATE
+                           SET delta_token = EXCLUDED.delta_token,
+                               updated_at  = NOW()
+                        """
+                    ),
+                    {"rid": str(resource_id), "did": drive_id,
+                     "tok": delta_token},
+                )
+                await session.commit()
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [sp_drive_delta] upsert failed "
+                f"(resource={resource_id}, drive={drive_id[:12] if drive_id else 'NA'}): "
+                f"{type(e).__name__}: {e}"
+            )
+
+    async def _acquire_tenant_slot(self, tenant_id: str) -> asyncio.Semaphore:
+        """Return the per-tenant fairness semaphore, lazily allocated.
+        Caller must `async with` the returned sem to acquire a slot.
+        Cap is `MAX_CONCURRENT_PARTITIONS_PER_TENANT` so one tenant's
+        N-shard fanout can't monopolise the partition lane.
+        """
+        sem = self._tenant_backup_semaphores.get(tenant_id)
+        if sem is not None:
+            return sem
+        async with self._tenant_sem_lock:
+            sem = self._tenant_backup_semaphores.get(tenant_id)
+            if sem is None:
+                sem = asyncio.Semaphore(settings.MAX_CONCURRENT_PARTITIONS_PER_TENANT)
+                self._tenant_backup_semaphores[tenant_id] = sem
+            return sem
+
+    async def _emit_partition_audit(
+        self,
+        action: str,
+        outcome: str,
+        *,
+        tenant_id: Optional[str],
+        resource_id: Optional[str],
+        snapshot_id: Optional[uuid.UUID],
+        job_id: Optional[uuid.UUID],
+        partition_id: uuid.UUID,
+        partition_type: Optional[str],
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Lifecycle audit for one partition shard.
+        Actions: PARTITION_STARTED / PARTITION_COMPLETED / PARTITION_FAILED.
+        Outcome: IN_PROGRESS / SUCCESS / FAILURE.
+        Always stamps `worker_region` so cross-cluster ops dashboards
+        can group by region in one query. Fire-and-forget — audit
+        downtime never masks the backup outcome.
+        """
+        try:
+            payload: Dict[str, Any] = {
+                "partition_id": str(partition_id),
+                "partition_type": partition_type or "ONEDRIVE_FILES",
+                "worker_region": self._worker_region,
+            }
+            if details:
+                payload.update(details)
+            await self.audit_logger.log(
+                action=action,
+                tenant_id=tenant_id,
+                actor_type="WORKER",
+                resource_id=resource_id,
+                resource_type="PARTITION",
+                outcome=outcome,
+                job_id=str(job_id) if job_id else None,
+                snapshot_id=str(snapshot_id) if snapshot_id else None,
+                details=payload,
+            )
+        except Exception as audit_err:
+            print(
+                f"[{self.worker_id}] [AuditLogger] partition audit "
+                f"failed: {audit_err}"
+            )
+
     async def process_backup_message(self, message: Dict[str, Any]):
         # OneDrive cross-replica partition shard — dispatched here so the
         # same `consume_queue` infrastructure (auto-restart, prefetch,
@@ -1680,6 +1888,31 @@ class BackupWorker:
         # resourceIds / resourceId — they identify work via partitionId.
         if message.get("messageType") == "BACKUP_ONEDRIVE_PARTITION":
             await self._process_onedrive_partition_message(message)
+            return
+        # Phase 2.3 / 3.2 / 3.3 partition envelopes. Each handler is
+        # responsible for atomically claiming its `snapshot_partitions`
+        # row before touching any drain logic — the message itself is
+        # a cheap pointer, the source of truth is the row.
+        #
+        # USER_CHATS partition shard (Phase 2.3b — coordinator hook
+        # shipped). Re-enters _backup_user_content_parallel scoped to
+        # this shard's chat_ids; partition consumer marks terminal and
+        # finalizes parent snapshot.
+        if message.get("messageType") == "BACKUP_CHATS_PARTITION":
+            await self._process_chats_partition_message(message)
+            return
+        # USER_MAIL partition shard (Phase 3.2b — coordinator hook
+        # shipped for Tier-2 USER_MAIL only; Tier-1 MAILBOX/SHARED/ROOM
+        # is handled inside the consumer with an explicit FAIL reason).
+        if message.get("messageType") == "BACKUP_MAIL_PARTITION":
+            await self._process_mail_partition_message(message)
+            return
+        # SharePoint partition shards (Phase 3.3 — Tier-1). Coordinator
+        # in `backup_sharepoint` decides fanout from drive enumeration;
+        # consumer re-enters `backup_sharepoint` with
+        # partitionFilter.driveIds carrying this shard's allowlist.
+        if message.get("messageType") == "BACKUP_SHAREPOINT_PARTITION":
+            await self._process_sharepoint_partition_message(message)
             return
 
         job_id = uuid.UUID(message["jobId"])
@@ -1946,8 +2179,36 @@ class BackupWorker:
             raise
 
         # ── Step 3b: success finalization — short sessions per write ──────
-        async with async_session_factory() as s:
-            await self.complete_snapshot(s, snapshot, result)
+        # Partition gate: if the handler (or any nested sub-call —
+        # M365_GROUP team-site → backup_sharepoint, etc.) flipped
+        # snapshot.extra_data['partitioned']=True, the partition shards
+        # own the terminal flip via _finalize_partitioned_snapshot.
+        # Firing complete_snapshot here would race the shards and lock
+        # the snapshot to PARTIAL totals before they finish writing.
+        _is_partitioned_run = bool(
+            (result or {}).get("partitioned"),
+        )
+        if not _is_partitioned_run:
+            try:
+                async with async_session_factory() as _refresh:
+                    _fresh = await _refresh.get(Snapshot, snapshot.id)
+                    _is_partitioned_run = bool(
+                        _fresh and (_fresh.extra_data or {}).get(
+                            "partitioned",
+                        )
+                    )
+            except Exception:
+                pass
+        if _is_partitioned_run:
+            print(
+                f"[{self.worker_id}] [SINGLE_BACKUP] "
+                f"{resource.display_name or resource.id}: "
+                f"snapshot partitioned — deferring complete_snapshot "
+                f"to partition finalizer"
+            )
+        else:
+            async with async_session_factory() as s:
+                await self.complete_snapshot(s, snapshot, result)
 
         # Safety reaper — catches any fire-and-forget background task
         # inside THIS resource's handler (e.g. the USER_CHATS hosted-
@@ -1965,40 +2226,44 @@ class BackupWorker:
         # failure path above — under fan-out the parent Job has N-1
         # siblings still running, so directly flipping it to COMPLETED
         # here would lie to Activity. Use the finalizer to flip only
-        # when every child has terminalised.
-        async with async_session_factory() as s:
-            parent = await s.get(Job, job_id)
-            is_bulk_parent = bool(
-                parent and parent.batch_resource_ids
-                and len(parent.batch_resource_ids) > 0
+        # when every child has terminalised. Partitioned snapshots
+        # also defer all of these — _finalize_partitioned_snapshot
+        # re-runs the same finalize / update_resource_backup_info /
+        # BACKUP_COMPLETED emission once every shard is terminal.
+        if not _is_partitioned_run:
+            async with async_session_factory() as s:
+                parent = await s.get(Job, job_id)
+                is_bulk_parent = bool(
+                    parent and parent.batch_resource_ids
+                    and len(parent.batch_resource_ids) > 0
+                )
+            if is_bulk_parent:
+                async with async_session_factory() as s:
+                    await self._finalize_bulk_parent_if_complete(s, job_id)
+            else:
+                async with async_session_factory() as s:
+                    await self.update_job_status(s, job_id, JobStatus.COMPLETED, result)
+
+            async with async_session_factory() as s:
+                await self.update_resource_backup_info(s, resource, job_id, snapshot.id, result)
+
+            # Audit event — fire-and-forget over HTTP, no DB session needed.
+            await self.audit_logger.log(
+                action="BACKUP_COMPLETED",
+                tenant_id=str(tenant.id),
+                org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
+                actor_type="WORKER",
+                resource_id=str(resource.id),
+                resource_type=resource_type,
+                resource_name=resource.display_name or resource.email or str(resource.id),
+                outcome="SUCCESS",
+                job_id=str(job_id),
+                snapshot_id=str(snapshot.id),
+                details={
+                    "item_count": result.get("item_count", 0),
+                    "bytes_added": result.get("bytes_added", 0),
+                },
             )
-        if is_bulk_parent:
-            async with async_session_factory() as s:
-                await self._finalize_bulk_parent_if_complete(s, job_id)
-        else:
-            async with async_session_factory() as s:
-                await self.update_job_status(s, job_id, JobStatus.COMPLETED, result)
-
-        async with async_session_factory() as s:
-            await self.update_resource_backup_info(s, resource, job_id, snapshot.id, result)
-
-        # Audit event — fire-and-forget over HTTP, no DB session needed.
-        await self.audit_logger.log(
-            action="BACKUP_COMPLETED",
-            tenant_id=str(tenant.id),
-            org_id=str(tenant.org_id) if hasattr(tenant, 'org_id') and tenant.org_id else None,
-            actor_type="WORKER",
-            resource_id=str(resource.id),
-            resource_type=resource_type,
-            resource_name=resource.display_name or resource.email or str(resource.id),
-            outcome="SUCCESS",
-            job_id=str(job_id),
-            snapshot_id=str(snapshot.id),
-            details={
-                "item_count": result.get("item_count", 0),
-                "bytes_added": result.get("bytes_added", 0),
-            },
-        )
 
         print(f"[{self.worker_id}] Completed backup for {resource_id}")
 
@@ -2459,11 +2724,26 @@ class BackupWorker:
                         f"{user_label_mail} ({user_id}) — "
                         f"{len(folder_tree)} folders"
                     )
-                    mail_existing_tokens: Dict[str, str] = dict(
+                    # Dual-read for the one-release transition off the
+                    # extra_data RMW pattern. The new
+                    # `mail_folder_delta` table is the authoritative
+                    # source going forward (each row written atomically
+                    # via _upsert_mail_folder_delta — concurrent folder
+                    # drains can no longer clobber each other's
+                    # tokens). Until prod is fully migrated, fall back
+                    # to the legacy dict per folder_id that hasn't
+                    # been re-baselined yet. New wins on conflict.
+                    _new_table_tokens = await self._load_mail_folder_deltas(
+                        resource.id,
+                    )
+                    _legacy_tokens = dict(
                         (resource.extra_data or {}).get(
                             "mail_delta_tokens_by_folder", {},
                         ) or {},
                     )
+                    mail_existing_tokens: Dict[str, str] = {
+                        **_legacy_tokens, **_new_table_tokens,
+                    }
                     mail_new_tokens: Dict[str, str] = {}
                     out: List = []
                     mail_select = (
@@ -2546,6 +2826,57 @@ class BackupWorker:
                         f"{len([f for f in mail_folder_ids if f])} to drain "
                         f"(mode={_mail_skip_mode})"
                     )
+
+                    # ── Cross-replica partition split (Phase 3.2b) ──
+                    # Same two-role design as USER_CHATS:
+                    # 1) Coordinator: no partitionFilter → if mailbox
+                    #    crosses MAIL_PARTITION_MIN_FOLDERS / MIN_BYTES,
+                    #    bin-pack folder_ids LPT-by-size, fanout via
+                    #    backup.mail_partition queue, mark snapshot
+                    #    partitioned, return [].
+                    # 2) Partition consumer: partitionFilter.folderIds
+                    #    carries the shard's allowlist → filter
+                    #    mail_folder_ids to allowlist, drain just those
+                    #    via existing _drain_one_folder closure.
+                    _mail_partition_filter = (message or {}).get(
+                        "partitionFilter",
+                    ) or {}
+                    _shard_folder_ids = _mail_partition_filter.get(
+                        "folderIds",
+                    )
+                    _running_as_mail_shard = False
+                    if _shard_folder_ids is not None:
+                        _shard_set = set(_shard_folder_ids)
+                        mail_folder_ids = [
+                            fid for fid in mail_folder_ids
+                            if fid is None or fid in _shard_set
+                        ]
+                        _running_as_mail_shard = True
+                        print(
+                            f"[{self.worker_id}] [USER_MAIL] partition "
+                            f"consumer: draining "
+                            f"{len([f for f in mail_folder_ids if f])} "
+                            f"folders in this shard"
+                        )
+                    else:
+                        _drain_fids = [f for f in mail_folder_ids if f]
+                        if self._should_partition_mail(
+                            _drain_fids, folder_tree_full,
+                        ):
+                            await self._fanout_mail_partitions(
+                                snapshot=snapshot,
+                                resource=resource,
+                                tenant=tenant,
+                                folder_ids=_drain_fids,
+                                folder_tree=folder_tree_full,
+                                job_id=job_id,
+                            )
+                            # Caller (_backup_one) reads
+                            # snapshot.extra_data['partitioned'] after
+                            # _fetch_for returns [] and short-circuits
+                            # so audit downstream doesn't emit
+                            # BACKUP_COMPLETED prematurely.
+                            return []
 
                     # Streaming-persist bookkeeping (mirror of the USER_CHATS
                     # path). Each folder's msgs persist the instant that
@@ -2777,10 +3108,29 @@ class BackupWorker:
                         # (snapshot_id, external_id, item_type)
                         # constraint on EMAIL rows.
                         if delta_out and _folder_persisted_ok:
+                            # Atomic per-row UPSERT — the safe write
+                            # under concurrent folder drains AND
+                            # cross-replica mail partitions. Replaces
+                            # the JSON-dict RMW that used to race here.
+                            await self._upsert_mail_folder_delta(
+                                resource.id,
+                                fid or "__all__",
+                                delta_out,
+                            )
                             try:
                                 async with async_session_factory() as _ck:
                                     _r = await _ck.get(Resource, resource.id)
                                     if _r is not None:
+                                        # Dual-write transition: keep
+                                        # the legacy dict in sync for
+                                        # one release so a quick
+                                        # rollback can still read its
+                                        # tokens. The RMW pattern
+                                        # remains here because the new
+                                        # table is the authoritative
+                                        # read path — racing dict
+                                        # writes can no longer cause
+                                        # incorrect cursors.
                                         _ed = dict(_r.extra_data or {})
                                         _toks = dict(
                                             _ed.get("mail_delta_tokens_by_folder") or {}
@@ -2858,12 +3208,25 @@ class BackupWorker:
                     # Also refresh mail_folder_fingerprints + advance
                     # mail_folder_baseline_at so the next incremental can
                     # skip unchanged folders via Layer C.
+                    # Atomic per-row UPSERT into mail_folder_delta for
+                    # every token the run produced. Idempotent against
+                    # the per-folder checkpoint above — same row, same
+                    # token, ON CONFLICT DO UPDATE wins either way.
+                    if mail_new_tokens:
+                        for _fid, _tok in mail_new_tokens.items():
+                            await self._upsert_mail_folder_delta(
+                                resource.id, _fid, _tok,
+                            )
+
                     try:
                         async with async_session_factory() as _s:
                             r = await _s.get(Resource, resource.id)
                             if r is not None:
                                 ed = dict(r.extra_data or {})
                                 if mail_new_tokens:
+                                    # Legacy dual-write (one-release
+                                    # transition; new table is the
+                                    # authoritative source).
                                     merged = dict(
                                         ed.get(
                                             "mail_delta_tokens_by_folder",
@@ -3611,6 +3974,56 @@ class BackupWorker:
                     chat_ids_to_drain = [
                         cid for cid in chat_meta.keys() if cid
                     ]
+
+                    # ── Cross-replica partition split (Phase 2.3b) ──
+                    # Two roles for this branch:
+                    #
+                    # 1) Coordinator: `partitionFilter` is absent. If the
+                    #    user has ≥ CHATS_PARTITION_MIN_CHATS chats and
+                    #    CHATS_PARTITION_ENABLED, bin-pack chat_ids
+                    #    round-robin into N shards, INSERT one
+                    #    snapshot_partitions row per shard, mark
+                    #    snapshot.extra_data['partitioned']=True, and
+                    #    publish N backup.chats_partition messages. Skip
+                    #    the inline drain — partition consumers own it.
+                    #
+                    # 2) Partition consumer: `partitionFilter.chatIds`
+                    #    carries the shard's allowlist. Filter
+                    #    chat_ids_to_drain to those chats and proceed
+                    #    with the existing parallel drain (it'll only
+                    #    touch the shard's chats).
+                    _partition_filter = (message or {}).get(
+                        "partitionFilter"
+                    ) or {}
+                    _shard_chat_ids = _partition_filter.get("chatIds")
+                    _running_as_chat_shard = False
+                    if _shard_chat_ids is not None:
+                        _shard_set = set(_shard_chat_ids)
+                        chat_ids_to_drain = [
+                            cid for cid in chat_ids_to_drain
+                            if cid in _shard_set
+                        ]
+                        _running_as_chat_shard = True
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] partition "
+                            f"consumer: draining {len(chat_ids_to_drain)} "
+                            f"chats in this shard"
+                        )
+                    elif self._should_partition_chats(chat_ids_to_drain):
+                        # Coordinator role — fan out + return early.
+                        await self._fanout_chats_partitions(
+                            snapshot=snapshot,
+                            resource=resource,
+                            tenant=tenant,
+                            chat_ids=chat_ids_to_drain,
+                            job_id=job_id,
+                        )
+                        # _backup_one (caller) reads the partition flag
+                        # from snapshot.extra_data after _fetch_for and
+                        # returns the placeholder result so audit
+                        # downstream doesn't fire BACKUP_COMPLETED.
+                        return []
+
                     chat_fanout = int(
                         os.getenv("USER_CHATS_PARALLEL_CHATS", "20"),
                     )
@@ -5030,6 +5443,40 @@ class BackupWorker:
                 # inline and return a lightweight attachment-candidate
                 # list. Cuts peak memory O(all-items) → O(one-chunk).
                 items_data = await _fetch_for(resource, snapshot)
+
+                # USER_CHATS / USER_MAIL coordinator: if `_fetch_for`
+                # decided to partition this user's work-set across
+                # replicas, it already INSERTed snapshot_partitions
+                # rows, marked snapshot.extra_data['partitioned']=True
+                # via a fresh DB write, and returned []. We refresh the
+                # snapshot row + short-circuit. The partition consumers
+                # drain the shards; the last shard's finalize flips the
+                # snapshot to COMPLETED.
+                if resource.type.value in (
+                    "USER_CHATS", "USER_MAIL",
+                ) and not items_data:
+                    try:
+                        async with async_session_factory() as _refresh:
+                            _fresh = await _refresh.get(Snapshot, snapshot.id)
+                            _is_partitioned = bool(
+                                _fresh and (_fresh.extra_data or {}).get(
+                                    "partitioned",
+                                )
+                            )
+                    except Exception:
+                        _is_partitioned = False
+                    if _is_partitioned:
+                        print(
+                            f"[{self.worker_id}] [USER_CHATS] "
+                            f"{resource.display_name or resource.id}: "
+                            f"partitioned — coordinator returning, "
+                            f"awaiting partition consumers."
+                        )
+                        return {
+                            "item_count": 0,
+                            "bytes_added": 0,
+                            "partitioned": True,
+                        }
 
                 # SLA exclusions — apply post-fetch but pre-persist for the
                 # five Tier-2 per-user shards (USER_MAIL, USER_ONEDRIVE,
@@ -6998,6 +7445,525 @@ class BackupWorker:
                     f"{type(pub_exc).__name__}: {pub_exc}"
                 )
 
+    # ------------------------------------------------------------------
+    # Mail folder partition helpers (Phase 3.2b)
+    # Covers USER_MAIL (Tier-2) + MAILBOX / SHARED_MAILBOX / ROOM_MAILBOX
+    # (Tier-1) — they all enumerate folders and drain per-folder via the
+    # same `_drain_one_folder` shape (each handler defines its own
+    # closure but the partition_type is uniform).
+    # ------------------------------------------------------------------
+    def _should_partition_mail(
+        self, folder_ids: List[Optional[str]],
+        folder_tree: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Decide whether the mailbox's folder set warrants partitioning.
+        Either folder count >= MIN_FOLDERS OR total mailbox bytes
+        (sum of sizeInBytes across folder_tree) >= MIN_BYTES. Sized to
+        catch both wide (many folders) AND deep (few but huge folders)
+        mailboxes.
+        """
+        real_ids = [f for f in folder_ids if f]
+        if not real_ids:
+            return False
+        try:
+            if not settings.MAIL_PARTITION_ENABLED:
+                return False
+            min_folders = int(settings.MAIL_PARTITION_MIN_FOLDERS)
+            min_bytes = int(settings.MAIL_PARTITION_MIN_BYTES)
+        except AttributeError:
+            return False
+        if len(real_ids) >= min_folders:
+            return True
+        if folder_tree:
+            total = sum(
+                int(entry.get("sizeInBytes") or 0)
+                for entry in folder_tree.values()
+                if isinstance(entry, dict)
+            )
+            if total >= min_bytes:
+                return True
+        return False
+
+    def _bin_pack_mail_folders_by_size(
+        self,
+        folder_ids: List[str],
+        folder_tree: Optional[Dict[str, Any]],
+        n_shards: int,
+    ) -> List[List[str]]:
+        """LPT by folder sizeInBytes when the tree carries sizes; falls
+        back to round-robin when sizes aren't available. Idempotent on
+        coordinator redelivery (sorted-desc → deterministic bins)."""
+        if n_shards <= 0:
+            n_shards = 1
+        sizes: Dict[str, int] = {}
+        if folder_tree:
+            for fid in folder_ids:
+                entry = folder_tree.get(fid) or {}
+                if isinstance(entry, dict):
+                    sizes[fid] = int(entry.get("sizeInBytes") or 0)
+        if not sizes:
+            shards: List[List[str]] = [[] for _ in range(n_shards)]
+            for i, fid in enumerate(folder_ids):
+                shards[i % n_shards].append(fid)
+            return shards
+        shards = [[] for _ in range(n_shards)]
+        shard_bytes = [0] * n_shards
+        for fid in sorted(folder_ids, key=lambda x: -sizes.get(x, 0)):
+            i = shard_bytes.index(min(shard_bytes))
+            shards[i].append(fid)
+            shard_bytes[i] += sizes.get(fid, 0)
+        return shards
+
+    async def _fanout_mail_partitions(
+        self,
+        *,
+        snapshot: Snapshot,
+        resource: Resource,
+        tenant: Tenant,
+        folder_ids: List[str],
+        folder_tree: Optional[Dict[str, Any]],
+        job_id: uuid.UUID,
+    ) -> None:
+        """Bin-pack folders into N shards by sizeInBytes (LPT), insert
+        one snapshot_partitions row per shard, mark snapshot.extra_data
+        partitioned=True, publish N backup.mail_partition messages.
+        Same idempotency story as the OneDrive/CHATS fanouts.
+        """
+        from shared.message_bus import create_mail_partition_message
+        total_bytes = 0
+        if folder_tree:
+            total_bytes = sum(
+                int((folder_tree.get(f) or {}).get("sizeInBytes") or 0)
+                for f in folder_ids
+            )
+        target = max(1, int(settings.MAIL_PARTITION_TARGET_BYTES_PER_SHARD))
+        max_shards = max(1, int(settings.MAIL_PARTITION_MAX_SHARDS))
+        if total_bytes > 0:
+            n_shards = max(
+                2,
+                min(max_shards, (total_bytes + target - 1) // target or 1),
+            )
+        else:
+            # No size info — fall back to chunk by count.
+            n_shards = max(
+                2,
+                min(max_shards, (len(folder_ids) + 9) // 10 or 1),
+            )
+
+        shards = self._bin_pack_mail_folders_by_size(
+            folder_ids, folder_tree, n_shards,
+        )
+        shards = [s for s in shards if s]
+        if len(shards) < 2:
+            shards = [folder_ids]
+
+        partition_msgs: List[Tuple[str, str, List[str]]] = []
+        resource_type_str = (
+            resource.type.value if hasattr(resource.type, "value")
+            else str(resource.type)
+        )
+        async with async_session_factory() as session:
+            snap = await session.get(Snapshot, snapshot.id)
+            if snap is not None:
+                ed = dict(snap.extra_data or {})
+                ed["partitioned"] = True
+                ed["partition_type"] = "MAIL_FOLDERS"
+                ed["partition_count"] = len(shards)
+                ed["partition_total_folders"] = len(folder_ids)
+                ed["partition_total_bytes_est"] = total_bytes
+                snap.extra_data = ed
+            for idx, shard_fids in enumerate(shards):
+                shard_bytes = 0
+                if folder_tree:
+                    shard_bytes = sum(
+                        int((folder_tree.get(f) or {}).get("sizeInBytes") or 0)
+                        for f in shard_fids
+                    )
+                partition_id = uuid.uuid4()
+                row = SnapshotPartition(
+                    id=partition_id,
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    resource_id=resource.id,
+                    job_id=job_id,
+                    partition_type="MAIL_FOLDERS",
+                    drive_id=None,
+                    partition_index=idx,
+                    file_ids=None,
+                    payload={
+                        "folder_ids": shard_fids,
+                        "resource_type": resource_type_str,
+                    },
+                    total_files=len(shard_fids),
+                    total_bytes_est=shard_bytes,
+                    status="QUEUED",
+                )
+                session.add(row)
+                partition_msgs.append(
+                    (str(partition_id), str(snapshot.id), shard_fids),
+                )
+            await session.commit()
+
+        print(
+            f"[{self.worker_id}] [MAIL] "
+            f"{resource.display_name or resource.id}: "
+            f"PARTITION fanout — {len(shards)} shards, "
+            f"{total_bytes / (1024 * 1024 * 1024):.2f} GiB total, "
+            f"{len(folder_ids)} folders."
+        )
+
+        for partition_id, snap_id_str, shard_fids in partition_msgs:
+            msg = create_mail_partition_message(
+                partition_id=partition_id,
+                snapshot_id=snap_id_str,
+                job_id=str(job_id),
+                tenant_id=str(tenant.id),
+                resource_id=str(resource.id),
+                folder_ids=shard_fids,
+                resource_type=resource_type_str,
+            )
+            try:
+                await message_bus.publish(
+                    "backup.mail_partition", msg, priority=3,
+                )
+            except Exception as pub_exc:
+                print(
+                    f"[{self.worker_id}] [MAIL] partition publish "
+                    f"failed (partition={partition_id}): "
+                    f"{type(pub_exc).__name__}: {pub_exc}"
+                )
+
+    # ------------------------------------------------------------------
+    # USER_CHATS partition helpers (Phase 2.3b)
+    # ------------------------------------------------------------------
+    def _should_partition_chats(
+        self, chat_ids: List[str],
+    ) -> bool:
+        """Decide whether this user's chat-set warrants a partitioned
+        cross-replica run. Single threshold (chat count) — chats are
+        roughly uniform per-chat in work cost, so byte-based bin-packing
+        isn't worth the extra Graph round-trips it would take to size
+        each chat in advance.
+        """
+        if not chat_ids:
+            return False
+        try:
+            if not settings.CHATS_PARTITION_ENABLED:
+                return False
+            return len(chat_ids) >= int(settings.CHATS_PARTITION_MIN_CHATS)
+        except AttributeError:
+            return False
+
+    @staticmethod
+    def _bin_pack_chats_round_robin(
+        chat_ids: List[str],
+        n_shards: int,
+    ) -> List[List[str]]:
+        """Round-robin into N shards. Chats are similar-sized per-chat
+        so a deterministic round-robin matches LPT closely while being
+        cheap + idempotent under coordinator redelivery (same chat_ids
+        → same shard membership)."""
+        if n_shards <= 0:
+            n_shards = 1
+        shards: List[List[str]] = [[] for _ in range(n_shards)]
+        for i, cid in enumerate(chat_ids):
+            shards[i % n_shards].append(cid)
+        return shards
+
+    async def _fanout_chats_partitions(
+        self,
+        *,
+        snapshot: Snapshot,
+        resource: Resource,
+        tenant: Tenant,
+        chat_ids: List[str],
+        job_id: uuid.UUID,
+    ) -> None:
+        """Bin-pack chat_ids round-robin into N shards, insert one
+        snapshot_partitions row per shard, mark the snapshot as
+        partitioned, and publish one `backup.chats_partition` message
+        per shard. Idempotent under coordinator redelivery via
+        UNIQUE(snapshot_id, partition_index) + ON CONFLICT DO NOTHING.
+        """
+        from shared.message_bus import create_chats_partition_message
+        total = len(chat_ids)
+        target = max(1, int(settings.CHATS_PARTITION_TARGET_CHATS_PER_SHARD))
+        max_shards = max(1, int(settings.CHATS_PARTITION_MAX_SHARDS))
+        n_shards = max(
+            2,
+            min(max_shards, (total + target - 1) // target or 1),
+        )
+
+        shards = self._bin_pack_chats_round_robin(chat_ids, n_shards)
+        shards = [s for s in shards if s]
+        if len(shards) < 2:
+            # Bin-pack degenerated to one shard — caller's threshold
+            # gate normally prevents this. Still produce one partition
+            # so the consumer path handles it uniformly.
+            shards = [chat_ids]
+
+        partition_msgs: List[Tuple[str, str, List[str]]] = []
+        async with async_session_factory() as session:
+            snap = await session.get(Snapshot, snapshot.id)
+            if snap is not None:
+                ed = dict(snap.extra_data or {})
+                ed["partitioned"] = True
+                ed["partition_type"] = "CHATS"
+                ed["partition_count"] = len(shards)
+                ed["partition_total_chats"] = total
+                snap.extra_data = ed
+            for idx, shard_chat_ids in enumerate(shards):
+                partition_id = uuid.uuid4()
+                row = SnapshotPartition(
+                    id=partition_id,
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    resource_id=resource.id,
+                    job_id=job_id,
+                    partition_type="CHATS",
+                    drive_id=None,
+                    partition_index=idx,
+                    file_ids=None,
+                    payload={"chat_ids": shard_chat_ids},
+                    total_files=len(shard_chat_ids),
+                    total_bytes_est=0,
+                    status="QUEUED",
+                )
+                session.add(row)
+                partition_msgs.append(
+                    (str(partition_id), str(snapshot.id), shard_chat_ids),
+                )
+            await session.commit()
+
+        print(
+            f"[{self.worker_id}] [USER_CHATS] "
+            f"{resource.display_name or resource.id}: "
+            f"PARTITION fanout — {len(shards)} shards, "
+            f"{total} chats."
+        )
+
+        for partition_id, snap_id_str, shard_chat_ids in partition_msgs:
+            msg = create_chats_partition_message(
+                partition_id=partition_id,
+                snapshot_id=snap_id_str,
+                job_id=str(job_id),
+                tenant_id=str(tenant.id),
+                resource_id=str(resource.id),
+                chat_ids=shard_chat_ids,
+            )
+            try:
+                await message_bus.publish(
+                    "backup.chats_partition",
+                    msg,
+                    priority=3,
+                )
+            except Exception as pub_exc:
+                print(
+                    f"[{self.worker_id}] [USER_CHATS] partition "
+                    f"publish failed (partition={partition_id}): "
+                    f"{type(pub_exc).__name__}: {pub_exc}"
+                )
+
+    # ------------------------------------------------------------------
+    # SHAREPOINT_SITE partition helpers (Phase 3.3 — Tier-1)
+    # ------------------------------------------------------------------
+    def _should_partition_sharepoint(
+        self,
+        drives: List[Dict[str, Any]],
+    ) -> bool:
+        """Decide whether a SharePoint site's drive set warrants a
+        cross-replica partitioned run. Either drive count >=
+        MIN_DRIVES OR sum of drive quota.used >= MIN_BYTES. Site can
+        be wide (many libraries) OR deep (a few huge libraries) —
+        both should split.
+        """
+        real_drives = [d for d in drives if d.get("id")]
+        if not real_drives:
+            return False
+        try:
+            if not settings.SP_PARTITION_ENABLED:
+                return False
+            min_drives = int(settings.SP_PARTITION_MIN_DRIVES)
+            min_bytes = int(settings.SP_PARTITION_MIN_BYTES)
+        except AttributeError:
+            return False
+        if len(real_drives) >= min_drives:
+            return True
+        total = 0
+        for d in real_drives:
+            q = d.get("quota") or {}
+            try:
+                total += int(q.get("used") or 0)
+            except (TypeError, ValueError):
+                continue
+        return total >= min_bytes
+
+    def _bin_pack_sharepoint_drives_by_size(
+        self,
+        drives: List[Dict[str, Any]],
+        n_shards: int,
+    ) -> List[List[str]]:
+        """LPT bin-pack drives by quota.used into N shards. Deterministic
+        on coordinator redelivery (sorted-desc + min-bin tie-break).
+        Falls back to round-robin when no drive carries usable quota.
+        """
+        if n_shards <= 0:
+            n_shards = 1
+        drive_ids: List[str] = [d.get("id") for d in drives if d.get("id")]
+        sizes: Dict[str, int] = {}
+        for d in drives:
+            did = d.get("id")
+            if not did:
+                continue
+            q = d.get("quota") or {}
+            try:
+                sizes[did] = int(q.get("used") or 0)
+            except (TypeError, ValueError):
+                sizes[did] = 0
+        if not any(sizes.values()):
+            shards: List[List[str]] = [[] for _ in range(n_shards)]
+            for i, did in enumerate(drive_ids):
+                shards[i % n_shards].append(did)
+            return shards
+        shards = [[] for _ in range(n_shards)]
+        shard_bytes = [0] * n_shards
+        for did in sorted(drive_ids, key=lambda x: -sizes.get(x, 0)):
+            i = shard_bytes.index(min(shard_bytes))
+            shards[i].append(did)
+            shard_bytes[i] += sizes.get(did, 0)
+        return shards
+
+    async def _fanout_sharepoint_partitions(
+        self,
+        *,
+        snapshot: Snapshot,
+        resource: Resource,
+        tenant: Tenant,
+        drives: List[Dict[str, Any]],
+        job_id: uuid.UUID,
+    ) -> None:
+        """Bin-pack drives into N shards by quota.used (LPT), insert
+        one snapshot_partitions row per shard, mark
+        snapshot.extra_data partitioned=True, publish N
+        backup.sharepoint_partition messages. Mirrors the
+        OneDrive/CHATS/MAIL fanouts.
+        """
+        from shared.message_bus import create_sharepoint_partition_message
+        drive_ids_all: List[str] = [
+            d.get("id") for d in drives if d.get("id")
+        ]
+        total_bytes = 0
+        for d in drives:
+            q = d.get("quota") or {}
+            try:
+                total_bytes += int(q.get("used") or 0)
+            except (TypeError, ValueError):
+                continue
+        target = max(1, int(settings.SP_PARTITION_TARGET_BYTES_PER_SHARD))
+        max_shards = max(1, int(settings.SP_PARTITION_MAX_SHARDS))
+        if total_bytes > 0:
+            n_shards = max(
+                2,
+                min(
+                    max_shards,
+                    (total_bytes + target - 1) // target or 1,
+                ),
+            )
+        else:
+            # No quota info — split by drive count, one drive per shard
+            # up to MAX_SHARDS.
+            n_shards = max(
+                2, min(max_shards, len(drive_ids_all) or 1),
+            )
+
+        shards = self._bin_pack_sharepoint_drives_by_size(
+            drives, n_shards,
+        )
+        shards = [s for s in shards if s]
+        if len(shards) < 2:
+            shards = [drive_ids_all]
+
+        # Bytes lookup for per-shard total stamping
+        per_drive_bytes: Dict[str, int] = {}
+        for d in drives:
+            did = d.get("id")
+            if not did:
+                continue
+            q = d.get("quota") or {}
+            try:
+                per_drive_bytes[did] = int(q.get("used") or 0)
+            except (TypeError, ValueError):
+                per_drive_bytes[did] = 0
+
+        partition_msgs: List[Tuple[str, str, List[str]]] = []
+        async with async_session_factory() as session:
+            snap = await session.get(Snapshot, snapshot.id)
+            if snap is not None:
+                ed = dict(snap.extra_data or {})
+                ed["partitioned"] = True
+                ed["partition_type"] = "SHAREPOINT_DRIVES"
+                ed["partition_count"] = len(shards)
+                ed["partition_total_drives"] = len(drive_ids_all)
+                ed["partition_total_bytes_est"] = total_bytes
+                snap.extra_data = ed
+            for idx, shard_dids in enumerate(shards):
+                shard_bytes = sum(
+                    per_drive_bytes.get(d, 0) for d in shard_dids
+                )
+                partition_id = uuid.uuid4()
+                row = SnapshotPartition(
+                    id=partition_id,
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    resource_id=resource.id,
+                    job_id=job_id,
+                    partition_type="SHAREPOINT_DRIVES",
+                    drive_id=None,
+                    partition_index=idx,
+                    file_ids=None,
+                    payload={
+                        "drive_ids": shard_dids,
+                        "site_id": resource.external_id,
+                    },
+                    total_files=len(shard_dids),
+                    total_bytes_est=shard_bytes,
+                    status="QUEUED",
+                )
+                session.add(row)
+                partition_msgs.append(
+                    (str(partition_id), str(snapshot.id), shard_dids),
+                )
+            await session.commit()
+
+        print(
+            f"[{self.worker_id}] [SHAREPOINT] "
+            f"{resource.display_name or resource.id}: "
+            f"PARTITION fanout — {len(shards)} shards, "
+            f"{total_bytes / (1024 * 1024 * 1024):.2f} GiB total, "
+            f"{len(drive_ids_all)} drives."
+        )
+
+        for partition_id, snap_id_str, shard_dids in partition_msgs:
+            msg = create_sharepoint_partition_message(
+                partition_id=partition_id,
+                snapshot_id=snap_id_str,
+                job_id=str(job_id),
+                tenant_id=str(tenant.id),
+                resource_id=str(resource.id),
+                drive_ids=shard_dids,
+                site_id=resource.external_id,
+            )
+            try:
+                await message_bus.publish(
+                    "backup.sharepoint_partition", msg, priority=3,
+                )
+            except Exception as pub_exc:
+                print(
+                    f"[{self.worker_id}] [SHAREPOINT] partition "
+                    f"publish failed (partition={partition_id}): "
+                    f"{type(pub_exc).__name__}: {pub_exc}"
+                )
+
     async def _claim_partition(
         self, partition_id: uuid.UUID, worker_id: str,
     ) -> Optional[Dict[str, Any]]:
@@ -7005,20 +7971,29 @@ class BackupWorker:
         success, None when another replica already owns it or the row
         has reached a terminal state.
 
+        Stamps `worker_region` from $WORKER_REGION so a multi-region
+        deployment can attribute each shard to its physical cluster
+        without changing the claim protocol. Returns all generalized
+        columns (partition_type, payload, retry_count) so workload-
+        specific consumers (chats/mail/sharepoint) get the shape they
+        need without an extra query.
+
         Re-claim window: a partition still IN_PROGRESS but idle past
         ONEDRIVE_PARTITION_STALE_SWEEP_MIN is treated as abandoned, so
         the scheduler-side sweep doesn't have to be the only path that
         unsticks dead claims.
         """
         stale_min = int(settings.ONEDRIVE_PARTITION_STALE_SWEEP_MIN)
+        worker_region = os.getenv("WORKER_REGION", "default")
         async with async_session_factory() as session:
             row = (await session.execute(
                 text(
                     """
                     UPDATE snapshot_partitions
-                       SET status      = 'IN_PROGRESS',
-                           worker_id   = :wid,
-                           started_at  = NOW()
+                       SET status        = 'IN_PROGRESS',
+                           worker_id     = :wid,
+                           worker_region = :wregion,
+                           started_at    = NOW()
                      WHERE id = :pid
                        AND (
                             status = 'QUEUED'
@@ -7029,11 +8004,13 @@ class BackupWorker:
                             )
                        )
                  RETURNING snapshot_id, tenant_id, resource_id,
-                           job_id, drive_id, file_ids,
-                           partition_index, total_files, total_bytes_est
+                           job_id, drive_id, file_ids, payload,
+                           partition_index, total_files, total_bytes_est,
+                           partition_type, retry_count
                     """
                 ),
                 {"pid": str(partition_id), "wid": worker_id,
+                 "wregion": worker_region,
                  "stale": stale_min},
             )).first()
             await session.commit()
@@ -7050,9 +8027,12 @@ class BackupWorker:
                 "job_id":          row[3],
                 "drive_id":        row[4],
                 "file_ids":        row[5],
-                "partition_index": row[6],
-                "total_files":     row[7],
-                "total_bytes_est": row[8],
+                "payload":         row[6],
+                "partition_index": row[7],
+                "total_files":     row[8],
+                "total_bytes_est": row[9],
+                "partition_type":  row[10],
+                "retry_count":     row[11],
             }
 
     async def _mark_partition_terminal(
@@ -7329,6 +8309,25 @@ class BackupWorker:
         job_id = uuid.UUID(str(claim["job_id"]))
         drive_id = str(claim["drive_id"])
         file_ids = list(claim["file_ids"] or [])
+        partition_type = str(claim.get("partition_type") or "ONEDRIVE_FILES")
+        partition_index = claim.get("partition_index")
+        total_files = claim.get("total_files") or len(file_ids)
+
+        # Audit — partition picked up by a worker. Stamps worker_region
+        # so multi-region ops can trace which cluster drained the shard.
+        started_at = time.monotonic()
+        await self._emit_partition_audit(
+            "PARTITION_STARTED", "IN_PROGRESS",
+            tenant_id=str(tenant_id), resource_id=str(resource_id),
+            snapshot_id=snapshot_id, job_id=job_id,
+            partition_id=partition_id, partition_type=partition_type,
+            details={
+                "partition_index": partition_index,
+                "total_files": total_files,
+                "drive_id": drive_id,
+            },
+        )
+
         if not file_ids:
             # Empty shard — mark complete and move on.
             await self._mark_partition_terminal(
@@ -7336,6 +8335,18 @@ class BackupWorker:
                 status="COMPLETED",
                 files_uploaded=0,
                 bytes_uploaded=0,
+            )
+            await self._emit_partition_audit(
+                "PARTITION_COMPLETED", "SUCCESS",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "files_uploaded": 0,
+                    "bytes_uploaded": 0,
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                    "empty_shard": True,
+                },
             )
             await self._finalize_partitioned_snapshot(
                 snapshot_id, job_id=job_id,
@@ -7354,6 +8365,16 @@ class BackupWorker:
                 partition_id, status="FAILED",
                 failure_state={"reason": "job_cancelled"},
             )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "reason": "job_cancelled",
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
             await self._finalize_partitioned_snapshot(
                 snapshot_id, job_id=job_id,
             )
@@ -7368,6 +8389,13 @@ class BackupWorker:
             await self._mark_partition_terminal(
                 partition_id, status="FAILED",
                 failure_state={"reason": "snapshot_or_resource_gone"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "snapshot_or_resource_gone"},
             )
             await self._finalize_partitioned_snapshot(
                 snapshot_id, job_id=job_id,
@@ -7408,6 +8436,16 @@ class BackupWorker:
                     "file_id_count": len(file_ids),
                 },
             )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "reason": "no_snapshot_items_for_file_ids",
+                    "file_id_count": len(file_ids),
+                },
+            )
             await self._finalize_partitioned_snapshot(
                 snapshot_id, job_id=job_id,
             )
@@ -7421,22 +8459,46 @@ class BackupWorker:
                 partition_id, status="FAILED",
                 failure_state={"reason": "no_graph_client"},
             )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "no_graph_client"},
+            )
             await self._finalize_partitioned_snapshot(
                 snapshot_id, job_id=job_id,
             )
             return
 
         # Drain this shard via the existing per-file loop.
+        # Tenant slot first → worker slot second. Tenant cap enforces
+        # fairness across tenants on this replica; worker cap enforces
+        # the absolute concurrency ceiling. Acquiring tenant first means
+        # a tenant blocked on its own cap doesn't hold a worker slot.
+        tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
         try:
-            async with self._onedrive_backup_semaphore:
-                uploaded, uploaded_bytes = await self._useronedrive_backup_files(
-                    graph_client, resource, snapshot, tenant,
-                    drive_id, file_items,
-                )
+            async with tenant_sem:
+                async with self._onedrive_backup_semaphore:
+                    uploaded, uploaded_bytes = await self._useronedrive_backup_files(
+                        graph_client, resource, snapshot, tenant,
+                        drive_id, file_items,
+                    )
             await self._mark_partition_terminal(
                 partition_id, status="COMPLETED",
                 files_uploaded=int(uploaded or 0),
                 bytes_uploaded=int(uploaded_bytes or 0),
+            )
+            await self._emit_partition_audit(
+                "PARTITION_COMPLETED", "SUCCESS",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "files_uploaded": int(uploaded or 0),
+                    "bytes_uploaded": int(uploaded_bytes or 0),
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
             )
         except Exception as e:
             print(
@@ -7450,6 +8512,17 @@ class BackupWorker:
                     "message": str(e)[:500],
                 },
             )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "reason": type(e).__name__,
+                    "message": str(e)[:500],
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
             raise
         finally:
             # Always attempt finalize — last-finisher pattern,
@@ -7461,6 +8534,719 @@ class BackupWorker:
                     snapshot_id,
                     tenant=tenant,
                     resource=resource,
+                    job_id=job_id,
+                )
+            except Exception as fin_exc:
+                print(
+                    f"[{self.worker_id}] [PARTITION FINALIZE] "
+                    f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
+                )
+
+    async def _process_chats_partition_message(
+        self, message: Dict[str, Any],
+    ) -> None:
+        """Handler for one `backup.chats_partition` message.
+
+        Strategy: claim the row, then re-enter
+        `_backup_user_content_parallel` with the same (job, resource)
+        and a `partitionFilter.chatIds` envelope field that scopes the
+        USER_CHATS branch to this shard's chats. `create_snapshot` is
+        idempotent per (job_id, resource_id), so the re-entry binds to
+        the EXISTING snapshot row the coordinator created — no new
+        snapshot, no duplicate audit. Last-finisher in
+        `_finalize_partitioned_snapshot` flips the parent.
+        """
+        partition_id = uuid.UUID(str(message["partitionId"]))
+        claim = await self._claim_partition(partition_id, self.worker_id)
+        if claim is None:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} — "
+                f"claim refused (already owned or terminal); ack-drop"
+            )
+            return
+
+        snapshot_id = uuid.UUID(str(claim["snapshot_id"]))
+        tenant_id = uuid.UUID(str(claim["tenant_id"]))
+        resource_id = uuid.UUID(str(claim["resource_id"]))
+        job_id = uuid.UUID(str(claim["job_id"]))
+        partition_type = str(claim.get("partition_type") or "CHATS")
+        partition_index = claim.get("partition_index")
+        payload = claim.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        shard_chat_ids: List[str] = list(payload.get("chat_ids") or [])
+        total_chats = claim.get("total_files") or len(shard_chat_ids)
+
+        # PARTITION_STARTED audit — operator can trace shard lifecycle
+        # across replicas. worker_region stamped for the multi-region
+        # case (defaults to "default" today).
+        started_at = time.monotonic()
+        await self._emit_partition_audit(
+            "PARTITION_STARTED", "IN_PROGRESS",
+            tenant_id=str(tenant_id), resource_id=str(resource_id),
+            snapshot_id=snapshot_id, job_id=job_id,
+            partition_id=partition_id, partition_type=partition_type,
+            details={
+                "partition_index": partition_index,
+                "total_chats": total_chats,
+            },
+        )
+
+        if not shard_chat_ids:
+            await self._mark_partition_terminal(
+                partition_id, status="COMPLETED",
+                files_uploaded=0, bytes_uploaded=0,
+            )
+            await self._emit_partition_audit(
+                "PARTITION_COMPLETED", "SUCCESS",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "files_uploaded": 0,
+                    "bytes_uploaded": 0,
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                    "empty_shard": True,
+                },
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        if await _is_job_cancelled(job_id):
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} — "
+                f"job {job_id} cancelled; marking partition FAILED"
+            )
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "job_cancelled"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "reason": "job_cancelled",
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        async with async_session_factory() as session:
+            resource = await session.get(Resource, resource_id)
+            tenant = await session.get(Tenant, tenant_id)
+
+        if resource is None or tenant is None:
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "snapshot_or_resource_gone"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "snapshot_or_resource_gone"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        graph_client = await self.get_graph_client(
+            tenant, handler_key="USER_CHATS",
+        )
+        if graph_client is None:
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "no_graph_client"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "no_graph_client"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        # Synthesize a backup message that re-enters the USER_CHATS
+        # coordinator scoped to this shard's chats. The handler's
+        # partition-decision branch (`_should_partition_chats`) is
+        # skipped because `partitionFilter.chatIds` is set — instead
+        # it filters chat_ids_to_drain to the allowlist and drains
+        # just those. `create_snapshot` is idempotent per (job_id,
+        # resource_id) and resumes the existing snapshot. Items land
+        # under the SAME snapshot_id the coordinator created; the
+        # last-finisher flips status.
+        synth_msg: Dict[str, Any] = {
+            "jobId": str(job_id),
+            "resourceId": str(resource_id),
+            "tenantId": str(tenant_id),
+            "type": "INCREMENTAL",
+            "priority": 3,
+            "partitionFilter": {"chatIds": shard_chat_ids},
+            "partitionId": str(partition_id),
+        }
+
+        tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
+        # Snapshot counters before the shard runs — diff against
+        # post-shard counters tells us how much THIS shard actually
+        # contributed. Used to stamp files_uploaded + bytes_uploaded
+        # on the partition row.
+        async with async_session_factory() as session:
+            pre = await session.get(Snapshot, snapshot_id)
+            pre_items = int((pre.item_count if pre else 0) or 0)
+            pre_bytes = int((pre.bytes_added if pre else 0) or 0)
+
+        try:
+            async with tenant_sem:
+                await self._backup_user_content_parallel(
+                    [resource], graph_client, tenant, synth_msg, job_id,
+                )
+            async with async_session_factory() as session:
+                post = await session.get(Snapshot, snapshot_id)
+                post_items = int((post.item_count if post else 0) or 0)
+                post_bytes = int((post.bytes_added if post else 0) or 0)
+            await self._mark_partition_terminal(
+                partition_id, status="COMPLETED",
+                files_uploaded=max(0, post_items - pre_items),
+                bytes_uploaded=max(0, post_bytes - pre_bytes),
+            )
+            await self._emit_partition_audit(
+                "PARTITION_COMPLETED", "SUCCESS",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "files_uploaded": max(0, post_items - pre_items),
+                    "bytes_uploaded": max(0, post_bytes - pre_bytes),
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} "
+                f"chats shard failed: {type(e).__name__}: {e}"
+            )
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={
+                    "reason": type(e).__name__,
+                    "message": str(e)[:500],
+                },
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "reason": type(e).__name__,
+                    "message": str(e)[:500],
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
+            raise
+        finally:
+            try:
+                await self._finalize_partitioned_snapshot(
+                    snapshot_id,
+                    tenant=tenant,
+                    resource=resource,
+                    job_id=job_id,
+                )
+            except Exception as fin_exc:
+                print(
+                    f"[{self.worker_id}] [PARTITION FINALIZE] "
+                    f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
+                )
+
+    async def _process_mail_partition_message(
+        self, message: Dict[str, Any],
+    ) -> None:
+        """Handler for one `backup.mail_partition` message.
+
+        Two re-entry paths share the same partitionFilter.folderIds
+        envelope:
+          * Tier-2 (USER_MAIL) → _backup_user_content_parallel filters
+            folder_ids inside _fetch_for and drains the shard.
+          * Tier-1 (MAILBOX / SHARED_MAILBOX / ROOM_MAILBOX) →
+            _backup_mailboxes_parallel filters folder_ids inside its
+            inner backup_one_mailbox closure (Phase 3.2b — Tier-1).
+        Both honour the same per-shard accounting + audit + finalize
+        plumbing.
+        """
+        partition_id = uuid.UUID(str(message["partitionId"]))
+        claim = await self._claim_partition(partition_id, self.worker_id)
+        if claim is None:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} — "
+                f"claim refused (already owned or terminal); ack-drop"
+            )
+            return
+
+        snapshot_id = uuid.UUID(str(claim["snapshot_id"]))
+        tenant_id = uuid.UUID(str(claim["tenant_id"]))
+        resource_id = uuid.UUID(str(claim["resource_id"]))
+        job_id = uuid.UUID(str(claim["job_id"]))
+        partition_type = str(claim.get("partition_type") or "MAIL_FOLDERS")
+        partition_index = claim.get("partition_index")
+        payload = claim.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        shard_folder_ids: List[str] = list(payload.get("folder_ids") or [])
+        resource_type_str = str(payload.get("resource_type") or "USER_MAIL")
+        total_folders = claim.get("total_files") or len(shard_folder_ids)
+
+        started_at = time.monotonic()
+        await self._emit_partition_audit(
+            "PARTITION_STARTED", "IN_PROGRESS",
+            tenant_id=str(tenant_id), resource_id=str(resource_id),
+            snapshot_id=snapshot_id, job_id=job_id,
+            partition_id=partition_id, partition_type=partition_type,
+            details={
+                "partition_index": partition_index,
+                "total_folders": total_folders,
+                "resource_type": resource_type_str,
+            },
+        )
+
+        if not shard_folder_ids:
+            await self._mark_partition_terminal(
+                partition_id, status="COMPLETED",
+                files_uploaded=0, bytes_uploaded=0,
+            )
+            await self._emit_partition_audit(
+                "PARTITION_COMPLETED", "SUCCESS",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "files_uploaded": 0, "bytes_uploaded": 0,
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                    "empty_shard": True,
+                },
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        if await _is_job_cancelled(job_id):
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "job_cancelled"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "job_cancelled"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        # Tier-1 (MAILBOX / SHARED_MAILBOX / ROOM_MAILBOX) dispatches
+        # to _backup_mailboxes_parallel; Tier-2 (USER_MAIL) uses
+        # _backup_user_content_parallel. The partitionFilter envelope
+        # filters folder_ids inside the matching handler's inner
+        # closure (Phase 3.2b — Tier-1 hook).
+        _tier1_mailbox_types = {
+            "MAILBOX", "SHARED_MAILBOX", "ROOM_MAILBOX",
+        }
+        is_tier1 = resource_type_str in _tier1_mailbox_types
+        if not is_tier1 and resource_type_str != "USER_MAIL":
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={
+                    "reason": "unsupported_resource_type",
+                    "resource_type": resource_type_str,
+                },
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "reason": "unsupported_resource_type",
+                    "resource_type": resource_type_str,
+                },
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        async with async_session_factory() as session:
+            resource = await session.get(Resource, resource_id)
+            tenant = await session.get(Tenant, tenant_id)
+
+        if resource is None or tenant is None:
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "snapshot_or_resource_gone"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "snapshot_or_resource_gone"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        graph_client = await self.get_graph_client(
+            tenant,
+            handler_key=resource_type_str if is_tier1 else "USER_MAIL",
+        )
+        if graph_client is None:
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "no_graph_client"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "no_graph_client"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        synth_msg: Dict[str, Any] = {
+            "jobId": str(job_id),
+            "resourceId": str(resource_id),
+            "tenantId": str(tenant_id),
+            "type": "INCREMENTAL",
+            "priority": 3,
+            "partitionFilter": {"folderIds": shard_folder_ids},
+            "partitionId": str(partition_id),
+        }
+
+        tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
+        async with async_session_factory() as session:
+            pre = await session.get(Snapshot, snapshot_id)
+            pre_items = int((pre.item_count if pre else 0) or 0)
+            pre_bytes = int((pre.bytes_added if pre else 0) or 0)
+
+        try:
+            async with tenant_sem:
+                if is_tier1:
+                    await self._backup_mailboxes_parallel(
+                        [resource], graph_client, tenant,
+                        synth_msg, job_id,
+                    )
+                else:
+                    await self._backup_user_content_parallel(
+                        [resource], graph_client, tenant,
+                        synth_msg, job_id,
+                    )
+            async with async_session_factory() as session:
+                post = await session.get(Snapshot, snapshot_id)
+                post_items = int((post.item_count if post else 0) or 0)
+                post_bytes = int((post.bytes_added if post else 0) or 0)
+            await self._mark_partition_terminal(
+                partition_id, status="COMPLETED",
+                files_uploaded=max(0, post_items - pre_items),
+                bytes_uploaded=max(0, post_bytes - pre_bytes),
+            )
+            await self._emit_partition_audit(
+                "PARTITION_COMPLETED", "SUCCESS",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "files_uploaded": max(0, post_items - pre_items),
+                    "bytes_uploaded": max(0, post_bytes - pre_bytes),
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} "
+                f"mail shard failed: {type(e).__name__}: {e}"
+            )
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={
+                    "reason": type(e).__name__,
+                    "message": str(e)[:500],
+                },
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "reason": type(e).__name__,
+                    "message": str(e)[:500],
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
+            raise
+        finally:
+            try:
+                await self._finalize_partitioned_snapshot(
+                    snapshot_id, tenant=tenant, resource=resource,
+                    job_id=job_id,
+                )
+            except Exception as fin_exc:
+                print(
+                    f"[{self.worker_id}] [PARTITION FINALIZE] "
+                    f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
+                )
+
+    async def _process_sharepoint_partition_message(
+        self, message: Dict[str, Any],
+    ) -> None:
+        """Handler for one `backup.sharepoint_partition` message.
+
+        Re-enters `backup_sharepoint` for the SHAREPOINT_SITE resource
+        with a partitionFilter.driveIds envelope so the drive_producer
+        filters its drives to this shard's allowlist before walking.
+        """
+        partition_id = uuid.UUID(str(message["partitionId"]))
+        claim = await self._claim_partition(partition_id, self.worker_id)
+        if claim is None:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} — "
+                f"claim refused (already owned or terminal); ack-drop"
+            )
+            return
+
+        snapshot_id = uuid.UUID(str(claim["snapshot_id"]))
+        tenant_id = uuid.UUID(str(claim["tenant_id"]))
+        resource_id = uuid.UUID(str(claim["resource_id"]))
+        job_id = uuid.UUID(str(claim["job_id"]))
+        partition_type = str(
+            claim.get("partition_type") or "SHAREPOINT_DRIVES",
+        )
+        partition_index = claim.get("partition_index")
+        payload = claim.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        shard_drive_ids: List[str] = list(payload.get("drive_ids") or [])
+        site_id = str(payload.get("site_id") or "")
+        total_drives = claim.get("total_files") or len(shard_drive_ids)
+
+        started_at = time.monotonic()
+        await self._emit_partition_audit(
+            "PARTITION_STARTED", "IN_PROGRESS",
+            tenant_id=str(tenant_id), resource_id=str(resource_id),
+            snapshot_id=snapshot_id, job_id=job_id,
+            partition_id=partition_id, partition_type=partition_type,
+            details={
+                "partition_index": partition_index,
+                "total_drives": total_drives,
+                "site_id": site_id,
+            },
+        )
+
+        if not shard_drive_ids:
+            await self._mark_partition_terminal(
+                partition_id, status="COMPLETED",
+                files_uploaded=0, bytes_uploaded=0,
+            )
+            await self._emit_partition_audit(
+                "PARTITION_COMPLETED", "SUCCESS",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "files_uploaded": 0, "bytes_uploaded": 0,
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                    "empty_shard": True,
+                },
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        if await _is_job_cancelled(job_id):
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "job_cancelled"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "job_cancelled"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        async with async_session_factory() as session:
+            resource = await session.get(Resource, resource_id)
+            tenant = await session.get(Tenant, tenant_id)
+            snapshot = await session.get(Snapshot, snapshot_id)
+
+        if resource is None or tenant is None or snapshot is None:
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "snapshot_or_resource_gone"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "snapshot_or_resource_gone"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        # Team-site path: M365_GROUP backups call backup_sharepoint
+        # with a SimpleNamespace site_proxy that pins the M365_GROUP's
+        # `id` but stamps the team-site's `external_id`. When that
+        # fanout publishes partition messages, payload.site_id carries
+        # the team-site external_id while `resource_id` resolves to the
+        # M365_GROUP row in the DB. Detect that mismatch and synthesize
+        # the same proxy here so backup_sharepoint walks the correct
+        # site instead of the M365_GROUP id.
+        if site_id and site_id != (resource.external_id or ""):
+            from types import SimpleNamespace as _SN
+            resource_for_sp = _SN(
+                id=resource.id,
+                tenant_id=resource.tenant_id,
+                type=_SN(value="SHAREPOINT_SITE"),
+                display_name=(
+                    f"{resource.display_name or resource.id} (team site)"
+                ),
+                external_id=site_id,
+                extra_data=resource.extra_data or {},
+                sla_policy_id=getattr(resource, "sla_policy_id", None),
+            )
+        else:
+            resource_for_sp = resource
+
+        graph_client = await self.get_graph_client(
+            tenant, handler_key="SHAREPOINT_SITE",
+        )
+        if graph_client is None:
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "no_graph_client"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "no_graph_client"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        synth_msg: Dict[str, Any] = {
+            "jobId": str(job_id),
+            "resourceId": str(resource_id),
+            "tenantId": str(tenant_id),
+            "type": "INCREMENTAL",
+            "priority": 3,
+            "partitionFilter": {"driveIds": shard_drive_ids},
+            "partitionId": str(partition_id),
+        }
+
+        tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
+
+        try:
+            async with tenant_sem:
+                # backup_sharepoint returns this shard's contribution
+                # (item_count + bytes_added). It does NOT write to the
+                # parent snapshot's counters — those are owned by the
+                # finalize path, which reconciles from snapshot_items.
+                # So we take the shard's contribution straight from
+                # the return dict rather than diffing snapshot counters
+                # (which stay at 0 mid-flight for SharePoint).
+                sp_result = await self.backup_sharepoint(
+                    graph_client, resource_for_sp, snapshot, tenant,
+                    synth_msg,
+                )
+            shard_items = int((sp_result or {}).get("item_count") or 0)
+            shard_bytes = int((sp_result or {}).get("bytes_added") or 0)
+            await self._mark_partition_terminal(
+                partition_id, status="COMPLETED",
+                files_uploaded=shard_items,
+                bytes_uploaded=shard_bytes,
+            )
+            await self._emit_partition_audit(
+                "PARTITION_COMPLETED", "SUCCESS",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "files_uploaded": shard_items,
+                    "bytes_uploaded": shard_bytes,
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} "
+                f"sharepoint shard failed: {type(e).__name__}: {e}"
+            )
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={
+                    "reason": type(e).__name__,
+                    "message": str(e)[:500],
+                },
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "reason": type(e).__name__,
+                    "message": str(e)[:500],
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
+            raise
+        finally:
+            try:
+                await self._finalize_partitioned_snapshot(
+                    snapshot_id, tenant=tenant, resource=resource,
                     job_id=job_id,
                 )
             except Exception as fin_exc:
@@ -9410,11 +11196,21 @@ class BackupWorker:
                             f"to per-message parentFolderId resolution"
                         )
 
-                    existing_tokens: Dict[str, str] = dict(
+                    # Dual-read transition — same pattern as USER_MAIL
+                    # above. New mail_folder_delta table is the
+                    # authoritative read source; fall back to legacy
+                    # extra_data dict per folder_id not yet baselined.
+                    _new_table_tokens = await self._load_mail_folder_deltas(
+                        resource.id,
+                    )
+                    _legacy_tokens = dict(
                         (resource.extra_data or {}).get(
                             "mail_delta_tokens_by_folder", {},
                         ) or {},
                     )
+                    existing_tokens: Dict[str, str] = {
+                        **_legacy_tokens, **_new_table_tokens,
+                    }
                     new_tokens: Dict[str, str] = {}
                     # Backwards-compat: an older deploy may have written
                     # a single `mail_delta_token` for the whole mailbox.
@@ -9425,6 +11221,72 @@ class BackupWorker:
                         existing_tokens["__all__"] = legacy_tok
 
                     folder_ids = list(folder_tree.keys()) or [None]
+
+                    # ── Cross-replica partition split (Phase 3.2b — Tier-1) ──
+                    # Same two-role design as USER_MAIL Tier-2:
+                    # 1) Coordinator: no partitionFilter → if mailbox
+                    #    crosses MAIL_PARTITION_MIN_FOLDERS / MIN_BYTES,
+                    #    bin-pack folder_ids LPT-by-size, fanout via
+                    #    backup.mail_partition queue, mark snapshot
+                    #    partitioned, short-circuit.
+                    # 2) Partition consumer: partitionFilter.folderIds
+                    #    carries the shard's allowlist → filter folder_ids
+                    #    to allowlist, drain just those via existing
+                    #    _drain_folder closure. Resource-type stays the
+                    #    same so _backup_mailboxes_parallel is the natural
+                    #    re-entry point for the Tier-1 shard.
+                    _mail_partition_filter = (message or {}).get(
+                        "partitionFilter",
+                    ) or {}
+                    _shard_folder_ids = _mail_partition_filter.get(
+                        "folderIds",
+                    )
+                    _running_as_mail_shard = False
+                    if _shard_folder_ids is not None:
+                        _shard_set = set(_shard_folder_ids)
+                        folder_ids = [
+                            fid for fid in folder_ids
+                            if fid is None or fid in _shard_set
+                        ]
+                        _running_as_mail_shard = True
+                        print(
+                            f"[{self.worker_id}] [MAILBOX] "
+                            f"{user_label}: partition consumer — "
+                            f"draining "
+                            f"{len([f for f in folder_ids if f])} "
+                            f"folders in this shard"
+                        )
+                    else:
+                        _drain_fids = [f for f in folder_ids if f]
+                        if self._should_partition_mail(
+                            _drain_fids, folder_tree,
+                        ):
+                            await self._fanout_mail_partitions(
+                                snapshot=snapshot,
+                                resource=resource,
+                                tenant=tenant,
+                                folder_ids=_drain_fids,
+                                folder_tree=folder_tree,
+                                job_id=job_id,
+                            )
+                            # Partition shards own the snapshot's
+                            # terminal flip via
+                            # _finalize_partitioned_snapshot. Skip
+                            # the inline drain + complete_snapshot +
+                            # BACKUP_COMPLETED audit so we don't
+                            # double-fire on the parent snapshot.
+                            print(
+                                f"[{self.worker_id}] [MAILBOX] "
+                                f"{user_label}: partitioned — "
+                                f"coordinator returning, awaiting "
+                                f"partition consumers."
+                            )
+                            return {
+                                "item_count": 0,
+                                "bytes_added": 0,
+                                "partitioned": True,
+                            }
+
                     mbx_sem = asyncio.Semaphore(max(1, mbx_fanout))
                     persist_lock = asyncio.Lock()
                     totals = {"items": 0, "bytes": 0, "folders_done": 0}
@@ -9683,8 +11545,20 @@ class BackupWorker:
                                 f"{type(att_err).__name__}: {att_err}"
                             )
 
+                    # Atomic per-row UPSERT for every token the run
+                    # produced — the safe path under concurrent folder
+                    # drains. Replaces the JSON-dict RMW that used to
+                    # silently clobber tokens.
+                    if new_tokens:
+                        for _fid, _tok in new_tokens.items():
+                            await self._upsert_mail_folder_delta(
+                                resource.id, _fid, _tok,
+                            )
+
                     # Persist per-folder delta tokens (merge, don't
                     # overwrite — failed folders keep their old tok).
+                    # Legacy dual-write — kept for one release as
+                    # rollback safety; new table is authoritative.
                     if new_tokens:
                         try:
                             async with async_session_factory() as _s:
@@ -9708,33 +11582,41 @@ class BackupWorker:
                                 f"persist failed: {_e}"
                             )
 
-                    # Mark the snapshot COMPLETED before update_resource_backup_info
-                    # runs — that helper re-derives storage_bytes from the latest
-                    # COMPLETED snapshot, and without this flip the mass-backup
-                    # path left snapshots IN_PROGRESS (later reaped to PARTIAL),
-                    # so the resource row showed storage_bytes=0 forever.
-                    async with async_session_factory() as sess:
-                        await self.complete_snapshot(
-                            sess, snapshot,
-                            {"item_count": totals["items"],
-                             "bytes_added": totals["bytes"]},
-                        )
+                    # Partition shards own the snapshot's terminal
+                    # flip via _finalize_partitioned_snapshot (called
+                    # by the partition consumer after this returns).
+                    # Skipping complete_snapshot here keeps the snapshot
+                    # IN_PROGRESS until every shard's items have
+                    # persisted — otherwise the first shard to finish
+                    # would flip COMPLETED with its own partial totals,
+                    # then update_resource_backup_info would derive
+                    # storage_bytes from the partial snapshot. The
+                    # shard's items + bytes are still written to
+                    # snapshot_items rows (the finalize-path bytes
+                    # reconcile picks them up).
+                    if not _running_as_mail_shard:
+                        async with async_session_factory() as sess:
+                            await self.complete_snapshot(
+                                sess, snapshot,
+                                {"item_count": totals["items"],
+                                 "bytes_added": totals["bytes"]},
+                            )
 
-                    async with async_session_factory() as sess:
-                        await self.update_resource_backup_info(
-                            sess, resource, job_id, snapshot.id,
-                            {"item_count": totals["items"],
-                             "bytes_added": totals["bytes"]},
-                        )
+                        async with async_session_factory() as sess:
+                            await self.update_resource_backup_info(
+                                sess, resource, job_id, snapshot.id,
+                                {"item_count": totals["items"],
+                                 "bytes_added": totals["bytes"]},
+                            )
 
-                    await self._emit_backup_audit(
-                        "BACKUP_COMPLETED", "SUCCESS",
-                        tenant, resource, snapshot, job_id,
-                        details={
-                            "item_count": totals["items"],
-                            "bytes_added": totals["bytes"],
-                        },
-                    )
+                        await self._emit_backup_audit(
+                            "BACKUP_COMPLETED", "SUCCESS",
+                            tenant, resource, snapshot, job_id,
+                            details={
+                                "item_count": totals["items"],
+                                "bytes_added": totals["bytes"],
+                            },
+                        )
                     return {"item_count": totals["items"], "bytes_added": totals["bytes"]}
                 except Exception as e:
                     print(
@@ -13215,9 +15097,32 @@ class BackupWorker:
         # site routinely has several document libraries; using the
         # singleton `/drive` endpoint (the legacy path) only captures
         # the default one.
-        drive_delta_tokens_by_site: Dict[str, Dict[str, str]] = (
+        #
+        # Dual-read transition (Phase 3.1): the authoritative source
+        # is now `sharepoint_drive_delta` (one row per drive — RMW-
+        # safe). Drive ids are globally unique in Graph, so we can
+        # ignore the legacy {site_id: {drive_id: tok}} nesting and
+        # pass a flat {drive_id: tok} into the producer; iter_
+        # sharepoint_site_all_drive_items only looks up by drive_id.
+        _new_table_drive_tokens = await self._load_sharepoint_drive_deltas(
+            resource.id,
+        )
+        _legacy_nested = (
             (resource.extra_data or {}).get("drive_delta_tokens_by_site") or {}
         )
+        # Flatten the legacy nested map so call sites that lookup by
+        # drive_id alone (the new path) get a uniform shape.
+        _legacy_flat: Dict[str, str] = {}
+        for _site_id, _per_drive in _legacy_nested.items():
+            if isinstance(_per_drive, dict):
+                for _did, _tok in _per_drive.items():
+                    if _tok:
+                        _legacy_flat[str(_did)] = str(_tok)
+        # Merge: new table wins on conflict (more recent + atomic).
+        _merged_drive_tokens: Dict[str, str] = {
+            **_legacy_flat, **_new_table_drive_tokens,
+        }
+        drive_delta_tokens_by_site: Dict[str, Dict[str, str]] = _legacy_nested
 
         site_targets: List[tuple[str, str, Optional[str]]] = [
             (resource.external_id, resource.display_name, delta_token)
@@ -13235,6 +15140,75 @@ class BackupWorker:
                 ))
         except Exception as exc:
             logger.warning("Failed to enumerate SharePoint subsites for %s: %s", resource.display_name, exc)
+
+        # ── Cross-replica partition split (Phase 3.3 — Tier-1) ──
+        # Same two-role design as the mail Tier-1 path:
+        # 1) Coordinator: no partitionFilter → enumerate drives for the
+        #    primary site once; if the site crosses
+        #    SP_PARTITION_MIN_DRIVES / MIN_BYTES, LPT bin-pack drives
+        #    by quota.used, fanout via backup.sharepoint_partition queue,
+        #    mark snapshot partitioned, short-circuit out of the heavy
+        #    producer/consumer pipeline.
+        # 2) Partition consumer: partitionFilter.driveIds carries this
+        #    shard's allowlist. Pass the allowlist through to the
+        #    drive_producer closure so iter_sharepoint_site_all_drive_items
+        #    only walks drives in the set. Subsites still drain in full
+        #    (they're cheap relative to the primary site's libraries).
+        _sp_partition_filter = (message or {}).get("partitionFilter") or {}
+        _sp_shard_drive_ids = _sp_partition_filter.get("driveIds")
+        _sp_allowed_drive_ids: Optional[Set[str]] = (
+            set(_sp_shard_drive_ids) if _sp_shard_drive_ids is not None
+            else None
+        )
+        if _sp_allowed_drive_ids is None:
+            try:
+                _sp_primary_drives = (
+                    await graph_client.list_sharepoint_site_drives(
+                        resource.external_id,
+                    )
+                )
+            except Exception as _sp_enum_exc:
+                _sp_primary_drives = []
+                print(
+                    f"[{self.worker_id}] [SHAREPOINT] partition "
+                    f"decision: drive enumerate failed for "
+                    f"{resource.display_name}: "
+                    f"{type(_sp_enum_exc).__name__}: {_sp_enum_exc}"
+                )
+            if (
+                _sp_primary_drives
+                and self._should_partition_sharepoint(_sp_primary_drives)
+            ):
+                await self._fanout_sharepoint_partitions(
+                    snapshot=snapshot,
+                    resource=resource,
+                    tenant=tenant,
+                    drives=_sp_primary_drives,
+                    job_id=job_id,
+                )
+                # Partition shards own the snapshot's terminal flip
+                # via _finalize_partitioned_snapshot. Coordinator
+                # returns a placeholder result so the outer
+                # _backup_one finalize block doesn't double-fire
+                # BACKUP_COMPLETED.
+                print(
+                    f"[{self.worker_id}] [SHAREPOINT] "
+                    f"{resource.display_name}: partitioned — "
+                    f"coordinator returning, awaiting partition consumers."
+                )
+                return {
+                    "item_count": 0,
+                    "bytes_added": 0,
+                    "new_delta_token": delta_token,
+                    "partitioned": True,
+                }
+        else:
+            print(
+                f"[{self.worker_id}] [SHAREPOINT] "
+                f"{resource.display_name}: partition consumer — "
+                f"draining {len(_sp_allowed_drive_ids)} drive(s) "
+                f"in this shard"
+            )
 
         # SLA exclusions — applied in the producer so excluded items never
         # reach the queue (saves memory + Graph/SP REST bandwidth). Compile
@@ -13273,7 +15247,15 @@ class BackupWorker:
             pipeline. Per-library delta tokens are persisted on the
             resource so subsequent runs resume cheaply per library
             instead of re-walking each one."""
-            per_drive_in = drive_delta_tokens_by_site.get(site_id) or {}
+            # New path: pass the flat merged map (new-table + legacy
+            # fallback). iter_sharepoint_site_all_drive_items looks up
+            # by drive_id alone — extra keys from sibling sites are
+            # harmless. Falls back to the legacy per-site dict if the
+            # merged map is empty (first run, pre-migration tenant).
+            per_drive_in = (
+                _merged_drive_tokens
+                or (drive_delta_tokens_by_site.get(site_id) or {})
+            )
             per_drive_out: Dict[str, Dict[str, Optional[str]]] = {}
 
             # Diagnostic: count what we actually enumerate + stream.
@@ -13284,10 +15266,24 @@ class BackupWorker:
             except Exception as exc:
                 print(f"[{self.worker_id}]   [SP_DRIVES] {site_label}: enumerate FAIL {type(exc).__name__}: {exc}")
 
+            # Partition-shard scoping: when running as a partition
+            # consumer, only walk drives in the shard's allowlist. The
+            # allowlist applies to the PRIMARY site only — subsites
+            # still drain in full because their inventory cost is
+            # negligible relative to the libraries we partition over.
+            _allowed_for_this_site: Optional[Set[str]] = (
+                _sp_allowed_drive_ids
+                if (
+                    _sp_allowed_drive_ids is not None
+                    and site_id == resource.external_id
+                )
+                else None
+            )
             streamed = 0
             try:
                 async for item in graph_client.iter_sharepoint_site_all_drive_items(
                     site_id, per_drive_in, per_drive_out,
+                    allowed_drive_ids=_allowed_for_this_site,
                 ):
                     streamed += 1
                     item["_site_label"] = site_label
@@ -13571,6 +15567,22 @@ class BackupWorker:
               f"meta_none={stats.get('rest_rows_meta_none', 0)} "
               f"size_zero={stats.get('rest_rows_size_zero', 0)}")
 
+        # Atomic per-drive UPSERT into sharepoint_drive_delta. The
+        # safe write under concurrent drive drains AND cross-replica
+        # SharePoint partitions. Replaces the
+        # `extra_data["drive_delta_tokens_by_site"]` RMW dict that
+        # silently clobbered tokens.
+        if stats["new_drive_tokens"]:
+            for _site_id_key, _per_drive in stats["new_drive_tokens"].items():
+                for _drive_id, _tok in (_per_drive or {}).items():
+                    if not _tok:
+                        continue
+                    await self._upsert_sharepoint_drive_delta(
+                        resource.id, str(_drive_id), str(_tok),
+                    )
+
+        # Legacy dual-write — kept for one release as rollback safety;
+        # new sharepoint_drive_delta table is authoritative.
         if stats["new_subsite_tokens"] or stats["new_drive_tokens"]:
             async with async_session_factory() as sess:
                 r = await sess.get(Resource, resource.id)
