@@ -195,7 +195,21 @@ def _group_batch_jobs(
             # In Progress — lead with percentage; bytes supplement it.
             # Average sibling progress_pct is the fallback when bytes
             # totals aren't populated yet (e.g. discovery-only siblings).
-            avg_pct = sum((c.progress_pct or 0) for c in children) // max(len(children), 1)
+            #
+            # Monotonic-pct fix: skip children with progress_pct=0.
+            # When a fresh Tier-2 sibling Job joins the batch group its
+            # progress_pct starts at 0; averaging that in would drag
+            # the displayed pct DOWN (the user saw 83% → 69% as new
+            # children spawned). Excluding pct=0 keeps the displayed
+            # pct monotonically non-decreasing across the run. As soon
+            # as a sibling starts making progress (pct > 0) it joins
+            # the average. If every child is at pct=0 (very rare —
+            # only at the very first moment), fall back to 0.
+            active_pcts = [
+                int(c.progress_pct) for c in children
+                if c.progress_pct and int(c.progress_pct) > 0
+            ]
+            avg_pct = (sum(active_pcts) // len(active_pcts)) if active_pcts else 0
             if total_data > 0:
                 pct = min(100, int((data_backed_up / total_data) * 100))
                 details = f"Progress: {pct}% ({_fmt_bytes(data_backed_up)} of {_fmt_bytes(total_data)})"
@@ -824,6 +838,25 @@ async def list_activities(
         # row headline stays in sync with both.
         # Each batch_resource_ids is a small UUID[] (≤ ~100 entries); one
         # query per group is cheap and bounded by the Activity page size.
+        # Tier-1→Tier-2 handoff flicker fix. A "Backup all" click
+        # creates a Tier-1 Job with batch_resource_ids = [9 ENTRA_USERs].
+        # Tier-2 fanout Jobs (USER_MAIL / USER_ONEDRIVE / USER_CHATS /
+        # USER_CALENDAR / USER_CONTACTS for each user) are inserted
+        # ~3-5s after Tier-1 completes — during that window the
+        # Activity row would show just "9 resources" and then jump to
+        # "54". Expand the resource set at read-time: any ENTRA_USER
+        # in res_ids implies its Tier-2 children belong to the same
+        # operator click, so include them whether or not the
+        # corresponding Tier-2 Jobs have spawned yet. The expansion is
+        # idempotent: once Tier-2 Jobs exist and contribute their own
+        # batch_resource_ids, the union is identical.
+        TIER2_TYPES = (
+            ResourceType.USER_MAIL,
+            ResourceType.USER_ONEDRIVE,
+            ResourceType.USER_CHATS,
+            ResourceType.USER_CALENDAR,
+            ResourceType.USER_CONTACTS,
+        )
         group_storage: Dict[Tuple[Any, str, str], Tuple[int, int]] = {}
         for group_key, children in groups.items():
             res_ids: Set[Any] = set()
@@ -832,6 +865,17 @@ async def list_activities(
                     res_ids.add(rid)
             if not res_ids:
                 continue
+            # Eager Tier-2 expansion: pull children of any ENTRA_USER
+            # in res_ids. One query per group, scoped by parent_id —
+            # cheap (≤ ~10 parents × ~6 child types each in practice).
+            tier2_rows = await db.execute(
+                select(Resource.id).where(
+                    Resource.parent_resource_id.in_(res_ids),
+                    Resource.type.in_(TIER2_TYPES),
+                )
+            )
+            for (child_id,) in tier2_rows:
+                res_ids.add(child_id)
             rs = await db.execute(
                 select(
                     func.count(Resource.id),
