@@ -116,6 +116,41 @@ async def _backfill_chat_topic_fallbacks():
             print(f"[SNAPSHOT] chat_topic backfill skipped: {e}")
 
 
+def _compose_chat_name(
+    chat_id: str,
+    topic: Optional[str],
+    chat_type: Optional[str],
+    member_names: Optional[list],
+) -> str:
+    """Read-time chat display name. Never persisted.
+
+    Resolution order:
+      1. Real Graph topic (when chat_threads.chat_topic is set).
+      2. Composed from chat_threads.member_names_json — picks the right
+         shape for 1:1 vs group.
+      3. Stable "Chat 19abc12" fallback (truncated chat_id). Never the
+         old "Group Chat (19:xxxxx)" synthetic value that used to leak
+         into folder_path and metadata.chatTopic at write time.
+    """
+    if isinstance(topic, str) and topic.strip():
+        return topic.strip()
+    names: List[str] = []
+    if isinstance(member_names, list):
+        names = [
+            str(n).strip()
+            for n in member_names
+            if isinstance(n, str) and n.strip()
+        ]
+    if names:
+        ct = (chat_type or "").lower()
+        if ct == "oneonone":
+            return " | ".join(names[:2])
+        if len(names) <= 3:
+            return ", ".join(names)
+        return ", ".join(names[:3]) + f" +{len(names) - 3} more"
+    return f"Chat {chat_id[:8]}"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from shared.storage.startup import startup_router, shutdown_router
@@ -1685,7 +1720,12 @@ async def list_snapshot_messages(
                 r.created_date_time.isoformat() if r.created_date_time
                 else (r.si_created_at.isoformat() if r.si_created_at else None)
             ),
-            "chatTopic": r.chat_topic or "",
+            "chatTopic": _compose_chat_name(
+                str(r.parent_external_id or ""),
+                r.chat_topic,
+                r.chat_type,
+                r.member_names_json,
+            ) if r.parent_external_id else (r.chat_topic or ""),
             "channelName": "",
             "folderPath": r.folder_path,
             "attachments": raw.get("attachments", []) if isinstance(raw, dict) else [],
@@ -1799,34 +1839,6 @@ async def list_snapshot_chat_groups(
         ),
         {"sids": [str(s) for s in sibling_ids]},
     )).all()
-
-    def _compose_chat_name(
-        chat_id: str,
-        topic: Optional[str],
-        chat_type: Optional[str],
-        member_names: Optional[list],
-    ) -> str:
-        # 1. Real Graph topic always wins.
-        if isinstance(topic, str) and topic.strip():
-            return topic.strip()
-        # 2. Compose from member names if we captured them.
-        names = []
-        if isinstance(member_names, list):
-            names = [
-                str(n).strip()
-                for n in member_names
-                if isinstance(n, str) and n.strip()
-            ]
-        if names:
-            ct = (chat_type or "").lower()
-            if ct == "oneonone":
-                return " | ".join(names[:2])
-            # group / meeting / unknown — show first three names + +N more
-            if len(names) <= 3:
-                return ", ".join(names)
-            return ", ".join(names[:3]) + f" +{len(names) - 3} more"
-        # 3. Last-resort fallback — never persisted, computed at read time.
-        return f"Chat {chat_id[:8]}"
 
     return [
         {
