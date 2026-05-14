@@ -610,15 +610,47 @@ async def list_resources(
     # to zero in the response).
     subtree_size_map: dict = {}
     if resource_ids:
+        # Subtree includes:
+        #   self (the root row)
+        #   direct children — EXCEPT Tier-2 USER_ONEDRIVE/USER_MAIL when the
+        #     user already has a Tier-1 ONEDRIVE/MAILBOX peer (those duplicate
+        #     each other's bytes_added; Tier-1 is canonical).
+        #   Tier-1 ONEDRIVE/MAILBOX peers — matched by (tenant_id, email).
+        #     These are NOT structurally children of ENTRA_USER, but they hold
+        #     the same user's drive/mail content, so they belong in the
+        #     per-user rollup.
         subtree_size_query = text("""
             WITH targets AS (
                 SELECT id AS root_id, id AS leaf_id
                 FROM resources
                 WHERE id = ANY(:resource_ids)
                 UNION ALL
-                SELECT parent_resource_id AS root_id, id AS leaf_id
-                FROM resources
-                WHERE parent_resource_id = ANY(:resource_ids)
+                SELECT child.parent_resource_id AS root_id, child.id AS leaf_id
+                FROM resources child
+                WHERE child.parent_resource_id = ANY(:resource_ids)
+                  AND NOT (
+                    child.type::text IN ('USER_ONEDRIVE', 'USER_MAIL')
+                    AND EXISTS (
+                      SELECT 1 FROM resources peer
+                      WHERE peer.tenant_id = child.tenant_id
+                        AND peer.email = child.email
+                        AND peer.archived_at IS NULL
+                        AND peer.type::text = CASE child.type::text
+                                                WHEN 'USER_ONEDRIVE' THEN 'ONEDRIVE'
+                                                WHEN 'USER_MAIL'     THEN 'MAILBOX'
+                                              END
+                    )
+                  )
+                UNION ALL
+                SELECT parent.id AS root_id, peer.id AS leaf_id
+                FROM resources parent
+                JOIN resources peer
+                  ON peer.tenant_id = parent.tenant_id
+                 AND peer.email = parent.email
+                 AND peer.archived_at IS NULL
+                 AND peer.type::text IN ('ONEDRIVE', 'MAILBOX')
+                WHERE parent.id = ANY(:resource_ids)
+                  AND parent.type::text = 'ENTRA_USER'
             )
             SELECT
                 t.root_id,
@@ -930,15 +962,39 @@ async def get_resources_by_type(
     # table, the Recovery panel, and any future surfaces all agree).
     subtree_size_map: dict = {}
     if resource_ids:
+        # See subtree CTE comment in get_resources for the dedup logic.
         subtree_size_query = text("""
             WITH targets AS (
                 SELECT id AS root_id, id AS leaf_id
                 FROM resources
                 WHERE id = ANY(:resource_ids)
                 UNION ALL
-                SELECT parent_resource_id AS root_id, id AS leaf_id
-                FROM resources
-                WHERE parent_resource_id = ANY(:resource_ids)
+                SELECT child.parent_resource_id AS root_id, child.id AS leaf_id
+                FROM resources child
+                WHERE child.parent_resource_id = ANY(:resource_ids)
+                  AND NOT (
+                    child.type::text IN ('USER_ONEDRIVE', 'USER_MAIL')
+                    AND EXISTS (
+                      SELECT 1 FROM resources peer
+                      WHERE peer.tenant_id = child.tenant_id
+                        AND peer.email = child.email
+                        AND peer.archived_at IS NULL
+                        AND peer.type::text = CASE child.type::text
+                                                WHEN 'USER_ONEDRIVE' THEN 'ONEDRIVE'
+                                                WHEN 'USER_MAIL'     THEN 'MAILBOX'
+                                              END
+                    )
+                  )
+                UNION ALL
+                SELECT parent.id AS root_id, peer.id AS leaf_id
+                FROM resources parent
+                JOIN resources peer
+                  ON peer.tenant_id = parent.tenant_id
+                 AND peer.email = parent.email
+                 AND peer.archived_at IS NULL
+                 AND peer.type::text IN ('ONEDRIVE', 'MAILBOX')
+                WHERE parent.id = ANY(:resource_ids)
+                  AND parent.type::text = 'ENTRA_USER'
             )
             SELECT
                 t.root_id,

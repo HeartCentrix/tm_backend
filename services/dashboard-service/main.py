@@ -14,6 +14,7 @@ from shared.models import (
     Resource, Job, JobType, JobStatus, Snapshot, SnapshotItem, SnapshotStatus,
     ResourceType, ResourceStatus, Tenant, TenantType, UI_HIDDEN_TYPES,
 )
+from shared.storage_rollup import exclude_tier2_storage_dupes_clause
 
 log = logging.getLogger("dashboard-service")
 
@@ -219,7 +220,10 @@ async def get_overview(
     failed = (await db.execute(select(func.count(Job.id)).where(Job.status == JobStatus.FAILED, Job.type == JobType.BACKUP, Job.created_at >= yesterday, *filters))).scalar() or 0
     pending = (await db.execute(select(func.count(Job.id)).where(Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]), Job.type == JobType.BACKUP, *filters))).scalar() or 0
     
-    storage = (await db.execute(select(func.sum(Resource.storage_bytes)).where(*filters))).scalar() or 0
+    storage = (await db.execute(
+        select(func.sum(Resource.storage_bytes))
+        .where(exclude_tier2_storage_dupes_clause(), *filters)
+    )).scalar() or 0
     last_backup = (await db.execute(select(func.max(Resource.last_backup_at)).where(*filters))).scalar()
     
     return {
@@ -533,7 +537,12 @@ async def get_backup_size(
     # many legacy FAILED rows and bytes_added is unreliable per snapshot, so using
     # it produced a dashboard where the headline said 7.9 MB but the chart/pills
     # read 0. All four fields below are derived from resources only.
-    total = int((await db.execute(select(func.sum(Resource.storage_bytes)).where(*filters))).scalar() or 0)
+    # Dedup: a Tier-1 ONEDRIVE/MAILBOX walk + a Tier-2 USER_ONEDRIVE/USER_MAIL
+    # walk both write storage_bytes for the same user. Exclude the Tier-2 dupe.
+    total = int((await db.execute(
+        select(func.sum(Resource.storage_bytes))
+        .where(exclude_tier2_storage_dupes_clause(), *filters)
+    )).scalar() or 0)
 
     # Per-day growth based on when each resource was last backed up.
     # Resources last backed up BEFORE the 30-day window seed day 0 as a baseline.
@@ -545,6 +554,7 @@ async def get_backup_size(
     per_day_rows = (await db.execute(
         select(day_bucket, func.sum(Resource.storage_bytes))
         .where(
+            exclude_tier2_storage_dupes_clause(),
             Resource.last_backup_at.isnot(None),
             Resource.last_backup_at >= window_start_ts,
             *filters,
@@ -561,6 +571,7 @@ async def get_backup_size(
 
     baseline = int((await db.execute(
         select(func.sum(Resource.storage_bytes)).where(
+            exclude_tier2_storage_dupes_clause(),
             Resource.last_backup_at.isnot(None),
             Resource.last_backup_at < window_start_ts,
             *filters,

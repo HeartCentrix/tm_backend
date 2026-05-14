@@ -35,6 +35,7 @@ from shared.models import (
 )
 from shared.config import settings
 from shared.security import get_current_user_from_token
+from shared.storage_rollup import exclude_tier2_storage_dupes_clause
 
 app = FastAPI(title="Report Service", version="1.0.0")
 
@@ -889,7 +890,12 @@ async def generate_report(request: GenerateReportRequest):
         # (Decimal) to avoid overflow — cast to int here so downstream math +
         # JSON serialization into report_data don't hit
         # "Object of type Decimal is not JSON serializable".
-        storage_result = await session.execute(select(func.sum(Resource.storage_bytes)))
+        # Dedup Tier-1 ONEDRIVE/MAILBOX + Tier-2 USER_ONEDRIVE/USER_MAIL — both
+        # walk the same content. See shared.storage_rollup.
+        storage_result = await session.execute(
+            select(func.sum(Resource.storage_bytes))
+            .where(exclude_tier2_storage_dupes_clause())
+        )
         total_storage_bytes = int(storage_result.scalar() or 0)
         storage_gb = round(total_storage_bytes / (1024 ** 3), 2)
 

@@ -32,6 +32,7 @@ from shared.config import settings
 from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
 from shared.message_bus import message_bus
+from shared.storage_rollup import exclude_tier2_storage_dupes_clause
 
 app = FastAPI(title="Audit Log Service", version="1.0.0")
 
@@ -94,17 +95,29 @@ def _compute_details(job: Job) -> str:
 def _group_batch_jobs(
     groups: Dict[Tuple[Any, str, str], List[Job]],
     status_reverse_map: Dict[Any, str],
+    group_storage: Optional[Dict[Tuple[Any, str, str], Tuple[int, int]]] = None,
 ) -> List[Dict[str, Any]]:
     """Collapse partitioned batch Jobs into one Activity row per click.
 
     Sibling Jobs from one _create_batch_backup_jobs call share a natural
     key (tenant_id, triggered_by, created_at). Aggregating on read keeps
     backend queue partitioning intact while presenting one row per
-    operator action."""
+    operator action.
+
+    `group_storage` (optional) maps each group key to
+    (deduped_resource_count, deduped_storage_bytes) — computed by the
+    caller from the union of every child's `batch_resource_ids` with the
+    Tier-1 / Tier-2 storage_bytes dedup applied. When present, those values
+    replace the in-job `spec.resource_count` + `bytes_processed` rollup so
+    the Activity row shows the same total as the Overview / User-list.
+    """
     rows: List[Dict[str, Any]] = []
-    for (_tenant, _trigger, _created), children in groups.items():
+    if group_storage is None:
+        group_storage = {}
+    for group_key, children in groups.items():
         if not children:
             continue
+        _tenant, _trigger, _created = group_key
 
         statuses = [c.status for c in children]
         any_active = any(
@@ -126,22 +139,27 @@ def _group_batch_jobs(
         else:
             group_status = status_reverse_map.get(statuses[0], "In Progress")
 
-        # total_resources reflects what the OPERATOR clicked, not the work
-        # the system fanned out internally. Tier-2 child Jobs (spec.tier2)
-        # represent discovered sub-resources of users the operator already
-        # counted on the parent siblings — including them here would
-        # balloon "18 users" into "72 resources" once OneDrives + mailboxes
-        # land. Skip them in the displayed total; they still contribute to
-        # status and progress aggregation below.
-        # Fallback when ALL siblings are tier2 (legacy rows without a
-        # primary, or a pure tier-2 trigger): sum them anyway so the row
-        # still shows a non-zero count.
-        primary_children = [c for c in children if not (c.spec or {}).get("tier2")]
-        counting_children = primary_children if primary_children else children
-        total_resources = sum(
-            int((c.spec or {}).get("resource_count") or 0)
-            for c in counting_children
-        )
+        # When `group_storage` is provided (settled COMPLETED rows), prefer
+        # the dedup'd storage_bytes total over the per-job bytes_processed
+        # sum: both Tier-1 (ONEDRIVE/MAILBOX) and Tier-2 (USER_ONEDRIVE/
+        # USER_MAIL) walk the same content, so summing every child Job's
+        # bytes_processed double-counts user drive + mail. The resource
+        # count likewise reflects the union of every child Job's
+        # `batch_resource_ids` so the Activity headline matches what the
+        # Overview tile + the per-user resource list show.
+        #
+        # In-flight rows fall back to the legacy spec.resource_count + live
+        # bytes_processed rollup so the running progress chip keeps moving
+        # before storage_bytes settles.
+        dedup_count, dedup_bytes = group_storage.get(group_key, (0, 0))
+        if dedup_count or dedup_bytes:
+            total_resources = dedup_count
+        else:
+            total_resources = sum(
+                int((c.spec or {}).get("resource_count") or 0)
+                for c in children
+            )
+
         data_backed_up = 0
         total_data = 0
         for c in children:
@@ -152,6 +170,11 @@ def _group_batch_jobs(
                 or (c.result.get("total_bytes", 0) if c.result else 0)
                 or 0
             )
+        # For terminal groups, swap in the dedup'd total. The bytes_processed
+        # sum stays in `data_backed_up` for the in-progress branch below.
+        if dedup_bytes and not any_active:
+            data_backed_up = dedup_bytes
+            total_data = max(total_data, dedup_bytes)
 
         completed_at = [c.completed_at for c in children if c.completed_at]
         finish_iso = max(completed_at).isoformat() if completed_at and not any_active else ""
@@ -779,7 +802,33 @@ async def list_activities(
                 created_key = ""
             groups.setdefault((job.tenant_id, trigger, created_key), []).append(job)
 
-        items.extend(_group_batch_jobs(groups, status_reverse_map))
+        # Per group, compute (deduped_resource_count, deduped_storage_bytes)
+        # from the union of every child's batch_resource_ids. This is the
+        # same dedup the Overview + User-list endpoints use, so the Activity
+        # row headline stays in sync with both.
+        # Each batch_resource_ids is a small UUID[] (≤ ~100 entries); one
+        # query per group is cheap and bounded by the Activity page size.
+        group_storage: Dict[Tuple[Any, str, str], Tuple[int, int]] = {}
+        for group_key, children in groups.items():
+            res_ids: Set[Any] = set()
+            for c in children:
+                for rid in (c.batch_resource_ids or []):
+                    res_ids.add(rid)
+            if not res_ids:
+                continue
+            rs = await db.execute(
+                select(
+                    func.count(Resource.id),
+                    func.coalesce(func.sum(Resource.storage_bytes), 0),
+                ).where(
+                    Resource.id.in_(res_ids),
+                    exclude_tier2_storage_dupes_clause(),
+                )
+            )
+            row = rs.one()
+            group_storage[group_key] = (int(row[0] or 0), int(row[1] or 0))
+
+        items.extend(_group_batch_jobs(groups, status_reverse_map, group_storage))
         # Per-group collapse reduces the post-pagination total.
         job_total -= max(0, len(batch_jobs) - len(groups))
 
