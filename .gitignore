@@ -10,6 +10,11 @@ __pycache__/
 .claude/
 dist/
 build/
+.env.macbook
+macbook_down.sh
+macbook_up.sh
+macbook_wipe.sh
+
 *.whl
 *.pyc
 *.pyo

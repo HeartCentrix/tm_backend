@@ -7733,10 +7733,31 @@ class BackupWorker:
             await session.execute(stmt)
             await session.commit()
 
-    # Maximum prior versions to capture per file. 3 = the 3 most recent
-    # historical versions (current version is captured separately as the live
-    # FILE row). Override per-deployment via env var; expose per-policy later.
-    MAX_FILE_VERSIONS = int(os.environ.get("MAX_FILE_VERSIONS", "3"))
+    # Default 0 — version capture is DISABLED by design.
+    #
+    # FILE_VERSION rows have no UI / API consumer today: the Recovery UI
+    # doesn't expose a per-file version dropdown (verified by grep across
+    # tm_vault/src — zero references), and no backend endpoint surfaces
+    # them for restore. Capturing them is pure waste: Graph quota, Seaweed
+    # storage, Postgres rows for data nobody can access.
+    #
+    # Industry comparison: AFI / Veeam / Avepoint / Spanning don't call
+    # the Microsoft Graph /versions API either. They achieve the
+    # equivalent "version history" UX by running backups frequently
+    # (3×/day for our Taylor Morrison config = 3 recovery points per day
+    # without touching /versions). The snapshot dropdown already in the
+    # Recovery UI provides this experience.
+    #
+    # When the per-file version restore UI is built (future product
+    # work), bump the default to 3 AND deploy the deferred-fan-out
+    # design in /Users/amit/.claude/plans/cuddly-marinating-shell.md so
+    # version capture doesn't block Snapshot.status=COMPLETED.
+    #
+    # History:
+    #   2026-04-17 commit 81b8a30 (akshat.verma) — feature introduced
+    #   2026-05-14 commit 7b58ef7 (rsharmaHC)    — 3-tier streaming + bulk listing
+    #   2026-05-14                                  — default disabled to 0
+    MAX_FILE_VERSIONS = int(os.environ.get("MAX_FILE_VERSIONS", "0"))
 
     # Office file extensions that have meaningful version history in Graph.
     # Other binary types (PDFs, images, archives, video, code…) either don't
