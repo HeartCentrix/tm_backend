@@ -147,9 +147,26 @@ def build_batch_rollup_query(
             BOOL_OR(j.status::text = 'CANCELLED')                  AS any_cancelled,
             BOOL_OR(j.status::text = 'FAILED')                     AS any_job_failed,
             BOOL_AND(j.status::text IN ('COMPLETED','FAILED','CANCELLED'))
-                                                                    AS all_jobs_terminal
+                                                                    AS all_jobs_terminal,
+            -- For non-bulk single-Job batches (no batch_resource_ids),
+            -- carry through job.resource_id so we can resolve a real
+            -- display name instead of falling back to "Bulk Operation".
+            -- COUNT()=1 + MIN()=MAX() guarantees single Job.
+            COUNT(*)                                               AS job_count,
+            -- PG has no MIN/MAX for uuid; array_agg + [1] pulls the
+            -- single resource_id when job_count=1.
+            (ARRAY_AGG(j.resource_id))[1]                          AS single_resource_id
         FROM filtered_jobs j
         GROUP BY 1, 2
+    ),
+    single_res AS (
+        SELECT
+            b.batch_id,
+            r.display_name AS single_resource_name,
+            r.type::text   AS single_resource_type
+        FROM batches b
+        LEFT JOIN resources r ON r.id = b.single_resource_id
+        WHERE b.job_count = 1 AND b.single_resource_id IS NOT NULL
     ),
     batch_res AS (
         -- Flatten batch_resource_ids per batch via lateral unnest.
@@ -257,12 +274,15 @@ def build_batch_rollup_query(
         COALESCE(sr.snap_failed, 0)         AS snap_failed,
         COALESCE(sr.snap_pending, 0)        AS snap_pending,
         COALESCE(pr.parts_pending, 0)       AS parts_pending,
-        COALESCE(f.missing_t2, 0)           AS missing_t2
+        COALESCE(f.missing_t2, 0)           AS missing_t2,
+        sres.single_resource_name           AS single_resource_name,
+        sres.single_resource_type           AS single_resource_type
     FROM batches b
     LEFT JOIN snap_roll   sr ON sr.batch_id = b.batch_id
     LEFT JOIN parts_roll  pr ON pr.batch_id = b.batch_id
     LEFT JOIN fanout       f ON f.batch_id  = b.batch_id
     LEFT JOIN entra_count ec ON ec.batch_id = b.batch_id
+    LEFT JOIN single_res  sres ON sres.batch_id = b.batch_id
     ORDER BY b.started_at DESC NULLS LAST
     LIMIT :size OFFSET :off
     """
@@ -317,12 +337,17 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
     # Resource-count display: "9 users" if the batch targets
     # ENTRA_USERs (the M365 click scope), else the total. Never the
     # post-fan-out leaf count — that's noise from the user's POV.
+    # For non-bulk single-Job backups (per-resource "Backup now"),
+    # prefer the resource display name to match legacy UX.
     entra = int(row.entra_user_count or 0)
     total = int(row.total_resource_count or 0)
+    single_name = getattr(row, "single_resource_name", None)
     if entra > 0:
         obj_label = f"{entra} users"
     elif total > 0:
         obj_label = f"{total} resources"
+    elif single_name:
+        obj_label = single_name
     else:
         obj_label = "Bulk Operation"
 
