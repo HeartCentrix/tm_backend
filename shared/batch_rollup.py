@@ -147,20 +147,24 @@ def build_batch_rollup_query(
             BOOL_OR(j.status::text = 'CANCELLED')                  AS any_cancelled,
             BOOL_OR(j.status::text = 'FAILED')                     AS any_job_failed,
             BOOL_AND(j.status::text IN ('COMPLETED','FAILED','CANCELLED'))
-                                                                    AS all_jobs_terminal,
-            -- Flatten batch_resource_ids across all child Jobs in the
-            -- batch. NULLs from non-bulk Jobs are coalesced to an
-            -- empty array so unnest stays safe.
-            COALESCE(
-                ARRAY(
-                    SELECT DISTINCT bid
-                    FROM unnest(ARRAY_AGG(COALESCE(j.batch_resource_ids, ARRAY[]::uuid[]))) AS arr,
-                         unnest(arr) AS bid
-                ),
-                ARRAY[]::uuid[]
-            )                                                       AS all_res_ids
+                                                                    AS all_jobs_terminal
         FROM filtered_jobs j
         GROUP BY 1, 2
+    ),
+    batch_res AS (
+        -- Flatten batch_resource_ids per batch via lateral unnest.
+        -- Avoids ARRAY_AGG(uuid[]) which fails on jagged arrays and
+        -- the unnest(uuid[][]) → scalar gotcha. NULLs coalesced to
+        -- empty array so the LATERAL stays safe.
+        SELECT
+            COALESCE(j.spec->>'batch_id', j.id::text) AS batch_id,
+            COALESCE(
+                ARRAY_AGG(DISTINCT bid) FILTER (WHERE bid IS NOT NULL),
+                ARRAY[]::uuid[]
+            ) AS all_res_ids
+        FROM filtered_jobs j
+        LEFT JOIN LATERAL unnest(COALESCE(j.batch_resource_ids, ARRAY[]::uuid[])) AS bid ON TRUE
+        GROUP BY 1
     ),
     snap_roll AS (
         SELECT
@@ -195,10 +199,10 @@ def build_batch_rollup_query(
         -- child) tells us which Tier-2 children we EXPECT to see
         -- regardless of whether the Tier-2 Jobs have spawned yet.
         SELECT
-            b.batch_id,
+            br.batch_id,
             r2.id AS child_resource_id
-        FROM batches b
-        CROSS JOIN LATERAL unnest(b.all_res_ids) AS bid
+        FROM batch_res br
+        CROSS JOIN LATERAL unnest(br.all_res_ids) AS bid
         JOIN resources r1 ON r1.id = bid AND r1.type::text = 'ENTRA_USER'
         JOIN resources r2 ON r2.parent_resource_id = r1.id
                          AND r2.type::text IN (
@@ -207,10 +211,10 @@ def build_batch_rollup_query(
     ),
     observed_t2 AS (
         SELECT DISTINCT
-            b.batch_id,
+            br.batch_id,
             bid AS child_resource_id
-        FROM batches b
-        CROSS JOIN LATERAL unnest(b.all_res_ids) AS bid
+        FROM batch_res br
+        CROSS JOIN LATERAL unnest(br.all_res_ids) AS bid
     ),
     fanout AS (
         SELECT
@@ -224,11 +228,11 @@ def build_batch_rollup_query(
     ),
     entra_count AS (
         SELECT
-            b.batch_id,
+            br.batch_id,
             COUNT(*) FILTER (WHERE r.type::text = 'ENTRA_USER') AS entra_user_count,
             COUNT(*)                                            AS total_resource_count
-        FROM batches b
-        CROSS JOIN LATERAL unnest(b.all_res_ids) AS bid
+        FROM batch_res br
+        CROSS JOIN LATERAL unnest(br.all_res_ids) AS bid
         LEFT JOIN resources r ON r.id = bid
         GROUP BY 1
     )
