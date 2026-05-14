@@ -343,9 +343,9 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
     total = int(row.total_resource_count or 0)
     single_name = getattr(row, "single_resource_name", None)
     if entra > 0:
-        obj_label = f"{entra} users"
+        obj_label = f"{entra} user" if entra == 1 else f"{entra} users"
     elif total > 0:
-        obj_label = f"{total} resources"
+        obj_label = f"{total} resource" if total == 1 else f"{total} resources"
     elif single_name:
         obj_label = single_name
     else:
