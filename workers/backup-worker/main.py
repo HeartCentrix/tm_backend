@@ -3058,9 +3058,20 @@ class BackupWorker:
                             if fid is None or fid in _shard_set
                         ]
                         _running_as_mail_shard = True
+                        # Bug #195: prepend [shard X/N] to user_label_mail
+                        # so parallel mail shards on the same mailbox
+                        # don't print identical-looking progress lines.
+                        _mp_idx = (message or {}).get("partitionIndex")
+                        _mp_total = (message or {}).get("partitionTotal")
+                        if _mp_idx is not None and _mp_total:
+                            user_label_mail = (
+                                f"[shard {int(_mp_idx) + 1}/"
+                                f"{int(_mp_total)}] {user_label_mail}"
+                            )
                         print(
-                            f"[{self.worker_id}] [USER_MAIL] partition "
-                            f"consumer: draining "
+                            f"[{self.worker_id}] [USER_MAIL] "
+                            f"{user_label_mail}: partition consumer — "
+                            f"draining "
                             f"{len([f for f in mail_folder_ids if f])} "
                             f"folders in this shard"
                         )
@@ -4235,10 +4246,24 @@ class BackupWorker:
                             if cid in _shard_set
                         ]
                         _running_as_chat_shard = True
+                        # Bug #195: prepend [shard X/N] to user_label so
+                        # every progress log line from this drain
+                        # disambiguates its shard. Pre-fix, N parallel
+                        # shards on the same user printed identical
+                        # "<user>: K/M chats, J msgs so far" lines and
+                        # the operator's tail looked like duplicates.
+                        _p_idx = (message or {}).get("partitionIndex")
+                        _p_total = (message or {}).get("partitionTotal")
+                        if _p_idx is not None and _p_total:
+                            user_label = (
+                                f"[shard {int(_p_idx) + 1}/{int(_p_total)}] "
+                                f"{user_label}"
+                            )
                         print(
-                            f"[{self.worker_id}] [USER_CHATS] partition "
-                            f"consumer: draining {len(chat_ids_to_drain)} "
-                            f"chats in this shard"
+                            f"[{self.worker_id}] [USER_CHATS] "
+                            f"{user_label}: partition consumer — "
+                            f"draining {len(chat_ids_to_drain)} chats "
+                            f"in this shard"
                         )
                     elif self._should_partition_chats(chat_ids_to_drain):
                         # Coordinator role — fan out + return early.
@@ -9021,6 +9046,26 @@ class BackupWorker:
         # resource_id) and resumes the existing snapshot. Items land
         # under the SAME snapshot_id the coordinator created; the
         # last-finisher flips status.
+        # Total shard count for this snapshot — used by the
+        # USER_CHATS branch to label every progress log with a
+        # [shard X/N] prefix. Without this, N parallel shards all
+        # log "<user>: K/M chats, J msgs so far" and look like
+        # duplicates in the operator's tail. One COUNT(*) per shard
+        # is negligible (the table is tiny).
+        total_partitions = 0
+        try:
+            async with async_session_factory() as session:
+                row = (await session.execute(
+                    text(
+                        "SELECT COUNT(*)::int AS n FROM snapshot_partitions "
+                        "WHERE snapshot_id = :sid"
+                    ),
+                    {"sid": str(snapshot_id)},
+                )).first()
+                total_partitions = int(row[0] or 0) if row else 0
+        except Exception:
+            total_partitions = 0
+
         synth_msg: Dict[str, Any] = {
             "jobId": str(job_id),
             "resourceId": str(resource_id),
@@ -9029,6 +9074,8 @@ class BackupWorker:
             "priority": 3,
             "partitionFilter": {"chatIds": shard_chat_ids},
             "partitionId": str(partition_id),
+            "partitionIndex": partition_index,
+            "partitionTotal": total_partitions,
         }
 
         tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
@@ -9283,6 +9330,24 @@ class BackupWorker:
             )
             return
 
+        # Bug #195: thread shard index + total so the USER_MAIL
+        # branch can prefix [shard X/N] on its progress log lines.
+        # Without this, N parallel shards print identical
+        # "<user>: K/M folders, J msgs" lines and look like duplicates.
+        total_partitions = 0
+        try:
+            async with async_session_factory() as session:
+                row = (await session.execute(
+                    text(
+                        "SELECT COUNT(*)::int AS n FROM snapshot_partitions "
+                        "WHERE snapshot_id = :sid"
+                    ),
+                    {"sid": str(snapshot_id)},
+                )).first()
+                total_partitions = int(row[0] or 0) if row else 0
+        except Exception:
+            total_partitions = 0
+
         synth_msg: Dict[str, Any] = {
             "jobId": str(job_id),
             "resourceId": str(resource_id),
@@ -9291,6 +9356,8 @@ class BackupWorker:
             "priority": 3,
             "partitionFilter": {"folderIds": shard_folder_ids},
             "partitionId": str(partition_id),
+            "partitionIndex": partition_index,
+            "partitionTotal": total_partitions,
         }
 
         tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
@@ -9563,6 +9630,21 @@ class BackupWorker:
             )
             return
 
+        # Bug #195: thread shard index + total for SharePoint shards.
+        total_partitions = 0
+        try:
+            async with async_session_factory() as session:
+                row = (await session.execute(
+                    text(
+                        "SELECT COUNT(*)::int AS n FROM snapshot_partitions "
+                        "WHERE snapshot_id = :sid"
+                    ),
+                    {"sid": str(snapshot_id)},
+                )).first()
+                total_partitions = int(row[0] or 0) if row else 0
+        except Exception:
+            total_partitions = 0
+
         synth_msg: Dict[str, Any] = {
             "jobId": str(job_id),
             "resourceId": str(resource_id),
@@ -9571,6 +9653,8 @@ class BackupWorker:
             "priority": 3,
             "partitionFilter": {"driveIds": shard_drive_ids},
             "partitionId": str(partition_id),
+            "partitionIndex": partition_index,
+            "partitionTotal": total_partitions,
         }
 
         tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
@@ -11674,6 +11758,14 @@ class BackupWorker:
                             if fid is None or fid in _shard_set
                         ]
                         _running_as_mail_shard = True
+                        # Bug #195: shard prefix on Tier-1 MAILBOX too.
+                        _mbx_idx = (message or {}).get("partitionIndex")
+                        _mbx_total = (message or {}).get("partitionTotal")
+                        if _mbx_idx is not None and _mbx_total:
+                            user_label = (
+                                f"[shard {int(_mbx_idx) + 1}/"
+                                f"{int(_mbx_total)}] {user_label}"
+                            )
                         print(
                             f"[{self.worker_id}] [MAILBOX] "
                             f"{user_label}: partition consumer — "
@@ -17506,6 +17598,20 @@ class BackupWorker:
                                id
                         FROM jobs WHERE id = :jid
                     ),
+                    parts_pending AS (
+                        -- Partition consumers commit their snapshot.bytes_added
+                        -- AFTER the snapshot status flips terminal (see
+                        -- ``_finalize_partitioned_snapshot``). If a sibling
+                        -- resource's rollup-call lands while partition rows
+                        -- are still QUEUED/CLAIMED/IN_PROGRESS, we must NOT
+                        -- flip the parent terminal yet — workers are still
+                        -- draining work that hasn't been folded into
+                        -- bytes_added. Gate the status flip on this count.
+                        SELECT COUNT(*) AS n_pending
+                        FROM snapshot_partitions
+                        WHERE job_id = :jid
+                          AND status NOT IN ('COMPLETED', 'FAILED')
+                    ),
                     counts AS (
                         SELECT
                           COUNT(*) FILTER (
@@ -17523,18 +17629,21 @@ class BackupWorker:
                     UPDATE jobs j SET
                         -- One-shot status flip: preserve any already-
                         -- terminal status (so we don't re-flip), else
-                        -- flip only when every child is terminal.
+                        -- flip only when every child snapshot is terminal
+                        -- AND every partition row (across all children)
+                        -- has reached COMPLETED/FAILED.
                         status = (CASE
                             WHEN e.prev_status IN (
                                 'COMPLETED','FAILED','CANCELLED','CANCELLING'
                             ) THEN j.status
                             WHEN c.terminal < e.n THEN j.status
+                            WHEN p.n_pending > 0 THEN j.status
                             WHEN c.completed = 0 AND c.partial = 0 THEN 'FAILED'::jobstatus
                             ELSE 'COMPLETED'::jobstatus
                         END),
                         completed_at = (CASE
                             WHEN e.prev_completed_at IS NOT NULL THEN j.completed_at
-                            WHEN c.terminal = e.n THEN NOW()
+                            WHEN c.terminal = e.n AND p.n_pending = 0 THEN NOW()
                             ELSE j.completed_at
                         END),
                         progress_pct = (CASE
@@ -17557,14 +17666,16 @@ class BackupWorker:
                             'snapshots_failed', c.failed,
                             'snapshots_partial', c.partial,
                             'items_processed', c.items,
-                            'bytes_processed', c.bytes
+                            'bytes_processed', c.bytes,
+                            'partitions_pending', p.n_pending
                         )
-                    FROM counts c, expected e
+                    FROM counts c, expected e, parts_pending p
                     WHERE j.id = :jid
                       AND e.n > 0
                     RETURNING j.status::text AS new_status,
                               e.prev_status AS prev_status,
-                              c.terminal, e.n
+                              c.terminal, e.n,
+                              p.n_pending AS parts_pending
                 """),
                 {"jid": job_id},
             )).first()
@@ -17575,6 +17686,9 @@ class BackupWorker:
             prev_status = row.prev_status if hasattr(row, "prev_status") else row[1]
             terminal = row.terminal if hasattr(row, "terminal") else row[2]
             expected = row.n if hasattr(row, "n") else row[3]
+            parts_pending = (
+                row.parts_pending if hasattr(row, "parts_pending") else row[4]
+            )
             # Only log on the actual flip (prev was non-terminal, now
             # terminal). Late-arriving bytes-only reconcile calls fire
             # silently — they update bytes_processed but don't flip
@@ -17582,12 +17696,25 @@ class BackupWorker:
             terminal_states = {"COMPLETED", "FAILED", "CANCELLED", "CANCELLING"}
             if (prev_status not in terminal_states
                 and new_status in ("COMPLETED", "FAILED")
-                and int(terminal) >= int(expected)):
+                and int(terminal) >= int(expected)
+                and int(parts_pending) == 0):
                 print(
                     f"[{self.worker_id}] [FANOUT/FINALIZE] job={job_id} "
-                    f"→ {new_status} ({terminal}/{expected} children terminal)"
+                    f"→ {new_status} ({terminal}/{expected} children terminal, "
+                    f"all partitions drained)"
                 )
                 return new_status
+            # Observability: children all terminal but partitions still
+            # draining — the gate is doing its job. Will re-fire when
+            # _finalize_partitioned_snapshot calls back.
+            if (prev_status not in terminal_states
+                and int(terminal) >= int(expected)
+                and int(parts_pending) > 0):
+                print(
+                    f"[{self.worker_id}] [FANOUT/FINALIZE] job={job_id} "
+                    f"→ HOLD ({terminal}/{expected} children terminal, "
+                    f"{parts_pending} partition(s) still pending)"
+                )
             return None
         except Exception as exc:
             # Finalizer is a best-effort flip — failures are caught by

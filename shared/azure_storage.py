@@ -917,10 +917,15 @@ class AzureStorageManager:
         Generate container name following Azure naming conventions.
         Containers must be lowercase, 3-63 chars, only alphanumeric and hyphens.
         """
+        # Defensive: accept UUID-objects as well as strings. Callers in
+        # the cancel-cleanup path occasionally pass `tenant.id` (a UUID)
+        # directly; UUID has no `.replace()` and would raise AttributeError.
+        # str(UUID) is the canonical hyphenated form so this is loss-free.
+        tenant_id_s = str(tenant_id) if tenant_id is not None else ""
         # Shorten tenant/tenant ID to avoid exceeding 63 char limit
-        tenant_short = tenant_id.replace("-", "")[:8]
+        tenant_short = tenant_id_s.replace("-", "")[:8]
         # Replace underscores with hyphens (Azure container names don't allow underscores)
-        safe_type = resource_type.lower().replace("_", "-")
+        safe_type = str(resource_type).lower().replace("_", "-")
         return f"backup-{safe_type}-{tenant_short}"
     
     def build_blob_path(self, tenant_id: str, resource_id: str, 
