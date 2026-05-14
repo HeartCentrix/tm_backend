@@ -126,7 +126,7 @@ def build_batch_rollup_query(
     Measured at ~80 ms on a 10 k-job tenant in similar audit-service
     aggregate queries.
     """
-    op_filter = "AND j.type = :op" if operation else ""
+    op_filter = "AND j.type::text = :op" if operation else ""
     sql = f"""
     WITH filtered_jobs AS (
         SELECT *
