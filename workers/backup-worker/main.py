@@ -2600,8 +2600,13 @@ class BackupWorker:
         # Chunked publish — 200 per gather keeps RMQ channel within
         # the aio-pika windowed publish budget. asyncio.gather makes
         # them concurrent; aio-pika's send-confirm is per-publish.
+        # Per-resource failure tracking: any resource whose publish
+        # raised needs its bulk_fanout_seen row rolled back so a
+        # bulk-message redelivery can retry it; without rollback the
+        # dedup table would silently drop unpublished resources on
+        # the retry.
         sent = 0
-        failed = 0
+        failed_resource_ids: List[str] = []
         CHUNK = int(os.environ.get("BACKUP_FANOUT_PUBLISH_CHUNK", "200"))
         for i in range(0, len(to_publish), CHUNK):
             batch = to_publish[i:i + CHUNK]
@@ -2612,11 +2617,52 @@ class BackupWorker:
                 ],
                 return_exceptions=True,
             )
-            for res in results:
+            for (_q, _m, rid_for_pub), res in zip(batch, results):
                 if isinstance(res, Exception):
-                    failed += 1
+                    failed_resource_ids.append(rid_for_pub)
                 else:
                     sent += 1
+        failed = len(failed_resource_ids)
+
+        # Roll back bulk_fanout_seen rows for resources whose publish
+        # failed. Without this, redelivery would see the row and skip
+        # the retry, leaving those resources unbacked-up forever.
+        if failed_resource_ids:
+            try:
+                async with async_session_factory() as session:
+                    await session.execute(
+                        text(
+                            """
+                            DELETE FROM bulk_fanout_seen
+                             WHERE job_id = :jid::uuid
+                               AND resource_id = ANY(
+                                   SELECT unnest(:rids)::uuid
+                               )
+                            """
+                        ),
+                        {
+                            "jid": str(job_id),
+                            "rids": failed_resource_ids,
+                        },
+                    )
+                    await session.commit()
+                print(
+                    f"[{self.worker_id}] [FANOUT] rolled back "
+                    f"{len(failed_resource_ids)} bulk_fanout_seen rows "
+                    f"for failed publishes (will retry on bulk redelivery)"
+                )
+            except Exception as exc:
+                # If rollback fails too, the failed resources stay
+                # blocked. Loud log so operator can clean up by hand
+                # if needed. Worst case = those resources don't get
+                # backed up until the next manual trigger; create_snapshot
+                # will still accept them in a new bulk run.
+                print(
+                    f"[{self.worker_id}] [FANOUT] bulk_fanout_seen "
+                    f"rollback FAILED for {len(failed_resource_ids)} "
+                    f"failed-publish resources: {exc} — these resources "
+                    f"may not retry on bulk redelivery"
+                )
 
         if failed:
             # Some publishes failed. The bulk message will be rejected
