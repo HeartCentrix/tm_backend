@@ -5,7 +5,7 @@ import os
 import httpx
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import AsyncGenerator, AsyncIterator, Iterator, List, Optional, Dict, Any, Tuple
+from typing import AsyncGenerator, AsyncIterator, Iterator, List, Optional, Dict, Any, Set, Tuple
 from datetime import datetime, timedelta
 import hashlib
 import time
@@ -2234,6 +2234,7 @@ class GraphClient:
         site_id: str,
         drive_delta_tokens: Optional[Dict[str, str]] = None,
         drive_delta_holder: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
+        allowed_drive_ids: Optional[Set[str]] = None,
     ):
         """Enumerate every drive on the site, then delta-iterate each.
         Yields the same drive-item dicts as
@@ -2247,6 +2248,11 @@ class GraphClient:
         ``drive_delta_holder`` — optional ``{drive_id: {"deltaLink": ...}}``
         written during iteration so callers can persist the new tokens
         after consuming the stream.
+
+        ``allowed_drive_ids`` — optional drive_id allowlist. When set,
+        drives not in the set are skipped entirely (per-shard scoping
+        for the cross-replica partition split). Default ``None`` means
+        iterate every drive on the site (full-site backup path).
         """
         drive_delta_tokens = drive_delta_tokens or {}
         drives = await self.list_sharepoint_site_drives(site_id)
@@ -2254,6 +2260,8 @@ class GraphClient:
             drive_id = drv.get("id")
             drive_name = drv.get("name") or drive_id
             if not drive_id:
+                continue
+            if allowed_drive_ids is not None and drive_id not in allowed_drive_ids:
                 continue
             local_holder: Dict[str, Optional[str]] = {"deltaLink": None}
             async for item in self.iter_drive_items_by_id(

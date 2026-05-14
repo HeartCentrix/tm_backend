@@ -848,6 +848,67 @@ async def init_db() -> None:
             UNIQUE (chat_thread_id, message_external_id)
         )
         """,
+        # snapshot_partitions — cross-replica OneDrive partition split.
+        # One row per shard of a partitioned USER_ONEDRIVE snapshot;
+        # multiple backup_worker replicas drain one drive in parallel.
+        # Mirrors `SnapshotPartition` in shared/models.py. The FK to
+        # snapshots uses ON DELETE CASCADE so deleting a partitioned
+        # snapshot reaps its shard rows automatically.
+        """
+        CREATE TABLE IF NOT EXISTS snapshot_partitions (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            snapshot_id UUID NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+            tenant_id UUID NOT NULL,
+            resource_id UUID NOT NULL,
+            job_id UUID NOT NULL,
+            partition_type VARCHAR NOT NULL DEFAULT 'ONEDRIVE_FILES',
+            drive_id TEXT,
+            partition_index INTEGER NOT NULL,
+            file_ids JSON,
+            payload JSON,
+            total_files INTEGER NOT NULL DEFAULT 0,
+            total_bytes_est BIGINT NOT NULL DEFAULT 0,
+            status VARCHAR NOT NULL DEFAULT 'QUEUED',
+            worker_id VARCHAR,
+            worker_region VARCHAR,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            enqueued_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            files_uploaded INTEGER NOT NULL DEFAULT 0,
+            bytes_uploaded BIGINT NOT NULL DEFAULT 0,
+            failure_state JSON,
+            UNIQUE (snapshot_id, partition_index)
+        )
+        """,
+        # mail_folder_delta — per-folder Graph delta tokens for the
+        # four mailbox resource types (USER_MAIL, MAILBOX,
+        # SHARED_MAILBOX, ROOM_MAILBOX). Replaces the JSON dict that
+        # used to live in resources.extra_data; the dict was unsafe
+        # under concurrent folder drains (RMW race). Promoting each
+        # (resource_id, folder_id) to its own row makes writes
+        # commute under per-row locks.
+        """
+        CREATE TABLE IF NOT EXISTS mail_folder_delta (
+            resource_id UUID NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+            folder_id TEXT NOT NULL,
+            delta_token TEXT NOT NULL,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (resource_id, folder_id)
+        )
+        """,
+        # sharepoint_drive_delta — per-drive Graph delta tokens for
+        # SHAREPOINT_SITE resources. Same fix for the same RMW
+        # pattern in resources.extra_data['drive_delta_tokens_by_site'].
+        """
+        CREATE TABLE IF NOT EXISTS sharepoint_drive_delta (
+            resource_id UUID NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+            drive_id TEXT NOT NULL,
+            delta_token TEXT NOT NULL,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (resource_id, drive_id)
+        )
+        """,
     ]
 
     index_statements = [
@@ -925,9 +986,43 @@ async def init_db() -> None:
         # Hot read path: hydrate a chat thread newest-first.
         "CREATE INDEX IF NOT EXISTS ix_chat_thread_messages_thread_time "
         "ON chat_thread_messages (chat_thread_id, created_date_time DESC)",
+        # snapshot_partitions — finalizer + stale-sweep hot paths.
+        # Finalizer: SELECT WHERE snapshot_id=... AND status=...
+        # Sweep: oldest enqueued non-terminal first.
+        "CREATE INDEX IF NOT EXISTS ix_snap_partition_status "
+        "ON snapshot_partitions (snapshot_id, status)",
+        "CREATE INDEX IF NOT EXISTS ix_snap_partition_claim "
+        "ON snapshot_partitions (enqueued_at) "
+        "WHERE status IN ('QUEUED', 'IN_PROGRESS')",
     ]
 
     add_column_statements = [
+        # snapshot_partitions — Phase-2 generalization for multi-workload
+        # + multi-region reuse. New columns are nullable / defaulted so
+        # existing OneDrive rows (Phase 1) keep working unchanged.
+        # IMPORTANT: the ALTER TABLEs run BEFORE everything else in this
+        # list so subsequent statements can reference the new columns
+        # safely if needed.
+        "ALTER TABLE snapshot_partitions "
+        "ADD COLUMN IF NOT EXISTS partition_type VARCHAR NOT NULL DEFAULT 'ONEDRIVE_FILES';",
+        "ALTER TABLE snapshot_partitions "
+        "ADD COLUMN IF NOT EXISTS payload JSON;",
+        "ALTER TABLE snapshot_partitions "
+        "ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE snapshot_partitions "
+        "ADD COLUMN IF NOT EXISTS worker_region VARCHAR;",
+        # drive_id was NOT NULL in Phase 1 (OneDrive-only). Loosen so
+        # CHATS / MAIL_FOLDERS / SHAREPOINT_DRIVES rows don't need a
+        # synthetic value. OneDrive rows still set it; consumer code
+        # validates per partition_type.
+        "ALTER TABLE snapshot_partitions "
+        "ALTER COLUMN drive_id DROP NOT NULL;",
+        # file_ids was NOT NULL in Phase 1. Same reasoning.
+        "ALTER TABLE snapshot_partitions "
+        "ALTER COLUMN file_ids DROP NOT NULL;",
+        # Cover the new partition_type filter on hot finalize queries.
+        "CREATE INDEX IF NOT EXISTS ix_snap_partition_type_status "
+        "ON snapshot_partitions (snapshot_id, partition_type, status);",
         # P2: soft-delete columns on tenants + chat_thread tables. A
         # tenant or chat marked with archived_at is invisible to read
         # paths but physically present until the 30-day purge worker

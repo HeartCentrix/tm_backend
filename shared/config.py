@@ -339,6 +339,123 @@ class Settings:
             "ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY", "8",
         ))
 
+        # ── OneDrive cross-replica partition split ──
+        # When a single OneDrive's file work would otherwise pin one
+        # backup_worker replica, partition the file_items list into N
+        # shards and publish one message per shard so multiple replicas
+        # drain the same drive in parallel. Default ON. Falls back to
+        # the inline path for drives below the size/file thresholds.
+        #
+        # Routing:  backup.onedrive_partition (own queue lane, prefetch=2).
+        # Gate:     drive_quota_used >= MIN_BYTES AND len(file_items) >= MIN_FILES.
+        # Shards:   min(MAX_SHARDS, ceil(total_bytes / TARGET_BYTES_PER_SHARD)).
+        # Cap:      MAX_SHARDS=4 → at most 4 partitions per snapshot, matching
+        #           a typical 4× backup_worker replica count on Railway.
+        self.ONEDRIVE_PARTITION_ENABLED = os.getenv(
+            "ONEDRIVE_PARTITION_ENABLED", "true",
+        ).lower() in ("true", "1", "yes")
+        self.ONEDRIVE_PARTITION_MIN_BYTES = int(os.getenv(
+            "ONEDRIVE_PARTITION_MIN_BYTES", str(5 * 1024 * 1024 * 1024),
+        ))
+        self.ONEDRIVE_PARTITION_MIN_FILES = int(os.getenv(
+            "ONEDRIVE_PARTITION_MIN_FILES", "200",
+        ))
+        self.ONEDRIVE_PARTITION_MAX_SHARDS = int(os.getenv(
+            "ONEDRIVE_PARTITION_MAX_SHARDS", "4",
+        ))
+        self.ONEDRIVE_PARTITION_TARGET_BYTES_PER_SHARD = int(os.getenv(
+            "ONEDRIVE_PARTITION_TARGET_BYTES_PER_SHARD",
+            str(20 * 1024 * 1024 * 1024),
+        ))
+        # Partition consumer's per-shard timeout. Default 6h matches the
+        # legacy per-file timeout; a stuck shard past this triggers
+        # stale-sweep retry.
+        self.ONEDRIVE_PARTITION_STALE_SWEEP_MIN = int(os.getenv(
+            "ONEDRIVE_PARTITION_STALE_SWEEP_MIN", "30",
+        ))
+
+        # ── USER_CHATS cross-replica partition ──
+        # Whale-user chat backups (a single user with hundreds of chats
+        # across many teams + 1:1s) partition by chat-id batches so
+        # multiple backup_worker replicas drain the same user's chats in
+        # parallel. Each shard reuses the existing USER_CHATS pipeline
+        # with a `chat_ids_filter` scoping its drain to the shard's chats.
+        # Default ON; falls back to inline when the user has fewer chats
+        # than MIN_CHATS.
+        self.CHATS_PARTITION_ENABLED = os.getenv(
+            "CHATS_PARTITION_ENABLED", "true",
+        ).lower() in ("true", "1", "yes")
+        self.CHATS_PARTITION_MIN_CHATS = int(os.getenv(
+            "CHATS_PARTITION_MIN_CHATS", "100",
+        ))
+        self.CHATS_PARTITION_TARGET_CHATS_PER_SHARD = int(os.getenv(
+            "CHATS_PARTITION_TARGET_CHATS_PER_SHARD", "50",
+        ))
+        self.CHATS_PARTITION_MAX_SHARDS = int(os.getenv(
+            "CHATS_PARTITION_MAX_SHARDS", "4",
+        ))
+
+        # ── Phase 3.2: Mail partition (covers USER_MAIL / MAILBOX /
+        # SHARED_MAILBOX / ROOM_MAILBOX — all four share the same
+        # backup_mailbox handler, so one set of flags applies). ──
+        self.MAIL_PARTITION_ENABLED = os.getenv(
+            "MAIL_PARTITION_ENABLED", "true",
+        ).lower() in ("true", "1", "yes")
+        # Minimum folder count to consider partitioning. Smaller
+        # mailboxes are dominated by single-folder drains, not folder
+        # fan-out, so partitioning adds overhead without benefit.
+        self.MAIL_PARTITION_MIN_FOLDERS = int(os.getenv(
+            "MAIL_PARTITION_MIN_FOLDERS", "20",
+        ))
+        # Minimum total mailbox bytes (sum of folder sizeInBytes) for
+        # partition split. 2 GiB default — typical enterprise mailbox
+        # threshold beyond which single-replica drain serializes too
+        # much I/O.
+        self.MAIL_PARTITION_MIN_BYTES = int(os.getenv(
+            "MAIL_PARTITION_MIN_BYTES", str(2 * 1024 * 1024 * 1024),
+        ))
+        self.MAIL_PARTITION_MAX_SHARDS = int(os.getenv(
+            "MAIL_PARTITION_MAX_SHARDS", "4",
+        ))
+        self.MAIL_PARTITION_TARGET_BYTES_PER_SHARD = int(os.getenv(
+            "MAIL_PARTITION_TARGET_BYTES_PER_SHARD",
+            str(2 * 1024 * 1024 * 1024),
+        ))
+
+        # ── Phase 3.3: SharePoint site partition (by drive list) ──
+        self.SP_PARTITION_ENABLED = os.getenv(
+            "SP_PARTITION_ENABLED", "true",
+        ).lower() in ("true", "1", "yes")
+        self.SP_PARTITION_MIN_DRIVES = int(os.getenv(
+            "SP_PARTITION_MIN_DRIVES", "3",
+        ))
+        self.SP_PARTITION_MIN_BYTES = int(os.getenv(
+            "SP_PARTITION_MIN_BYTES", str(5 * 1024 * 1024 * 1024),
+        ))
+        self.SP_PARTITION_MAX_SHARDS = int(os.getenv(
+            "SP_PARTITION_MAX_SHARDS", "4",
+        ))
+        self.SP_PARTITION_TARGET_BYTES_PER_SHARD = int(os.getenv(
+            "SP_PARTITION_TARGET_BYTES_PER_SHARD",
+            str(20 * 1024 * 1024 * 1024),
+        ))
+
+        # ── Generic partition resilience knobs ──
+        # Per-tenant concurrency cap on partition shards (across all
+        # partition_types). Prevents one tenant's whale OneDrive +
+        # whale chats from monopolizing every partition slot on a
+        # replica when other tenants also want service.
+        self.MAX_CONCURRENT_PARTITIONS_PER_TENANT = int(os.getenv(
+            "MAX_CONCURRENT_PARTITIONS_PER_TENANT", "2",
+        ))
+        # Stale-sweep retry budget — once retry_count crosses this
+        # threshold, the partition row is marked FAILED and stops
+        # being re-published. The parent snapshot then flips to
+        # PARTIAL on the next finalize.
+        self.PARTITION_MAX_RETRIES = int(os.getenv(
+            "PARTITION_MAX_RETRIES", "5",
+        ))
+
         # ── Heavy backup pool ──
         # Default on: route OneDrive drives above the heavy threshold to
         # backup.heavy so one monster drive doesn't starve every regular

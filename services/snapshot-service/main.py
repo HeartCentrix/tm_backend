@@ -477,6 +477,61 @@ async def get_snapshot(snapshot_id: str, db: AsyncSession = Depends(get_db)):
     snapshot = result.scalar_one_or_none()
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    # Partition rollup — populated only when this snapshot was sharded
+    # by the cross-replica partition path. Non-partitioned snapshots
+    # return `partitions: null` (backward compatible). Single join +
+    # GROUP BY covers all partition_types (ONEDRIVE_FILES / CHATS /
+    # MAIL_FOLDERS / SHAREPOINT_DRIVES) — the discriminator is opaque
+    # to the rollup; ops uses it to filter, the UI doesn't read it.
+    partitions_block = None
+    try:
+        rows = (await db.execute(
+            text(
+                """
+                SELECT
+                  COUNT(*)                                    AS total,
+                  COUNT(*) FILTER (WHERE status='QUEUED')     AS queued,
+                  COUNT(*) FILTER (WHERE status='IN_PROGRESS')AS in_progress,
+                  COUNT(*) FILTER (WHERE status='COMPLETED')  AS completed,
+                  COUNT(*) FILTER (WHERE status='FAILED')     AS failed,
+                  COALESCE(SUM(files_uploaded), 0)            AS files_uploaded,
+                  COALESCE(SUM(bytes_uploaded), 0)            AS bytes_uploaded
+                FROM snapshot_partitions
+                WHERE snapshot_id = :sid
+                """
+            ),
+            {"sid": str(snapshot.id)},
+        )).first()
+        if rows and (rows[0] or 0) > 0:
+            by_region_rows = (await db.execute(
+                text(
+                    """
+                    SELECT COALESCE(worker_region, 'unassigned') AS region,
+                           COUNT(*) AS n
+                      FROM snapshot_partitions
+                     WHERE snapshot_id = :sid
+                     GROUP BY 1
+                    """
+                ),
+                {"sid": str(snapshot.id)},
+            )).fetchall()
+            partitions_block = {
+                "total":          int(rows[0] or 0),
+                "queued":         int(rows[1] or 0),
+                "in_progress":    int(rows[2] or 0),
+                "completed":      int(rows[3] or 0),
+                "failed":         int(rows[4] or 0),
+                "files_uploaded": int(rows[5] or 0),
+                "bytes_uploaded": int(rows[6] or 0),
+                "by_region": {
+                    str(r[0]): int(r[1] or 0) for r in by_region_rows
+                },
+            }
+    except Exception as _part_exc:
+        # Table may not exist on older deployments; fall back to null.
+        partitions_block = None
+
     return SnapshotResponse(
         id=str(snapshot.id), resourceId=str(snapshot.resource_id),
         createdAt=snapshot.created_at.isoformat(),
@@ -485,6 +540,7 @@ async def get_snapshot(snapshot_id: str, db: AsyncSession = Depends(get_db)):
         type=snapshot.type.value if hasattr(snapshot.type, 'value') else str(snapshot.type),
         itemCount=snapshot.item_count or 0,
         jobId=str(snapshot.job_id) if snapshot.job_id else None,
+        partitions=partitions_block,
     )
 
 

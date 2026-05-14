@@ -543,6 +543,141 @@ class SnapshotItem(Base):
     created_at = Column(DateTime, default=utcnow)
 
 
+class SnapshotPartition(Base):
+    """Per-shard tracking row for a partitioned Snapshot.
+
+    A workload whose work-set exceeds the partition threshold for its
+    type fans out into N shards; each shard is a row here, claimable
+    via the same atomic UPDATE-RETURNING by any backup_worker replica
+    in any cluster/region. The last shard to terminate flips the
+    parent Snapshot via `_finalize_partitioned_snapshot`.
+
+    `partition_type` discriminates the work-set shape:
+      ONEDRIVE_FILES    — payload: ignored; uses legacy `file_ids` column
+                          (one shard owns a list of OneDrive file_ids)
+      CHATS             — payload: {"chat_ids": [...]}
+      MAIL_FOLDERS      — payload: {"folder_ids": [...]}
+      SHAREPOINT_DRIVES — payload: {"drive_ids": [...]}
+
+    The OneDrive path still uses `drive_id` + `file_ids` for backwards
+    compat with already-shipped Phase-1 code. Other partition_types
+    leave `drive_id` NULL and carry their work-set in `payload`.
+    """
+    __tablename__ = "snapshot_partitions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    snapshot_id = Column(UUID(as_uuid=True),
+                         ForeignKey("snapshots.id", ondelete="CASCADE"),
+                         nullable=False, index=True)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    resource_id = Column(UUID(as_uuid=True), nullable=False)
+    job_id = Column(UUID(as_uuid=True), nullable=False)
+    # Discriminator. Default keeps existing OneDrive rows valid.
+    partition_type = Column(String, nullable=False, default="ONEDRIVE_FILES")
+    # OneDrive-specific (legacy). Nullable now so MAIL/CHATS/SHAREPOINT
+    # rows don't need a synthetic drive_id.
+    drive_id = Column(Text, nullable=True)
+    partition_index = Column(Integer, nullable=False)
+    # Legacy OneDrive payload — list of file_ids for the shard.
+    # New partition_types use `payload` instead.
+    file_ids = Column(JSON, nullable=True)
+    # Generic per-shard payload for non-ONEDRIVE_FILES partition types:
+    #   CHATS            → {"chat_ids": [...]}
+    #   MAIL_FOLDERS     → {"folder_ids": [...]}
+    #   SHAREPOINT_DRIVES→ {"drive_ids": [...]}
+    payload = Column(JSON, nullable=True)
+    total_files = Column(Integer, nullable=False, default=0)
+    total_bytes_est = Column(BigInteger, nullable=False, default=0)
+    # QUEUED | IN_PROGRESS | COMPLETED | FAILED
+    status = Column(String, nullable=False, default="QUEUED")
+    worker_id = Column(String)
+    # Worker region that owns this claim. Stamped from
+    # os.getenv("WORKER_REGION", "default") on _claim_partition. Pure
+    # observability for the multi-region case; today every claim
+    # stamps "default".
+    worker_region = Column(String)
+    # Number of times stale-sweep has re-queued this row after a
+    # failed/abandoned attempt. Once it crosses PARTITION_MAX_RETRIES
+    # (default 5), the row goes to status='FAILED' and stops being
+    # re-published — partition lifecycle audit emits PARTITION_FAILED
+    # with reason='max_retries_exceeded'.
+    retry_count = Column(Integer, nullable=False, default=0)
+    enqueued_at = Column(DateTime, default=utcnow, nullable=False)
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    files_uploaded = Column(Integer, nullable=False, default=0)
+    bytes_uploaded = Column(BigInteger, nullable=False, default=0)
+    failure_state = Column(JSON)
+
+    __table_args__ = (
+        # One row per (snapshot, shard-index). Re-publish of the same
+        # partition message after worker crash hits this constraint and
+        # the publishing INSERT does ON CONFLICT DO NOTHING — making
+        # fan-out idempotent under coordinator redelivery.
+        Index(
+            "uq_snap_partition",
+            "snapshot_id", "partition_index",
+            unique=True,
+        ),
+        # Hot read path for the finalizer + stale-sweep:
+        #   SELECT WHERE snapshot_id=:sid AND status=...
+        Index("ix_snap_partition_status", "snapshot_id", "status"),
+        # Stale-sweep scan: oldest enqueued non-terminal first.
+        Index(
+            "ix_snap_partition_claim", "enqueued_at",
+            postgresql_where=sql_text(
+                "status IN ('QUEUED','IN_PROGRESS')"
+            ),
+        ),
+    )
+
+
+class MailFolderDelta(Base):
+    """Per-folder delta token for mailbox-style resources.
+
+    Replaces the JSON dict that used to live in
+    `resource.extra_data["mail_delta_tokens_by_folder"]`. That dict had
+    a Read-Modify-Write race when two folder drains finished
+    concurrently — within one worker (asyncio interleave) OR across
+    replicas after partitioning — and silently clobbered each other's
+    tokens. Promoting each (resource, folder) → its own row gives
+    PostgreSQL row-level atomicity, so concurrent UPSERTs commute.
+
+    Covers all mailbox flavours (`USER_MAIL` / `MAILBOX` /
+    `SHARED_MAILBOX` / `ROOM_MAILBOX`) — the worker's mail handler
+    is shared, and folder ids are unique within a resource regardless
+    of resource type.
+    """
+    __tablename__ = "mail_folder_delta"
+    resource_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("resources.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    folder_id = Column(Text, primary_key=True)
+    delta_token = Column(Text, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class SharePointDriveDelta(Base):
+    """Per-drive delta token for SharePoint sites.
+
+    Mirrors `MailFolderDelta` for SharePoint's
+    `extra_data["drive_delta_tokens_by_site"]` dict. A SharePoint
+    site can have many drives (documents libraries); each drive has
+    its own `@odata.deltaLink`. The old JSON-dict RMW pattern broke
+    the same way; this table fixes it the same way.
+    """
+    __tablename__ = "sharepoint_drive_delta"
+    resource_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("resources.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    drive_id = Column(Text, primary_key=True)
+    delta_token = Column(Text, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+
 class JobLog(Base):
     __tablename__ = "job_logs"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
