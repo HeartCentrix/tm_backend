@@ -894,6 +894,9 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
                        f"{', '.join(r['id'] + '(' + r['status'] + ')' for r in inaccessible_resources)}"
             )
 
+        # Always have a batch_id so Tier-1 + Tier-2 routing-key splits
+        # collapse to one Activity row, even when the caller forgot to
+        # supply one.
         return await _create_batch_backup_jobs(
             resources_map=resources_map,
             db=db,
@@ -901,7 +904,7 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
             priority=request.priority or 1,
             note=request.note,
             trigger_label="MANUAL_BATCH",
-            batch_id=request.batchId,
+            batch_id=request.batchId or str(uuid4()),
             tier2=bool(getattr(request, "tier2", False)),
         )
 

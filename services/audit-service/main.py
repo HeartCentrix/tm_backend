@@ -1451,13 +1451,19 @@ async def get_batch_children(batch_id: str):
         """), {"rids": [str(r) for r in res_ids]})
         rs = resources_q.all()
 
+        # Look up by resource_id (not job_id) so sibling routing-split jobs
+        # and pre-batch_id-propagation snapshots both resolve correctly.
+        # We fetch the latest snapshot per resource across:
+        #   - resources directly listed in the batch (Tier-1)
+        #   - their Tier-2 children
+        all_rid_strs = [str(rid) for rid, *_ in rs]
         snaps_q = await db.execute(text("""
             SELECT DISTINCT ON (resource_id)
                    id, resource_id, status::text, item_count, bytes_added
             FROM snapshots
-            WHERE job_id = ANY(CAST(:jids AS UUID[]))
+            WHERE resource_id = ANY(CAST(:rids AS UUID[]))
             ORDER BY resource_id, created_at DESC
-        """), {"jids": [str(j) for j in job_ids]})
+        """), {"rids": all_rid_strs})
         snap_by_rid: Dict[Any, Dict[str, Any]] = {}
         for sr in snaps_q.all():
             snap_by_rid[sr.resource_id] = {

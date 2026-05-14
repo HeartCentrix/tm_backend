@@ -474,6 +474,13 @@ async def backup_user_with_discovery(
     tenant_external_id = tenant.external_tenant_id
     tenant_uuid = tenant.id
 
+    # One operator click = one batch_id, so Tier-1 + Tier-2 child Jobs
+    # produced by the routing-key split inside trigger-bulk collapse to
+    # one Activity row. Generated here (not in trigger-bulk) so we have a
+    # stable id BEFORE the orchestrator HTTP roundtrip — future-proof for
+    # any other side-channels that need the same id.
+    batch_id = str(uuid4())
+
     async def _orchestrate():
         client_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
         client_secret = settings.MICROSOFT_CLIENT_SECRET or settings.AZURE_AD_CLIENT_SECRET
@@ -508,7 +515,12 @@ async def backup_user_with_discovery(
             async with _httpx.AsyncClient(timeout=15.0) as _c:
                 r = await _c.post(
                     f"{settings.JOB_SERVICE_URL}/api/v1/backups/trigger-bulk",
-                    json={"resourceIds": backup_targets, "fullBackup": False, "priority": 1},
+                    json={
+                        "resourceIds": backup_targets,
+                        "fullBackup": False,
+                        "priority": 1,
+                        "batchId": batch_id,
+                    },
                 )
                 if r.status_code >= 300:
                     print(f"[BACKUP-ORCHESTRATOR] trigger-bulk rejected (status={r.status_code}): {r.text[:300]}")
