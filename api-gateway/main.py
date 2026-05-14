@@ -469,6 +469,7 @@ async def progress_proxy(request: Request):
 
 @app.get("/api/v1/activity")
 @app.get("/api/v1/activity/export")
+@app.get("/api/v1/activity/batches/{batch_id}/children")
 @app.get("/api/v1/audit/events")
 @app.get("/api/v1/audit/events/{event_id}")
 @app.get("/api/v1/audit/risk-signals")

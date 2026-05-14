@@ -615,6 +615,69 @@ async def health():
     return {"status": "healthy", "service": "audit-log"}
 
 
+async def _list_activities_batch(
+    *,
+    tenantId: Optional[str],
+    serviceType: Optional[str],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    operation: Optional[str],
+    status: Optional[str],
+    page: int,
+    size: int,
+) -> Dict[str, Any]:
+    """Batch-aggregated Activity feed.
+
+    Delegates SQL + row shaping to ``shared.batch_rollup``. One row per
+    ``spec.batch_id`` (or per job_id for legacy single-Job rows that
+    predate batch_id propagation). Status is rolled up across Jobs +
+    Snapshots + snapshot_partitions — see the design at
+    ``docs/superpowers/specs/2026-05-15-activity-batch-rollup-design.md``.
+
+    ``serviceType`` is intentionally NOT applied as a post-filter in
+    v1: the rollup CTE doesn't carry resource-type discrimination per
+    row, and a per-batch resource-type lookup would balloon to one
+    extra round-trip per page. The Activity page is already scoped by
+    tenantId, which covers the common case. Cross-service filtering
+    stays accurate on the legacy per-Job path (``?group=job``).
+    """
+    from shared.batch_rollup import build_batch_rollup_query, shape_batch_row
+
+    async with async_session_factory() as db:
+        offset = (page - 1) * size
+        # Fetch one extra row so we can populate has_more cheaply
+        # without a separate COUNT(*) over the same CTE.
+        stmt = build_batch_rollup_query(
+            tenant_id=tenantId,
+            start_date=start_date,
+            end_date=end_date,
+            operation=(operation.upper() if operation else None),
+            size=size + 1,
+            offset=offset,
+        )
+        rows = (await db.execute(stmt)).all()
+        has_more = len(rows) > size
+        page_rows = rows[:size]
+        items = [shape_batch_row(r) for r in page_rows]
+
+        # Frontend-aligned status filter. "Warning" maps to "Done with
+        # at least one partial/failed child snapshot."
+        if status:
+            wanted = status
+            if wanted == "Warning":
+                items = [it for it in items if it.get("warnings")]
+            else:
+                items = [it for it in items if it.get("status") == wanted]
+
+    return {
+        "items": items,
+        "total": offset + len(items) + (1 if has_more else 0),
+        "page":  page,
+        "size":  size,
+        "has_more": has_more,
+    }
+
+
 @app.get("/api/v1/activity")
 async def list_activities(
     tenantId: Optional[str] = Query(None),
@@ -625,11 +688,33 @@ async def list_activities(
     status: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
+    group: Optional[str] = Query(None),
 ):
+    """List backup/restore activities.
+
+    ``group=batch`` (DEFAULT): one row per click, rolled up across all
+    Jobs sharing ``spec.batch_id``. Includes Snapshot +
+    snapshot_partition state in the terminal-flip decision so the row
+    never shows Done before every shard has settled.
+
+    ``group=job`` (debug, kept for backwards compat with audit-export
+    consumers): the per-Job rows the endpoint produced before this
+    change. Falls through to the legacy code path below.
+
+    Default toggle via ``ACTIVITY_GROUP_DEFAULT`` env var on the
+    audit-service container. Set to ``job`` for a 30-second rollback
+    without redeploying anything else.
     """
-    List backup/restore activities (job-level operations) for the Tasks tab.
-    Maps jobs to the frontend's expected ActivityItem format.
-    """
+    if group is None:
+        group = os.environ.get("ACTIVITY_GROUP_DEFAULT", "batch")
+    if group == "batch":
+        return await _list_activities_batch(
+            tenantId=tenantId, serviceType=serviceType,
+            start_date=start_date, end_date=end_date,
+            operation=operation, status=status,
+            page=page, size=size,
+        )
+    # Fall through to the legacy per-Job rollup below.
     async with async_session_factory() as db:
         service_key = _parse_service_type(serviceType)
         service_resource_types = _resource_types_for_service(service_key)
@@ -1035,8 +1120,55 @@ async def export_activity_csv(
     end_date: Optional[str] = Query(None),
     operation: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    group: Optional[str] = Query(None),
 ):
-    """Export activity (jobs) as CSV for the Tasks tab"""
+    """Export activity as CSV for the Tasks tab.
+
+    Same ``group`` semantics as ``/api/v1/activity``: ``batch`` (default,
+    one row per click) or ``job`` (legacy per-Job rows, kept for the
+    auditor-facing report). Default driven by ``ACTIVITY_GROUP_DEFAULT``
+    env var so the rollback flip is single-knob.
+    """
+    if group is None:
+        group = os.environ.get("ACTIVITY_GROUP_DEFAULT", "batch")
+    if group == "batch":
+        data = await _list_activities_batch(
+            tenantId=tenantId, serviceType=serviceType,
+            start_date=start_date, end_date=end_date,
+            operation=operation, status=status,
+            page=1, size=5000,
+        )
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Batch ID", "Start Time", "Operation", "Object",
+            "Status", "Finish Time", "Details",
+            "Snapshots Total", "Snapshots Done",
+            "Snapshots Partial", "Snapshots Failed",
+            "Bytes Backed Up",
+        ])
+        for it in data["items"]:
+            counts = it.get("counts") or {}
+            writer.writerow([
+                it.get("batchId") or it.get("id") or "",
+                it.get("start_time") or "",
+                it.get("operation") or "",
+                it.get("object") or "",
+                it.get("status") or "",
+                it.get("finish_time") or "",
+                it.get("details") or "",
+                counts.get("total", 0),
+                counts.get("done", 0),
+                counts.get("partial", 0),
+                counts.get("failed", 0),
+                it.get("data_backed_up") or 0,
+            ])
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=activities.csv"},
+        )
     status_map = {
         "Done": JobStatus.COMPLETED,
         "In Progress": JobStatus.RUNNING,
@@ -1114,6 +1246,117 @@ async def export_activity_csv(
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=activities.csv"},
         )
+
+
+@app.get("/api/v1/activity/batches/{batch_id}/children")
+async def get_batch_children(batch_id: str):
+    """Per-resource drilldown for one Activity batch row.
+
+    Returns the Tier-1 resources (ENTRA_USER / MAILBOX / SHAREPOINT_SITE
+    / SHARED_MAILBOX / ROOM_MAILBOX) targeted by the batch with their
+    Tier-2 children nested. Each leaf carries the latest snapshot status,
+    item_count, bytes_added, and partition rollup. Used by the
+    Activity-row expand-on-click drilldown.
+
+    ``batch_id`` resolves via ``COALESCE(spec->>'batch_id', id::text)``
+    so legacy single-Job rows (no batch_id in spec) are addressable by
+    their job_id too.
+    """
+    TIER1_TYPES = {"ENTRA_USER", "MAILBOX", "SHAREPOINT_SITE",
+                   "SHARED_MAILBOX", "ROOM_MAILBOX"}
+
+    async with async_session_factory() as db:
+        jobs_q = await db.execute(text("""
+            SELECT id, batch_resource_ids
+            FROM jobs
+            WHERE COALESCE(spec->>'batch_id', id::text) = :bid
+        """), {"bid": batch_id})
+        jrows = jobs_q.all()
+        if not jrows:
+            raise HTTPException(status_code=404, detail="batch not found")
+        job_ids = [r[0] for r in jrows]
+        res_ids: Set[Any] = set()
+        for _, rids in jrows:
+            for rid in (rids or []):
+                res_ids.add(rid)
+
+        if not res_ids:
+            return {"batchId": batch_id, "resources": []}
+
+        resources_q = await db.execute(text("""
+            SELECT id, parent_resource_id, type::text, display_name
+            FROM resources
+            WHERE id = ANY(CAST(:rids AS UUID[]))
+               OR parent_resource_id = ANY(CAST(:rids AS UUID[]))
+        """), {"rids": [str(r) for r in res_ids]})
+        rs = resources_q.all()
+
+        snaps_q = await db.execute(text("""
+            SELECT DISTINCT ON (resource_id)
+                   id, resource_id, status::text, item_count, bytes_added
+            FROM snapshots
+            WHERE job_id = ANY(CAST(:jids AS UUID[]))
+            ORDER BY resource_id, created_at DESC
+        """), {"jids": [str(j) for j in job_ids]})
+        snap_by_rid: Dict[Any, Dict[str, Any]] = {}
+        for sr in snaps_q.all():
+            snap_by_rid[sr.resource_id] = {
+                "snapshotId": str(sr.id),
+                "status":     sr.status,
+                "itemCount":  int(sr.item_count or 0),
+                "bytesAdded": int(sr.bytes_added or 0),
+            }
+
+        snap_ids = [v["snapshotId"] for v in snap_by_rid.values()]
+        parts_by_sid: Dict[str, Dict[str, int]] = {}
+        if snap_ids:
+            parts_q = await db.execute(text("""
+                SELECT
+                  snapshot_id::text                                   AS sid,
+                  COUNT(*)                                            AS total,
+                  COUNT(*) FILTER (WHERE status::text = 'COMPLETED')  AS done,
+                  COUNT(*) FILTER (WHERE status::text NOT IN ('COMPLETED','FAILED'))
+                                                                      AS pending,
+                  COUNT(*) FILTER (WHERE status::text = 'FAILED')     AS failed
+                FROM snapshot_partitions
+                WHERE snapshot_id = ANY(CAST(:sids AS UUID[]))
+                GROUP BY 1
+            """), {"sids": snap_ids})
+            for pr in parts_q.all():
+                parts_by_sid[pr.sid] = {
+                    "total":   int(pr.total or 0),
+                    "done":    int(pr.done or 0),
+                    "pending": int(pr.pending or 0),
+                    "failed":  int(pr.failed or 0),
+                }
+
+        tier1: List[Dict[str, Any]] = []
+        children_by_parent: Dict[Any, List[Dict[str, Any]]] = {}
+        for rid, parent, rtype, name in rs:
+            entry: Dict[str, Any] = {
+                "resourceId":  str(rid),
+                "displayName": name or "",
+                "type":        rtype,
+                "tier":        1 if rtype in TIER1_TYPES else 2,
+            }
+            snap = snap_by_rid.get(rid)
+            if snap:
+                entry.update(snap)
+                parts = parts_by_sid.get(snap["snapshotId"])
+                if parts:
+                    entry["partitions"] = parts
+            if rtype in TIER1_TYPES:
+                entry["children"] = []
+                tier1.append(entry)
+            else:
+                children_by_parent.setdefault(parent, []).append(entry)
+
+        for t in tier1:
+            t["children"] = children_by_parent.get(
+                uuid.UUID(t["resourceId"]), []
+            )
+
+    return {"batchId": batch_id, "resources": tier1}
 
 
 @app.post("/api/v1/audit/log")
