@@ -1137,6 +1137,66 @@ async def startup():
         _sweep_tier2_gaps, "interval", seconds=_TIER2_BACKSTOP_S,
     )
 
+    # backup_batches finalizer sweep — gated by
+    # BATCH_ROW_REDESIGN_ENABLED. Re-runs the strict 4-condition gate
+    # for every IN_PROGRESS batch (catches lost finalize events), and
+    # flips long-stalled rows to PARTIAL / FAILED so operators see a
+    # terminal status rather than a row stuck "In Progress" forever.
+    async def _sweep_inflight_batches():
+        try:
+            from shared.config import settings as _s
+            if not _s.BATCH_ROW_REDESIGN_ENABLED:
+                return
+            from shared.batch_rollup import _finalize_batch_if_complete
+            async with async_session_factory() as session:
+                rows = (await session.execute(text("""
+                    SELECT id FROM backup_batches
+                     WHERE status = 'IN_PROGRESS'
+                       AND created_at > NOW() - make_interval(hours => :hh)
+                     ORDER BY created_at ASC
+                     LIMIT 500
+                """), {"hh": _s.BATCH_STALL_TIMEOUT_HOURS})).all()
+                for r in rows:
+                    try:
+                        await _finalize_batch_if_complete(r.id, session)
+                    except Exception as fex:
+                        print(
+                            f"[backup-scheduler] batch re-finalize {r.id} "
+                            f"failed: {fex}"
+                        )
+
+                stalled = (await session.execute(text("""
+                    SELECT b.id,
+                           EXISTS(
+                               SELECT 1 FROM snapshots s
+                                 JOIN jobs j ON j.id = s.job_id
+                                WHERE COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text
+                                  AND s.created_at > b.created_at
+                           ) AS has_any_snapshot
+                      FROM backup_batches b
+                     WHERE b.status = 'IN_PROGRESS'
+                       AND b.created_at < NOW() - make_interval(hours => :hh)
+                     LIMIT 500
+                """), {"hh": _s.BATCH_STALL_TIMEOUT_HOURS})).all()
+                for r in stalled:
+                    new_status = "PARTIAL" if r.has_any_snapshot else "FAILED"
+                    await session.execute(text("""
+                        UPDATE backup_batches
+                           SET status = :ns, completed_at = NOW()
+                         WHERE id = cast(:bid AS uuid)
+                           AND status = 'IN_PROGRESS'
+                    """), {"ns": new_status, "bid": str(r.id)})
+                    await session.commit()
+                    print(
+                        f"[backup-scheduler] stalled batch {r.id} → "
+                        f"{new_status} (no progress in "
+                        f"{_s.BATCH_STALL_TIMEOUT_HOURS}h)"
+                    )
+        except Exception as exc:
+            print(f"[backup-scheduler] _sweep_inflight_batches failed: {exc}")
+
+    scheduler.add_job(_sweep_inflight_batches, "interval", minutes=5)
+
     # Stuck-RUNNING job reaper — fixes the "all snapshots COMPLETED
     # but job stays RUNNING forever" failure mode.
     #

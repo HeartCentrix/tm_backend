@@ -452,3 +452,164 @@ def _fmt_bytes(n: int) -> str:
             return f"{v:.1f} {u}"
         v /= 1024.0
     return f"{v:.1f} EiB"
+
+
+async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
+    """Strict 4-condition completion gate for a backup_batches row.
+
+    Returns the new terminal status ('COMPLETED' / 'PARTIAL' / 'FAILED')
+    when the gate passed AND the row was actually flipped from
+    IN_PROGRESS. Returns None when the gate did not pass OR another
+    worker already flipped the row (idempotent via ``WHERE status =
+    'IN_PROGRESS'``).
+
+    Gate conditions (all must pass; see design spec
+    ``docs/superpowers/specs/2026-05-15-backup-batch-row-redesign-design.md``):
+
+      1. Every ENTRA_USER in ``scope_user_ids`` has at least one Tier-2
+         child in ``resources`` (parent_resource_id = user.id,
+         archived_at IS NULL). Non-ENTRA_USER scope entries skip this
+         check (treated as direct leaves).
+      2. Every Tier-2 child has a snapshot with ``created_at >
+         batch.created_at`` AND ``status::text IN
+         ('COMPLETED','PARTIAL','FAILED')``.
+      3. Every ENTRA_USER itself has a snapshot with ``created_at >
+         batch.created_at`` AND ``status::text IN
+         ('COMPLETED','PARTIAL','FAILED')``. Non-ENTRA scope entries
+         use this rule directly.
+      4. No ``snapshot_partitions`` row for any of those snapshots has
+         ``status::text IN ('QUEUED','IN_PROGRESS')``.
+
+    SQL safety: ``cast(:x AS uuid)`` (not ``:x::uuid``);
+    ``COALESCE(spec::jsonb, ...)`` (spec column is JSON, not JSONB);
+    enums compared with ``::text``; writes wrapped in
+    ``SELECT FOR UPDATE`` for race protection.
+    """
+    locked = (await session.execute(text("""
+        SELECT id, created_at, scope_user_ids
+          FROM backup_batches
+         WHERE id = cast(:bid AS uuid)
+           AND status = 'IN_PROGRESS'
+         FOR UPDATE
+    """), {"bid": str(batch_id)})).first()
+    if not locked:
+        return None
+
+    batch_created_at = locked.created_at
+    scope = list(locked.scope_user_ids or [])
+    if not scope:
+        await session.execute(text("""
+            UPDATE backup_batches
+               SET status = 'COMPLETED', completed_at = NOW()
+             WHERE id = cast(:bid AS uuid) AND status = 'IN_PROGRESS'
+        """), {"bid": str(batch_id)})
+        await session.commit()
+        return "COMPLETED"
+
+    scope_str = [str(u) for u in scope]
+
+    # Classify scope: ENTRA_USER rows expand to (user + tier-2 children);
+    # non-ENTRA scope rows are treated as direct leaves.
+    entra_rows = (await session.execute(text("""
+        SELECT id FROM resources
+         WHERE id = ANY(cast(:ids AS uuid[]))
+           AND type = 'ENTRA_USER'
+           AND archived_at IS NULL
+    """), {"ids": scope_str})).all()
+    entra_ids = [str(r.id) for r in entra_rows]
+    non_entra = [s for s in scope_str if s not in set(entra_ids)]
+
+    # Gate 1: every ENTRA_USER must have at least one Tier-2 child
+    # (otherwise discovery hasn't finished yet → wait).
+    if entra_ids:
+        missing_t2 = (await session.execute(text("""
+            SELECT s.user_id
+              FROM unnest(cast(:ids AS uuid[])) s(user_id)
+              LEFT JOIN resources r
+                ON r.parent_resource_id = s.user_id
+               AND r.archived_at IS NULL
+             GROUP BY s.user_id
+             HAVING COUNT(r.id) = 0
+        """), {"ids": entra_ids})).all()
+        if missing_t2:
+            return None
+
+    # Resolve full leaf set: entra-users + their tier-2 children + non-entra scope.
+    if entra_ids:
+        leaves_rows = (await session.execute(text("""
+            WITH scope AS (
+                SELECT cast(unnest(cast(:ids AS uuid[])) AS uuid) AS user_id
+            ),
+            targets AS (
+                SELECT user_id AS resource_id FROM scope
+                UNION ALL
+                SELECT r.id AS resource_id
+                  FROM resources r
+                  JOIN scope s ON r.parent_resource_id = s.user_id
+                 WHERE r.archived_at IS NULL
+            )
+            SELECT DISTINCT resource_id FROM targets
+        """), {"ids": entra_ids})).all()
+        leaf_ids = [str(r.resource_id) for r in leaves_rows]
+    else:
+        leaf_ids = []
+    leaf_ids.extend(non_entra)
+    leaf_ids = list(dict.fromkeys(leaf_ids))  # dedupe, preserve order
+
+    if not leaf_ids:
+        return None
+
+    # Gates 2 + 3: every leaf must have a terminal snapshot newer than batch.created_at.
+    pending = (await session.execute(text("""
+        WITH leaves AS (
+            SELECT cast(unnest(cast(:lids AS uuid[])) AS uuid) AS rid
+        ),
+        latest AS (
+            SELECT DISTINCT ON (s.resource_id)
+                   s.resource_id, s.status::text AS status
+              FROM snapshots s
+              JOIN leaves l ON s.resource_id = l.rid
+             WHERE s.created_at > cast(:created AS timestamp)
+             ORDER BY s.resource_id, s.created_at DESC
+        )
+        SELECT l.rid
+          FROM leaves l
+          LEFT JOIN latest la ON la.resource_id = l.rid
+         WHERE la.resource_id IS NULL
+            OR la.status NOT IN ('COMPLETED','PARTIAL','FAILED')
+    """), {"lids": leaf_ids, "created": batch_created_at})).all()
+    if pending:
+        return None
+
+    # Gate 4: every snapshot_partition for those snapshots must be terminal.
+    inflight = (await session.execute(text("""
+        SELECT 1
+          FROM snapshot_partitions sp
+          JOIN snapshots s ON s.id = sp.snapshot_id
+         WHERE s.resource_id = ANY(cast(:lids AS uuid[]))
+           AND s.created_at > cast(:created AS timestamp)
+           AND sp.status::text IN ('QUEUED','IN_PROGRESS')
+         LIMIT 1
+    """), {"lids": leaf_ids, "created": batch_created_at})).first()
+    if inflight:
+        return None
+
+    # Resolve target status — PARTIAL if any leaf snapshot is PARTIAL/FAILED.
+    any_partial = (await session.execute(text("""
+        SELECT 1
+          FROM snapshots s
+         WHERE s.resource_id = ANY(cast(:lids AS uuid[]))
+           AND s.created_at > cast(:created AS timestamp)
+           AND s.status::text IN ('PARTIAL','FAILED')
+         LIMIT 1
+    """), {"lids": leaf_ids, "created": batch_created_at})).first()
+    new_status = "PARTIAL" if any_partial else "COMPLETED"
+
+    await session.execute(text("""
+        UPDATE backup_batches
+           SET status = :ns, completed_at = NOW()
+         WHERE id = cast(:bid AS uuid)
+           AND status = 'IN_PROGRESS'
+    """), {"ns": new_status, "bid": str(batch_id)})
+    await session.commit()
+    return new_status

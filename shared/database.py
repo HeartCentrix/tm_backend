@@ -518,6 +518,20 @@ async def init_db() -> None:
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS backup_batches (
+            id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id       UUID NOT NULL,
+            created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at    TIMESTAMP,
+            source          TEXT NOT NULL,
+            actor_email     TEXT,
+            scope_user_ids  UUID[] NOT NULL,
+            bytes_expected  BIGINT,
+            status          TEXT NOT NULL DEFAULT 'IN_PROGRESS'
+                              CHECK (status IN ('IN_PROGRESS','COMPLETED','PARTIAL','FAILED','CANCELLED'))
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS snapshots (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             resource_id UUID REFERENCES resources(id),
@@ -958,6 +972,9 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_group_policy_assignments_policy ON group_policy_assignments(policy_id)",
         # Two-tier discovery — fast lookup of all child rows under a parent user.
         "CREATE INDEX IF NOT EXISTS ix_resources_parent_id ON resources(parent_resource_id)",
+        # backup_batches — operator-intent row for one Backup-all click.
+        "CREATE INDEX IF NOT EXISTS ix_backup_batches_tenant_started ON backup_batches (tenant_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_backup_batches_status_inprogress ON backup_batches (status) WHERE status = 'IN_PROGRESS'",
         # Teams-chat packed-blob content-hash dedup. When two users share a
         # chat, their backups hit the same message bytes — this tenant-scoped
         # checksum index lets the writer reuse an existing blob_path instead

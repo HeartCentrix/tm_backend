@@ -838,6 +838,114 @@ async def _list_activities_batch(
     }
 
 
+async def _list_activities_batch_v2(
+    *,
+    tenantId: Optional[str],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    operation: Optional[str],
+    status: Optional[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """BACKUP rows read directly from backup_batches.
+
+    Active when settings.BATCH_ROW_REDESIGN_ENABLED. Returns the same
+    row shape as the legacy CTE rollup so the caller can union them.
+    """
+    if operation and operation.upper() != "BACKUP":
+        return []
+    async with async_session_factory() as session:
+        await session.execute(text("SET LOCAL lock_timeout = '2s'"))
+        await session.execute(text("SET LOCAL statement_timeout = '15s'"))
+        await session.execute(text("SET LOCAL TRANSACTION READ ONLY"))
+
+        params: Dict[str, Any] = {"size": limit}
+        where_clauses = ["1=1"]
+        if tenantId:
+            where_clauses.append("b.tenant_id = cast(:tid AS uuid)")
+            params["tid"] = tenantId
+        if start_date:
+            where_clauses.append("b.created_at >= cast(:sd AS timestamp)")
+            params["sd"] = start_date
+        if end_date:
+            where_clauses.append("b.created_at <= cast(:ed AS timestamp)")
+            params["ed"] = end_date
+        rows = (await session.execute(text(f"""
+            SELECT
+              b.id::text                AS batch_id,
+              b.created_at,
+              b.completed_at,
+              b.status,
+              b.source,
+              b.actor_email,
+              b.scope_user_ids,
+              b.bytes_expected,
+              (SELECT COALESCE(SUM(s.bytes_added), 0)
+                 FROM snapshots s
+                 JOIN jobs j ON j.id = s.job_id
+                WHERE COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text
+                  AND s.status::text IN ('COMPLETED','PARTIAL','IN_PROGRESS')
+                  AND s.created_at > b.created_at)                AS bytes_done,
+              (SELECT array_agg(DISTINCT j.id)
+                 FROM jobs j
+                WHERE COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text) AS job_ids
+              FROM backup_batches b
+             WHERE {' AND '.join(where_clauses)}
+             ORDER BY b.created_at DESC
+             LIMIT :size
+        """), params)).all()
+
+        # Status filter map matches the legacy labels.
+        status_label_map = {
+            "IN_PROGRESS": "In Progress",
+            "COMPLETED": "Done",
+            "PARTIAL": "Partial",
+            "FAILED": "Failed",
+            "CANCELLED": "Canceled",
+        }
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            bytes_done = int(r.bytes_done or 0)
+            bytes_expected = int(r.bytes_expected) if r.bytes_expected else None
+            progress_pct = None
+            if bytes_expected and bytes_expected > 0:
+                progress_pct = min(100, int(100 * bytes_done / bytes_expected))
+            status_label = status_label_map.get(r.status, r.status)
+            if status and status_label != status:
+                continue
+
+            # Friendly object label: one user name for single-user, "N users" else.
+            ids = list(r.scope_user_ids or [])
+            if len(ids) == 1:
+                name_row = (await session.execute(text("""
+                    SELECT COALESCE(display_name, name) AS dn
+                      FROM resources WHERE id = cast(:rid AS uuid) LIMIT 1
+                """), {"rid": str(ids[0])})).first()
+                object_label = (name_row.dn if name_row and name_row.dn else str(ids[0]))
+            elif len(ids) == 0:
+                object_label = "No scope"
+            else:
+                object_label = f"{len(ids)} users"
+
+            out.append({
+                "id": r.batch_id,
+                "batchId": r.batch_id,
+                "start_time": r.created_at.isoformat() if r.created_at else None,
+                "finish_time": r.completed_at.isoformat() if r.completed_at else None,
+                "status": status_label,
+                "operation": "BACKUP",
+                "object": object_label,
+                "details": "",
+                "batchSource": r.source,
+                "jobIds": [str(j) for j in (r.job_ids or [])],
+                "progressPct": progress_pct,
+                "bytesDone": bytes_done,
+                "bytesExpected": bytes_expected,
+            })
+        return out
+
+
 @app.get("/api/v1/activity")
 async def list_activities(
     tenantId: Optional[str] = Query(None),
@@ -868,12 +976,40 @@ async def list_activities(
     if group is None:
         group = os.environ.get("ACTIVITY_GROUP_DEFAULT", "batch")
     if group == "batch":
-        return await _list_activities_batch(
+        legacy = await _list_activities_batch(
             tenantId=tenantId, serviceType=serviceType,
             start_date=start_date, end_date=end_date,
             operation=operation, status=status,
             page=page, size=size,
         )
+        if not settings.BATCH_ROW_REDESIGN_ENABLED:
+            return legacy
+        # Flag on: union backup_batches rows over the legacy slice.
+        # v2 rows replace any legacy BACKUP row sharing the same batchId
+        # (the click had a backup_batches row inserted — that's authoritative).
+        v2_rows = await _list_activities_batch_v2(
+            tenantId=tenantId,
+            start_date=start_date, end_date=end_date,
+            operation=operation, status=status,
+            limit=max(size, page * size),
+        )
+        v2_batch_ids = {row["batchId"] for row in v2_rows if row.get("batchId")}
+        legacy_items = legacy.get("items", []) if isinstance(legacy, dict) else []
+        merged: List[Dict[str, Any]] = list(v2_rows)
+        for it in legacy_items:
+            if it.get("operation") == "BACKUP" and it.get("batchId") in v2_batch_ids:
+                continue
+            merged.append(it)
+        merged.sort(key=lambda r: r.get("start_time") or "", reverse=True)
+        total = len(merged)
+        start_idx = (page - 1) * size
+        return {
+            "items": merged[start_idx:start_idx + size],
+            "total": total,
+            "page": page,
+            "size": size,
+            "has_more": (page * size) < total,
+        }
     # Fall through to the legacy per-Job rollup below.
     async with async_session_factory() as db:
         service_key = _parse_service_type(serviceType)
@@ -1432,19 +1568,35 @@ async def get_batch_children(batch_id: str):
         await db.execute(text("SET LOCAL statement_timeout = '15s'"))
         await db.execute(text("SET LOCAL TRANSACTION READ ONLY"))
 
-        jobs_q = await db.execute(text("""
-            SELECT id, batch_resource_ids
-            FROM jobs
-            WHERE COALESCE(spec->>'batch_id', id::text) = :bid
-        """), {"bid": batch_id})
-        jrows = jobs_q.all()
-        if not jrows:
-            raise HTTPException(status_code=404, detail="batch not found")
-        job_ids = [r[0] for r in jrows]
         res_ids: Set[Any] = set()
-        for _, rids in jrows:
-            for rid in (rids or []):
-                res_ids.add(rid)
+
+        # backup_batches first-class scope (flag on). Operator click intent
+        # lives here; jobs-reconstruction is fallback for legacy rows.
+        if settings.BATCH_ROW_REDESIGN_ENABLED:
+            try:
+                bb_row = (await db.execute(text("""
+                    SELECT scope_user_ids
+                      FROM backup_batches
+                     WHERE id = cast(:bid AS uuid)
+                """), {"bid": batch_id})).first()
+            except Exception:
+                bb_row = None
+            if bb_row and bb_row.scope_user_ids:
+                for rid in bb_row.scope_user_ids:
+                    res_ids.add(rid)
+
+        if not res_ids:
+            jobs_q = await db.execute(text("""
+                SELECT id, batch_resource_ids
+                FROM jobs
+                WHERE COALESCE(spec->>'batch_id', id::text) = :bid
+            """), {"bid": batch_id})
+            jrows = jobs_q.all()
+            if not jrows:
+                raise HTTPException(status_code=404, detail="batch not found")
+            for _, rids in jrows:
+                for rid in (rids or []):
+                    res_ids.add(rid)
 
         if not res_ids:
             return {"batchId": batch_id, "resources": []}

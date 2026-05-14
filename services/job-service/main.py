@@ -13,7 +13,7 @@ from sqlalchemy import select, func, text
 
 from shared.config import settings
 from shared.database import get_db, close_db, AsyncSession, engine
-from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot, SnapshotItem, SnapshotStatus, SlaPolicy, ResourceType, ResourceStatus
+from shared.models import Job, JobLog, JobType, JobStatus, Resource, Snapshot, SnapshotItem, SnapshotStatus, SlaPolicy, ResourceType, ResourceStatus, BackupBatch
 from shared.schemas import (
     JobResponse, JobListResponse, TriggerBackupRequest, TriggerBulkBackupRequest, TriggerDatasourceBackupRequest
 )
@@ -176,6 +176,61 @@ async def _create_batch_backup_jobs(
 ):
     if not resources_map:
         raise HTTPException(status_code=404, detail="No valid resources found")
+
+    # Ensure a backup_batches row exists for batch_id. Idempotent:
+    # when tenant-service already inserted the row, ON CONFLICT keeps
+    # its source/actor_email/bytes_expected. When the caller is the UI
+    # "Backup all" (no batchId supplied → fresh uuid4 generated above),
+    # this is the first INSERT for that row.
+    #
+    # Source = manual_bulk for trigger-bulk callers (frontend & datasource);
+    # tenant-service's pre-insert already used 'manual_user' so its row
+    # is untouched. Tier-2 fanout (tier2=True) does NOT insert — those
+    # waves inherit an existing batch_id from their parent click.
+    if batch_id and not tier2:
+        try:
+            sample_res = next(iter(resources_map.values()))
+            tenant_for_batch = sample_res.tenant_id
+            scope_ids = [r.id for r in resources_map.values()]
+            await db.execute(text("""
+                INSERT INTO backup_batches
+                    (id, tenant_id, source, scope_user_ids, status, created_at)
+                VALUES
+                    (cast(:bid AS uuid), cast(:tid AS uuid), :src,
+                     cast(:scope AS uuid[]), 'IN_PROGRESS', NOW())
+                ON CONFLICT (id) DO NOTHING
+            """), {
+                "bid": batch_id,
+                "tid": str(tenant_for_batch),
+                "src": "manual_bulk",
+                "scope": [str(x) for x in scope_ids],
+            })
+            await db.commit()
+        except Exception as _e:
+            # Non-fatal — flag-off behaviour: legacy CTE still works
+            # if the row never lands; flag-on path will surface this via
+            # the validation check below.
+            print(f"[JOB_SERVICE] backup_batches INSERT failed (non-fatal): {_e}")
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
+    # When the feature flag is on, the row MUST exist by now (either via
+    # tenant-service pre-insert or the ON CONFLICT block above). Reject
+    # if missing so a forgotten propagation site doesn't silently break
+    # Activity grouping.
+    if settings.BATCH_ROW_REDESIGN_ENABLED and batch_id and not tier2:
+        exists_row = (await db.execute(text("""
+            SELECT 1 FROM backup_batches WHERE id = cast(:bid AS uuid) LIMIT 1
+        """), {"bid": batch_id})).first()
+        if not exists_row:
+            raise HTTPException(
+                status_code=400,
+                detail=f"backup_batches row {batch_id} not found "
+                       f"(BATCH_ROW_REDESIGN_ENABLED). Caller forgot to "
+                       f"INSERT before trigger-bulk.",
+            )
 
     resources_without_sla = [rid for rid, res in resources_map.items() if not res.sla_policy_id]
     if resources_without_sla:

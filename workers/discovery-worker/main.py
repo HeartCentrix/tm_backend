@@ -1253,8 +1253,17 @@ async def _consume_tier2_discovery():
                 source = body.get("source") or "UNKNOWN"
                 # batch_id propagates from the original bulk-trigger so
                 # child Jobs created below share the same Activity row
-                # with their parent.
+                # with their parent. Loud WARN on missing — when the
+                # BATCH_ROW_REDESIGN_ENABLED flag is on, job-service will
+                # also 400 the forwarded trigger-bulk, surfacing any
+                # regression on the producer side.
                 forward_batch_id = body.get("batchId")
+                if not forward_batch_id:
+                    logger.warning(
+                        "[tier2-discovery] discovery message missing batchId — "
+                        "Activity row grouping for tenant=%s users=%d will break",
+                        tenant_id, len(user_ids_raw),
+                    )
 
                 logger.info(
                     "[tier2-discovery] %s tenant=%s users=%d thenBackup=%s",
@@ -1314,8 +1323,9 @@ async def _consume_tier2_discovery():
                                 # display count omits them.
                                 "tier2": True,
                             }
-                            if forward_batch_id:
-                                payload["batchId"] = forward_batch_id
+                            # Always forward — may be None when caller forgot;
+                            # job-service rejects in that case under the flag.
+                            payload["batchId"] = forward_batch_id
                             r = await _c.post(
                                 f"{settings.JOB_SERVICE_URL}/api/v1/backups/trigger-bulk",
                                 json=payload,

@@ -466,6 +466,28 @@ class Job(Base):
     pre_toggle_job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id"))
 
 
+class BackupBatch(Base):
+    """Operator-intent row for one 'Backup all' / 'Backup user' click.
+
+    Inserted at click time. Every Job, RMQ message, and discovery
+    follow-up stamps spec.batch_id = this.id. Activity feed reads this
+    row directly; the strict 4-condition finalizer
+    (shared.batch_rollup._finalize_batch_if_complete) flips status
+    terminal only when every scoped leaf has a terminal snapshot AND
+    no snapshot_partitions row remains in-flight.
+    """
+    __tablename__ = "backup_batches"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    source = Column(String, nullable=False)  # 'manual_bulk' | 'manual_user' | 'scheduler'
+    actor_email = Column(String, nullable=True)
+    scope_user_ids = Column(ARRAY(UUID(as_uuid=True)), nullable=False)
+    bytes_expected = Column(BigInteger, nullable=True)
+    status = Column(String, nullable=False, default="IN_PROGRESS")
+
+
 class Snapshot(Base):
     __tablename__ = "snapshots"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

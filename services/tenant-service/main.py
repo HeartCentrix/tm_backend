@@ -11,7 +11,7 @@ from sqlalchemy import select, func, text
 
 from shared.config import settings
 from shared.database import get_db, close_db, AsyncSession, engine, async_session_factory
-from shared.models import Tenant, TenantType, TenantStatus, Organization, Resource, ResourceStatus, ResourceType, SlaPolicy
+from shared.models import Tenant, TenantType, TenantStatus, Organization, Resource, ResourceStatus, ResourceType, SlaPolicy, BackupBatch
 from shared.schemas import (
     TenantResponse, TenantCreateRequest, DiscoveryStatus, TenantInfoResponse,
     StorageSummaryItem, OrganizationResponse
@@ -479,7 +479,36 @@ async def backup_user_with_discovery(
     # one Activity row. Generated here (not in trigger-bulk) so we have a
     # stable id BEFORE the orchestrator HTTP roundtrip — future-proof for
     # any other side-channels that need the same id.
-    batch_id = str(uuid4())
+    #
+    # When BATCH_ROW_REDESIGN_ENABLED, also INSERT a backup_batches row
+    # with operator intent — Activity feed reads this row directly and
+    # the finalizer gates the terminal flip on every scoped leaf.
+    batch_row_id = uuid4()
+    batch_id = str(batch_row_id)
+    bytes_expected = None
+    try:
+        from shared.storage_rollup import exclude_tier2_storage_dupes_clause
+        bytes_expected = (await db.execute(
+            select(func.coalesce(func.sum(Resource.storage_bytes), 0))
+            .where(
+                Resource.tenant_id == tenant_uuid,
+                Resource.id == user_id,
+                exclude_tier2_storage_dupes_clause(),
+            )
+        )).scalar() or None
+    except Exception as _e:
+        # bytes_expected is ETA-only — non-fatal if the rollup query fails.
+        bytes_expected = None
+    db.add(BackupBatch(
+        id=batch_row_id,
+        tenant_id=tenant_uuid,
+        source="manual_user",
+        actor_email=None,  # request-scope user identity not propagated here yet
+        scope_user_ids=[user_id],
+        bytes_expected=int(bytes_expected) if bytes_expected else None,
+        status="IN_PROGRESS",
+    ))
+    await db.commit()
 
     async def _orchestrate():
         client_id = settings.MICROSOFT_CLIENT_ID or settings.AZURE_AD_CLIENT_ID
@@ -534,6 +563,7 @@ async def backup_user_with_discovery(
         "accepted": True,
         "tenantId": tenant_id,
         "userResourceId": user_resource_id,
+        "batchId": batch_id,
         "message": "Discovery + backup queued. Status will appear on the Activity page shortly.",
     }
 

@@ -8627,6 +8627,33 @@ class BackupWorker:
             f"{persisted_count} items, "
             f"{persisted_bytes / (1024 * 1024):.1f} MB)"
         )
+
+        # ---- backup_batches finalizer hook ----
+        # When BATCH_ROW_REDESIGN_ENABLED, walk the Job's spec.batch_id
+        # and try to flip the parent backup_batches row. Idempotent +
+        # gated; safe to call on every partition finalize.
+        if settings.BATCH_ROW_REDESIGN_ENABLED and parent_job_id:
+            try:
+                async with async_session_factory() as bsession:
+                    job_row = (await bsession.execute(text("""
+                        SELECT spec FROM jobs WHERE id = cast(:jid AS uuid)
+                    """), {"jid": str(parent_job_id)})).first()
+                    spec_blob = (job_row.spec if job_row else {}) or {}
+                    bid = spec_blob.get("batch_id") if isinstance(spec_blob, dict) else None
+                    if bid:
+                        from shared.batch_rollup import _finalize_batch_if_complete
+                        flipped = await _finalize_batch_if_complete(bid, bsession)
+                        if flipped:
+                            print(
+                                f"[{self.worker_id}] [BATCH FINALIZE] "
+                                f"batch={bid} flipped {flipped}"
+                            )
+            except Exception as bex:
+                print(
+                    f"[{self.worker_id}] [BATCH FINALIZE] failed for "
+                    f"parent_job={parent_job_id}: {type(bex).__name__}: {bex}"
+                )
+
         return new_status
 
     async def _process_onedrive_partition_message(
@@ -17733,6 +17760,27 @@ class BackupWorker:
                     f"→ {new_status} ({terminal}/{expected} children terminal, "
                     f"all partitions drained)"
                 )
+                # ---- backup_batches finalizer hook ----
+                if settings.BATCH_ROW_REDESIGN_ENABLED:
+                    try:
+                        spec_row = (await session.execute(text("""
+                            SELECT spec FROM jobs WHERE id = cast(:jid AS uuid)
+                        """), {"jid": str(job_id)})).first()
+                        spec_blob = (spec_row.spec if spec_row else {}) or {}
+                        bid = spec_blob.get("batch_id") if isinstance(spec_blob, dict) else None
+                        if bid:
+                            from shared.batch_rollup import _finalize_batch_if_complete
+                            flipped = await _finalize_batch_if_complete(bid, session)
+                            if flipped:
+                                print(
+                                    f"[{self.worker_id}] [BATCH FINALIZE] "
+                                    f"batch={bid} flipped {flipped}"
+                                )
+                    except Exception as bex:
+                        print(
+                            f"[{self.worker_id}] [BATCH FINALIZE] failed for "
+                            f"job={job_id}: {type(bex).__name__}: {bex}"
+                        )
                 return new_status
             # Observability: children all terminal but partitions still
             # draining — the gate is doing its job. Will re-fire when

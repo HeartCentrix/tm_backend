@@ -261,6 +261,18 @@ class Settings:
         # MAIL_RESTORE_V2_ENABLED=false in env to roll back to the legacy
         # _restore_email_to_mailbox path if the engine misbehaves.
         self.MAIL_RESTORE_V2_ENABLED = os.getenv("MAIL_RESTORE_V2_ENABLED", "true").lower() == "true"
+        # Activity batch-row redesign — first-class backup_batches row per click.
+        # Flag-off behaviour: legacy CTE rollup, batch_batches row inserted but
+        # unused by reads. Flag-on: tenant-service mandates the row, job-service
+        # validates batchId presence, audit-service reads backup_batches directly.
+        # Rollback = unset env var, redeploy. Spec at
+        # docs/superpowers/specs/2026-05-15-backup-batch-row-redesign-design.md.
+        self.BATCH_ROW_REDESIGN_ENABLED = os.getenv(
+            "BATCH_ROW_REDESIGN_ENABLED", "false"
+        ).lower() in ("true", "1", "yes")
+        self.BATCH_STALL_TIMEOUT_HOURS = int(
+            os.getenv("BATCH_STALL_TIMEOUT_HOURS", "24")
+        )
         # Per-worker global cap on concurrent mail-restore tasks across all
         # in-flight jobs. Keeps Graph traffic bounded even if many jobs run at once.
         self.MAIL_RESTORE_GLOBAL_POOL = int(os.getenv("MAIL_RESTORE_GLOBAL_POOL", "32"))
