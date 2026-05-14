@@ -141,9 +141,9 @@ def build_batch_rollup_query(
         SELECT
             COALESCE(j.spec->>'batch_id', j.id::text)              AS batch_id,
             j.tenant_id                                            AS tenant_id,
-            MIN(j.started_at)                                      AS started_at,
+            MIN(j.created_at)                                      AS started_at,
             MAX(j.completed_at)                                    AS jobs_max_completed_at,
-            ARRAY_AGG(j.id ORDER BY j.started_at)                  AS job_ids,
+            ARRAY_AGG(j.id ORDER BY j.created_at)                  AS job_ids,
             BOOL_OR(j.status::text = 'CANCELLED')                  AS any_cancelled,
             BOOL_OR(j.status::text = 'FAILED')                     AS any_job_failed,
             BOOL_AND(j.status::text IN ('COMPLETED','FAILED','CANCELLED'))
