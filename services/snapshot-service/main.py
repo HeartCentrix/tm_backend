@@ -129,9 +129,11 @@ def _compose_chat_name(
       1. Real Graph topic (when chat_threads.chat_topic is set).
       2. Composed from chat_threads.member_names_json — picks the right
          shape for 1:1 vs group.
-      3. Stable "Chat 19abc12" fallback (truncated chat_id). Never the
-         old "Group Chat (19:xxxxx)" synthetic value that used to leak
-         into folder_path and metadata.chatTopic at write time.
+      3. "Untitled chat #abcdef" / "Untitled group #abcdef" — natural-
+         reading fallback with a short ref suffix derived from chat_id
+         (alphanumeric-only, last 6 chars). Must match the write-side
+         fallback in backup-worker exactly so /folders and /chats/groups
+         agree on the displayed name.
     """
     if isinstance(topic, str) and topic.strip():
         return topic.strip()
@@ -142,14 +144,18 @@ def _compose_chat_name(
             for n in member_names
             if isinstance(n, str) and n.strip()
         ]
+    ct = (chat_type or "").lower()
     if names:
-        ct = (chat_type or "").lower()
         if ct == "oneonone":
             return " | ".join(names[:2])
         if len(names) <= 3:
             return ", ".join(names)
         return ", ".join(names[:3]) + f" +{len(names) - 3} more"
-    return f"Chat {chat_id[:8]}"
+    cid_clean = "".join(c for c in chat_id if c.isalnum()) or chat_id
+    suffix = cid_clean[-6:]
+    if ct == "oneonone":
+        return f"Untitled chat #{suffix}"
+    return f"Untitled group #{suffix}"
 
 
 @asynccontextmanager

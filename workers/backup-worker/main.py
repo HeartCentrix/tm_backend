@@ -3864,15 +3864,21 @@ class BackupWorker:
                         return ch_dt > _baseline_dt
 
                     def _cached_name_is_fallback(c: Dict[str, Any]) -> bool:
-                        # A cached entry whose displayName is the synthetic
-                        # "(19:xxxxx)" placeholder is worse than no cache —
-                        # reusing it locks the bad name in for the whole
-                        # baseline window. Force a refetch so the four-step
+                        # A cached entry whose displayName is a synthetic
+                        # placeholder is worse than no cache — reusing it
+                        # locks the bad name in for the whole baseline
+                        # window. Force a refetch so the four-step
                         # resolution chain (members → /users → message
-                        # author) gets another shot at producing a real name.
+                        # author) gets another shot at producing a real
+                        # name. Detects both legacy synthetic formats
+                        # (still in old cached entries until first
+                        # successful re-resolution) and the current
+                        # "Untitled chat/group #..." natural fallback.
                         dn = (c or {}).get("displayName") or ""
                         return (
-                            dn.startswith("1-on-1 Chat (19:")
+                            dn.startswith("Untitled chat #")
+                            or dn.startswith("Untitled group #")
+                            or dn.startswith("1-on-1 Chat (19:")
                             or dn.startswith("Group Chat (19:")
                             or dn.startswith("Chat ")
                         )
@@ -4069,15 +4075,34 @@ class BackupWorker:
                         ctype = ch.get("chatType", "unknown")
                         topic = ch.get("topic")
                         emails, names = member_lookup.get(cid, ([], []))
-                        # Display-name ladder, copied from
-                        # graph_client.discover_teams (reference 31c6f2c).
+                        # Display-name ladder. Fallback reads like a natural
+                        # label, not a technical chat-id dump. We strip the
+                        # "19:" Graph prefix and take a short reference
+                        # suffix (last 6 alphanumeric chars of the chat id)
+                        # so each unresolved chat keeps a unique, stable
+                        # path — required for the Recovery left-rail click-
+                        # through to filter the right messages — but the
+                        # user sees "Untitled chat #abc123" instead of
+                        # "Chat 19abcde7" or "Group Chat (19:abc123)".
+                        #
+                        # MUST match snapshot-service `_compose_chat_name`
+                        # final fallback exactly. Keeping write-time and
+                        # read-time formats identical is what makes this
+                        # durable: no migration ever needed when Graph
+                        # later resolves real members/topic — the post-
+                        # drain folder_path normalizer at line ~5476 picks
+                        # up the improvement and rewrites in place.
+                        _cid_clean = "".join(
+                            c for c in cid if c.isalnum()
+                        ) or cid
+                        _cid_suffix = _cid_clean[-6:]
                         if ctype == "oneOnOne":
                             if topic:
                                 display_name = topic
                             elif names:
                                 display_name = " | ".join(names)
                             else:
-                                display_name = f"1-on-1 Chat ({cid[:8]})"
+                                display_name = f"Untitled chat #{_cid_suffix}"
                         else:
                             if topic:
                                 display_name = topic
@@ -4086,7 +4111,7 @@ class BackupWorker:
                                 if len(names) > 3:
                                     display_name += f" +{len(names) - 3} more"
                             else:
-                                display_name = f"Group Chat ({cid[:8]})"
+                                display_name = f"Untitled group #{_cid_suffix}"
                         chat_meta[cid] = {
                             "displayName": display_name,
                             "chatType": ctype,
@@ -5393,7 +5418,9 @@ class BackupWorker:
                         _resolved_msg = 0
                         for _cid_local, _info in chat_meta.items():
                             _dn = (_info or {}).get("displayName") or ""
-                            if not (_dn.startswith("1-on-1 Chat (19:")
+                            if not (_dn.startswith("Untitled chat #")
+                                    or _dn.startswith("Untitled group #")
+                                    or _dn.startswith("1-on-1 Chat (19:")
                                     or _dn.startswith("Group Chat (19:")
                                     or _dn.startswith("Chat ")):
                                 continue
@@ -5488,7 +5515,9 @@ class BackupWorker:
                             dn = (info or {}).get("displayName")
                             # Skip fallback names — no point overwriting one
                             # bad name with another, and skip empties.
-                            if not dn or dn.startswith("1-on-1 Chat (19:") \
+                            if not dn or dn.startswith("Untitled chat #") \
+                                    or dn.startswith("Untitled group #") \
+                                    or dn.startswith("1-on-1 Chat (19:") \
                                     or dn.startswith("Group Chat (19:") \
                                     or dn.startswith("Chat "):
                                 continue
