@@ -1009,17 +1009,14 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS ix_snap_partition_claim "
         "ON snapshot_partitions (enqueued_at) "
         "WHERE status IN ('QUEUED', 'IN_PROGRESS')",
-        # Per-resource single-claim guarantee for the fan-out path. The
-        # model carries this in Snapshot.__table_args__, but SQLAlchemy
-        # create_all() only emits CREATE INDEX for *new* tables — pre-
-        # existing snapshots tables never picked it up, which let RMQ
-        # message redelivery silently create duplicate IN_PROGRESS rows
-        # and re-run the same drain. Explicit raw CREATE INDEX IF NOT
-        # EXISTS here makes the migration deterministic across every
-        # existing deployment, not just fresh schemas.
-        "CREATE UNIQUE INDEX IF NOT EXISTS ix_snapshots_job_resource_inprogress "
-        "ON snapshots (job_id, resource_id) "
-        "WHERE status = 'IN_PROGRESS'",
+        # NOTE: ix_snapshots_job_resource_inprogress lives in
+        # post_alter_index_statements (below) — its WHERE predicate
+        # references the snapshots.status enum, so it MUST be created
+        # AFTER alter_statements converts the column from VARCHAR to
+        # snapshotstatus. Created here it forces the cast `(status)::text`
+        # into the index predicate, and the next ALTER COLUMN TYPE then
+        # fails with "functions in index predicate must be marked
+        # IMMUTABLE" because enum→text is STABLE.
     ]
 
     add_column_statements = [
@@ -1224,6 +1221,18 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_jobs_tenant_type_status "
         "ON jobs (tenant_id, type, status) "
         "WHERE status IN ('QUEUED'::jobstatus,'PENDING'::jobstatus,'RUNNING'::jobstatus)",
+        # Per-resource single-claim guarantee for the fan-out path. The
+        # model carries this in Snapshot.__table_args__, but SQLAlchemy
+        # create_all() only emits CREATE INDEX for *new* tables — pre-
+        # existing snapshots tables never picked it up, which let RMQ
+        # message redelivery silently create duplicate IN_PROGRESS rows
+        # and re-run the same drain. Explicit raw CREATE INDEX IF NOT
+        # EXISTS here makes the migration deterministic. Must be in
+        # post_alter list because the WHERE predicate references the
+        # snapshotstatus enum (created by alter_statements above).
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_snapshots_job_resource_inprogress "
+        "ON snapshots (job_id, resource_id) "
+        "WHERE status = 'IN_PROGRESS'::snapshotstatus",
     ]
 
     alter_statements = [

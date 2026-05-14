@@ -2087,6 +2087,14 @@ class BackupWorker:
             #    the fetch. If the IN_PROGRESS row is older than 25
             #    min, the original worker likely died — fall through
             #    and let the stale-sweep / requeue cycle handle it.
+            # SnapshotStatus has no CANCELLED member — cancellation lives
+            # on the Job, and the snapshot is left at whatever state the
+            # worker last wrote (typically IN_PROGRESS → stale-swept to
+            # FAILED, OR PARTIAL if some content drained before cancel).
+            # COMPLETED + PARTIAL are the only durable terminal states
+            # we should treat as "re-running would waste work." FAILED is
+            # deliberately NOT in this list — a failed attempt should be
+            # retryable when RMQ redelivers.
             prior_terminal = (await session.execute(
                 select(Snapshot.id, Snapshot.status).where(
                     Snapshot.job_id == job_id,
@@ -2094,7 +2102,6 @@ class BackupWorker:
                     Snapshot.status.in_([
                         SnapshotStatus.COMPLETED,
                         SnapshotStatus.PARTIAL,
-                        SnapshotStatus.CANCELLED,
                     ]),
                 ).limit(1)
             )).first()
