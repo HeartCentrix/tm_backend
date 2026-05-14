@@ -252,6 +252,19 @@ def build_batch_rollup_query(
         CROSS JOIN LATERAL unnest(br.all_res_ids) AS bid
         LEFT JOIN resources r ON r.id = bid
         GROUP BY 1
+    ),
+    -- When a batch targets exactly one ENTRA_USER, pull that user's
+    -- display_name so the Activity row shows "Hemant Singh" instead of
+    -- "1 user". Multi-user batches fall through to the "N users" label.
+    entra_one AS (
+        SELECT
+            br.batch_id,
+            (ARRAY_AGG(r.display_name))[1] AS entra_user_name
+        FROM batch_res br
+        CROSS JOIN LATERAL unnest(br.all_res_ids) AS bid
+        JOIN resources r ON r.id = bid AND r.type::text = 'ENTRA_USER'
+        GROUP BY 1
+        HAVING COUNT(*) = 1
     )
     SELECT
         b.batch_id,
@@ -276,13 +289,15 @@ def build_batch_rollup_query(
         COALESCE(pr.parts_pending, 0)       AS parts_pending,
         COALESCE(f.missing_t2, 0)           AS missing_t2,
         sres.single_resource_name           AS single_resource_name,
-        sres.single_resource_type           AS single_resource_type
+        sres.single_resource_type           AS single_resource_type,
+        eo.entra_user_name                  AS entra_user_name
     FROM batches b
     LEFT JOIN snap_roll   sr ON sr.batch_id = b.batch_id
     LEFT JOIN parts_roll  pr ON pr.batch_id = b.batch_id
     LEFT JOIN fanout       f ON f.batch_id  = b.batch_id
     LEFT JOIN entra_count ec ON ec.batch_id = b.batch_id
     LEFT JOIN single_res  sres ON sres.batch_id = b.batch_id
+    LEFT JOIN entra_one   eo ON eo.batch_id = b.batch_id
     ORDER BY b.started_at DESC NULLS LAST
     LIMIT :size OFFSET :off
     """
@@ -342,10 +357,13 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
     entra = int(row.entra_user_count or 0)
     total = int(row.total_resource_count or 0)
     single_name = getattr(row, "single_resource_name", None)
-    if entra > 0:
-        obj_label = f"{entra} user" if entra == 1 else f"{entra} users"
+    entra_name = getattr(row, "entra_user_name", None)
+    if entra == 1 and entra_name:
+        obj_label = entra_name
+    elif entra > 1:
+        obj_label = f"{entra} users"
     elif total > 0:
-        obj_label = f"{total} resource" if total == 1 else f"{total} resources"
+        obj_label = single_name or (f"{total} resource" if total == 1 else f"{total} resources")
     elif single_name:
         obj_label = single_name
     else:
