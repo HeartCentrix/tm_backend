@@ -1426,6 +1426,12 @@ async def get_batch_children(batch_id: str):
                    "SHARED_MAILBOX", "ROOM_MAILBOX"}
 
     async with async_session_factory() as db:
+        # Read-only endpoint. Cap lock waits so we never deadlock with the
+        # finalize worker holding ExclusiveLock on snapshots/snapshot_partitions.
+        await db.execute(text("SET LOCAL lock_timeout = '2s'"))
+        await db.execute(text("SET LOCAL statement_timeout = '15s'"))
+        await db.execute(text("SET LOCAL TRANSACTION READ ONLY"))
+
         jobs_q = await db.execute(text("""
             SELECT id, batch_resource_ids
             FROM jobs
