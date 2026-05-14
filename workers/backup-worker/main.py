@@ -8060,7 +8060,7 @@ class BackupWorker:
                            completed_at   = NOW(),
                            files_uploaded = :nf,
                            bytes_uploaded = :nb,
-                           failure_state  = COALESCE(CAST(:fs AS JSONB), failure_state)
+                           failure_state  = COALESCE(CAST(:fs AS JSONB), failure_state::jsonb)
                      WHERE id = :pid
                        AND status NOT IN ('COMPLETED', 'FAILED')
                     """
@@ -16092,10 +16092,10 @@ class BackupWorker:
                                 bytes_added = COALESCE(bytes_added, :b),
                                 duration_secs = COALESCE(duration_secs,
                                     EXTRACT(EPOCH FROM (NOW() - started_at))::int),
-                                extra_data = COALESCE(extra_data, '{}'::json)::jsonb
+                                extra_data = COALESCE(extra_data::jsonb, '{}'::jsonb)
                                              || jsonb_build_object(
                                                 'reaped', true,
-                                                'reap_reason', :r)
+                                                'reap_reason', CAST(:r AS text))
                             WHERE id = :sid
                         """),
                         {"sid": sid, "n": n_items, "b": b_bytes, "r": reason},
@@ -17022,7 +17022,7 @@ class BackupWorker:
                         ),
                         items_processed = c.items,
                         bytes_processed = c.bytes,
-                        result = COALESCE(j.result, '{}'::json)::jsonb || jsonb_build_object(
+                        result = COALESCE(j.result::jsonb, '{}'::jsonb) || jsonb_build_object(
                             'snapshots_total', e.n,
                             'snapshots_completed', c.completed,
                             'snapshots_failed', c.failed,

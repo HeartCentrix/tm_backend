@@ -453,7 +453,7 @@ async def startup():
                         completed_at = NOW(),
                         duration_secs = EXTRACT(EPOCH FROM
                             (NOW() - c.started_at))::int,
-                        extra_data = COALESCE(s.extra_data, '{}'::json)::jsonb
+                        extra_data = COALESCE(s.extra_data::jsonb, '{}'::jsonb)
                                      || jsonb_build_object(
                                         'stale_sweep', true,
                                         'reason',
@@ -584,7 +584,7 @@ async def startup():
                             progress_pct = 100,
                             items_processed = c.items,
                             bytes_processed = c.bytes,
-                            result = COALESCE(j.result, '{}'::json)::jsonb
+                            result = COALESCE(j.result::jsonb, '{}'::jsonb)
                                      || jsonb_build_object(
                                         'finalized_by', 'stale_sweep',
                                         'snapshots_total', bj.n,
