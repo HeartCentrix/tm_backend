@@ -16551,6 +16551,36 @@ class BackupWorker:
         )
         await session.commit()
 
+        # Bubble the subtree-sum up to the ENTRA_USER parent so its
+        # storage_bytes reflects the full user-level rollup, not just
+        # whichever children happened to be done when its own handler
+        # finalized. Without this, ENTRA_USER's value freezes early and
+        # the Overview's per-user total drifts from Activity's per-batch
+        # bytes (which sums the child snapshots directly). The dedup
+        # clause in shared/storage_rollup.py excludes USER_* rows when
+        # their ENTRA_USER parent exists, so the parent must carry the
+        # full subtree-sum or the Overview undercounts.
+        parent_id = resource.parent_resource_id
+        if parent_id is not None:
+            parent_subtree_sum = (await session.execute(text("""
+                WITH targets AS (
+                    SELECT cast(:pid AS uuid) AS leaf
+                    UNION ALL
+                    SELECT id FROM resources
+                    WHERE parent_resource_id = cast(:pid AS uuid)
+                )
+                SELECT COALESCE(SUM(s.bytes_added), 0)
+                FROM targets t
+                JOIN snapshots s ON s.resource_id = t.leaf
+                WHERE s.status IN ('COMPLETED', 'PARTIAL', 'PENDING_DELETION')
+            """), {"pid": str(parent_id)})).scalar()
+            await session.execute(
+                sa_update(Resource)
+                .where(Resource.id == parent_id)
+                .values(storage_bytes=int(parent_subtree_sum or 0))
+            )
+            await session.commit()
+
     async def _reap_orphan_snapshots_for_job(
         self, job_id, reason: str,
         resource_id_filter: Optional[str] = None,
