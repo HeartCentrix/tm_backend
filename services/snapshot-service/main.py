@@ -294,9 +294,16 @@ async def list_snapshots(
     # NOTE: Job.spec is a plain JSON column, not JSONB — `.astext` is
     # JSONB-only and raises AttributeError on Comparator. Use
     # json_extract_path_text which works for both JSON and JSONB.
+    # `batch_id_raw` is the unmunged batch_id (may be NULL); `dedup_group`
+    # is the COALESCE used for ranking. Surfacing batch_id_raw on the
+    # response lets the Recovery UI's version-dropdown collapse cross-
+    # resource children of one bulk click into a single entry — the
+    # 3-Job fan-out (Tier-1 + Tier-2-urgent + Tier-2-heavy) shares
+    # batch_id but has 3 distinct job_ids, so jobId alone over-counts.
     snap_with_batch = (
         select(
             Snapshot,
+            _func.json_extract_path_text(Job.spec, "batch_id").label("batch_id_raw"),
             _func.coalesce(
                 _func.json_extract_path_text(Job.spec, "batch_id"),
                 _func.cast(Snapshot.job_id, String),
@@ -331,15 +338,18 @@ async def list_snapshots(
         .where(deduped_filter)
     )).scalar() or 0
     stmt = (
-        select(snap_alias)
+        select(
+            snap_alias,
+            ranked.c.batch_id_raw,
+        )
         .where(deduped_filter)
         .order_by(snap_alias.created_at.desc())
         .offset((page - 1) * size)
         .limit(size)
     )
     result = await db.execute(stmt)
-    snapshots = result.scalars().all()
-    
+    rows = result.all()
+
     return SnapshotListResponse(
         content=[
             SnapshotResponse(
@@ -350,8 +360,9 @@ async def list_snapshots(
                 type=s.type.value if hasattr(s.type, 'value') else str(s.type),
                 itemCount=s.item_count or 0,
                 jobId=str(s.job_id) if s.job_id else None,
+                batchId=batch_id_raw or None,
             )
-            for s in snapshots
+            for (s, batch_id_raw) in rows
         ],
         totalPages=max(1, (total + size - 1) // size),
         totalElements=total,
@@ -590,6 +601,19 @@ async def get_snapshot(snapshot_id: str, db: AsyncSession = Depends(get_db)):
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot not found")
 
+    # Pull batch_id from the Job's spec for parity with the list
+    # endpoint. Same plain-JSON path used in dedup_group above.
+    batch_id_raw: Optional[str] = None
+    if snapshot.job_id:
+        try:
+            from sqlalchemy import func as _func
+            batch_id_raw = (await db.execute(
+                select(_func.json_extract_path_text(Job.spec, "batch_id"))
+                .where(Job.id == snapshot.job_id)
+            )).scalar_one_or_none()
+        except Exception:
+            batch_id_raw = None
+
     # Partition rollup — populated only when this snapshot was sharded
     # by the cross-replica partition path. Non-partitioned snapshots
     # return `partitions: null` (backward compatible). Single join +
@@ -652,6 +676,7 @@ async def get_snapshot(snapshot_id: str, db: AsyncSession = Depends(get_db)):
         type=snapshot.type.value if hasattr(snapshot.type, 'value') else str(snapshot.type),
         itemCount=snapshot.item_count or 0,
         jobId=str(snapshot.job_id) if snapshot.job_id else None,
+        batchId=batch_id_raw or None,
         partitions=partitions_block,
     )
 

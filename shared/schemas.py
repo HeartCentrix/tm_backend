@@ -314,6 +314,13 @@ class SnapshotResponse(BaseModel):
     type: str
     itemCount: int
     jobId: Optional[str] = None
+    # `batch_id` from the Job's spec — shared by Tier-1 + Tier-2-urgent
+    # + Tier-2-heavy Jobs that fan out from a single "Backup now" click.
+    # Recovery UI uses this to collapse cross-resource children of one
+    # bulk run into a single dropdown entry (the dropdown bucketing by
+    # jobId alone over-counted because the 3 Jobs have 3 distinct ids).
+    # `null` for legacy snapshots whose Job has no batch_id in spec.
+    batchId: Optional[str] = None
     # Cross-replica partition rollup. Populated only for snapshots
     # that were partitioned (OneDrive/Chats/Mail/SharePoint shards).
     # `null` for non-partitioned snapshots — backward compatible.
