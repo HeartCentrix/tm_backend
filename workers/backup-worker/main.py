@@ -6239,6 +6239,7 @@ class BackupWorker:
                     # See _compute_snapshot_delta_from_prior.
                     delta_items, delta_bytes = await self._compute_snapshot_delta_from_prior(
                         session, snapshot.id, resource.id, total_items, bytes_total,
+                        current_job_id=job_id,
                     )
                     snap = await session.get(Snapshot, snapshot.id)
                     snap.item_count = total_items
@@ -8477,6 +8478,7 @@ class BackupWorker:
                 delta_items, delta_bytes = await self._compute_snapshot_delta_from_prior(
                     session, snapshot_id, snap.resource_id,
                     persisted_count, persisted_bytes,
+                    current_job_id=snap.job_id,
                 )
                 snap.item_count = persisted_count
                 snap.new_item_count = delta_items
@@ -16326,6 +16328,7 @@ class BackupWorker:
         resource_id: Any,
         current_item_count: int,
         current_bytes_total: int,
+        current_job_id: Optional[uuid.UUID] = None,
     ) -> Tuple[int, int]:
         """Return (new_item_count, bytes_added) for a settling snapshot.
 
@@ -16345,16 +16348,27 @@ class BackupWorker:
         backup of this resource), delta = full inventory. If prior is
         bigger than current (rare, e.g. messages got deleted), delta = 0
         — never negative.
+
+        IMPORTANT: exclude snapshots from the same job_id. Same-run
+        siblings (e.g. duplicate snapshots produced by the partition
+        coordinator + a stray non-partitioned consumer race) would
+        otherwise look like "prior" and produce nonsense deltas where
+        the second sibling reports bytes_added=0 even though it was a
+        first-time write. Only TRULY-prior runs (different job_id)
+        should be considered for delta computation.
         """
+        filters = [
+            Snapshot.resource_id == resource_id,
+            Snapshot.id != snapshot_id,
+            Snapshot.status.in_(
+                [SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]
+            ),
+        ]
+        if current_job_id is not None:
+            filters.append(Snapshot.job_id != current_job_id)
         prior = (await session.execute(
             select(Snapshot.item_count, Snapshot.bytes_total)
-            .where(
-                Snapshot.resource_id == resource_id,
-                Snapshot.id != snapshot_id,
-                Snapshot.status.in_(
-                    [SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]
-                ),
-            )
+            .where(*filters)
             .order_by(desc(Snapshot.completed_at))
             .limit(1)
         )).first()
@@ -17311,12 +17325,30 @@ class BackupWorker:
         would add a duplicate, polluting Recovery view with phantom
         spinning snapshots until the stale-sweep closes them.
 
-        Resume-first: for (job_id, resource_id), if an IN_PROGRESS
-        snapshot already exists, return it. The handler continues
-        writing items against the same snapshot id, idempotency keys
-        on snapshot_items (external_id) keep dupes out. Only create
-        a fresh snapshot when no prior one exists for this exact
+        Resume-first: for (job_id, resource_id), if a snapshot in
+        IN_PROGRESS, COMPLETED, or PARTIAL state already exists,
+        return it. The handler continues writing items against the
+        same snapshot id; idempotency keys on snapshot_items
+        (external_id) keep dupes out. Only create a fresh snapshot
+        when no non-FAILED snapshot exists for this exact
         (job_id, resource_id) pair.
+
+        IMPORTANT — terminal-resume scenario: partition consumers
+        (CHATS / MAIL / SharePoint / OneDrive) can arrive LATE — i.e.
+        the original partition message lands after sibling partitions
+        already finished and `_finalize_partitioned_snapshot` flipped
+        the coordinator's snapshot to COMPLETED/PARTIAL. Without the
+        terminal-status branch below, this helper would see no
+        IN_PROGRESS row and create a fresh non-partitioned snapshot
+        for the same (job_id, resource_id) — producing the duplicate
+        observed 2026-05-15 (6 resources with two snapshots, one
+        `partitioned=true` and a second with no partition flag, both
+        same job_id). Resume terminal snapshots to keep the partition
+        path strictly idempotent on the snapshot table.
+
+        FAILED snapshots are deliberately excluded — a failed attempt
+        is retryable; redelivery of its message should create a new
+        snapshot and try again.
 
         Race-safety: the partial unique index
         ``ix_snapshots_job_resource_inprogress`` (see shared/models.py
@@ -17334,8 +17366,12 @@ class BackupWorker:
                 select(Snapshot).where(
                     Snapshot.job_id == job_id,
                     Snapshot.resource_id == resource.id,
-                    Snapshot.status == SnapshotStatus.IN_PROGRESS,
-                ).limit(1),
+                    Snapshot.status.in_([
+                        SnapshotStatus.IN_PROGRESS,
+                        SnapshotStatus.COMPLETED,
+                        SnapshotStatus.PARTIAL,
+                    ]),
+                ).order_by(desc(Snapshot.created_at)).limit(1),
             )
             prior = existing.scalar_one_or_none()
             if prior is not None:

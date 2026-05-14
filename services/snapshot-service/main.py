@@ -291,11 +291,14 @@ async def list_snapshots(
     # collapse N different users' snapshots from one bulk into a single
     # row.
     from sqlalchemy import func as _func
+    # NOTE: Job.spec is a plain JSON column, not JSONB — `.astext` is
+    # JSONB-only and raises AttributeError on Comparator. Use
+    # json_extract_path_text which works for both JSON and JSONB.
     snap_with_batch = (
         select(
             Snapshot,
             _func.coalesce(
-                Job.spec["batch_id"].astext,
+                _func.json_extract_path_text(Job.spec, "batch_id"),
                 _func.cast(Snapshot.job_id, String),
                 _func.cast(Snapshot.id, String),
             ).label("dedup_group"),
@@ -942,7 +945,7 @@ async def get_content_snapshots(
             func.count(
                 distinct(
                     func.coalesce(
-                        Job.spec["batch_id"].astext,
+                        func.json_extract_path_text(Job.spec, "batch_id"),
                         func.cast(Snapshot.job_id, String),
                         func.cast(Snapshot.id, String),
                     )
