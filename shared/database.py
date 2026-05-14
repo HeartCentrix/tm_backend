@@ -909,6 +909,21 @@ async def init_db() -> None:
             PRIMARY KEY (resource_id, drive_id)
         )
         """,
+        # bulk_fanout_seen — per-resource dedup marker for the bulk
+        # backup fanout coordinator (_fanout_bulk_to_per_resource).
+        # Inserted BEFORE per-resource publish; ON CONFLICT DO NOTHING
+        # is the atomic dedup point that prevents bulk-message
+        # redelivery from re-publishing duplicate per-resource backups
+        # (the observed loop where one user's USER_CHATS spawns 2-3
+        # snapshots per session). Stale-sweep prunes rows > 24h.
+        """
+        CREATE TABLE IF NOT EXISTS bulk_fanout_seen (
+            job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            resource_id UUID NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (job_id, resource_id)
+        )
+        """,
     ]
 
     index_statements = [

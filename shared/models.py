@@ -678,6 +678,41 @@ class SharePointDriveDelta(Base):
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
 
 
+class BulkFanoutSeen(Base):
+    """Per-resource dedup marker for bulk-fanout publish.
+
+    `_fanout_bulk_to_per_resource` publishes one per-resource backup
+    message per resource in a bulk Job. Under RMQ redelivery (visibility
+    timeout, NACK on PG saturation, worker restart mid-fanout) the bulk
+    coordinator re-runs and would re-publish the same per-resource
+    messages a second time — producing 2-3× duplicate USER_CHATS /
+    USER_MAIL messages per user, which each spin up their own
+    SnapshotPartition fanout, which the operator sees as a backup-loop.
+
+    Fix: insert one row per (job_id, resource_id) BEFORE publishing.
+    The PK + ON CONFLICT DO NOTHING is the atomic dedup point — on
+    redelivery, the second pass's INSERTs return 0 rows and the
+    coordinator skips the publish entirely. Idempotent + crash-safe
+    (the row commits in the same txn as the publish-intent batch).
+
+    Cleanup: stale-sweep prunes rows older than 24h. Even with no
+    cleanup the table is small — at 5k users × 8 resource-types =
+    40k rows per bulk run, growth is bounded by bulk-trigger frequency.
+    """
+    __tablename__ = "bulk_fanout_seen"
+    job_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    resource_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("resources.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+
 class JobLog(Base):
     __tablename__ = "job_logs"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

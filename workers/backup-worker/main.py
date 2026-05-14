@@ -2538,6 +2538,58 @@ class BackupWorker:
             msg["parentBulkJobId"] = str(job_id)
             to_publish.append((queue, msg, rid))
 
+        # Loop fix: atomic per-resource dedup BEFORE publishing. On
+        # bulk-message redelivery (RMQ visibility timeout, NACK on PG
+        # saturation, worker mid-fanout restart) the coordinator would
+        # otherwise re-publish the same per-resource messages a second
+        # time, spawning 2-3× snapshots per user (observed live on
+        # Railway 9-user run: Ranjeet=3 partition fanouts, Rohit=2).
+        # ON CONFLICT DO NOTHING + RETURNING is the atomic point — the
+        # second pass's INSERTs return 0 rows, and we drop those
+        # publishes. G2's IN_PROGRESS-snapshot check above catches the
+        # slow path; this catches the fast path before any snapshot
+        # exists. Best-effort: a DB failure here falls through (the
+        # create_snapshot partial unique index still de-dupes per
+        # (job_id, resource_id), so worst case is one wasted message hop).
+        if to_publish:
+            try:
+                async with async_session_factory() as session:
+                    rids_to_insert = [rid for (_q, _m, rid) in to_publish]
+                    accepted_rows = (await session.execute(
+                        text(
+                            """
+                            INSERT INTO bulk_fanout_seen
+                                (job_id, resource_id, created_at)
+                            SELECT :jid::uuid, unnest(:rids)::uuid, NOW()
+                            ON CONFLICT (job_id, resource_id) DO NOTHING
+                            RETURNING resource_id::text
+                            """
+                        ),
+                        {"jid": str(job_id), "rids": rids_to_insert},
+                    )).fetchall()
+                    await session.commit()
+                accepted = {row[0] for row in accepted_rows}
+                pre_dedup_count = len(to_publish)
+                to_publish = [
+                    item for item in to_publish if item[2] in accepted
+                ]
+                deduped = pre_dedup_count - len(to_publish)
+                if deduped:
+                    print(
+                        f"[{self.worker_id}] [FANOUT] bulk redelivery "
+                        f"dedup: skipped {deduped} resources already "
+                        f"fanned out for job={job_id}"
+                    )
+            except Exception as exc:
+                # Fall through — create_snapshot's partial unique
+                # index will catch downstream duplicates. Log loudly
+                # so the operator can investigate the dedup-table
+                # availability separately.
+                print(
+                    f"[{self.worker_id}] [FANOUT] bulk_fanout_seen "
+                    f"dedup query failed (non-fatal): {exc}"
+                )
+
         already = len(resources) - len(to_publish)
         print(
             f"[{self.worker_id}] [FANOUT] job={job_id} "
@@ -8140,8 +8192,50 @@ class BackupWorker:
             )).first()
             await session.commit()
 
+        # Pre-empt path: REAPER (stale-sweep) can flip s.status from
+        # IN_PROGRESS to PARTIAL/FAILED before the last partition
+        # finishes, snapshotting a stale bytes_total. The CTE-UPDATE
+        # above then returns no row because the IN_PROGRESS guard
+        # fails. Re-query so the bytes reconcile still runs — the
+        # operator-facing total stays correct even when REAPER won
+        # the flip. The `partition_reconciled` marker keeps the path
+        # idempotent under last-finisher race.
+        preempted = False
         if row is None:
-            return None
+            async with async_session_factory() as session:
+                row = (await session.execute(
+                    text(
+                        """
+                        SELECT s.status::text AS new_status,
+                               c.terminal,
+                               c.n,
+                               s.job_id,
+                               s.resource_id,
+                               COALESCE(
+                                   (s.extra_data->>'partition_reconciled')::bool,
+                                   false
+                               ) AS already_done
+                          FROM snapshots s
+                          CROSS JOIN LATERAL (
+                              SELECT COUNT(*) AS n,
+                                     COUNT(*) FILTER (
+                                         WHERE status IN ('COMPLETED','FAILED')
+                                     ) AS terminal
+                                FROM snapshot_partitions
+                               WHERE snapshot_id = :sid
+                          ) c
+                         WHERE s.id = :sid
+                        """
+                    ),
+                    {"sid": str(snapshot_id)},
+                )).first()
+            if (row is None
+                or int(row.terminal) < int(row.n)
+                or row.new_status not in ("COMPLETED", "PARTIAL", "FAILED")
+                or row.already_done):
+                return None
+            preempted = True
+
         new_status = row.new_status if hasattr(row, "new_status") else row[0]
         terminal   = row.terminal   if hasattr(row, "terminal")   else row[1]
         expected   = row.n          if hasattr(row, "n")          else row[2]
@@ -8150,9 +8244,10 @@ class BackupWorker:
         ):
             return None
 
-        # Winning caller: run the DB-grounded bytes reconcile so
-        # snapshot.bytes_added matches the actual on-disk content.
-        # Mirrors `_backup_user_content_parallel`'s finalize block.
+        # Run the DB-grounded bytes reconcile so snapshot.bytes_added
+        # matches the actual on-disk content. Mirrors
+        # `_backup_user_content_parallel`'s finalize block. Idempotent —
+        # safe on both winning-flip and preempted-by-REAPER paths.
         async with async_session_factory() as session:
             CHILD_ITEM_TYPES = (
                 "CHAT_ATTACHMENT",
@@ -8176,6 +8271,11 @@ class BackupWorker:
                 snap.new_item_count = persisted_count
                 snap.bytes_total = persisted_bytes
                 snap.bytes_added = persisted_bytes
+                # Mark so a second pre-empted entry returns early.
+                snap.extra_data = {
+                    **(snap.extra_data or {}),
+                    "partition_reconciled": True,
+                }
                 if snap.completed_at is None:
                     snap.completed_at = datetime.utcnow()
                 if snap.started_at and snap.completed_at:
@@ -8185,7 +8285,10 @@ class BackupWorker:
                 await session.commit()
 
             # Bubble the new bytes up to the parent Job so the
-            # Activity row reflects this snapshot's work.
+            # Activity row reflects this snapshot's work. On the
+            # preempted path REAPER already rolled the parent up
+            # once; the reconcile above corrected this snapshot's
+            # bytes, so call it again to re-roll with fresh totals.
             parent_job_id = job_id
             if parent_job_id is None:
                 parent_job_id = (
@@ -8231,44 +8334,47 @@ class BackupWorker:
         # Audit event — the inline path emits BACKUP_COMPLETED /
         # BACKUP_FAILED per-resource; for the partitioned path the
         # coordinator skipped its emission, so we do it here once
-        # the snapshot has settled to terminal.
-        try:
-            if resource is None:
-                # Lazy-load resource for the audit event.
-                async with async_session_factory() as s:
-                    rid_val = (
-                        row.resource_id
-                        if hasattr(row, "resource_id") else row[4]
+        # the snapshot has settled to terminal. Skip on the preempted
+        # path — REAPER already owns the audit emission for snapshots
+        # it flipped, and double-firing would over-count in dashboards.
+        if not preempted:
+            try:
+                if resource is None:
+                    # Lazy-load resource for the audit event.
+                    async with async_session_factory() as s:
+                        rid_val = (
+                            row.resource_id
+                            if hasattr(row, "resource_id") else row[4]
+                        )
+                        if rid_val is not None:
+                            resource = await s.get(Resource, rid_val)
+                if tenant is None and resource is not None:
+                    async with async_session_factory() as s:
+                        tenant = await s.get(Tenant, resource.tenant_id)
+                if resource is not None and tenant is not None:
+                    audit_action = (
+                        "BACKUP_FAILED"
+                        if new_status == "FAILED"
+                        else "BACKUP_COMPLETED"
                     )
-                    if rid_val is not None:
-                        resource = await s.get(Resource, rid_val)
-            if tenant is None and resource is not None:
-                async with async_session_factory() as s:
-                    tenant = await s.get(Tenant, resource.tenant_id)
-            if resource is not None and tenant is not None:
-                audit_action = (
-                    "BACKUP_FAILED"
-                    if new_status == "FAILED"
-                    else "BACKUP_COMPLETED"
+                    audit_outcome = (
+                        "FAILURE" if new_status == "FAILED" else "SUCCESS"
+                    )
+                    await self._emit_backup_audit(
+                        audit_action, audit_outcome,
+                        tenant, resource, snapshot_id, parent_job_id,
+                        details={
+                            "item_count": persisted_count,
+                            "bytes_added": persisted_bytes,
+                            "snapshot_status": new_status,
+                            "partitioned": True,
+                        },
+                    )
+            except Exception as au_exc:
+                print(
+                    f"[{self.worker_id}] [PARTITION FINALIZE] audit "
+                    f"emit failed: {type(au_exc).__name__}: {au_exc}"
                 )
-                audit_outcome = (
-                    "FAILURE" if new_status == "FAILED" else "SUCCESS"
-                )
-                await self._emit_backup_audit(
-                    audit_action, audit_outcome,
-                    tenant, resource, snapshot_id, parent_job_id,
-                    details={
-                        "item_count": persisted_count,
-                        "bytes_added": persisted_bytes,
-                        "snapshot_status": new_status,
-                        "partitioned": True,
-                    },
-                )
-        except Exception as au_exc:
-            print(
-                f"[{self.worker_id}] [PARTITION FINALIZE] audit "
-                f"emit failed: {type(au_exc).__name__}: {au_exc}"
-            )
 
         print(
             f"[{self.worker_id}] [PARTITION FINALIZE] snapshot="
@@ -8955,10 +9061,38 @@ class BackupWorker:
         }
 
         tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
+        # DB-grounded pre/post counters from snapshot_items. The mail
+        # handler doesn't increment Snapshot.item_count / bytes_added
+        # in real time the way the OneDrive handler does — those land
+        # at the END of the per-resource backup. Reading from
+        # snapshot_items directly gives the shard's actual contribution
+        # regardless of when the parent snapshot fields settle. CHAT_*
+        # and EMAIL_ATTACHMENT pointer rows are excluded so the parent
+        # item's size isn't double-counted.
+        _DERIVED_ITEM_EXCLUDES = (
+            "CHAT_ATTACHMENT",
+            "EMAIL_ATTACHMENT",
+            "CHAT_HOSTED_CONTENT",
+        )
         async with async_session_factory() as session:
-            pre = await session.get(Snapshot, snapshot_id)
-            pre_items = int((pre.item_count if pre else 0) or 0)
-            pre_bytes = int((pre.bytes_added if pre else 0) or 0)
+            row = (await session.execute(
+                text(
+                    """
+                    SELECT COUNT(*) AS n,
+                           COALESCE(SUM(content_size), 0) AS b
+                      FROM snapshot_items
+                     WHERE snapshot_id = :sid
+                       AND item_type NOT IN (
+                           'CHAT_ATTACHMENT',
+                           'EMAIL_ATTACHMENT',
+                           'CHAT_HOSTED_CONTENT'
+                       )
+                    """
+                ),
+                {"sid": str(snapshot_id)},
+            )).one()
+            pre_items = int(row[0] or 0)
+            pre_bytes = int(row[1] or 0)
 
         try:
             async with tenant_sem:
@@ -8973,9 +9107,24 @@ class BackupWorker:
                         synth_msg, job_id,
                     )
             async with async_session_factory() as session:
-                post = await session.get(Snapshot, snapshot_id)
-                post_items = int((post.item_count if post else 0) or 0)
-                post_bytes = int((post.bytes_added if post else 0) or 0)
+                row = (await session.execute(
+                    text(
+                        """
+                        SELECT COUNT(*) AS n,
+                               COALESCE(SUM(content_size), 0) AS b
+                          FROM snapshot_items
+                         WHERE snapshot_id = :sid
+                           AND item_type NOT IN (
+                               'CHAT_ATTACHMENT',
+                               'EMAIL_ATTACHMENT',
+                               'CHAT_HOSTED_CONTENT'
+                           )
+                        """
+                    ),
+                    {"sid": str(snapshot_id)},
+                )).one()
+                post_items = int(row[0] or 0)
+                post_bytes = int(row[1] or 0)
             await self._mark_partition_terminal(
                 partition_id, status="COMPLETED",
                 files_uploaded=max(0, post_items - pre_items),

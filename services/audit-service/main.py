@@ -78,13 +78,17 @@ def _compute_details(job: Job) -> str:
     if job.status == JobStatus.CANCELLED:
         return "Cancelled"
 
-    # RUNNING / PENDING — progress text is meaningful.
+    # RUNNING / PENDING — lead with percentage so the operator sees
+    # "how far along" at a glance; bytes are supplementary context.
+    # Prior shape was bytes-first (e.g. "5.0 GB backed up"), which is
+    # less actionable mid-flight.
     if total_data > 0:
         pct = min(100, int((data_backed_up / total_data) * 100))
-        return f"{pct}% ({_fmt_bytes(data_backed_up)} / {_fmt_bytes(total_data)})"
+        return f"Progress: {pct}% ({_fmt_bytes(data_backed_up)} of {_fmt_bytes(total_data)})"
+    pct = job.progress_pct or 0
     if data_backed_up > 0:
-        return f"{_fmt_bytes(data_backed_up)} backed up"
-    return f"Progress: {job.progress_pct or 0}%"
+        return f"Progress: {pct}% ({_fmt_bytes(data_backed_up)} so far)"
+    return f"Progress: {pct}%"
 
 
 def _group_batch_jobs(
@@ -165,13 +169,16 @@ def _group_batch_jobs(
         elif group_status == "Canceled":
             details = "Cancelled"
         else:
+            # In Progress — lead with percentage; bytes supplement it.
+            # Average sibling progress_pct is the fallback when bytes
+            # totals aren't populated yet (e.g. discovery-only siblings).
+            avg_pct = sum((c.progress_pct or 0) for c in children) // max(len(children), 1)
             if total_data > 0:
                 pct = min(100, int((data_backed_up / total_data) * 100))
-                details = f"{pct}% ({_fmt_bytes(data_backed_up)} / {_fmt_bytes(total_data)})"
+                details = f"Progress: {pct}% ({_fmt_bytes(data_backed_up)} of {_fmt_bytes(total_data)})"
             elif data_backed_up > 0:
-                details = f"{_fmt_bytes(data_backed_up)} backed up"
+                details = f"Progress: {avg_pct}% ({_fmt_bytes(data_backed_up)} so far)"
             else:
-                avg_pct = sum((c.progress_pct or 0) for c in children) // max(len(children), 1)
                 details = f"Progress: {avg_pct}%"
 
         # Use the EARLIEST sibling's created_at as the row's start_time so
