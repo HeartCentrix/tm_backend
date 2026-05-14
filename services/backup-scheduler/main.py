@@ -2663,6 +2663,34 @@ async def sweep_dirty_lifecycle_policies():
     # and release explicitly at the end.
     lock_acquired = False
     lock_session = None
+
+    async def _release_lifecycle_lock():
+        """Release the pg-advisory lock + close the session.
+        Idempotent: safe to call from any early-return path or the
+        outer finally. Without this, the early-exit branches below
+        (SeaweedFS short-circuit, ImportError fallback, empty-dirty
+        result, empty-tenant guard) leaked one asyncpg connection per
+        sweep tick, surfacing as `garbage collector is trying to clean
+        up non-checked-in connection` SAWarnings in the scheduler log.
+        """
+        nonlocal lock_acquired, lock_session
+        if lock_acquired and lock_session is not None:
+            try:
+                await lock_session.execute(
+                    text("SELECT pg_advisory_unlock(:k)"),
+                    {"k": _LOCK_KEY_LIFECYCLE_SWEEP},
+                )
+                await lock_session.commit()
+            except Exception as e:
+                print(f"[LIFECYCLE-SWEEP] advisory_unlock failed: {e}")
+        if lock_session is not None:
+            try:
+                await lock_session.__aexit__(None, None, None)
+            except Exception:
+                pass
+        lock_session = None
+        lock_acquired = False
+
     try:
         lock_session = async_session_factory()
         await lock_session.__aenter__()
@@ -2673,16 +2701,11 @@ async def sweep_dirty_lifecycle_policies():
         lock_acquired = bool(got)
         if not lock_acquired:
             print("[LIFECYCLE-SWEEP] another pod holds the sweeper lock — skipping this tick")
-            await lock_session.__aexit__(None, None, None)
-            lock_session = None
+            await _release_lifecycle_lock()
             return
     except Exception as e:
         print(f"[LIFECYCLE-SWEEP] advisory-lock acquire failed, skipping tick: {e}")
-        if lock_session is not None:
-            try:
-                await lock_session.__aexit__(None, None, None)
-            except Exception:
-                pass
+        await _release_lifecycle_lock()
         return
 
     # SeaweedFS short-circuit (same logic as the daily reconciler).
@@ -2703,6 +2726,7 @@ async def sweep_dirty_lifecycle_policies():
         if active_kind and active_kind != "azure_blob":
             print(f"[LIFECYCLE-SWEEP] active backend is '{active_kind}' — "
                   f"skipping (dirty flags preserved for Azure-flip replay)")
+            await _release_lifecycle_lock()
             return
     except Exception:
         pass  # router not loaded yet — let the per-call ARM check gate it
@@ -2715,6 +2739,7 @@ async def sweep_dirty_lifecycle_policies():
             apply_encryption_scope,
         )
     except ImportError:
+        await _release_lifecycle_lock()
         return
 
     async with async_session_factory() as session:
@@ -2730,6 +2755,7 @@ async def sweep_dirty_lifecycle_policies():
         _sla_metrics.set_dirty_count(len(dirty_policies))
 
     if not dirty_policies:
+        await _release_lifecycle_lock()
         return
 
     print(f"[LIFECYCLE-SWEEP] {len(dirty_policies)} dirty policy(ies) to reconcile")
@@ -2745,6 +2771,7 @@ async def sweep_dirty_lifecycle_policies():
     async with async_session_factory() as session:
         tenant_ids = list(by_tenant.keys())
         if not tenant_ids:
+            await _release_lifecycle_lock()
             return
         t_rows = (await session.execute(
             select(Tenant).where(Tenant.id.in_(tenant_ids))
@@ -2814,20 +2841,9 @@ async def sweep_dirty_lifecycle_policies():
     finally:
         # Release the advisory lock no matter what — non-leaders never
         # acquired so this is a no-op for them; the leader frees the lock
-        # so the next 5-min tick can elect again.
-        if lock_acquired and lock_session is not None:
-            try:
-                await lock_session.execute(
-                    text("SELECT pg_advisory_unlock(:k)"),
-                    {"k": _LOCK_KEY_LIFECYCLE_SWEEP},
-                )
-                await lock_session.commit()
-            except Exception as e:
-                print(f"[LIFECYCLE-SWEEP] advisory_unlock failed: {e}")
-            try:
-                await lock_session.__aexit__(None, None, None)
-            except Exception:
-                pass
+        # so the next 5-min tick can elect again. Idempotent with the
+        # early-return release calls above.
+        await _release_lifecycle_lock()
 
 
 async def _reconcile_policies_for_tenant(tenant, policies):

@@ -333,7 +333,7 @@ async def _create_batch_backup_jobs(
     await db.commit()
 
     for routing_key, msg in pending_publishes:
-        print(f"[JOB_SERVICE] batch backup → {routing_key} ({len(msg.get('resource_ids', []))} resources)")
+        print(f"[JOB_SERVICE] batch backup → {routing_key} ({msg.get('batchSize', len(msg.get('resourceIds', [])))} resources)")
         await message_bus.publish(routing_key, msg, priority=priority)
 
     for queued_job in job_objects:

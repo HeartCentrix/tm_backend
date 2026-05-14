@@ -5,7 +5,13 @@ WORKDIR /app
 # Copy shared library first
 COPY shared /app/shared
 
-# Copy service code
+# Copy service code + the services package marker so cross-service
+# imports resolve (e.g. `from services.exports_cleanup import ...`
+# used by the daily exports-cleanup cron — without these the cron
+# silently fails every 24h with `No module named services.exports_cleanup`,
+# and orphaned export ZIPs never get reaped).
+COPY services/__init__.py /app/services/__init__.py
+COPY services/exports_cleanup.py /app/services/exports_cleanup.py
 COPY services/backup-scheduler /app/services/backup-scheduler
 
 # Install dependencies

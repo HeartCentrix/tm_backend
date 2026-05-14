@@ -909,6 +909,15 @@ async def _copy_chat_attachment_rows_to_snapshot(
     if not tenant_id or not target_snapshot_id or not chat_id:
         return 0
     async with async_session_factory() as s:
+        # Race-free idempotent copy: rely on the (snapshot_id, external_id,
+        # item_type) unique index via ON CONFLICT DO NOTHING. Two shards
+        # claiming different chats on the same partitioned snapshot may
+        # both reference the same source attachment (e.g. an attachment
+        # forwarded between chats); the old NOT EXISTS subquery raced
+        # because it evaluated at SELECT time while the unique constraint
+        # fires at INSERT time. DISTINCT ON also collapses any intra-call
+        # duplicates the source SELECT itself produces (one source row per
+        # snapshot it's been kept in, but only one destination row needed).
         result = await s.execute(
             text(
                 "INSERT INTO snapshot_items ("
@@ -918,7 +927,8 @@ async def _copy_chat_attachment_rows_to_snapshot(
                 "  encryption_key_id, backup_version, metadata, is_deleted, "
                 "  indexed_at, backend_id, created_at"
                 ") "
-                "SELECT gen_random_uuid(), :tsid, :tid, src.item_type, "
+                "SELECT DISTINCT ON (src.external_id, src.item_type) "
+                "       gen_random_uuid(), :tsid, :tid, src.item_type, "
                 "       src.external_id, "
                 "       COALESCE(src.parent_external_id, split_part(src.external_id, '::', 1)), "
                 "       src.name, "
@@ -937,12 +947,7 @@ async def _copy_chat_attachment_rows_to_snapshot(
                 "           JOIN chat_threads t ON t.id = m.chat_thread_id "
                 "          WHERE t.tenant_id = :tid AND t.chat_id = :cid "
                 "       ) "
-                "   AND NOT EXISTS ( "
-                "         SELECT 1 FROM snapshot_items dst "
-                "          WHERE dst.snapshot_id = :tsid "
-                "            AND dst.external_id = src.external_id "
-                "            AND dst.item_type = src.item_type "
-                "       )"
+                "ON CONFLICT (snapshot_id, external_id, item_type) DO NOTHING"
             ),
             {
                 "tsid": target_snapshot_id,
@@ -8055,7 +8060,7 @@ class BackupWorker:
                            completed_at   = NOW(),
                            files_uploaded = :nf,
                            bytes_uploaded = :nb,
-                           failure_state  = COALESCE(:fs::json, failure_state)
+                           failure_state  = COALESCE(CAST(:fs AS JSONB), failure_state)
                      WHERE id = :pid
                        AND status NOT IN ('COMPLETED', 'FAILED')
                     """
@@ -15024,6 +15029,95 @@ class BackupWorker:
             excluded = before - len(items)
             if excluded:
                 print(f"[{self.worker_id}]   [FILES] Excluded {excluded}/{before} by SLA policy rules")
+
+        # ── Cross-replica partition gate (Tier-1 ONEDRIVE) ──
+        # Mirrors the Tier-2 USER_ONEDRIVE branch in
+        # _backup_user_content_parallel (around line 5790). For whale
+        # drives (≥ ONEDRIVE_PARTITION_MIN_BYTES AND ≥ MIN_FILES) we
+        # pre-INSERT ONEDRIVE_FILE metadata rows so the partition
+        # consumer can hydrate file_items from snapshot_items.extra_data
+        # .raw, then fan out N `backup.onedrive_partition` messages.
+        # The shard handler (_process_onedrive_partition_message) does
+        # the actual downloads via _useronedrive_backup_files and the
+        # last partition to terminate flips the snapshot via
+        # _finalize_partitioned_snapshot — skipping this function's
+        # inline backup_single_file loop entirely. Without this gate
+        # Tier-1 ONEDRIVE drives stay single-replica even when they
+        # match the partition thresholds.
+        try:
+            partition_enabled = bool(settings.ONEDRIVE_PARTITION_ENABLED)
+        except AttributeError:
+            partition_enabled = False
+        if (
+            partition_enabled
+            and items
+            and self._should_partition_onedrive(items)
+        ):
+            drive_id = resource.external_id
+            # Pre-INSERT ONEDRIVE_FILE rows so the partition consumer's
+            # hydration query (select extra_data.raw FROM snapshot_items
+            # WHERE external_id IN file_ids) returns the Graph payload
+            # each shard needs to download its files.
+            metadata_rows: List[Dict[str, Any]] = []
+            for f in items:
+                ext_id = str(f.get("id") or "")
+                if not ext_id:
+                    continue
+                par = f.get("parentReference") or {}
+                par_path = par.get("path") or ""
+                folder_path = par_path.split("root:", 1)[-1] if "root:" in par_path else (par_path or "/")
+                metadata_rows.append({
+                    "id": uuid.uuid4(),
+                    "snapshot_id": snapshot.id,
+                    "tenant_id": tenant.id,
+                    "external_id": ext_id,
+                    "item_type": "ONEDRIVE_FILE",
+                    "name": (f.get("name") or "")[:255],
+                    "folder_path": folder_path,
+                    "content_size": int(f.get("size") or 0),
+                    "content_hash": None,
+                    "extra_data": {"raw": f},
+                    "content_checksum": None,
+                })
+            if metadata_rows:
+                async with async_session_factory() as _meta_s:
+                    await _bulk_upsert_snapshot_items(_meta_s, metadata_rows)
+
+            # Resolve the parent Job ID for the partition rows. Prefer
+            # the message envelope's jobId; fall back to snapshot.job_id
+            # which the coordinator already set.
+            _job_id_str = (message or {}).get("jobId") or str(snapshot.job_id or "")
+            try:
+                _job_id = uuid.UUID(str(_job_id_str)) if _job_id_str else None
+            except (ValueError, AttributeError):
+                _job_id = None
+            if _job_id is None:
+                # Without a job_id we can't stamp partition rows correctly
+                # (stale-sweep + cancel-guard both key on it). Fall through
+                # to the inline path so we don't drop the run.
+                print(
+                    f"[{self.worker_id}]   [PARTITION] Tier-1 ONEDRIVE: "
+                    f"no job_id resolvable — falling through to inline drain"
+                )
+            else:
+                await self._fanout_onedrive_partitions(
+                    snapshot=snapshot,
+                    resource=resource,
+                    tenant=tenant,
+                    drive_id=drive_id,
+                    file_items=items,
+                    job_id=_job_id,
+                )
+                new_delta = files.get("@odata.deltaLink")
+                # Bytes counted by the partition finalizer (it sums
+                # bytes_uploaded across all shards). Items returned as
+                # the pre-INSERT count so the caller sees non-zero work.
+                return {
+                    "item_count": len(metadata_rows),
+                    "bytes_added": 0,
+                    "new_delta_token": new_delta,
+                    "partitioned": True,
+                }
 
         # Process files in parallel (up to BACKUP_CONCURRENCY at once)
         file_tasks = [
