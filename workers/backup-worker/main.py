@@ -2025,8 +2025,12 @@ class BackupWorker:
                                 flush=True,
                             )
                         except Exception as exc:
+                            import traceback as _tb
                             print(
-                                f"[{self.worker_id}] cancel-cleanup job={job_id} failed: {exc}",
+                                f"[{self.worker_id}] cancel-cleanup job={job_id} failed: "
+                                f"{type(exc).__name__}: {exc} | "
+                                f"job_id_type={type(job_id).__name__}\n"
+                                f"{_tb.format_exc()}",
                                 flush=True,
                             )
 
@@ -2222,10 +2226,19 @@ class BackupWorker:
         # the filter a per-resource handler under bulk fan-out would
         # reap its siblings' actively-running snapshots and falsely
         # flip them to PARTIAL.
-        await self._reap_orphan_snapshots_for_job(
-            job_id, "single-backup finalize",
-            resource_id_filter=str(resource.id),
-        )
+        #
+        # Bug #169 defense: skip the reaper entirely for partitioned
+        # runs. The coordinator returns early before partition shards
+        # finish, so the snapshot row is genuinely IN_PROGRESS by
+        # design — `_finalize_partitioned_snapshot` will flip it
+        # terminal once the last shard settles. Running the reaper
+        # here would race that finalizer and mis-flag the snapshot
+        # PARTIAL with stale bytes_total.
+        if not _is_partitioned_run:
+            await self._reap_orphan_snapshots_for_job(
+                job_id, "single-backup finalize",
+                resource_id_filter=str(resource.id),
+            )
 
         # Bulk-parent awareness on success: identical reasoning to the
         # failure path above — under fan-out the parent Job has N-1
@@ -2560,7 +2573,10 @@ class BackupWorker:
                             """
                             INSERT INTO bulk_fanout_seen
                                 (job_id, resource_id, created_at)
-                            SELECT :jid::uuid, unnest(:rids)::uuid, NOW()
+                            SELECT CAST(:jid AS uuid),
+                                   CAST(uid AS uuid),
+                                   NOW()
+                              FROM unnest(CAST(:rids AS text[])) AS uid
                             ON CONFLICT (job_id, resource_id) DO NOTHING
                             RETURNING resource_id::text
                             """
@@ -2634,9 +2650,10 @@ class BackupWorker:
                         text(
                             """
                             DELETE FROM bulk_fanout_seen
-                             WHERE job_id = :jid::uuid
+                             WHERE job_id = CAST(:jid AS uuid)
                                AND resource_id = ANY(
-                                   SELECT unnest(:rids)::uuid
+                                   SELECT CAST(uid AS uuid)
+                                     FROM unnest(CAST(:rids AS text[])) AS uid
                                )
                             """
                         ),
@@ -8255,6 +8272,8 @@ class BackupWorker:
                         SELECT s.status::text AS new_status,
                                c.terminal,
                                c.n,
+                               c.completed,
+                               c.failed,
                                s.job_id,
                                s.resource_id,
                                COALESCE(
@@ -8266,7 +8285,13 @@ class BackupWorker:
                               SELECT COUNT(*) AS n,
                                      COUNT(*) FILTER (
                                          WHERE status IN ('COMPLETED','FAILED')
-                                     ) AS terminal
+                                     ) AS terminal,
+                                     COUNT(*) FILTER (
+                                         WHERE status = 'COMPLETED'
+                                     ) AS completed,
+                                     COUNT(*) FILTER (
+                                         WHERE status = 'FAILED'
+                                     ) AS failed
                                 FROM snapshot_partitions
                                WHERE snapshot_id = :sid
                           ) c
@@ -8285,6 +8310,27 @@ class BackupWorker:
         new_status = row.new_status if hasattr(row, "new_status") else row[0]
         terminal   = row.terminal   if hasattr(row, "terminal")   else row[1]
         expected   = row.n          if hasattr(row, "n")          else row[2]
+        # Late-finalize status upgrade — Bug #169 fix. When REAPER pre-
+        # empted by flipping IN_PROGRESS → PARTIAL while partitions were
+        # still draining, and ALL partitions ultimately reach COMPLETED
+        # (no FAILED), the stale PARTIAL is misleading. Re-derive the
+        # accurate terminal status from partition counts and upgrade the
+        # snapshot.status in the reconcile block below. Only applies to
+        # the preempted branch (winning-path CTE already computes this
+        # correctly via WHEN c.failed > 0 THEN 'PARTIAL').
+        partitions_failed = (
+            int(row.failed) if hasattr(row, "failed") and row.failed is not None else 0
+        )
+        partitions_completed = (
+            int(row.completed)
+            if hasattr(row, "completed") and row.completed is not None
+            else 0
+        )
+        if (preempted
+            and new_status == "PARTIAL"
+            and partitions_failed == 0
+            and partitions_completed == int(expected)):
+            new_status = "COMPLETED"
         if int(terminal) < int(expected) or new_status not in (
             "COMPLETED", "PARTIAL", "FAILED",
         ):
@@ -8317,6 +8363,12 @@ class BackupWorker:
                 snap.new_item_count = persisted_count
                 snap.bytes_total = persisted_bytes
                 snap.bytes_added = persisted_bytes
+                # Bug #169 fix — persist the upgraded status when the
+                # preempted path determined PARTIAL was a stale REAPER
+                # flip and all partitions actually completed cleanly.
+                if (preempted and new_status == "COMPLETED"
+                    and snap.status == SnapshotStatus.PARTIAL):
+                    snap.status = SnapshotStatus.COMPLETED
                 # Mark so a second pre-empted entry returns early.
                 snap.extra_data = {
                     **(snap.extra_data or {}),
@@ -8859,24 +8911,38 @@ class BackupWorker:
         }
 
         tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
-        # Snapshot counters before the shard runs — diff against
-        # post-shard counters tells us how much THIS shard actually
-        # contributed. Used to stamp files_uploaded + bytes_uploaded
-        # on the partition row.
-        async with async_session_factory() as session:
-            pre = await session.get(Snapshot, snapshot_id)
-            pre_items = int((pre.item_count if pre else 0) or 0)
-            pre_bytes = int((pre.bytes_added if pre else 0) or 0)
+        # Bug #168 fix: Snapshot.item_count / bytes_added are NOT
+        # updated mid-flight for partitioned runs (the reconcile only
+        # fires at finalize time), so diffing those columns produces
+        # 0/0 every shard. Count directly from snapshot_items —
+        # source of truth — for both pre and post. Under parallel
+        # shard execution sibling rows are included, but the LAST
+        # shard's diff captures everything since the previous shard's
+        # snapshot, and total across partition rows reconciles to
+        # snapshot.item_count by design.
+        async def _snap_counters() -> tuple[int, int]:
+            async with async_session_factory() as session:
+                row = (await session.execute(
+                    text(
+                        """
+                        SELECT COUNT(*) AS n,
+                               COALESCE(SUM(content_size), 0)::bigint AS b
+                          FROM snapshot_items
+                         WHERE snapshot_id = :sid
+                        """
+                    ),
+                    {"sid": str(snapshot_id)},
+                )).first()
+                return int(row[0] or 0), int(row[1] or 0)
+
+        pre_items, pre_bytes = await _snap_counters()
 
         try:
             async with tenant_sem:
                 await self._backup_user_content_parallel(
                     [resource], graph_client, tenant, synth_msg, job_id,
                 )
-            async with async_session_factory() as session:
-                post = await session.get(Snapshot, snapshot_id)
-                post_items = int((post.item_count if post else 0) or 0)
-                post_bytes = int((post.bytes_added if post else 0) or 0)
+            post_items, post_bytes = await _snap_counters()
             await self._mark_partition_terminal(
                 partition_id, status="COMPLETED",
                 files_uploaded=max(0, post_items - pre_items),
@@ -11102,6 +11168,58 @@ class BackupWorker:
                         async with client.stream(
                             "GET", download_url, headers=headers,
                         ) as resp:
+                            # Bug #172 fix: SharePoint / Graph CDN can
+                            # 429/503 the download itself when parallel
+                            # partition shards saturate a tenant's quota.
+                            # Honor `Retry-After` (RFC 7231) AND the JSON
+                            # body's `retryAfterSeconds` (Graph quirk),
+                            # sleep, then resume — within the existing
+                            # max_resumes budget so a hostile remote
+                            # can't stall the worker forever. Without
+                            # this, the previous code raised on 429
+                            # immediately and the file was lost.
+                            if resp.status_code in (429, 503):
+                                body = await resp.aread()
+                                retry_secs = 10.0
+                                ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+                                if ra:
+                                    try:
+                                        retry_secs = float(int(ra.strip()))
+                                    except (ValueError, AttributeError):
+                                        pass
+                                else:
+                                    try:
+                                        import json as _json
+                                        parsed = _json.loads(body)
+                                        if isinstance(parsed, dict):
+                                            err = parsed.get("error") or {}
+                                            cand = (
+                                                err.get("retryAfterSeconds")
+                                                or parsed.get("retryAfterSeconds")
+                                            )
+                                            if cand is not None:
+                                                retry_secs = float(cand)
+                                    except Exception:
+                                        pass
+                                retry_secs = min(max(retry_secs, 1.0), 120.0)
+                                if resume_attempt >= max_resumes:
+                                    raise RuntimeError(
+                                        f"Graph download HTTP "
+                                        f"{resp.status_code} for "
+                                        f"{file_name} (exhausted "
+                                        f"{max_resumes} throttle retries): "
+                                        f"{body[:200]!r}"
+                                    )
+                                resume_attempt += 1
+                                print(
+                                    f"[{self.worker_id}] [USER_ONEDRIVE] "
+                                    f"{file_name}: throttled HTTP "
+                                    f"{resp.status_code}, sleeping "
+                                    f"{retry_secs:.0f}s (retry "
+                                    f"{resume_attempt}/{max_resumes})"
+                                )
+                                await asyncio.sleep(retry_secs)
+                                continue
                             # First request must be 200/206. Resume
                             # requests MUST be 206 — a 200 here means
                             # the CDN ignored Range and would replay
@@ -16239,6 +16357,12 @@ class BackupWorker:
         running."""
         try:
             async with async_session_factory() as session:
+                # Bug #169 defense-in-depth: a partitioned snapshot whose
+                # shards are still QUEUED / CLAIMED / IN_PROGRESS is
+                # genuinely live — the partition finalizer owns its
+                # terminal flip. Excluding those here keeps the reaper
+                # safe even if a future caller forgets the partition
+                # gate at the call site.
                 if resource_id_filter is not None:
                     rows = (await session.execute(
                         text("""
@@ -16247,6 +16371,13 @@ class BackupWorker:
                             WHERE s.job_id = :jid
                               AND s.resource_id = :rid
                               AND s.status = 'IN_PROGRESS'
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM snapshot_partitions sp
+                                   WHERE sp.snapshot_id = s.id
+                                     AND sp.status IN (
+                                         'QUEUED','CLAIMED','IN_PROGRESS'
+                                     )
+                              )
                         """),
                         {"jid": job_id, "rid": resource_id_filter},
                     )).all()
@@ -16256,6 +16387,13 @@ class BackupWorker:
                             SELECT s.id
                             FROM snapshots s
                             WHERE s.job_id = :jid AND s.status = 'IN_PROGRESS'
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM snapshot_partitions sp
+                                   WHERE sp.snapshot_id = s.id
+                                     AND sp.status IN (
+                                         'QUEUED','CLAIMED','IN_PROGRESS'
+                                     )
+                              )
                         """),
                         {"jid": job_id},
                     )).all()

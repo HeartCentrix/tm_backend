@@ -3563,6 +3563,54 @@ class GraphClient:
                         headers["Range"] = f"bytes={len(buf)}-"
                     try:
                         async with client.stream("GET", download_url, headers=headers) as resp:
+                            # Bug #172 fix: SharePoint CDN can 429/503
+                            # under partition-shard concurrency. Honor
+                            # `Retry-After` header AND the JSON body's
+                            # `retryAfterSeconds` (Graph quirk on shared-
+                            # link path), sleep, then resume — within the
+                            # existing max_resumes budget so a hostile
+                            # remote can't stall the worker forever.
+                            if resp.status_code in (429, 503):
+                                body = await resp.aread()
+                                retry_secs = 10.0
+                                ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+                                if ra:
+                                    try:
+                                        retry_secs = float(int(ra.strip()))
+                                    except (ValueError, AttributeError):
+                                        pass
+                                else:
+                                    try:
+                                        import json as _json
+                                        parsed_body = _json.loads(body)
+                                        if isinstance(parsed_body, dict):
+                                            err = parsed_body.get("error") or {}
+                                            cand = (
+                                                err.get("retryAfterSeconds")
+                                                or parsed_body.get("retryAfterSeconds")
+                                            )
+                                            if cand is not None:
+                                                retry_secs = float(cand)
+                                    except Exception:
+                                        pass
+                                retry_secs = min(max(retry_secs, 1.0), 120.0)
+                                if resume_attempt >= max_resumes:
+                                    print(
+                                        f"[GraphClient] shared URL download "
+                                        f"HTTP {resp.status_code} ({label}…) "
+                                        f"— exhausted {max_resumes} throttle "
+                                        f"retries; giving up"
+                                    )
+                                    return None
+                                resume_attempt += 1
+                                print(
+                                    f"[GraphClient] shared URL throttled "
+                                    f"HTTP {resp.status_code} ({label}…), "
+                                    f"sleeping {retry_secs:.0f}s "
+                                    f"(retry {resume_attempt}/{max_resumes})"
+                                )
+                                await asyncio.sleep(retry_secs)
+                                continue
                             if not buf:
                                 if resp.status_code not in (200, 206):
                                     body = await resp.aread()

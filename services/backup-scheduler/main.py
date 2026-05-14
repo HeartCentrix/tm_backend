@@ -444,6 +444,22 @@ async def startup():
                                  WHERE si.snapshot_id = s.id),
                                 s.started_at
                               ) < NOW() - INTERVAL '30 minutes'
+                          -- Bug #169 defense: never reap a partitioned
+                          -- snapshot whose shards are still in flight.
+                          -- The partition stale-sweep below owns the
+                          -- per-shard liveness check; this CTE only
+                          -- targets snapshots that have no live shards
+                          -- left (either non-partitioned runs or
+                          -- partitioned runs whose every shard already
+                          -- settled). Avoids racing the partition
+                          -- finalizer with a stale-bytes flip.
+                          AND NOT EXISTS (
+                              SELECT 1 FROM snapshot_partitions sp
+                               WHERE sp.snapshot_id = s.id
+                                 AND sp.status IN (
+                                     'QUEUED','CLAIMED','IN_PROGRESS'
+                                 )
+                          )
                     )
                     UPDATE snapshots s SET
                         status = (CASE WHEN c.n_items > 0 THEN 'COMPLETED'
@@ -930,6 +946,23 @@ async def startup():
                         .where(Snapshot.job_id == job.id),
                     )
                     if (snap_exists.scalar() or 0) > 0:
+                        continue
+                    # Bug #159 fix: also skip if the bulk-fanout coordinator
+                    # has already INSERTed bulk_fanout_seen rows for this
+                    # job — that means the per-resource messages have been
+                    # published and snapshots will appear shortly. Without
+                    # this guard, the 3-min sweep races the fanout's snap-
+                    # shot-creation window and produces redundant publishes
+                    # (eaten by bulk_fanout_seen dedup downstream, but still
+                    # wasteful and confusing in logs).
+                    fanout_exists = await session.execute(
+                        text(
+                            "SELECT COUNT(*) FROM bulk_fanout_seen "
+                            "WHERE job_id = CAST(:jid AS uuid)"
+                        ),
+                        {"jid": str(job.id)},
+                    )
+                    if (fanout_exists.scalar() or 0) > 0:
                         continue
                     resource_ids = [
                         str(r) for r in (job.batch_resource_ids or [])

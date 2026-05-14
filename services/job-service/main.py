@@ -723,7 +723,13 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
                 )
                 print(f"[JOB_SERVICE] cancel-cleanup job={jid}: {stats}")
             except Exception as exc:
-                print(f"[JOB_SERVICE] cancel-cleanup job={jid} failed: {exc}")
+                import traceback as _tb
+                print(
+                    f"[JOB_SERVICE] cancel-cleanup job={jid} failed: "
+                    f"{type(exc).__name__}: {exc} | jid_type={type(jid).__name__}\n"
+                    f"{_tb.format_exc()}",
+                    flush=True,
+                )
 
         try:
             import asyncio as _aio
