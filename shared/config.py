@@ -339,6 +339,41 @@ class Settings:
             "ONEDRIVE_LARGE_FILE_SEGMENT_CONCURRENCY", "8",
         ))
 
+        # ── OneDrive cross-replica partition split ──
+        # When a single OneDrive's file work would otherwise pin one
+        # backup_worker replica, partition the file_items list into N
+        # shards and publish one message per shard so multiple replicas
+        # drain the same drive in parallel. Default ON. Falls back to
+        # the inline path for drives below the size/file thresholds.
+        #
+        # Routing:  backup.onedrive_partition (own queue lane, prefetch=2).
+        # Gate:     drive_quota_used >= MIN_BYTES AND len(file_items) >= MIN_FILES.
+        # Shards:   min(MAX_SHARDS, ceil(total_bytes / TARGET_BYTES_PER_SHARD)).
+        # Cap:      MAX_SHARDS=4 → at most 4 partitions per snapshot, matching
+        #           a typical 4× backup_worker replica count on Railway.
+        self.ONEDRIVE_PARTITION_ENABLED = os.getenv(
+            "ONEDRIVE_PARTITION_ENABLED", "true",
+        ).lower() in ("true", "1", "yes")
+        self.ONEDRIVE_PARTITION_MIN_BYTES = int(os.getenv(
+            "ONEDRIVE_PARTITION_MIN_BYTES", str(5 * 1024 * 1024 * 1024),
+        ))
+        self.ONEDRIVE_PARTITION_MIN_FILES = int(os.getenv(
+            "ONEDRIVE_PARTITION_MIN_FILES", "200",
+        ))
+        self.ONEDRIVE_PARTITION_MAX_SHARDS = int(os.getenv(
+            "ONEDRIVE_PARTITION_MAX_SHARDS", "4",
+        ))
+        self.ONEDRIVE_PARTITION_TARGET_BYTES_PER_SHARD = int(os.getenv(
+            "ONEDRIVE_PARTITION_TARGET_BYTES_PER_SHARD",
+            str(20 * 1024 * 1024 * 1024),
+        ))
+        # Partition consumer's per-shard timeout. Default 6h matches the
+        # legacy per-file timeout; a stuck shard past this triggers
+        # stale-sweep retry.
+        self.ONEDRIVE_PARTITION_STALE_SWEEP_MIN = int(os.getenv(
+            "ONEDRIVE_PARTITION_STALE_SWEEP_MIN", "30",
+        ))
+
         # ── Heavy backup pool ──
         # Default on: route OneDrive drives above the heavy threshold to
         # backup.heavy so one monster drive doesn't starve every regular

@@ -64,6 +64,15 @@ class MessageBus:
                     settings.BACKUP_HEAVY_QUEUE,
                     routing_key=settings.BACKUP_HEAVY_QUEUE,
                 )
+                # Cross-replica OneDrive partition split — one message per
+                # shard, claimed by any free backup_worker replica. The
+                # coordinator (initial USER_ONEDRIVE handler) publishes N
+                # of these per partitioned drive; consumers each drain
+                # their assigned file_ids slice.
+                await self._declare_queue(
+                    "backup.onedrive_partition",
+                    routing_key="backup.onedrive_partition",
+                )
                 await self._declare_queue("restore.urgent", routing_key="restore.urgent")
                 await self._declare_queue("restore.normal", routing_key="restore.normal")
                 await self._declare_queue("restore.low", routing_key="restore.low")
@@ -194,6 +203,34 @@ def create_backup_message(job_id: str, resource_id: str, tenant_id: str, full_ba
         "tenantId": tenant_id,
         "type": "FULL" if full_backup else "INCREMENTAL",
         "priority": 1 if full_backup else 5,
+        "createdAt": datetime.utcnow().isoformat(),
+    }
+
+
+def create_onedrive_partition_message(
+    *,
+    partition_id: str,
+    snapshot_id: str,
+    job_id: str,
+    tenant_id: str,
+    resource_id: str,
+    drive_id: str,
+) -> dict:
+    """Envelope for one shard of a partitioned OneDrive snapshot.
+
+    Consumed by `_consume_onedrive_partition` in backup-worker. The
+    consumer atomically claims the snapshot_partitions row, loads the
+    file_ids JSON column, builds a `file_items` list in the shape
+    `_useronedrive_backup_files` expects, and drains the shard.
+    """
+    return {
+        "messageType": "BACKUP_ONEDRIVE_PARTITION",
+        "partitionId": partition_id,
+        "snapshotId": snapshot_id,
+        "jobId": job_id,
+        "tenantId": tenant_id,
+        "resourceId": resource_id,
+        "driveId": drive_id,
         "createdAt": datetime.utcnow().isoformat(),
     }
 

@@ -615,6 +615,82 @@ async def startup():
                 print(
                     f"[backup-scheduler] bulk_parent_finalize failed: {bulk_exc}",
                 )
+
+            # OneDrive partition stale-sweep — mirrors the snapshot
+            # sweep above but for `snapshot_partitions`. A partition
+            # consumer that died mid-shard leaves its row IN_PROGRESS;
+            # without this sweep the parent Snapshot can never flip
+            # terminal (the partition finalizer waits for ALL shards
+            # to be terminal). Same 30-min idle horizon as the
+            # snapshot sweep so ops semantics are consistent.
+            try:
+                stale_min = int(
+                    os.getenv("ONEDRIVE_PARTITION_STALE_SWEEP_MIN", "30")
+                )
+                async with async_session_factory() as session:
+                    stuck_rows = (await session.execute(
+                        text(
+                            """
+                            UPDATE snapshot_partitions
+                               SET status      = 'QUEUED',
+                                   worker_id   = NULL,
+                                   started_at  = NULL,
+                                   failure_state = COALESCE(
+                                       failure_state, '{}'::json
+                                   )::jsonb || jsonb_build_object(
+                                       'stale_sweep', true,
+                                       'reset_at', NOW()
+                                   )
+                             WHERE status = 'IN_PROGRESS'
+                               AND started_at IS NOT NULL
+                               AND started_at < NOW()
+                                                - (:stale * INTERVAL '1 minute')
+                         RETURNING id, snapshot_id, job_id, tenant_id,
+                                   resource_id, drive_id
+                            """
+                        ),
+                        {"stale": stale_min},
+                    )).fetchall()
+                    await session.commit()
+                if stuck_rows:
+                    print(
+                        f"[backup-scheduler] partition_sweep: reset "
+                        f"{len(stuck_rows)} IN_PROGRESS partitions to "
+                        f"QUEUED (idle > {stale_min} min)"
+                    )
+                    # Re-publish so a healthy worker picks them up
+                    # without waiting for the next coordinator run.
+                    if settings.RABBITMQ_ENABLED:
+                        from shared.message_bus import (
+                            message_bus as _mb,
+                            create_onedrive_partition_message as _mkp,
+                        )
+                        for _pid, _sid, _jid, _tid, _rid, _drv in stuck_rows:
+                            try:
+                                msg = _mkp(
+                                    partition_id=str(_pid),
+                                    snapshot_id=str(_sid),
+                                    job_id=str(_jid),
+                                    tenant_id=str(_tid),
+                                    resource_id=str(_rid),
+                                    drive_id=str(_drv),
+                                )
+                                await _mb.publish(
+                                    "backup.onedrive_partition",
+                                    msg,
+                                    priority=3,
+                                )
+                            except Exception as pub_exc:
+                                print(
+                                    f"[backup-scheduler] partition_sweep "
+                                    f"re-publish failed (partition={_pid}): "
+                                    f"{pub_exc}"
+                                )
+            except Exception as part_exc:
+                print(
+                    f"[backup-scheduler] partition stale sweep failed: "
+                    f"{part_exc}"
+                )
         except Exception as exc:
             print(f"[backup-scheduler] stale_snapshot_sweep failed: {exc}")
 

@@ -1040,10 +1040,13 @@ from sqlalchemy.orm import selectinload
 
 from shared.database import async_session_factory
 from shared.models import (
-    Resource, Tenant, Job, Snapshot, SnapshotItem,
+    Resource, Tenant, Job, Snapshot, SnapshotItem, SnapshotPartition,
     SlaPolicy, ResourceType, ResourceStatus, JobStatus, SnapshotType, SnapshotStatus
 )
-from shared.message_bus import message_bus
+from shared.message_bus import (
+    message_bus,
+    create_onedrive_partition_message,
+)
 from shared.config import settings
 from shared.graph_client import GraphClient
 from shared.multi_app_manager import multi_app_manager
@@ -1499,6 +1502,14 @@ class BackupWorker:
                 (self._backup_queue_name, 20),
                 ("backup.low", 50),
             ]
+        # OneDrive partition lane — both the light and heavy pools
+        # subscribe so any free replica can drain a shard. Prefetch=2
+        # keeps each replica's in-flight shard count modest (a shard
+        # may hold several GB of file work and saturate one replica
+        # on its own); RMQ's fair-share dispatch distributes the
+        # remaining queued shards across the rest of the pool.
+        if settings.ONEDRIVE_PARTITION_ENABLED:
+            queues.append(("backup.onedrive_partition", 2))
 
         tasks = []
         for queue_name, prefetch in queues:
@@ -1661,6 +1672,16 @@ class BackupWorker:
             print(f"[{self.worker_id}] [AuditLogger] lifecycle emit failed: {audit_err}")
 
     async def process_backup_message(self, message: Dict[str, Any]):
+        # OneDrive cross-replica partition shard — dispatched here so the
+        # same `consume_queue` infrastructure (auto-restart, prefetch,
+        # retry/DLQ on the broker side) covers the partition lane
+        # without duplicating consumer plumbing. Partition envelopes
+        # carry `messageType="BACKUP_ONEDRIVE_PARTITION"` and have no
+        # resourceIds / resourceId — they identify work via partitionId.
+        if message.get("messageType") == "BACKUP_ONEDRIVE_PARTITION":
+            await self._process_onedrive_partition_message(message)
+            return
+
         job_id = uuid.UUID(message["jobId"])
         resource_ids = message.get("resourceIds", [])
         resource_id = message.get("resourceId")
@@ -5098,6 +5119,27 @@ class BackupWorker:
                         # real dedup key and hashing inline JSON didn't
                         # actually contribute to dedup.
                         body_hash = _fast_hash_hex(body)
+                        # For real-file payloads (ONEDRIVE_FILE in Graph
+                        # delta), stamp the actual file size from
+                        # extra.raw.size — len(body) here is the JSON
+                        # metadata envelope (~3 KB), NOT the file size.
+                        # The flusher inside _useronedrive_backup_files
+                        # rewrites content_size after upload with the
+                        # same value, but stamping it correctly at
+                        # insert means accounting (bytes_added → Job
+                        # → Activity "X backed up") is right even
+                        # when the flusher hasn't fired yet by
+                        # snapshot-finalize time, or when an upload
+                        # genuinely fails. Non-file types (chats,
+                        # email metadata, calendar) carry their full
+                        # payload in the JSON body, so len(body)
+                        # remains the correct content_size for them.
+                        if item_type == "ONEDRIVE_FILE":
+                            _raw = extra.get("raw") if isinstance(extra.get("raw"), dict) else {}
+                            _file_size = int(_raw.get("size") or 0)
+                            content_size = _file_size or len(body)
+                        else:
+                            content_size = len(body)
                         db_rows.append({
                             "id": uuid.uuid4(),
                             "snapshot_id": snapshot.id,
@@ -5106,7 +5148,7 @@ class BackupWorker:
                             "item_type": item_type,
                             "name": (name or "")[:255],
                             "folder_path": folder_path,
-                            "content_size": len(body),
+                            "content_size": content_size,
                             "content_hash": body_hash,
                             "extra_data": extra,
                             "content_checksum": None,
@@ -5123,6 +5165,12 @@ class BackupWorker:
                 #   USER_CHATS → CHAT_ATTACHMENT rows (reference + cards)
                 att_items, att_bytes = [], 0
                 total_hosted_items = 0
+                # Set True by the USER_ONEDRIVE branch when a drive crosses
+                # the partition threshold — the per-shard work runs on
+                # `backup.onedrive_partition` consumers elsewhere, so this
+                # coordinator path returns early and lets the last partition
+                # to finish flip the snapshot to COMPLETED.
+                _onedrive_partitioned = False
                 if resource.type.value == "USER_MAIL":
                     user_id = (resource.extra_data or {}).get("user_id")
                     if user_id:
@@ -5270,20 +5318,51 @@ class BackupWorker:
                         if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
                     ]
                     if drive_id and file_items:
-                        # This updates the ONEDRIVE_FILE rows in-place (adds
-                        # blob_path, real content_size, sha256). att_bytes
-                        # captures the REAL file bytes uploaded to blob so
-                        # the snapshot's bytes_total reflects actual storage
-                        # consumed, not just the JSON metadata footprint.
-                        #
-                        # The per-worker semaphore caps how many simultaneous
-                        # OneDrive drives one worker replica runs — without it,
-                        # an uncapped v2 run lets a single worker pick up
-                        # every redelivered drive and thrash under memory.
-                        async with self._onedrive_backup_semaphore:
-                            _uploaded, att_bytes = await self._useronedrive_backup_files(
-                                graph_client, resource, snapshot, tenant, drive_id, file_items,
+                        # ── Cross-replica partition split ──
+                        # For whale drives (≥ ONEDRIVE_PARTITION_MIN_BYTES
+                        # of work AND ≥ ONEDRIVE_PARTITION_MIN_FILES), bin-
+                        # pack file_items into N shards and publish one
+                        # `backup.onedrive_partition` message per shard.
+                        # Each partition is drained by ANY free backup_worker
+                        # replica via `_consume_onedrive_partition`. The
+                        # parent Snapshot is left IN_PROGRESS with
+                        # extra_data.partitioned=True; the last partition
+                        # to terminate flips it via
+                        # `_finalize_partitioned_snapshot`. Skip the inline
+                        # finalize block below by setting
+                        # `_onedrive_partitioned` so the per-resource
+                        # _backup_one returns early without flipping
+                        # COMPLETED here.
+                        if (
+                            settings.ONEDRIVE_PARTITION_ENABLED
+                            and self._should_partition_onedrive(file_items)
+                        ):
+                            await self._fanout_onedrive_partitions(
+                                snapshot=snapshot,
+                                resource=resource,
+                                tenant=tenant,
+                                drive_id=drive_id,
+                                file_items=file_items,
+                                job_id=job_id,
                             )
+                            # Skip the inline finalize: partition consumers
+                            # own the snapshot's terminal flip.
+                            _onedrive_partitioned = True
+                        else:
+                            # This updates the ONEDRIVE_FILE rows in-place (adds
+                            # blob_path, real content_size, sha256). att_bytes
+                            # captures the REAL file bytes uploaded to blob so
+                            # the snapshot's bytes_total reflects actual storage
+                            # consumed, not just the JSON metadata footprint.
+                            #
+                            # The per-worker semaphore caps how many simultaneous
+                            # OneDrive drives one worker replica runs — without it,
+                            # an uncapped v2 run lets a single worker pick up
+                            # every redelivered drive and thrash under memory.
+                            async with self._onedrive_backup_semaphore:
+                                _uploaded, att_bytes = await self._useronedrive_backup_files(
+                                    graph_client, resource, snapshot, tenant, drive_id, file_items,
+                                )
 
                 if att_items:
                     # Guard against IntegrityError on session.add_all(). If
@@ -5371,6 +5450,30 @@ class BackupWorker:
                             f"carry-forward failed: "
                             f"{type(_cf_err).__name__}: {_cf_err}"
                         )
+
+                # ── Partition gate ──
+                # The USER_ONEDRIVE branch above set _onedrive_partitioned
+                # if it fanned the drive's file work out to N
+                # `backup.onedrive_partition` messages. In that case the
+                # parent Snapshot is intentionally LEFT IN_PROGRESS here —
+                # `_finalize_partitioned_snapshot` flips it to COMPLETED
+                # from the partition consumer once every shard terminates.
+                # Return early with a placeholder result so audit logging
+                # downstream doesn't fire BACKUP_COMPLETED prematurely
+                # (the partition consumer emits the audit event itself
+                # when it observes the snapshot flipping to terminal).
+                if _onedrive_partitioned:
+                    print(
+                        f"[{self.worker_id}] [USER_ONEDRIVE] "
+                        f"{resource.display_name or resource.id}: "
+                        f"partitioned — coordinator returning, "
+                        f"awaiting partition consumers."
+                    )
+                    return {
+                        "item_count": 0,
+                        "bytes_added": 0,
+                        "partitioned": True,
+                    }
 
                 # Count from the DB rather than `len(items_data)` because the
                 # USER_MAIL streaming-persist path filters items_data down to
@@ -5474,6 +5577,13 @@ class BackupWorker:
                     },
                 )
             elif isinstance(outcome, dict):
+                # Partitioned OneDrive coordinator returned early — the
+                # snapshot is still IN_PROGRESS pending shard consumers.
+                # The terminal audit event fires from the last partition's
+                # `_finalize_partitioned_snapshot` once every shard
+                # terminates. Skip the premature SUCCESS emission here.
+                if outcome.get("partitioned"):
+                    continue
                 await self._emit_backup_audit(
                     "BACKUP_COMPLETED", "SUCCESS",
                     tenant, res, snap_id, job_id,
@@ -6715,6 +6825,649 @@ class BackupWorker:
     # ONEDRIVE_BACKUP_V2_ENABLED is false (rollback safety).
     LEGACY_USER_ONEDRIVE_MAX_FILES = 50
     LEGACY_USER_ONEDRIVE_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
+
+    # ==================== Cross-replica OneDrive partition split ====================
+    #
+    # A single user's whale OneDrive (≥ ONEDRIVE_PARTITION_MIN_BYTES of work
+    # AND ≥ ONEDRIVE_PARTITION_MIN_FILES files) splits its file-byte work
+    # across N backup_worker replicas by publishing one
+    # `backup.onedrive_partition` message per shard. The list-delta phase
+    # (which reads the @odata.deltaLink + walks /root/delta) stays on the
+    # coordinator (cheap, ~1 min even on 500 GB); only the
+    # download-and-upload loop fans out. Below-threshold drives stay on
+    # the original inline path so we don't pay a 4-way fan-out tax on a
+    # 200 MB user-drive.
+
+    def _should_partition_onedrive(
+        self, file_items: List[Dict[str, Any]],
+    ) -> bool:
+        """Decide whether this drive's file work warrants a partitioned
+        cross-replica run. Both bytes + file-count thresholds must be
+        met — small-but-many or large-but-few drives stay inline
+        because the fan-out overhead would dwarf the parallel win.
+        """
+        if not file_items:
+            return False
+        try:
+            min_bytes = settings.ONEDRIVE_PARTITION_MIN_BYTES
+            min_files = settings.ONEDRIVE_PARTITION_MIN_FILES
+        except AttributeError:
+            return False
+        if len(file_items) < min_files:
+            return False
+        total_bytes = sum(int(f.get("size") or 0) for f in file_items)
+        return total_bytes >= min_bytes
+
+    def _bin_pack_files_by_size(
+        self,
+        file_items: List[Dict[str, Any]],
+        n_shards: int,
+    ) -> List[List[Dict[str, Any]]]:
+        """Largest-Processing-Time (LPT) bin-pack: sort files desc,
+        repeatedly drop the next file on the lightest current shard.
+        Yields shards whose total bytes are within ~(largest_file)
+        of each other. Good enough for our 4-way split — exact
+        balancing is wasted on Graph download variance anyway.
+        """
+        shards: List[List[Dict[str, Any]]] = [[] for _ in range(n_shards)]
+        shard_bytes = [0] * n_shards
+        ordered = sorted(
+            file_items,
+            key=lambda f: int(f.get("size") or 0),
+            reverse=True,
+        )
+        for f in ordered:
+            i = shard_bytes.index(min(shard_bytes))
+            shards[i].append(f)
+            shard_bytes[i] += int(f.get("size") or 0)
+        return shards
+
+    async def _fanout_onedrive_partitions(
+        self,
+        *,
+        snapshot: Snapshot,
+        resource: Resource,
+        tenant: Tenant,
+        drive_id: str,
+        file_items: List[Dict[str, Any]],
+        job_id: uuid.UUID,
+    ) -> None:
+        """Bin-pack file_items, insert one snapshot_partitions row per
+        shard, mark the snapshot as partitioned, and publish one
+        backup.onedrive_partition message per shard.
+
+        Idempotent on coordinator redelivery: the partition rows have a
+        UNIQUE(snapshot_id, partition_index) constraint and the INSERT
+        uses ON CONFLICT DO NOTHING. Re-publishing the messages is also
+        safe — partition consumers ack-drop if the row is already
+        terminal or claimed by another worker.
+        """
+        # Decide shard count from total bytes vs target-per-shard.
+        total_bytes = sum(int(f.get("size") or 0) for f in file_items)
+        target = max(
+            1,
+            int(settings.ONEDRIVE_PARTITION_TARGET_BYTES_PER_SHARD),
+        )
+        max_shards = max(1, int(settings.ONEDRIVE_PARTITION_MAX_SHARDS))
+        n_shards = max(
+            2,
+            min(max_shards, (total_bytes + target - 1) // target or 1),
+        )
+
+        shards = self._bin_pack_files_by_size(file_items, n_shards)
+        # Drop empty trailing shards if bin-pack yielded fewer non-empty
+        # bins than n_shards (rare; only when all files smaller than
+        # n_shards items).
+        shards = [s for s in shards if s]
+        if len(shards) < 2:
+            # Degenerate: bin-pack didn't actually split. Fall back to
+            # inline by NOT publishing — but the caller already set
+            # _onedrive_partitioned=True, so we have to fix that here
+            # via the snapshot extra_data hint. Simpler: still partition
+            # into one shard so the partition consumer drains it, but
+            # mark the snapshot accordingly. This branch is essentially
+            # unreachable given the threshold gate.
+            shards = [file_items]
+
+        partition_msgs: List[Tuple[str, str, str]] = []
+        async with async_session_factory() as session:
+            # Mark the snapshot itself as partitioned so the coordinator
+            # path skips the inline finalize block and so any human
+            # reading the snapshot row can tell at a glance.
+            snap = await session.get(Snapshot, snapshot.id)
+            if snap is not None:
+                ed = dict(snap.extra_data or {})
+                ed["partitioned"] = True
+                ed["partition_count"] = len(shards)
+                ed["partition_total_bytes_est"] = total_bytes
+                snap.extra_data = ed
+            for idx, shard in enumerate(shards):
+                shard_bytes = sum(int(f.get("size") or 0) for f in shard)
+                file_ids = [f["id"] for f in shard if f.get("id")]
+                partition_id = uuid.uuid4()
+                row = SnapshotPartition(
+                    id=partition_id,
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    resource_id=resource.id,
+                    job_id=job_id,
+                    drive_id=drive_id,
+                    partition_index=idx,
+                    file_ids=file_ids,
+                    total_files=len(file_ids),
+                    total_bytes_est=shard_bytes,
+                    status="QUEUED",
+                )
+                session.add(row)
+                partition_msgs.append(
+                    (str(partition_id), str(snapshot.id), drive_id),
+                )
+            await session.commit()
+
+        print(
+            f"[{self.worker_id}] [USER_ONEDRIVE] "
+            f"{resource.display_name or resource.id}: "
+            f"PARTITION fanout — {len(shards)} shards, "
+            f"{total_bytes / (1024 * 1024 * 1024):.1f} GiB total, "
+            f"{len(file_items)} files."
+        )
+
+        for partition_id, snap_id_str, drv_id in partition_msgs:
+            msg = create_onedrive_partition_message(
+                partition_id=partition_id,
+                snapshot_id=snap_id_str,
+                job_id=str(job_id),
+                tenant_id=str(tenant.id),
+                resource_id=str(resource.id),
+                drive_id=drv_id,
+            )
+            try:
+                await message_bus.publish(
+                    "backup.onedrive_partition",
+                    msg,
+                    priority=3,
+                )
+            except Exception as pub_exc:
+                # Best-effort publish — the partition row exists either
+                # way, and the stale-sweep eventually re-publishes
+                # stranded QUEUED rows. Don't fail the whole snapshot
+                # over a single broker hiccup.
+                print(
+                    f"[{self.worker_id}] [USER_ONEDRIVE] partition "
+                    f"publish failed (partition={partition_id}): "
+                    f"{type(pub_exc).__name__}: {pub_exc}"
+                )
+
+    async def _claim_partition(
+        self, partition_id: uuid.UUID, worker_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically claim a partition row. Returns the row dict on
+        success, None when another replica already owns it or the row
+        has reached a terminal state.
+
+        Re-claim window: a partition still IN_PROGRESS but idle past
+        ONEDRIVE_PARTITION_STALE_SWEEP_MIN is treated as abandoned, so
+        the scheduler-side sweep doesn't have to be the only path that
+        unsticks dead claims.
+        """
+        stale_min = int(settings.ONEDRIVE_PARTITION_STALE_SWEEP_MIN)
+        async with async_session_factory() as session:
+            row = (await session.execute(
+                text(
+                    """
+                    UPDATE snapshot_partitions
+                       SET status      = 'IN_PROGRESS',
+                           worker_id   = :wid,
+                           started_at  = NOW()
+                     WHERE id = :pid
+                       AND (
+                            status = 'QUEUED'
+                            OR (
+                                status = 'IN_PROGRESS'
+                                AND started_at < NOW()
+                                                - (:stale * INTERVAL '1 minute')
+                            )
+                       )
+                 RETURNING snapshot_id, tenant_id, resource_id,
+                           job_id, drive_id, file_ids,
+                           partition_index, total_files, total_bytes_est
+                    """
+                ),
+                {"pid": str(partition_id), "wid": worker_id,
+                 "stale": stale_min},
+            )).first()
+            await session.commit()
+        if row is None:
+            return None
+        # Row mapping varies between drivers; use _mapping fallback.
+        try:
+            return dict(row._mapping)
+        except AttributeError:
+            return {
+                "snapshot_id":     row[0],
+                "tenant_id":       row[1],
+                "resource_id":     row[2],
+                "job_id":          row[3],
+                "drive_id":        row[4],
+                "file_ids":        row[5],
+                "partition_index": row[6],
+                "total_files":     row[7],
+                "total_bytes_est": row[8],
+            }
+
+    async def _mark_partition_terminal(
+        self,
+        partition_id: uuid.UUID,
+        *,
+        status: str,
+        files_uploaded: int = 0,
+        bytes_uploaded: int = 0,
+        failure_state: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Flip a partition row to COMPLETED or FAILED. Idempotent:
+        a row already in a terminal state stays put."""
+        async with async_session_factory() as session:
+            await session.execute(
+                text(
+                    """
+                    UPDATE snapshot_partitions
+                       SET status         = :st,
+                           completed_at   = NOW(),
+                           files_uploaded = :nf,
+                           bytes_uploaded = :nb,
+                           failure_state  = COALESCE(:fs::json, failure_state)
+                     WHERE id = :pid
+                       AND status NOT IN ('COMPLETED', 'FAILED')
+                    """
+                ),
+                {
+                    "pid": str(partition_id),
+                    "st":  status,
+                    "nf":  int(files_uploaded),
+                    "nb":  int(bytes_uploaded),
+                    "fs":  json.dumps(failure_state) if failure_state else None,
+                },
+            )
+            await session.commit()
+
+    async def _finalize_partitioned_snapshot(
+        self,
+        snapshot_id: uuid.UUID,
+        tenant: Optional[Tenant] = None,
+        resource: Optional[Resource] = None,
+        job_id: Optional[uuid.UUID] = None,
+    ) -> Optional[str]:
+        """Flip a partitioned Snapshot to terminal status iff ALL of
+        its snapshot_partitions rows are terminal. Idempotent under
+        last-finisher race via the `status = 'IN_PROGRESS'` guard:
+        once a winner has flipped the snapshot, no subsequent caller
+        can re-flip it.
+
+        On the winning call, also runs the same DB-grounded bytes
+        reconcile the inline path does at the end of
+        `_backup_user_content_parallel` and rolls the result up into
+        the parent Job (so the Activity row converges on the right
+        total). Returns the snapshot's new status string on the
+        winning call, else None.
+        """
+        async with async_session_factory() as session:
+            row = (await session.execute(
+                text(
+                    """
+                    WITH expected AS (
+                        SELECT COUNT(*) AS n
+                          FROM snapshot_partitions
+                         WHERE snapshot_id = :sid
+                    ),
+                    counts AS (
+                        SELECT
+                          COUNT(*) FILTER (
+                            WHERE status IN ('COMPLETED','FAILED')
+                          ) AS terminal,
+                          COUNT(*) FILTER (WHERE status='COMPLETED') AS completed,
+                          COUNT(*) FILTER (WHERE status='FAILED')    AS failed,
+                          COALESCE(SUM(files_uploaded), 0) AS items_uploaded,
+                          COALESCE(SUM(bytes_uploaded), 0) AS bytes_uploaded
+                        FROM snapshot_partitions
+                        WHERE snapshot_id = :sid
+                    )
+                    UPDATE snapshots s SET
+                        status = (CASE
+                            WHEN c.terminal < e.n THEN s.status
+                            WHEN c.completed = 0 THEN 'FAILED'::snapshotstatus
+                            WHEN c.failed > 0    THEN 'PARTIAL'::snapshotstatus
+                            ELSE 'COMPLETED'::snapshotstatus
+                        END),
+                        completed_at = (CASE
+                            WHEN c.terminal = e.n THEN NOW()
+                            ELSE s.completed_at
+                        END)
+                    FROM counts c, expected e
+                    WHERE s.id = :sid
+                      AND e.n > 0
+                      AND s.status = 'IN_PROGRESS'
+                  RETURNING s.status::text AS new_status,
+                            c.terminal, e.n, s.job_id,
+                            s.resource_id
+                    """
+                ),
+                {"sid": str(snapshot_id)},
+            )).first()
+            await session.commit()
+
+        if row is None:
+            return None
+        new_status = row.new_status if hasattr(row, "new_status") else row[0]
+        terminal   = row.terminal   if hasattr(row, "terminal")   else row[1]
+        expected   = row.n          if hasattr(row, "n")          else row[2]
+        if int(terminal) < int(expected) or new_status not in (
+            "COMPLETED", "PARTIAL", "FAILED",
+        ):
+            return None
+
+        # Winning caller: run the DB-grounded bytes reconcile so
+        # snapshot.bytes_added matches the actual on-disk content.
+        # Mirrors `_backup_user_content_parallel`'s finalize block.
+        async with async_session_factory() as session:
+            CHILD_ITEM_TYPES = (
+                "CHAT_ATTACHMENT",
+                "EMAIL_ATTACHMENT",
+                "CHAT_HOSTED_CONTENT",
+            )
+            _row = (await session.execute(
+                select(
+                    func.count(SnapshotItem.id).filter(
+                        ~SnapshotItem.item_type.in_(CHILD_ITEM_TYPES)
+                    ),
+                    func.coalesce(func.sum(SnapshotItem.content_size), 0),
+                ).where(SnapshotItem.snapshot_id == snapshot_id)
+            )).one()
+            persisted_count = int(_row[0] or 0)
+            persisted_bytes = int(_row[1] or 0)
+
+            snap = await session.get(Snapshot, snapshot_id)
+            if snap is not None:
+                snap.item_count = persisted_count
+                snap.new_item_count = persisted_count
+                snap.bytes_total = persisted_bytes
+                snap.bytes_added = persisted_bytes
+                if snap.completed_at is None:
+                    snap.completed_at = datetime.utcnow()
+                if snap.started_at and snap.completed_at:
+                    snap.duration_secs = int(
+                        (snap.completed_at - snap.started_at).total_seconds()
+                    )
+                await session.commit()
+
+            # Bubble the new bytes up to the parent Job so the
+            # Activity row reflects this snapshot's work.
+            parent_job_id = job_id
+            if parent_job_id is None:
+                parent_job_id = (
+                    row.job_id if hasattr(row, "job_id") else row[3]
+                )
+            try:
+                await self._finalize_bulk_parent_if_complete(
+                    session, parent_job_id,
+                )
+            except Exception as fin_exc:
+                print(
+                    f"[{self.worker_id}] [PARTITION FINALIZE] "
+                    f"_finalize_bulk_parent_if_complete failed "
+                    f"(job={parent_job_id}): "
+                    f"{type(fin_exc).__name__}: {fin_exc}"
+                )
+
+            # Update resource's last_backup metadata (matches inline
+            # path). Best-effort — never fail the snapshot flip.
+            try:
+                rid_val = (
+                    row.resource_id
+                    if hasattr(row, "resource_id")
+                    else row[4]
+                )
+                if resource is None and rid_val is not None:
+                    resource = await session.get(Resource, rid_val)
+                if resource is not None and parent_job_id is not None:
+                    await self.update_resource_backup_info(
+                        session, resource, parent_job_id, snapshot_id,
+                        {
+                            "item_count": persisted_count,
+                            "bytes_added": persisted_bytes,
+                        },
+                    )
+            except Exception as ru_exc:
+                print(
+                    f"[{self.worker_id}] [PARTITION FINALIZE] "
+                    f"update_resource_backup_info failed: "
+                    f"{type(ru_exc).__name__}: {ru_exc}"
+                )
+
+        # Audit event — the inline path emits BACKUP_COMPLETED /
+        # BACKUP_FAILED per-resource; for the partitioned path the
+        # coordinator skipped its emission, so we do it here once
+        # the snapshot has settled to terminal.
+        try:
+            if resource is None:
+                # Lazy-load resource for the audit event.
+                async with async_session_factory() as s:
+                    rid_val = (
+                        row.resource_id
+                        if hasattr(row, "resource_id") else row[4]
+                    )
+                    if rid_val is not None:
+                        resource = await s.get(Resource, rid_val)
+            if tenant is None and resource is not None:
+                async with async_session_factory() as s:
+                    tenant = await s.get(Tenant, resource.tenant_id)
+            if resource is not None and tenant is not None:
+                audit_action = (
+                    "BACKUP_FAILED"
+                    if new_status == "FAILED"
+                    else "BACKUP_COMPLETED"
+                )
+                audit_outcome = (
+                    "FAILURE" if new_status == "FAILED" else "SUCCESS"
+                )
+                await self._emit_backup_audit(
+                    audit_action, audit_outcome,
+                    tenant, resource, snapshot_id, parent_job_id,
+                    details={
+                        "item_count": persisted_count,
+                        "bytes_added": persisted_bytes,
+                        "snapshot_status": new_status,
+                        "partitioned": True,
+                    },
+                )
+        except Exception as au_exc:
+            print(
+                f"[{self.worker_id}] [PARTITION FINALIZE] audit "
+                f"emit failed: {type(au_exc).__name__}: {au_exc}"
+            )
+
+        print(
+            f"[{self.worker_id}] [PARTITION FINALIZE] snapshot="
+            f"{snapshot_id} → {new_status} "
+            f"({terminal}/{expected} partitions terminal, "
+            f"{persisted_count} items, "
+            f"{persisted_bytes / (1024 * 1024):.1f} MB)"
+        )
+        return new_status
+
+    async def _process_onedrive_partition_message(
+        self, message: Dict[str, Any],
+    ) -> None:
+        """Handler for one `backup.onedrive_partition` message.
+
+        Steps:
+          1. Atomically claim the partition row via
+             `_claim_partition`. Ack-drop if the row is already
+             owned / terminal.
+          2. Resolve snapshot + resource + tenant + Graph client.
+          3. Build a file_items shard from snapshot_items metadata
+             stored under (snapshot_id, file_id) — the coordinator
+             already INSERTed ONEDRIVE_FILE rows for the whole drive
+             with extra_data.raw carrying Graph delta payload, so we
+             reconstruct shard-local file_items from there.
+          4. Call `_useronedrive_backup_files` for this shard's files.
+          5. Mark partition row COMPLETED (or FAILED on raise).
+          6. Run `_finalize_partitioned_snapshot` — last-finisher
+             flips the parent snapshot + the Job.
+        """
+        partition_id = uuid.UUID(str(message["partitionId"]))
+        claim = await self._claim_partition(partition_id, self.worker_id)
+        if claim is None:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} — "
+                f"claim refused (already owned or terminal); ack-drop"
+            )
+            return
+
+        snapshot_id = uuid.UUID(str(claim["snapshot_id"]))
+        tenant_id = uuid.UUID(str(claim["tenant_id"]))
+        resource_id = uuid.UUID(str(claim["resource_id"]))
+        job_id = uuid.UUID(str(claim["job_id"]))
+        drive_id = str(claim["drive_id"])
+        file_ids = list(claim["file_ids"] or [])
+        if not file_ids:
+            # Empty shard — mark complete and move on.
+            await self._mark_partition_terminal(
+                partition_id,
+                status="COMPLETED",
+                files_uploaded=0,
+                bytes_uploaded=0,
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        # Cancel guard — if the parent Job was cancelled while this
+        # message was in queue, ack-drop quietly. `_is_job_cancelled`
+        # is a module-level helper (see ~line 957), not a method.
+        if await _is_job_cancelled(job_id):
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} — "
+                f"job {job_id} cancelled; marking partition FAILED"
+            )
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "job_cancelled"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        async with async_session_factory() as session:
+            snapshot = await session.get(Snapshot, snapshot_id)
+            resource = await session.get(Resource, resource_id)
+            tenant = await session.get(Tenant, tenant_id)
+
+        if snapshot is None or resource is None or tenant is None:
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "snapshot_or_resource_gone"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        # Reconstruct file_items for this shard. The coordinator
+        # already wrote ONEDRIVE_FILE rows for every file in the
+        # drive (extra_data.raw carries the Graph delta payload),
+        # so we hydrate this shard's slice by external_id.
+        async with async_session_factory() as session:
+            rows = (await session.execute(
+                select(SnapshotItem.extra_data, SnapshotItem.external_id)
+                .where(
+                    SnapshotItem.snapshot_id == snapshot_id,
+                    SnapshotItem.item_type == "ONEDRIVE_FILE",
+                    SnapshotItem.external_id.in_(file_ids),
+                )
+            )).all()
+        file_items: List[Dict[str, Any]] = []
+        for extra, _ext_id in rows:
+            if isinstance(extra, dict):
+                raw = extra.get("raw") if isinstance(extra.get("raw"), dict) else None
+                if raw:
+                    file_items.append(raw)
+
+        if not file_items:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} — "
+                f"no snapshot_items resolved for {len(file_ids)} "
+                f"file_ids; partition likely raced against snapshot "
+                f"deletion. Marking FAILED."
+            )
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={
+                    "reason": "no_snapshot_items_for_file_ids",
+                    "file_id_count": len(file_ids),
+                },
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        graph_client = await self.get_graph_client(
+            tenant, handler_key="USER_ONEDRIVE",
+        )
+        if graph_client is None:
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "no_graph_client"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        # Drain this shard via the existing per-file loop.
+        try:
+            async with self._onedrive_backup_semaphore:
+                uploaded, uploaded_bytes = await self._useronedrive_backup_files(
+                    graph_client, resource, snapshot, tenant,
+                    drive_id, file_items,
+                )
+            await self._mark_partition_terminal(
+                partition_id, status="COMPLETED",
+                files_uploaded=int(uploaded or 0),
+                bytes_uploaded=int(uploaded_bytes or 0),
+            )
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} "
+                f"shard failed: {type(e).__name__}: {e}"
+            )
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={
+                    "reason": type(e).__name__,
+                    "message": str(e)[:500],
+                },
+            )
+            raise
+        finally:
+            # Always attempt finalize — last-finisher pattern,
+            # idempotent. Even if this partition's drain raised
+            # mid-way, other shards may still be in flight; the
+            # finalize won't flip until all are terminal.
+            try:
+                await self._finalize_partitioned_snapshot(
+                    snapshot_id,
+                    tenant=tenant,
+                    resource=resource,
+                    job_id=job_id,
+                )
+            except Exception as fin_exc:
+                print(
+                    f"[{self.worker_id}] [PARTITION FINALIZE] "
+                    f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
+                )
 
     async def _useronedrive_backup_files(
         self,

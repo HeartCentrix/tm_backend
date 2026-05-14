@@ -543,6 +543,63 @@ class SnapshotItem(Base):
     created_at = Column(DateTime, default=utcnow)
 
 
+class SnapshotPartition(Base):
+    """Per-shard tracking row for a partitioned OneDrive snapshot.
+
+    One USER_ONEDRIVE Snapshot above a size threshold (see
+    settings.ONEDRIVE_PARTITION_MIN_BYTES /
+    ONEDRIVE_PARTITION_MIN_FILES) fans its file-byte work across N
+    partition messages so multiple backup_worker replicas can drain a
+    single drive in parallel. Each row claims one shard of file_ids;
+    the last partition to terminate flips the parent Snapshot via
+    `_finalize_partitioned_snapshot`.
+    """
+    __tablename__ = "snapshot_partitions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    snapshot_id = Column(UUID(as_uuid=True),
+                         ForeignKey("snapshots.id", ondelete="CASCADE"),
+                         nullable=False, index=True)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    resource_id = Column(UUID(as_uuid=True), nullable=False)
+    job_id = Column(UUID(as_uuid=True), nullable=False)
+    drive_id = Column(Text, nullable=False)
+    partition_index = Column(Integer, nullable=False)
+    file_ids = Column(JSON, nullable=False)
+    total_files = Column(Integer, nullable=False, default=0)
+    total_bytes_est = Column(BigInteger, nullable=False, default=0)
+    # QUEUED | IN_PROGRESS | COMPLETED | FAILED
+    status = Column(String, nullable=False, default="QUEUED")
+    worker_id = Column(String)
+    enqueued_at = Column(DateTime, default=utcnow, nullable=False)
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    files_uploaded = Column(Integer, nullable=False, default=0)
+    bytes_uploaded = Column(BigInteger, nullable=False, default=0)
+    failure_state = Column(JSON)
+
+    __table_args__ = (
+        # One row per (snapshot, shard-index). Re-publish of the same
+        # partition message after worker crash hits this constraint and
+        # the publishing INSERT does ON CONFLICT DO NOTHING — making
+        # fan-out idempotent under coordinator redelivery.
+        Index(
+            "uq_snap_partition",
+            "snapshot_id", "partition_index",
+            unique=True,
+        ),
+        # Hot read path for the finalizer + stale-sweep:
+        #   SELECT WHERE snapshot_id=:sid AND status=...
+        Index("ix_snap_partition_status", "snapshot_id", "status"),
+        # Stale-sweep scan: oldest enqueued non-terminal first.
+        Index(
+            "ix_snap_partition_claim", "enqueued_at",
+            postgresql_where=sql_text(
+                "status IN ('QUEUED','IN_PROGRESS')"
+            ),
+        ),
+    )
+
+
 class JobLog(Base):
     __tablename__ = "job_logs"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

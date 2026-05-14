@@ -848,6 +848,35 @@ async def init_db() -> None:
             UNIQUE (chat_thread_id, message_external_id)
         )
         """,
+        # snapshot_partitions — cross-replica OneDrive partition split.
+        # One row per shard of a partitioned USER_ONEDRIVE snapshot;
+        # multiple backup_worker replicas drain one drive in parallel.
+        # Mirrors `SnapshotPartition` in shared/models.py. The FK to
+        # snapshots uses ON DELETE CASCADE so deleting a partitioned
+        # snapshot reaps its shard rows automatically.
+        """
+        CREATE TABLE IF NOT EXISTS snapshot_partitions (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            snapshot_id UUID NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+            tenant_id UUID NOT NULL,
+            resource_id UUID NOT NULL,
+            job_id UUID NOT NULL,
+            drive_id TEXT NOT NULL,
+            partition_index INTEGER NOT NULL,
+            file_ids JSON NOT NULL,
+            total_files INTEGER NOT NULL DEFAULT 0,
+            total_bytes_est BIGINT NOT NULL DEFAULT 0,
+            status VARCHAR NOT NULL DEFAULT 'QUEUED',
+            worker_id VARCHAR,
+            enqueued_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            files_uploaded INTEGER NOT NULL DEFAULT 0,
+            bytes_uploaded BIGINT NOT NULL DEFAULT 0,
+            failure_state JSON,
+            UNIQUE (snapshot_id, partition_index)
+        )
+        """,
     ]
 
     index_statements = [
@@ -925,6 +954,14 @@ async def init_db() -> None:
         # Hot read path: hydrate a chat thread newest-first.
         "CREATE INDEX IF NOT EXISTS ix_chat_thread_messages_thread_time "
         "ON chat_thread_messages (chat_thread_id, created_date_time DESC)",
+        # snapshot_partitions — finalizer + stale-sweep hot paths.
+        # Finalizer: SELECT WHERE snapshot_id=... AND status=...
+        # Sweep: oldest enqueued non-terminal first.
+        "CREATE INDEX IF NOT EXISTS ix_snap_partition_status "
+        "ON snapshot_partitions (snapshot_id, status)",
+        "CREATE INDEX IF NOT EXISTS ix_snap_partition_claim "
+        "ON snapshot_partitions (enqueued_at) "
+        "WHERE status IN ('QUEUED', 'IN_PROGRESS')",
     ]
 
     add_column_statements = [
