@@ -1971,8 +1971,13 @@ async def reconcile_pending_discovery():
                         "jobId": str(uuid.uuid4()),
                         "tenantId": str(tenant.id),
                         "externalTenantId": tenant.external_tenant_id,
+                        # Per-user OneDrive is Tier 2 (USER_ONEDRIVE under each
+                        # ENTRA_USER) — listing "onedrive" here would create a
+                        # duplicate Tier 1 ONEDRIVE row per user and double the
+                        # backup walk. The Tier 1 reconciler only needs the
+                        # tenant-level container resources.
                         "discoveryScope": ["users", "groups", "mailboxes", "shared_mailboxes",
-                                           "onedrive", "sharepoint", "teams"],
+                                           "sharepoint", "teams"],
                         "triggeredBy": "RECONCILER",
                         "triggeredAt": datetime.utcnow().isoformat(),
                     }, priority=5)

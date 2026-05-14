@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, distinct, and_, or_, text
+from sqlalchemy.orm import aliased
 
 from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType
@@ -258,8 +259,53 @@ async def list_snapshots(
     if not include_empty:
         filters.append(Snapshot.item_count > 0)
 
-    total = (await db.execute(select(func.count(Snapshot.id)).where(*filters))).scalar() or 0
-    stmt = select(Snapshot).where(*filters).order_by(Snapshot.created_at.desc()).offset((page-1)*size).limit(size)
+    # Per-bulk-run dedup. Some legacy snapshots (created before the
+    # ix_snapshots_job_resource_inprogress partial-unique index landed)
+    # produced 2-3 rows for the same (job_id, resource_id) on long-running
+    # workloads (USER_CHATS, USER_MAIL) when RMQ redelivered the bulk
+    # message mid-drain. Each row is a real, separate snapshot — but for
+    # the Recovery UI they're a single backup attempt and should collapse
+    # to one entry per job. Keep the most "complete" row per job: highest
+    # item_count, ties break by latest created_at. Snapshots without a
+    # job_id (manual / ad-hoc) are passed through unchanged (treated as
+    # singletons).
+    from sqlalchemy import func as _func
+    # Partition key MUST include resource_id. Bulk runs share one job_id
+    # across N resources; partitioning by job_id alone would collapse
+    # N different users' snapshots into a single row when this endpoint
+    # is called without a resource_id filter (admin views, search). The
+    # COALESCE on job_id keeps manual/ad-hoc snapshots (job_id=NULL) as
+    # their own singleton partitions via snapshot.id.
+    row_num = _func.row_number().over(
+        partition_by=(
+            _func.coalesce(Snapshot.job_id, Snapshot.id),
+            Snapshot.resource_id,
+        ),
+        order_by=(
+            Snapshot.item_count.desc().nullslast(),
+            Snapshot.created_at.desc(),
+        ),
+    ).label("dedup_rank")
+    ranked = (
+        select(Snapshot, row_num)
+        .where(*filters)
+        .subquery()
+    )
+    snap_alias = aliased(Snapshot, ranked)
+    deduped_filter = ranked.c.dedup_rank == 1
+
+    total = (await db.execute(
+        select(_func.count())
+        .select_from(ranked)
+        .where(deduped_filter)
+    )).scalar() or 0
+    stmt = (
+        select(snap_alias)
+        .where(deduped_filter)
+        .order_by(snap_alias.created_at.desc())
+        .offset((page - 1) * size)
+        .limit(size)
+    )
     result = await db.execute(stmt)
     snapshots = result.scalars().all()
     
@@ -851,6 +897,21 @@ async def get_content_snapshots(
         .where(Snapshot.status == SnapshotStatus.COMPLETED)
     )).scalar() or 0
 
+    # versionCount = how many distinct backup *attempts* (job_ids) have
+    # completed for this identity. One "Backup now" click for a user
+    # fans out to ~5 surface snapshots but is a single recovery point
+    # from the user's POV — AFI calls these "versions." Computed across
+    # the same subtree (parent + Tier-2 children) so the right-panel
+    # header shows the number that matches "how many times has this
+    # user been backed up." NULL job_ids (manual/ad-hoc snapshots) are
+    # filtered out — they have no fan-out to consolidate.
+    version_count = (await db.execute(
+        select(func.count(distinct(Snapshot.job_id)))
+        .where(Snapshot.resource_id.in_(counted_ids))
+        .where(Snapshot.status == SnapshotStatus.COMPLETED)
+        .where(Snapshot.job_id.is_not(None))
+    )).scalar() or 0
+
     # Per-content-type item_type to count against (for the aggregated
     # roll-up below). Mail & chats are delta-backed and their per-snapshot
     # item_count reflects only the delta captured in that run — we need
@@ -927,6 +988,7 @@ async def get_content_snapshots(
     return {
         "resourceId": str(parent.id),
         "snapshotCount": int(snapshot_count),
+        "versionCount": int(version_count),
         "byContent": by_content,
     }
 

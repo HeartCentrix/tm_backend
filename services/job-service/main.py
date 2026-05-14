@@ -50,12 +50,19 @@ AZURE_WORKLOAD_QUEUES = {
 }
 
 M365_RESOURCE_TYPES = [
-    # Tier-1 mailbox / drive resources (legacy, still in use for some
-    # tenants).
-    ResourceType.MAILBOX,
+    # Tier-1 mailbox containers that don't have a Tier-2 sibling: shared
+    # mailboxes + room mailboxes live at the tenant level (not under any
+    # ENTRA_USER), so they stay here and continue to back up via the
+    # backup_mailbox handler.
+    # User MAILBOX + user ONEDRIVE are intentionally EXCLUDED — the
+    # canonical home for user mail / drive content is the Tier-2 child
+    # rows (USER_MAIL / USER_ONEDRIVE) listed below. Including the Tier-1
+    # peers here would re-walk the same content for every user and double
+    # the per-backup Graph + storage cost (see shared/storage_rollup.py
+    # for the read-side dedup that kept totals correct while legacy rows
+    # still existed).
     ResourceType.SHARED_MAILBOX,
     ResourceType.ROOM_MAILBOX,
-    ResourceType.ONEDRIVE,
     # Tier-2 per-workload children. Each ENTRA_USER discovered today
     # gets one of each — USER_MAIL/USER_CALENDAR/USER_CONTACTS/
     # USER_ONEDRIVE/USER_CHATS — and the actual backup data lives in

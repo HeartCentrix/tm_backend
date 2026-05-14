@@ -1852,13 +1852,19 @@ class BackupWorker:
         partition_type: Optional[str],
         details: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Lifecycle audit for one partition shard.
-        Actions: PARTITION_STARTED / PARTITION_COMPLETED / PARTITION_FAILED.
-        Outcome: IN_PROGRESS / SUCCESS / FAILURE.
-        Always stamps `worker_region` so cross-cluster ops dashboards
-        can group by region in one query. Fire-and-forget — audit
-        downtime never masks the backup outcome.
+        """Partition shards are infrastructure, not user-facing actions.
+        Operator audit feed should only carry backup / discovery /
+        storage / risk / restore events — the things an admin actually
+        needs to trace. Whether a 10 GB OneDrive was split into 4 shards
+        and which worker drained each one belongs in worker logs, not
+        the audit log. This helper is intentionally a no-op so all
+        existing call sites stay valid (and partition-trace data is
+        still printed to stdout for ops); only the audit row is
+        suppressed. To re-enable for an investigation, set
+        AUDIT_EMIT_PARTITION_EVENTS=true and remove this early return.
         """
+        if os.environ.get("AUDIT_EMIT_PARTITION_EVENTS", "false").lower() not in ("1", "true", "yes", "on"):
+            return
         try:
             payload: Dict[str, Any] = {
                 "partition_id": str(partition_id),
@@ -2050,6 +2056,79 @@ class BackupWorker:
             )).scalar_one_or_none()
             if not tenant:
                 print(f"[{self.worker_id}] Tenant not found for resource {resource_id}, skipping")
+                return
+            # Intake-level RMQ redelivery guard. Two pieces:
+            #
+            # 1. Definitive-terminal check (COMPLETED / PARTIAL /
+            #    CANCELLED). If a snapshot for this exact
+            #    (job_id, resource_id) already reached one of those
+            #    states, the message in our hands is an RMQ redelivery
+            #    of work we already finished. Drop it without any
+            #    Graph or blob work — the consumer ACKs on return.
+            #
+            #    FAILED is *deliberately excluded* from this set. A
+            #    failed snapshot is retry-able: either the consumer
+            #    requeue (delivery_count < MAX_RETRIES) or the
+            #    stale-sweep finds it. Either path lands here again
+            #    and we want the retry to proceed.
+            #
+            # 2. Fresh-IN_PROGRESS check. The partial unique index
+            #    ix_snapshots_job_resource_inprogress lets at most one
+            #    IN_PROGRESS row exist per (job_id, resource_id), but
+            #    it does NOT prevent a second worker from running the
+            #    *handler* against that row via create_snapshot's
+            #    resume path — and that path was the source of the
+            #    duplicate Graph fetches the user observed (Amit
+            #    Mishra 6:18 → 6:20 → 6:28 PM USER_CHATS rows spanning
+            #    the ~10-min chats drain). If the existing IN_PROGRESS
+            #    row was started recently (under 25 min — within the
+            #    30-min stale-sweep window), another worker is alive
+            #    and on it; drop this delivery so we don't double up
+            #    the fetch. If the IN_PROGRESS row is older than 25
+            #    min, the original worker likely died — fall through
+            #    and let the stale-sweep / requeue cycle handle it.
+            prior_terminal = (await session.execute(
+                select(Snapshot.id, Snapshot.status).where(
+                    Snapshot.job_id == job_id,
+                    Snapshot.resource_id == resource.id,
+                    Snapshot.status.in_([
+                        SnapshotStatus.COMPLETED,
+                        SnapshotStatus.PARTIAL,
+                        SnapshotStatus.CANCELLED,
+                    ]),
+                ).limit(1)
+            )).first()
+            if prior_terminal is not None:
+                prior_id, prior_status = prior_terminal
+                status_name = (
+                    prior_status.name if hasattr(prior_status, "name")
+                    else str(prior_status)
+                )
+                print(
+                    f"[{self.worker_id}] RMQ redelivery dropped — terminal "
+                    f"snapshot already exists for job={job_id} "
+                    f"resource={resource.id} (snapshot={prior_id} "
+                    f"status={status_name}); ACKing without re-running."
+                )
+                return
+
+            fresh_inprogress = (await session.execute(
+                select(Snapshot.id, Snapshot.started_at).where(
+                    Snapshot.job_id == job_id,
+                    Snapshot.resource_id == resource.id,
+                    Snapshot.status == SnapshotStatus.IN_PROGRESS,
+                    Snapshot.started_at > datetime.utcnow() - timedelta(minutes=25),
+                ).limit(1)
+            )).first()
+            if fresh_inprogress is not None:
+                ip_id, ip_started = fresh_inprogress
+                print(
+                    f"[{self.worker_id}] RMQ redelivery dropped — another "
+                    f"worker is actively running this backup for "
+                    f"job={job_id} resource={resource.id} "
+                    f"(snapshot={ip_id} started_at={ip_started}); "
+                    f"ACKing without re-running."
+                )
                 return
             # Detach so we can use these objects after the session closes.
             session.expunge_all()
@@ -5554,10 +5633,12 @@ class BackupWorker:
                 await _raise_if_job_cancelled(job_id)
                 snapshot = await self.create_snapshot(resource, message, job_id)
                 _snap_by_resource[str(resource.id)] = str(snapshot.id)
-                await self._emit_backup_audit(
-                    "BACKUP_STARTED", "IN_PROGRESS",
-                    tenant, resource, snapshot, job_id,
-                )
+                # Audit: BACKUP_STARTED is emitted ONCE at the outermost
+                # entry point (_process_single_backup for individual /
+                # fanout-mass paths, _finalize_partitioned_snapshot for
+                # the terminal). Emitting again here used to surface as
+                # 4–6 duplicate events per backup (outer + this closure +
+                # one per partition shard re-entry via synth_msg).
                 # Pass snapshot into the fetcher so handlers (USER_CHATS
                 # today, USER_MAIL next) can stream-persist their items
                 # inline and return a lightweight attachment-candidate
@@ -6127,39 +6208,13 @@ class BackupWorker:
 
         results = await asyncio.gather(*[_backup_one(r) for r in resources], return_exceptions=True)
 
-        # Emit BACKUP_COMPLETED / BACKUP_FAILED for each resource now that
-        # we know its outcome. gather(return_exceptions=True) gave us dicts
-        # for success and Exception instances for failure — _snap_by_resource
-        # lets us attach the snapshot_id either way (populated right after
-        # create_snapshot inside _backup_one).
-        for res, outcome in zip(resources, results):
-            snap_id = _snap_by_resource.get(str(res.id))
-            if isinstance(outcome, Exception):
-                await self._emit_backup_audit(
-                    "BACKUP_FAILED", "FAILURE",
-                    tenant, res, snap_id, job_id,
-                    details={
-                        "error": str(outcome)[:500],
-                        "error_type": type(outcome).__name__,
-                    },
-                )
-            elif isinstance(outcome, dict):
-                # Partitioned OneDrive coordinator returned early — the
-                # snapshot is still IN_PROGRESS pending shard consumers.
-                # The terminal audit event fires from the last partition's
-                # `_finalize_partitioned_snapshot` once every shard
-                # terminates. Skip the premature SUCCESS emission here.
-                if outcome.get("partitioned"):
-                    continue
-                await self._emit_backup_audit(
-                    "BACKUP_COMPLETED", "SUCCESS",
-                    tenant, res, snap_id, job_id,
-                    details={
-                        "item_count": outcome.get("item_count", 0),
-                        "bytes_added": outcome.get("bytes_added", 0),
-                    },
-                )
-
+        # Per-resource BACKUP_COMPLETED / BACKUP_FAILED used to fire
+        # here, but for the individual / fanout-mass paths the outer
+        # `_process_single_backup` already emits the terminal audit
+        # (line 2342 success / 2243 failure), and for partitioned runs
+        # the partition finalizer emits exactly once at line 8534. This
+        # closure ran inside both flows, so emitting again here
+        # produced 2–6× duplicate audit rows per attempt.
         item_count = sum(r.get("item_count", 0) for r in results if isinstance(r, dict))
         bytes_added = sum(r.get("bytes_added", 0) for r in results if isinstance(r, dict))
         return {"item_count": item_count, "bytes_added": bytes_added}
@@ -10092,10 +10147,9 @@ class BackupWorker:
                 snapshot = None
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
-                    await self._emit_backup_audit(
-                        "BACKUP_STARTED", "IN_PROGRESS",
-                        tenant, resource, snapshot, job_id,
-                    )
+                    # BACKUP_STARTED emitted once at the outer entry
+                    # (_process_single_backup); see comment in
+                    # _backup_user_content_parallel for the rationale.
                     delta_token = (resource.extra_data or {}).get("delta_token")
 
                     if resource_type == "ONEDRIVE":
@@ -10207,25 +10261,13 @@ class BackupWorker:
                             "bytes_added": actual_bytes,
                         })
 
-                    await self._emit_backup_audit(
-                        "BACKUP_COMPLETED", "SUCCESS",
-                        tenant, resource, snapshot, job_id,
-                        details={
-                            "item_count": actual_items,
-                            "bytes_added": actual_bytes,
-                        },
-                    )
+                    # BACKUP_COMPLETED emitted at the outer entry
+                    # (_process_single_backup line 2342) or by the
+                    # partition finalizer for partitioned runs.
                     return {"item_count": actual_items, "bytes_added": actual_bytes}
                 except Exception as e:
                     print(f"[{self.worker_id}] File backup failed for {resource.id}: {e}")
-                    await self._emit_backup_audit(
-                        "BACKUP_FAILED", "FAILURE",
-                        tenant, resource, snapshot, job_id,
-                        details={
-                            "error": str(e)[:500],
-                            "error_type": type(e).__name__,
-                        },
-                    )
+                    # BACKUP_FAILED emitted at the outer (line 2243).
                     return {"item_count": 0, "bytes_added": 0}
 
         results = await asyncio.gather(*[backup_one_resource(r) for r in resources], return_exceptions=True)
@@ -11487,10 +11529,9 @@ class BackupWorker:
                 user_label = resource.display_name or resource.external_id
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
-                    await self._emit_backup_audit(
-                        "BACKUP_STARTED", "IN_PROGRESS",
-                        tenant, resource, snapshot, job_id,
-                    )
+                    # BACKUP_STARTED emitted once at the outer entry
+                    # (_process_single_backup); inner emission removed
+                    # to prevent 4–6× duplicate audit rows per attempt.
 
                     try:
                         folder_tree = await graph_client.get_mail_folder_tree(resource.external_id)
@@ -11927,14 +11968,9 @@ class BackupWorker:
                                  "bytes_added": totals["bytes"]},
                             )
 
-                        await self._emit_backup_audit(
-                            "BACKUP_COMPLETED", "SUCCESS",
-                            tenant, resource, snapshot, job_id,
-                            details={
-                                "item_count": totals["items"],
-                                "bytes_added": totals["bytes"],
-                            },
-                        )
+                        # BACKUP_COMPLETED emitted at the outer
+                        # (_process_single_backup line 2342) or the
+                        # partition finalizer for partitioned runs.
                     return {"item_count": totals["items"], "bytes_added": totals["bytes"]}
                 except Exception as e:
                     print(
@@ -11947,14 +11983,7 @@ class BackupWorker:
                                 await self.fail_snapshot(s, snapshot, e)
                         except Exception:
                             pass
-                    await self._emit_backup_audit(
-                        "BACKUP_FAILED", "FAILURE",
-                        tenant, resource, snapshot, job_id,
-                        details={
-                            "error": str(e)[:500],
-                            "error_type": type(e).__name__,
-                        },
-                    )
+                    # BACKUP_FAILED emitted at the outer (line 2243).
                     return {"item_count": 0, "bytes_added": 0}
 
         results = await asyncio.gather(
@@ -12025,10 +12054,9 @@ class BackupWorker:
                 snapshot = None
                 try:
                     snapshot = await self.create_snapshot(resource, message, job_id)
-                    await self._emit_backup_audit(
-                        "BACKUP_STARTED", "IN_PROGRESS",
-                        tenant, resource, snapshot, job_id,
-                    )
+                    # BACKUP_STARTED emitted once at the outer entry
+                    # (_process_single_backup); inner emission removed
+                    # to prevent duplicate audit rows per attempt.
                     resource_type = resource.type.value
 
                     # Route to appropriate handler
@@ -12050,14 +12078,7 @@ class BackupWorker:
                                 await self.complete_snapshot(s, snapshot, result)
                         except Exception as fe:
                             print(f"[{self.worker_id}] complete_snapshot failed for {resource.id}: {fe}")
-                    await self._emit_backup_audit(
-                        "BACKUP_COMPLETED", "SUCCESS",
-                        tenant, resource, snapshot, job_id,
-                        details={
-                            "item_count": (result or {}).get("item_count", 0) if isinstance(result, dict) else 0,
-                            "bytes_added": (result or {}).get("bytes_added", 0) if isinstance(result, dict) else 0,
-                        },
-                    )
+                    # BACKUP_COMPLETED emitted at the outer (line 2342).
                     return result
                 except Exception as e:
                     print(f"[{self.worker_id}] Generic backup failed for {resource.id}: {e}")
@@ -12067,14 +12088,7 @@ class BackupWorker:
                                 await self.fail_snapshot(s, snapshot, e)
                         except Exception:
                             pass
-                    await self._emit_backup_audit(
-                        "BACKUP_FAILED", "FAILURE",
-                        tenant, resource, snapshot, job_id,
-                        details={
-                            "error": str(e)[:500],
-                            "error_type": type(e).__name__,
-                        },
-                    )
+                    # BACKUP_FAILED emitted at the outer (line 2243).
                     return {"item_count": 0, "bytes_added": 0}
 
         results = await asyncio.gather(*[backup_one(r) for r in resources], return_exceptions=True)

@@ -236,6 +236,93 @@ async def get_overview(
     }
 
 
+def _build_service_clause(service_key, service_resource_types):
+    """Return the service-bucket filter shared by 24h + 7d endpoints.
+
+    Two shapes of backup job exist:
+      1. Per-resource: Job.resource_id points at a single Resource.
+         Match by that resource's type.
+      2. Batch (MANUAL_BATCH / USER_ORCHESTRATION): Job.resource_id is
+         NULL and batch_resource_ids holds the fan-out. We can't join
+         array → resources cheaply, so we match by Tenant.type — a
+         tenant is either M365 or AZURE, not both.
+    """
+    if not (service_key and service_resource_types):
+        return None
+    service_tenant_type = TenantType.M365 if service_key == "m365" else TenantType.AZURE
+    return or_(
+        and_(Job.resource_id.is_not(None), Resource.type.in_(service_resource_types)),
+        and_(Job.resource_id.is_(None), Tenant.type == service_tenant_type),
+    )
+
+
+def _batch_group_key(job_id, status, spec, result, created_at, tenant_id):
+    """Compute the Activity-style batch key for a Job row.
+
+    A single operator click ("Backup all 9 users") fans out into N Job
+    rows in the DB: one per (tenant, routing_key) partition for the
+    parent ENTRA_USER bulk, plus more rows for the Tier-2 child fan-out
+    that discovery-worker enqueues. All these rows share a `batch_id`
+    in `spec` (job-service propagates it through every stage), so
+    grouping by that key collapses them back to ONE logical task.
+
+    For pre-batch_id legacy rows (and SLA-scheduled jobs that don't
+    share a batch), the fallback (tenant, triggered_by, second-precision
+    created_at) is the same grouping the Audit / Activity tab uses, so
+    every dashboard surface counts the same way.
+    """
+    spec = spec or {}
+    batch_id = spec.get("batch_id")
+    if batch_id:
+        return (tenant_id, "BATCH", str(batch_id))
+    trigger = str(spec.get("triggered_by") or "")
+    created_key = (
+        created_at.replace(microsecond=0).isoformat()
+        if created_at else ""
+    )
+    return (tenant_id, trigger, created_key)
+
+
+def _roll_up_group_outcome(children):
+    """Reduce a batch group's child Jobs to a single outcome bucket.
+
+    Buckets mirror the per-Job semantics of the old query but applied
+    to the whole batch:
+      * success   — every child COMPLETED with no failed/skipped items
+      * warnings  — at least one child COMPLETED with failed/skipped
+                    items, OR at least one child RETRYING (mid-retry)
+      * failures  — at least one child FAILED
+      * inflight  — at least one child still RUNNING/QUEUED and no
+                    child has failed yet. Counted nowhere (the card
+                    only shows finished outcomes).
+      * cancelled — every child CANCELLED. Counted nowhere.
+    Returns "success" | "warnings" | "failures" | None.
+    """
+    statuses = [s for s, _ in children]
+    results = [r or {} for _, r in children]
+    any_failed = any(s == JobStatus.FAILED for s in statuses)
+    any_retrying = any(s == JobStatus.RETRYING for s in statuses)
+    any_running = any(s in (JobStatus.RUNNING, JobStatus.QUEUED) for s in statuses)
+    any_completed = any(s == JobStatus.COMPLETED for s in statuses)
+    any_partial = any(
+        int(r.get("failed_count") or 0) > 0
+        or int(r.get("skipped_count") or 0) > 0
+        for r in results
+    )
+
+    if any_failed:
+        return "failures"
+    if any_running:
+        return None  # in-flight — not an outcome yet
+    if any_retrying:
+        return "warnings"
+    if any_completed and any_partial:
+        return "warnings"
+    if any_completed:
+        return "success"
+    return None  # all cancelled / pending — not counted
+
+
 @app.get("/api/v1/dashboard/status/24hour")
 async def get_24hour_status(
     tenantId: Optional[str] = Query(None),
@@ -251,69 +338,44 @@ async def get_24hour_status(
     if tenantId:
         filters.append(Job.tenant_id == UUID(tenantId))
 
-    service_clause = None
-    if service_key and service_resource_types:
-        # Two shapes of backup job exist:
-        #   1. Per-resource: Job.resource_id points at a single Resource.
-        #      Match by that resource's type.
-        #   2. Batch (MANUAL_BATCH / USER_ORCHESTRATION): Job.resource_id is
-        #      NULL and batch_resource_ids holds the fan-out. We can't join
-        #      array → resources cheaply, so we match by Tenant.type
-        #      instead — a tenant is either M365 or AZURE, not both, so the
-        #      tenant's type tells us which service bucket the batch belongs
-        #      to. Replaces the old MANUAL_DATASOURCE_{service} label check
-        #      which didn't match the MANUAL_BATCH / USER_ORCHESTRATION
-        #      labels our batch jobs actually carry.
-        service_tenant_type = TenantType.M365 if service_key == "m365" else TenantType.AZURE
-        service_clause = or_(
-            and_(Job.resource_id.is_not(None), Resource.type.in_(service_resource_types)),
-            and_(Job.resource_id.is_(None), Tenant.type == service_tenant_type),
+    service_clause = _build_service_clause(service_key, service_resource_types)
+
+    # One pass: fetch every backup Job in the window, group by batch
+    # key, and tally outcomes per group. This is the same grouping the
+    # Activity tab uses (audit-service _group_batch_jobs), so a 9-user
+    # bulk click that the audit tab shows as one row also counts as one
+    # "task" here — matching the operator's mental model of "one click
+    # = one task." Counting raw Job rows (the old behavior) leaked the
+    # backend's queue partitioning + Tier-2 fan-out into the dashboard.
+    jobs_stmt = (
+        select(
+            Job.id, Job.status, Job.spec, Job.result,
+            Job.created_at, Job.tenant_id,
         )
-
-    success_stmt = (select(func.count()).select_from(Job)
+        .select_from(Job)
         .outerjoin(Resource, Job.resource_id == Resource.id)
-        .outerjoin(Tenant, Job.tenant_id == Tenant.id))
-    warning_stmt = (select(func.count()).select_from(Job)
-        .outerjoin(Resource, Job.resource_id == Resource.id)
-        .outerjoin(Tenant, Job.tenant_id == Tenant.id))
-    failure_stmt = (select(func.count()).select_from(Job)
-        .outerjoin(Resource, Job.resource_id == Resource.id)
-        .outerjoin(Tenant, Job.tenant_id == Tenant.id))
-
-    if service_clause is not None:
-        success_stmt = success_stmt.where(service_clause)
-        warning_stmt = warning_stmt.where(service_clause)
-        failure_stmt = failure_stmt.where(service_clause)
-
-    # Outcome categories (do NOT count RUNNING/QUEUED — those are
-    # in-flight, not outcomes):
-    #   success  — COMPLETED with zero failed AND zero skipped items
-    #   warnings — COMPLETED with failed_count>0 OR skipped_count>0
-    #              (partial success, typical AFI/Veeam dashboard signal),
-    #              plus RETRYING jobs (transient failures mid-execution)
-    #   failures — FAILED
-    # Runtime, queued, cancelled are intentionally excluded.
-    _partial_json = text(
-        "COALESCE((jobs.result->>'failed_count')::int, 0) > 0 "
-        "OR COALESCE((jobs.result->>'skipped_count')::int, 0) > 0"
+        .outerjoin(Tenant, Job.tenant_id == Tenant.id)
+        .where(*filters)
     )
-    success = (await db.execute(
-        success_stmt.where(
-            Job.status == JobStatus.COMPLETED,
-            text("NOT (" + _partial_json.text + ")"),
-            *filters,
-        )
-    )).scalar() or 0
-    warnings = (await db.execute(
-        warning_stmt.where(
-            or_(
-                and_(Job.status == JobStatus.COMPLETED, _partial_json),
-                Job.status == JobStatus.RETRYING,
-            ),
-            *filters,
-        )
-    )).scalar() or 0
-    failures = (await db.execute(failure_stmt.where(Job.status == JobStatus.FAILED, *filters))).scalar() or 0
+    if service_clause is not None:
+        jobs_stmt = jobs_stmt.where(service_clause)
+    rows = (await db.execute(jobs_stmt)).all()
+
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for r in rows:
+        key = _batch_group_key(*r)
+        groups[key].append((r.status, r.result))
+
+    success = warnings = failures = 0
+    for children in groups.values():
+        outcome = _roll_up_group_outcome(children)
+        if outcome == "success":
+            success += 1
+        elif outcome == "warnings":
+            warnings += 1
+        elif outcome == "failures":
+            failures += 1
 
     return {"success": success, "warnings": warnings, "failures": failures}
 
@@ -332,68 +394,67 @@ async def get_7day_status(
     filters = [Job.type == JobType.BACKUP, Job.created_at >= seven_days_ago]
     if tenantId:
         filters.append(Job.tenant_id == UUID(tenantId))
-    
-    # 7-day outcome buckets match the 24h definitions above. RUNNING /
-    # QUEUED jobs are in-flight and don't belong to any outcome bucket;
-    # previously they were mis-counted as "warnings" so every active
-    # backup inflated the Warnings number on the Overview chart.
-    _partial_json_7d = text(
-        "COALESCE((jobs.result->>'failed_count')::int, 0) > 0 "
-        "OR COALESCE((jobs.result->>'skipped_count')::int, 0) > 0"
-    )
-    stmt = (
+
+    service_clause = _build_service_clause(service_key, service_resource_types)
+
+    # Group by batch key per Activity semantics so a single bulk click
+    # (which fans out into multiple Job rows internally) registers as
+    # ONE task on the dashboard, on its earliest-child date. Counting
+    # raw Job rows (the old behavior) double/triple-counted the same
+    # operator action.
+    jobs_stmt = (
         select(
-            func.date(Job.created_at).label("date"),
-            func.count().filter(
-                and_(
-                    Job.status == JobStatus.COMPLETED,
-                    text("NOT (" + _partial_json_7d.text + ")"),
-                )
-            ).label("success"),
-            func.count().filter(
-                or_(
-                    and_(Job.status == JobStatus.COMPLETED, _partial_json_7d),
-                    Job.status == JobStatus.RETRYING,
-                )
-            ).label("warnings"),
-            func.count().filter(Job.status == JobStatus.FAILED).label("failures"),
+            Job.id, Job.status, Job.spec, Job.result,
+            Job.created_at, Job.tenant_id,
         )
         .select_from(Job)
         .outerjoin(Resource, Job.resource_id == Resource.id)
         .outerjoin(Tenant, Job.tenant_id == Tenant.id)
         .where(*filters)
-        .group_by(func.date(Job.created_at))
-        .order_by(func.date(Job.created_at))
     )
-    if service_key and service_resource_types:
-        service_tenant_type = TenantType.M365 if service_key == "m365" else TenantType.AZURE
-        stmt = stmt.where(
-            or_(
-                and_(Job.resource_id.is_not(None), Resource.type.in_(service_resource_types)),
-                and_(Job.resource_id.is_(None), Tenant.type == service_tenant_type),
-            )
-        )
-    result = await db.execute(stmt)
-    rows = result.all()
+    if service_clause is not None:
+        jobs_stmt = jobs_stmt.where(service_clause)
+    rows = (await db.execute(jobs_stmt)).all()
 
-    # Build a dict of existing data
-    data_by_date = {str(r.date): {"success": r.success or 0, "warnings": r.warnings or 0, "failures": r.failures or 0} for r in rows}
-    
-    # Fill all 7 days, padding missing days with zeros
+    # Group → per-group earliest date + outcome → daily tally.
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    earliest_at: dict = {}
+    for r in rows:
+        key = _batch_group_key(*r)
+        groups[key].append((r.status, r.result))
+        if r.created_at is not None:
+            existing = earliest_at.get(key)
+            if existing is None or r.created_at < existing:
+                earliest_at[key] = r.created_at
+
+    daily_tally: dict = defaultdict(lambda: {"success": 0, "warnings": 0, "failures": 0})
+    for key, children in groups.items():
+        outcome = _roll_up_group_outcome(children)
+        if outcome is None:
+            continue
+        anchor = earliest_at.get(key)
+        if anchor is None:
+            continue
+        date_str = anchor.date().isoformat()
+        daily_tally[date_str][outcome] += 1
+
+    # Fill all 7 days, padding missing days with zeros.
     daily_status = []
     for i in range(7):
         date = (datetime.utcnow() - timedelta(days=6-i)).date()
         date_str = date.isoformat()
+        bucket = daily_tally.get(date_str, {"success": 0, "warnings": 0, "failures": 0})
         daily_status.append({
             "date": date_str,
-            "success": data_by_date.get(date_str, {}).get("success", 0),
-            "warnings": data_by_date.get(date_str, {}).get("warnings", 0),
-            "failures": data_by_date.get(date_str, {}).get("failures", 0),
+            "success": bucket["success"],
+            "warnings": bucket["warnings"],
+            "failures": bucket["failures"],
         })
-    
+
     total_backups = sum(d["success"] + d["warnings"] + d["failures"] for d in daily_status)
     total_success = sum(d["success"] for d in daily_status)
-    
+
     return {
         "dailyStatus": daily_status,
         "summary": {

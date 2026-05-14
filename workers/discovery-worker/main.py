@@ -103,12 +103,22 @@ DISCOVERY_SCOPE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "groups": {"method": "discover_groups", "resource_types": {ResourceType.ENTRA_GROUP, ResourceType.M365_GROUP}},
     "mailboxes": {
         "method": "discover_mailboxes",
-        # Tier 1 only emits SHARED + ROOM mailboxes (user MAILBOX rows are
-        # Tier 2 children of an ENTRA_USER); leave MAILBOX in the stale-mark
-        # set so legacy rows still get cleaned up by the next pass.
+        # Tier 1 only emits SHARED + ROOM mailboxes — user MAILBOX rows are
+        # Tier 2 children of an ENTRA_USER (USER_MAIL). Pass the explicit
+        # `kinds` filter so the scope-based discovery path matches
+        # `discover_all()` (graph_client.py:1768) and never creates a
+        # duplicate user MAILBOX row alongside its Tier 2 USER_MAIL sibling.
+        # MAILBOX stays in the stale-mark set so any pre-migration legacy
+        # rows get cleaned up by the next pass.
+        "method_kwargs": {"kinds": {"SHARED_MAILBOX", "ROOM_MAILBOX"}},
         "resource_types": {ResourceType.MAILBOX, ResourceType.SHARED_MAILBOX, ResourceType.ROOM_MAILBOX},
     },
-    "onedrive": {"method": "discover_onedrive", "resource_types": {ResourceType.ONEDRIVE}},
+    # `discover_onedrive` is intentionally NOT a tenant-wide scope: per-user
+    # drives are Tier 2 USER_ONEDRIVE rows created via `discover_user_content`
+    # under each ENTRA_USER. Keeping the method on GraphClient (for shared /
+    # group drives, group-OneDrive recovery, etc.) but never auto-firing at
+    # the tenant scope avoids the Tier-1/Tier-2 double walk that bloated
+    # backup time + Graph quota by ~2× per user.
     "sharepoint": {"method": "discover_sharepoint", "resource_types": {ResourceType.SHAREPOINT_SITE}},
     # Tier 1: channels only. Per-user TEAMS_CHAT + TEAMS_CHAT_EXPORT shards
     # are now produced by the Tier 2 per-user discovery, not the tenant scan.

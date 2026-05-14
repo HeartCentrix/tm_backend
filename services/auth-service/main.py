@@ -531,8 +531,12 @@ async def datasource_callback(
             "jobId": str(uuid4()),
             "tenantId": str(tenant_id),
             "externalTenantId": external_tenant_id,
+            # Per-user OneDrive is a Tier 2 USER_ONEDRIVE row under each
+            # ENTRA_USER, materialised on demand via discover_user_content.
+            # Listing "onedrive" here would emit a duplicate Tier 1 ONEDRIVE
+            # row per user and double the backup walk.
             "discoveryScope": ["users", "groups", "mailboxes", "shared_mailboxes",
-                               "onedrive", "sharepoint", "teams"],
+                               "sharepoint", "teams"],
             "triggeredBy": str(current_user["id"]),
             "triggeredAt": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         }
