@@ -643,38 +643,198 @@ async def _list_activities_batch(
     """
     from shared.batch_rollup import build_batch_rollup_query, shape_batch_row
 
+    service_key = _parse_service_type(serviceType)
+    service_resource_types = _resource_types_for_service(service_key)
+    service_type_values = (
+        {rt.value if hasattr(rt, "value") else str(rt) for rt in service_resource_types}
+        if service_resource_types else None
+    )
+    op_upper = operation.upper() if operation else None
+
+    # Operation filter gates which source contributes rows.
+    include_backup = (op_upper is None) or (op_upper == "BACKUP")
+    include_discovery = (op_upper is None) or (op_upper == "DISCOVERY")
+    # Warnings are BACKUP-domain alerts (RANSOMWARE_SIGNAL etc.).
+    include_warnings = include_backup and (status != "Warning" or status is None or status == "Warning")
+    # Status filter: "Warning" hides backup+discovery rows; "Done"/"In Progress"/
+    # "Failed"/"Canceled" hides warning rows.
+    if status == "Warning":
+        include_backup = False
+        include_discovery = False
+    elif status in ("Done", "In Progress", "Failed", "Canceled"):
+        include_warnings = False
+
+    fetch_limit = max(size, page * size)
+    items: List[Dict[str, Any]] = []
+
     async with async_session_factory() as db:
-        offset = (page - 1) * size
-        # Fetch one extra row so we can populate has_more cheaply
-        # without a separate COUNT(*) over the same CTE.
-        stmt = build_batch_rollup_query(
-            tenant_id=tenantId,
-            start_date=start_date,
-            end_date=end_date,
-            operation=(operation.upper() if operation else None),
-            size=size + 1,
-            offset=offset,
-        )
-        rows = (await db.execute(stmt)).all()
-        has_more = len(rows) > size
-        page_rows = rows[:size]
-        items = [shape_batch_row(r) for r in page_rows]
+        # --- 1. BACKUP rows via batch CTE rollup ---
+        if include_backup:
+            stmt = build_batch_rollup_query(
+                tenant_id=tenantId,
+                start_date=start_date,
+                end_date=end_date,
+                operation="BACKUP",
+                size=fetch_limit,
+                offset=0,
+            )
+            rows = (await db.execute(stmt)).all()
+            for r in rows:
+                row = shape_batch_row(r)
+                if status and status != "Warning":
+                    if row.get("status") != status:
+                        continue
+                items.append(row)
 
-        # Frontend-aligned status filter. "Warning" maps to "Done with
-        # at least one partial/failed child snapshot."
-        if status:
-            wanted = status
-            if wanted == "Warning":
-                items = [it for it in items if it.get("warnings")]
-            else:
-                items = [it for it in items if it.get("status") == wanted]
+        # --- 2. WARNING audit events (RANSOMWARE_SIGNAL, BACKUP_SKIPPED_SLA_SCOPE) ---
+        if include_warnings:
+            wfilters = [AuditEvent.action.in_(WARNING_ACTIVITY_ACTIONS)]
+            if tenantId:
+                wfilters.append(AuditEvent.tenant_id == uuid.UUID(tenantId))
+            if start_date:
+                wfilters.append(AuditEvent.occurred_at >= datetime.fromisoformat(start_date))
+            if end_date:
+                wfilters.append(AuditEvent.occurred_at <= datetime.fromisoformat(end_date))
+            if service_type_values:
+                wfilters.append(AuditEvent.resource_type.in_(service_type_values))
+            wstmt = (
+                select(AuditEvent).where(and_(*wfilters))
+                .order_by(desc(AuditEvent.occurred_at)).limit(fetch_limit)
+            )
+            for event in (await db.execute(wstmt)).scalars().all():
+                details = event.details or {}
+                message = details.get("message")
+                if not message:
+                    if event.action == "RANSOMWARE_SIGNAL":
+                        anomaly = details.get("anomaly_type") or "Anomaly"
+                        avg_prior = details.get("avg_prior_item_count")
+                        current = details.get("current_item_count")
+                        drop_pct = details.get("drop_pct")
+                        if anomaly == "ITEM_COUNT_DROP" and avg_prior is not None and current is not None:
+                            pct = f" ({drop_pct}% drop)" if drop_pct is not None else ""
+                            message = f"Ransomware signal: item count dropped from avg {avg_prior} to {current}{pct}."
+                        else:
+                            message = f"Ransomware signal detected ({anomaly})."
+                    elif event.action == "BACKUP_SKIPPED_SLA_SCOPE":
+                        message = "Backup skipped because the assigned SLA does not cover this resource type."
+                    else:
+                        message = ACTIONS.get(event.action, event.action)
+                items.append({
+                    "id": f"audit-{event.id}",
+                    "start_time": event.occurred_at.isoformat() if event.occurred_at else "",
+                    "operation": "BACKUP",
+                    "object": event.resource_name or event.resource_type or "Unknown resource",
+                    "status": "Warning",
+                    "finish_time": event.occurred_at.isoformat() if event.occurred_at else "",
+                    "details": message,
+                })
 
+        # --- 3. DISCOVERY rows (STARTED + RUN paired) ---
+        if include_discovery:
+            dfilters = [AuditEvent.action.in_(DISCOVERY_ACTIVITY_ACTIONS)]
+            if tenantId:
+                dfilters.append(AuditEvent.tenant_id == uuid.UUID(tenantId))
+            if start_date:
+                dfilters.append(AuditEvent.occurred_at >= datetime.fromisoformat(start_date))
+            if end_date:
+                dfilters.append(AuditEvent.occurred_at <= datetime.fromisoformat(end_date))
+            if service_key:
+                dfilters.append(AuditEvent.resource_type == service_key.upper())
+            dstmt = (
+                select(AuditEvent).where(and_(*dfilters))
+                .order_by(desc(AuditEvent.occurred_at)).limit(fetch_limit)
+            )
+            dev = (await db.execute(dstmt)).scalars().all()
+            started_sorted = sorted(
+                (e for e in dev if e.action == "DISCOVERY_STARTED"),
+                key=lambda e: e.occurred_at or datetime.min,
+            )
+            run_sorted = sorted(
+                (e for e in dev if e.action == "DISCOVERY_RUN"),
+                key=lambda e: e.occurred_at or datetime.min,
+            )
+            run_buckets: Dict[Any, List[AuditEvent]] = {}
+            for r in run_sorted:
+                run_buckets.setdefault((r.tenant_id, r.resource_type), []).append(r)
+            paired_run_ids: Set[Any] = set()
+            paired: List[Tuple[AuditEvent, Optional[AuditEvent]]] = []
+            for s in started_sorted:
+                bucket = run_buckets.get((s.tenant_id, s.resource_type), [])
+                match: Optional[AuditEvent] = None
+                while bucket:
+                    candidate = bucket[0]
+                    if (candidate.occurred_at or datetime.min) >= (s.occurred_at or datetime.min) \
+                            and candidate.id not in paired_run_ids:
+                        match = candidate
+                        paired_run_ids.add(candidate.id)
+                        bucket.pop(0)
+                        break
+                    bucket.pop(0)
+                paired.append((s, match))
+            orphan_runs = [r for r in run_sorted if r.id not in paired_run_ids]
+
+            def _disco_row(started: Optional[AuditEvent], run: Optional[AuditEvent]):
+                anchor = started or run
+                if anchor is None:
+                    return None
+                details_src = (run.details if run else started.details) or {}
+                disco_type = details_src.get("type") or anchor.resource_type or "Discovery"
+                if run is None:
+                    disco_status = "In Progress"
+                    detail_text = f"{disco_type} discovery in progress"
+                    finish_time = ""
+                else:
+                    outcome = (run.outcome or "").upper()
+                    if outcome == "SUCCESS":
+                        disco_status = "Done"
+                        found = (run.details or {}).get("resourcesFound")
+                        detail_text = f"{disco_type} discovery completed"
+                        if found is not None:
+                            detail_text += f" — {found} resources"
+                    elif outcome == "FAILURE":
+                        disco_status = "Failed"
+                        err = (run.details or {}).get("error") or "unknown error"
+                        detail_text = f"{disco_type} discovery failed: {err}"
+                    else:
+                        disco_status = "In Progress"
+                        detail_text = f"{disco_type} discovery"
+                    finish_time = run.occurred_at.isoformat() if run.occurred_at else ""
+                if status and status != disco_status:
+                    return None
+                anchor_for_id = run or started
+                start_time = (started.occurred_at if started else run.occurred_at)
+                object_name = (started.resource_name if started else None) \
+                    or (run.resource_name if run else None) or disco_type
+                return {
+                    "id": f"discovery-{anchor_for_id.id}",
+                    "start_time": start_time.isoformat() if start_time else "",
+                    "operation": "DISCOVERY",
+                    "object": object_name,
+                    "status": disco_status,
+                    "finish_time": finish_time,
+                    "details": detail_text,
+                }
+
+            for s, r in paired:
+                row = _disco_row(s, r)
+                if row:
+                    items.append(row)
+            for r in orphan_runs:
+                row = _disco_row(None, r)
+                if row:
+                    items.append(row)
+
+    # Merge + sort + paginate.
+    items.sort(key=lambda it: it.get("start_time") or "", reverse=True)
+    total = len(items)
+    start_idx = (page - 1) * size
+    page_items = items[start_idx:start_idx + size]
     return {
-        "items": items,
-        "total": offset + len(items) + (1 if has_more else 0),
+        "items": page_items,
+        "total": total,
         "page":  page,
         "size":  size,
-        "has_more": has_more,
+        "has_more": (page * size) < total,
     }
 
 
