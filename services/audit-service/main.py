@@ -540,6 +540,8 @@ M365_RESOURCE_TYPES = {
     ResourceType.TEAMS_CHAT,
     ResourceType.ENTRA_USER,
     ResourceType.ENTRA_GROUP,
+    ResourceType.M365_GROUP,
+    ResourceType.ENTRA_DIRECTORY,
     ResourceType.ENTRA_APP,
     ResourceType.ENTRA_DEVICE,
     ResourceType.ENTRA_SERVICE_PRINCIPAL,
@@ -552,6 +554,20 @@ M365_RESOURCE_TYPES = {
     ResourceType.TODO,
     ResourceType.ONENOTE,
     ResourceType.DYNAMIC_GROUP,
+    # Tier-2 per-user content types — Tier-1 ENTRA_USER discovers the user,
+    # Tier-2 fans out into USER_* rows that carry the actual backup work.
+    # Omitting them here made the M365 Activity filter drop every Tier-2
+    # fan-out job, so the homepage "Recent Activity" tile showed only the
+    # 9-resource ENTRA_USER metadata bulk (~130 KB) and flipped to "Done"
+    # while USER_ONEDRIVE / USER_MAIL / USER_CHATS were still running on
+    # MANUAL_BATCH-triggered child jobs — same bug class as the one already
+    # fixed in dashboard-service M365_RESOURCE_TYPES.
+    ResourceType.USER_MAIL,
+    ResourceType.USER_ONEDRIVE,
+    ResourceType.USER_CONTACTS,
+    ResourceType.USER_CALENDAR,
+    ResourceType.USER_CHATS,
+    ResourceType.TEAMS_CHAT_EXPORT,
 }
 
 AZURE_RESOURCE_TYPES = {

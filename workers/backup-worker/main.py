@@ -1039,7 +1039,7 @@ async def _update_job_pct(job_id, pct: int) -> None:
 import aio_pika
 from aio_pika import IncomingMessage
 import httpx
-from sqlalchemy import select, and_, func, text
+from sqlalchemy import select, and_, func, text, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -5199,7 +5199,17 @@ class BackupWorker:
                                 # Live item_count bump on the snapshot
                                 # row so the Recovery UI shows real
                                 # progress instead of sitting at 0
-                                # until the very end.
+                                # until the very end. The final settle in
+                                # _backup_one (or in the partition
+                                # consumer for partitioned snapshots)
+                                # computes the proper delta against the
+                                # PRIOR snapshot for this resource and
+                                # overwrites new_item_count / bytes_added
+                                # with that — so the per-chat live bump
+                                # only needs to keep item_count moving;
+                                # the in-flight new_item_count below is
+                                # a best-effort placeholder that lands
+                                # only if the worker dies before settle.
                                 try:
                                     async with async_session_factory() as _s2:
                                         snap = await _s2.get(
@@ -6222,11 +6232,19 @@ class BackupWorker:
                           f"{type(fe).__name__}: {fe}")
 
                 async with async_session_factory() as session:
+                    # Delta-from-prior so reuse-heavy paths (chat skip-by-
+                    # activity, mail folder-fingerprint skip, OneDrive
+                    # empty-delta) don't double-count the full retained
+                    # inventory as "newly backed up" on every re-backup.
+                    # See _compute_snapshot_delta_from_prior.
+                    delta_items, delta_bytes = await self._compute_snapshot_delta_from_prior(
+                        session, snapshot.id, resource.id, total_items, bytes_total,
+                    )
                     snap = await session.get(Snapshot, snapshot.id)
                     snap.item_count = total_items
-                    snap.new_item_count = total_items
+                    snap.new_item_count = delta_items
                     snap.bytes_total = bytes_total
-                    snap.bytes_added = bytes_total
+                    snap.bytes_added = delta_bytes
                     snap.status = SnapshotStatus.COMPLETED
                     snap.completed_at = datetime.utcnow()
                     if snap.started_at:
@@ -6235,7 +6253,7 @@ class BackupWorker:
 
                     await self.update_resource_backup_info(session, resource, job_id, snapshot.id, {
                         "item_count": total_items,
-                        "bytes_added": bytes_total,
+                        "bytes_added": delta_bytes,
                     })
 
                 suffix = f" + {len(att_items)} attachments" if att_items else ""
@@ -8450,10 +8468,20 @@ class BackupWorker:
 
             snap = await session.get(Snapshot, snapshot_id)
             if snap is not None:
+                # Delta-from-prior (see _compute_snapshot_delta_from_prior).
+                # Partition consumers walk the same inventory every run;
+                # without this, every re-backup of a partitioned resource
+                # showed full inventory as "newly added" on the Activity
+                # row even when reuse paths inside the partition handler
+                # never touched Graph.
+                delta_items, delta_bytes = await self._compute_snapshot_delta_from_prior(
+                    session, snapshot_id, snap.resource_id,
+                    persisted_count, persisted_bytes,
+                )
                 snap.item_count = persisted_count
-                snap.new_item_count = persisted_count
+                snap.new_item_count = delta_items
                 snap.bytes_total = persisted_bytes
-                snap.bytes_added = persisted_bytes
+                snap.bytes_added = delta_bytes
                 # Bug #169 fix — persist the upgraded status when the
                 # preempted path determined PARTIAL was a stale REAPER
                 # flip and all partitions actually completed cleanly.
@@ -8510,7 +8538,7 @@ class BackupWorker:
                         session, resource, parent_job_id, snapshot_id,
                         {
                             "item_count": persisted_count,
-                            "bytes_added": persisted_bytes,
+                            "bytes_added": delta_bytes,
                         },
                     )
             except Exception as ru_exc:
@@ -16290,6 +16318,54 @@ class BackupWorker:
             stats["rest_rows"] += 1
         except Exception as exc:
             logger.warning("sp_rest_row persist failed for %s/%s/%s: %s", site_label, display, name, exc)
+
+    @staticmethod
+    async def _compute_snapshot_delta_from_prior(
+        session: AsyncSession,
+        snapshot_id: uuid.UUID,
+        resource_id: Any,
+        current_item_count: int,
+        current_bytes_total: int,
+    ) -> Tuple[int, int]:
+        """Return (new_item_count, bytes_added) for a settling snapshot.
+
+        Reuse-heavy paths (chat skip-by-activity, cross-user claim-skip,
+        mail folder-fingerprint skip, OneDrive empty-delta) write the full
+        prior inventory back as pointer rows for this snapshot — so
+        ``item_count`` and ``bytes_total`` always reflect the full
+        retained content for the resource. Setting ``new_item_count`` /
+        ``bytes_added`` to the same numbers inflated the Activity row's
+        "X.X GB backed up" by the FULL inventory on every re-backup, even
+        when the underlying storage layer had correctly deduped to zero
+        new bytes (observed 2026-05-14: a 7-user re-click 52s after the
+        first showed 3.9 GB "added" when the real Graph fetch was ~0 B).
+
+        Compute the delta against the immediately-prior COMPLETED /
+        PARTIAL snapshot of the same resource. If there is none (first
+        backup of this resource), delta = full inventory. If prior is
+        bigger than current (rare, e.g. messages got deleted), delta = 0
+        — never negative.
+        """
+        prior = (await session.execute(
+            select(Snapshot.item_count, Snapshot.bytes_total)
+            .where(
+                Snapshot.resource_id == resource_id,
+                Snapshot.id != snapshot_id,
+                Snapshot.status.in_(
+                    [SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]
+                ),
+            )
+            .order_by(desc(Snapshot.completed_at))
+            .limit(1)
+        )).first()
+        if prior is None:
+            return current_item_count, current_bytes_total
+        prior_items = int(prior[0] or 0)
+        prior_bytes = int(prior[1] or 0)
+        return (
+            max(0, current_item_count - prior_items),
+            max(0, current_bytes_total - prior_bytes),
+        )
 
     async def update_resource_backup_info(self, session: AsyncSession, resource: Resource,
                                           job_id: uuid.UUID, snapshot_id: uuid.UUID,

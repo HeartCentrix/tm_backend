@@ -10,11 +10,11 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, distinct, and_, or_, text
+from sqlalchemy import select, func, distinct, and_, or_, text, String
 from sqlalchemy.orm import aliased
 
 from shared.database import get_db, init_db, close_db, AsyncSession
-from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType
+from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, Job
 from shared.config import settings
 from shared.power_bi_snapshot import assemble_power_bi_items
 from shared.azure_storage import azure_storage_manager, workload_candidates_for_resource_type
@@ -265,36 +265,58 @@ async def list_snapshots(
     if not include_empty:
         filters.append(Snapshot.item_count > 0)
 
-    # Per-bulk-run dedup. Some legacy snapshots (created before the
-    # ix_snapshots_job_resource_inprogress partial-unique index landed)
-    # produced 2-3 rows for the same (job_id, resource_id) on long-running
-    # workloads (USER_CHATS, USER_MAIL) when RMQ redelivered the bulk
-    # message mid-drain. Each row is a real, separate snapshot — but for
-    # the Recovery UI they're a single backup attempt and should collapse
-    # to one entry per job. Keep the most "complete" row per job: highest
-    # item_count, ties break by latest created_at. Snapshots without a
-    # job_id (manual / ad-hoc) are passed through unchanged (treated as
-    # singletons).
+    # Per-bulk-run dedup. One "Backup now" click for a user fans out to
+    # THREE Jobs sharing the same `spec.batch_id`: Tier-1 ENTRA_USER bulk,
+    # Tier-2 mail/chats/cal/contacts bulk, and Tier-2 OneDrive bulk in
+    # the heavy lane. Each Job creates its own per-resource snapshots —
+    # and partitioned workloads (USER_CHATS, USER_MAIL, SharePoint) ALSO
+    # produce a coordinator snapshot plus N partition-shard snapshots
+    # for the same (job_id, resource_id) pair. From the Recovery UI's
+    # POV all of these are a single backup attempt and should collapse
+    # to one entry per (batch_id, resource_id). The previous (job_id,
+    # resource_id) partition was the right level of dedup BEFORE the
+    # batch_id propagation work landed — now it over-counts: Narendra
+    # with 2 clicks showed 5 "versions" because batch_1's tier-1, mail/
+    # chats/cal/contacts tier-2, OneDrive tier-2, plus batch_2's tier-1
+    # and tier-2 were 5 distinct job_ids.
+    #
+    # Partition key COALESCE order:
+    #   1. spec.batch_id  — one click, even across multiple Jobs
+    #   2. snapshot.job_id — pre-batch-id legacy snapshots
+    #   3. snapshot.id    — manual / ad-hoc snapshots (no job)
+    # NULL job_id snapshots stay singletons via the snapshot.id fallback.
+    #
+    # The resource_id half of the partition is non-negotiable: without
+    # it, calls without a resource_id filter (admin / search) would
+    # collapse N different users' snapshots from one bulk into a single
+    # row.
     from sqlalchemy import func as _func
-    # Partition key MUST include resource_id. Bulk runs share one job_id
-    # across N resources; partitioning by job_id alone would collapse
-    # N different users' snapshots into a single row when this endpoint
-    # is called without a resource_id filter (admin views, search). The
-    # COALESCE on job_id keeps manual/ad-hoc snapshots (job_id=NULL) as
-    # their own singleton partitions via snapshot.id.
+    snap_with_batch = (
+        select(
+            Snapshot,
+            _func.coalesce(
+                Job.spec["batch_id"].astext,
+                _func.cast(Snapshot.job_id, String),
+                _func.cast(Snapshot.id, String),
+            ).label("dedup_group"),
+        )
+        .select_from(Snapshot)
+        .outerjoin(Job, Job.id == Snapshot.job_id)
+        .where(*filters)
+        .subquery()
+    )
     row_num = _func.row_number().over(
         partition_by=(
-            _func.coalesce(Snapshot.job_id, Snapshot.id),
-            Snapshot.resource_id,
+            snap_with_batch.c.dedup_group,
+            snap_with_batch.c.resource_id,
         ),
         order_by=(
-            Snapshot.item_count.desc().nullslast(),
-            Snapshot.created_at.desc(),
+            snap_with_batch.c.item_count.desc().nullslast(),
+            snap_with_batch.c.created_at.desc(),
         ),
     ).label("dedup_rank")
     ranked = (
-        select(Snapshot, row_num)
-        .where(*filters)
+        select(snap_with_batch, row_num)
         .subquery()
     )
     snap_alias = aliased(Snapshot, ranked)
@@ -903,19 +925,34 @@ async def get_content_snapshots(
         .where(Snapshot.status == SnapshotStatus.COMPLETED)
     )).scalar() or 0
 
-    # versionCount = how many distinct backup *attempts* (job_ids) have
+    # versionCount = how many distinct backup *attempts* (batch_id) have
     # completed for this identity. One "Backup now" click for a user
-    # fans out to ~5 surface snapshots but is a single recovery point
-    # from the user's POV — AFI calls these "versions." Computed across
-    # the same subtree (parent + Tier-2 children) so the right-panel
-    # header shows the number that matches "how many times has this
-    # user been backed up." NULL job_ids (manual/ad-hoc snapshots) are
-    # filtered out — they have no fan-out to consolidate.
+    # fans out to ~5 surface snapshots across THREE Jobs (the Tier-1
+    # ENTRA_USER bulk + Tier-2 fan-out into mail/chats/cal/contacts + a
+    # separate heavy-lane OneDrive Tier-2 Job) — but is a single
+    # recovery point from the user's POV. AFI calls these "versions."
+    # All three Jobs share the same `spec.batch_id` (set by job-service
+    # at trigger time, propagated to Tier-2 via the discovery handoff),
+    # so counting DISTINCT batch_id collapses one click into one row.
+    # Counting DISTINCT job_id would over-report by 2-3x. NULL job_ids
+    # (manual / ad-hoc) fall back to grouping by snapshot.id so each
+    # singleton stays its own version.
     version_count = (await db.execute(
-        select(func.count(distinct(Snapshot.job_id)))
+        select(
+            func.count(
+                distinct(
+                    func.coalesce(
+                        Job.spec["batch_id"].astext,
+                        func.cast(Snapshot.job_id, String),
+                        func.cast(Snapshot.id, String),
+                    )
+                )
+            )
+        )
+        .select_from(Snapshot)
+        .outerjoin(Job, Job.id == Snapshot.job_id)
         .where(Snapshot.resource_id.in_(counted_ids))
         .where(Snapshot.status == SnapshotStatus.COMPLETED)
-        .where(Snapshot.job_id.is_not(None))
     )).scalar() or 0
 
     # Per-content-type item_type to count against (for the aggregated
