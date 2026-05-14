@@ -17441,13 +17441,32 @@ class BackupWorker:
         progress (counts.completed > 0 or counts.partial > 0);
         FAILED only when every single child failed. Operators see
         the per-resource breakdown via the snapshots table — Job
-        status is the coarse outcome."""
+        status is the coarse outcome.
+
+        Late-finalize reconcile (Bug B fix): partition consumers
+        commit their snapshot.bytes_added AFTER the snapshot's
+        status flips terminal (the CTE-UPDATE in
+        ``_finalize_partitioned_snapshot`` flips status separately
+        from the bytes/items write). A sibling resource's
+        rollup-call that interleaves between those two commits
+        would see the partitioned snapshot as terminal-with-zero-
+        bytes, undercount the SUM, and (if it flipped the parent
+        Job terminal) lock in the wrong bytes_processed because
+        the old code gated the entire UPDATE on
+        ``j.status NOT IN (terminal)``. Fix: drop the status-guard
+        from the bytes/items refresh — let every finalizer re-roll
+        them — and keep the status flip one-shot via a CASE that
+        preserves an already-terminal status. The bytes/items
+        refresh is naturally idempotent (same SUM under PG row
+        lock), so late-arriving finalizers can converge the row to
+        the correct totals even after status terminal."""
         try:
             row = (await session.execute(
                 text("""
                     WITH expected AS (
                         SELECT COALESCE(array_length(batch_resource_ids, 1), 0) AS n,
-                               status::text AS j_status,
+                               status::text AS prev_status,
+                               completed_at AS prev_completed_at,
                                id
                         FROM jobs WHERE id = :jid
                     ),
@@ -17466,19 +17485,34 @@ class BackupWorker:
                         FROM snapshots WHERE job_id = :jid
                     )
                     UPDATE jobs j SET
+                        -- One-shot status flip: preserve any already-
+                        -- terminal status (so we don't re-flip), else
+                        -- flip only when every child is terminal.
                         status = (CASE
+                            WHEN e.prev_status IN (
+                                'COMPLETED','FAILED','CANCELLED','CANCELLING'
+                            ) THEN j.status
                             WHEN c.terminal < e.n THEN j.status
                             WHEN c.completed = 0 AND c.partial = 0 THEN 'FAILED'::jobstatus
                             ELSE 'COMPLETED'::jobstatus
                         END),
                         completed_at = (CASE
+                            WHEN e.prev_completed_at IS NOT NULL THEN j.completed_at
                             WHEN c.terminal = e.n THEN NOW()
                             ELSE j.completed_at
                         END),
-                        progress_pct = GREATEST(
-                            COALESCE(j.progress_pct, 0),
-                            LEAST(99, (100 * c.terminal / NULLIF(e.n, 0))::int)
-                        ),
+                        progress_pct = (CASE
+                            WHEN e.prev_status IN (
+                                'COMPLETED','FAILED','CANCELLED','CANCELLING'
+                            ) THEN COALESCE(j.progress_pct, 100)
+                            ELSE GREATEST(
+                                COALESCE(j.progress_pct, 0),
+                                LEAST(99, (100 * c.terminal / NULLIF(e.n, 0))::int)
+                            )
+                        END),
+                        -- Bytes / items / result refresh UNCONDITIONALLY
+                        -- so late partition finalizers can correct the
+                        -- rollup even after the parent flipped terminal.
                         items_processed = c.items,
                         bytes_processed = c.bytes,
                         result = COALESCE(j.result::jsonb, '{}'::jsonb) || jsonb_build_object(
@@ -17492,11 +17526,9 @@ class BackupWorker:
                     FROM counts c, expected e
                     WHERE j.id = :jid
                       AND e.n > 0
-                      AND j.status NOT IN (
-                          'COMPLETED'::jobstatus, 'FAILED'::jobstatus,
-                          'CANCELLED'::jobstatus, 'CANCELLING'::jobstatus
-                      )
-                    RETURNING j.status::text AS new_status, c.terminal, e.n
+                    RETURNING j.status::text AS new_status,
+                              e.prev_status AS prev_status,
+                              c.terminal, e.n
                 """),
                 {"jid": job_id},
             )).first()
@@ -17504,11 +17536,17 @@ class BackupWorker:
             if row is None:
                 return None
             new_status = row.new_status if hasattr(row, "new_status") else row[0]
-            terminal = row.terminal if hasattr(row, "terminal") else row[1]
-            expected = row.n if hasattr(row, "n") else row[2]
-            if int(terminal) >= int(expected) and new_status in (
-                "COMPLETED", "FAILED",
-            ):
+            prev_status = row.prev_status if hasattr(row, "prev_status") else row[1]
+            terminal = row.terminal if hasattr(row, "terminal") else row[2]
+            expected = row.n if hasattr(row, "n") else row[3]
+            # Only log on the actual flip (prev was non-terminal, now
+            # terminal). Late-arriving bytes-only reconcile calls fire
+            # silently — they update bytes_processed but don't flip
+            # status, so logging them every time would be noise.
+            terminal_states = {"COMPLETED", "FAILED", "CANCELLED", "CANCELLING"}
+            if (prev_status not in terminal_states
+                and new_status in ("COMPLETED", "FAILED")
+                and int(terminal) >= int(expected)):
                 print(
                     f"[{self.worker_id}] [FANOUT/FINALIZE] job={job_id} "
                     f"→ {new_status} ({terminal}/{expected} children terminal)"

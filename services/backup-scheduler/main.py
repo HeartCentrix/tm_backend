@@ -632,6 +632,88 @@ async def startup():
                     f"[backup-scheduler] bulk_parent_finalize failed: {bulk_exc}",
                 )
 
+            # Bug B fix — late-bytes reconcile for recently-terminal
+            # bulks. When a partition consumer commits its snapshot's
+            # bytes_added AFTER the parent Job has already flipped
+            # terminal (the worker's _finalize_bulk_parent_if_complete
+            # already refreshes bytes unconditionally on its own call,
+            # but if no sibling finalizer fires after the late commit,
+            # the parent's bytes_processed can still lag). This sweep
+            # re-rolls bytes_processed for bulks that flipped terminal
+            # in the last 2h, idempotently — same SUM produces the
+            # same value, so repeated passes are harmless. Bounded to
+            # 2h to keep the sweep cheap on large history.
+            try:
+                async with async_session_factory() as session:
+                    reconciled = (await session.execute(text("""
+                        WITH recent_bulks AS (
+                            SELECT id,
+                                   COALESCE(array_length(batch_resource_ids, 1), 0) AS n,
+                                   bytes_processed AS prev_bytes
+                            FROM jobs
+                            WHERE status IN (
+                                'COMPLETED'::jobstatus, 'FAILED'::jobstatus
+                            )
+                              AND batch_resource_ids IS NOT NULL
+                              AND array_length(batch_resource_ids, 1) > 0
+                              AND completed_at >= NOW() - interval '2 hours'
+                        ),
+                        counts AS (
+                            SELECT
+                                s.job_id,
+                                COUNT(*) FILTER (WHERE s.status='COMPLETED') AS completed,
+                                COUNT(*) FILTER (WHERE s.status='FAILED')    AS failed,
+                                COUNT(*) FILTER (WHERE s.status='PARTIAL')   AS partial,
+                                COALESCE(SUM(s.item_count) FILTER (
+                                    WHERE s.status IN ('COMPLETED','PARTIAL')
+                                ), 0) AS items,
+                                COALESCE(SUM(s.bytes_added) FILTER (
+                                    WHERE s.status IN ('COMPLETED','PARTIAL')
+                                ), 0) AS bytes
+                            FROM snapshots s
+                            JOIN recent_bulks rb ON s.job_id = rb.id
+                            GROUP BY s.job_id
+                        )
+                        UPDATE jobs j SET
+                            items_processed = c.items,
+                            bytes_processed = c.bytes,
+                            result = COALESCE(j.result::jsonb, '{}'::jsonb)
+                                     || jsonb_build_object(
+                                         'reconciled_by', 'late_bytes_sweep',
+                                         'reconciled_at', NOW()::text,
+                                         'snapshots_total', rb.n,
+                                         'snapshots_completed', c.completed,
+                                         'snapshots_failed', c.failed,
+                                         'snapshots_partial', c.partial,
+                                         'items_processed', c.items,
+                                         'bytes_processed', c.bytes
+                                     )
+                        FROM counts c, recent_bulks rb
+                        WHERE j.id = rb.id
+                          AND j.id = c.job_id
+                          AND c.bytes <> rb.prev_bytes
+                        RETURNING j.id,
+                                  rb.prev_bytes AS old_bytes,
+                                  c.bytes      AS new_bytes
+                    """))).fetchall()
+                    await session.commit()
+                    if reconciled:
+                        diffs = [
+                            f"{r[0]}: {int(r[1] or 0)} → {int(r[2] or 0)}"
+                            for r in reconciled[:5]
+                        ]
+                        print(
+                            f"[backup-scheduler] late_bytes_reconcile: "
+                            f"corrected bytes_processed on "
+                            f"{len(reconciled)} terminal bulks "
+                            f"({diffs}{'...' if len(reconciled) > 5 else ''})"
+                        )
+            except Exception as late_exc:
+                print(
+                    f"[backup-scheduler] late_bytes_reconcile failed: "
+                    f"{late_exc}",
+                )
+
             # Partition stale-sweep — mirrors the snapshot sweep above
             # but for `snapshot_partitions`. A partition consumer that
             # died mid-shard leaves its row IN_PROGRESS; without this
