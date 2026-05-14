@@ -39,10 +39,19 @@ class Settings:
         # (transaction-mode) and treat pool size as in-flight transaction
         # slots instead of backend conns.
         #
-        # Heads-up: previous comment claimed Railway PG ships with ~500
-        # max_connections — measured value on Railway Pro is 100. Bump
-        # POSTGRES_MAX_CONNECTIONS on the PG service (or use PgBouncer)
-        # before raising these defaults further.
+        # Connection budget (current deployment):
+        #   16 services + 5 workers = 21 processes, 50 max conns each
+        #   ⇒ theoretical peak ≈ 1050 conns (rare; only if every process
+        #     bursts simultaneously). Realistic concurrent peak during a
+        #     bulk backup is ~10 hot processes × 50 = ~500 conns.
+        #   Railway PG must be configured with POSTGRES_MAX_CONNECTIONS=800
+        #   (set on the Postgres service, not on app services). Local
+        #   docker-compose already runs PG with `-c max_connections=800`.
+        #   Less than 800 → "FATAL: sorry, too many clients already"
+        #   surfaces as SQLAlchemy QueuePool / asyncpg TooManyConnections
+        #   errors during bulks. Do NOT shrink DB_POOL_SIZE /
+        #   DB_MAX_OVERFLOW to "fix" this — pool starvation cascades into
+        #   stuck snapshots. Raise PG max_connections instead.
         self.DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "30"))
         self.DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
         self.DB_POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
