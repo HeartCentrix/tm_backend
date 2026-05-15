@@ -34,6 +34,22 @@ from shared.multi_app_manager import multi_app_manager
 from shared.message_bus import message_bus
 from shared.storage_rollup import exclude_tier2_storage_dupes_clause
 
+# Sibling-file load: audit-service has a hyphen so a plain
+# `from .activity_backup import` won't resolve. Load via importlib
+# the same way tests/workers/test_exclusion_matcher.py loads
+# backup-worker/main.py.
+import importlib.util as _ilu_ab
+import pathlib as _pl_ab
+import sys as _sys_ab
+_ab_path = _pl_ab.Path(__file__).resolve().parent / "activity_backup.py"
+_ab_spec = _ilu_ab.spec_from_file_location(
+    "audit_service_activity_backup", _ab_path,
+)
+_ab_mod = _ilu_ab.module_from_spec(_ab_spec)
+_sys_ab.modules["audit_service_activity_backup"] = _ab_mod
+_ab_spec.loader.exec_module(_ab_mod)
+shape_activity_row = _ab_mod.shape_activity_row
+
 app = FastAPI(title="Audit Log Service", version="1.0.0")
 
 # Action codes
@@ -1269,7 +1285,64 @@ async def list_activities(
             row = rs.one()
             group_storage[group_key] = (int(row[0] or 0), int(row[1] or 0))
 
-        items.extend(_group_batch_jobs(groups, status_reverse_map, group_storage))
+        # Split groups: any group whose key is keyed by an explicit
+        # batch_id (third tuple element is the batch_id string) reads
+        # directly from backup_batches — the single source of truth
+        # for one operator click. Legacy groups (no batch_id, keyed
+        # by triggered_by + created_at) keep the _group_batch_jobs
+        # reconstruction path for backward compat with scheduled /
+        # SLA-driven runs that predate batch_id propagation.
+        #
+        # Why split: pre-fix both paths produced different progress
+        # numbers and different user counts for the same click
+        # because they aggregated different children. Reading
+        # backup_batches.scope_user_ids gives the click-time scope
+        # exactly; bytes_done from snapshots tied via spec.batch_id
+        # gives a single progress number. See
+        # docs/superpowers/specs/2026-05-15-backup-batch-race-fix-design.md.
+        batched_group_keys = []
+        legacy_groups = {}
+        for gk, jobs_in_group in groups.items():
+            _tenant, _kind, _bid = gk
+            if _kind == "BATCH":
+                batched_group_keys.append(_bid)
+            else:
+                legacy_groups[gk] = jobs_in_group
+
+        if batched_group_keys:
+            bb_rows = (await db.execute(text("""
+                SELECT
+                  b.id::text                AS batch_id,
+                  b.created_at,
+                  b.completed_at,
+                  b.status,
+                  b.source,
+                  b.actor_email,
+                  b.scope_user_ids,
+                  b.bytes_expected,
+                  COALESCE(array_length(b.scope_user_ids, 1), 0) AS total_scope_count,
+                  (SELECT COALESCE(SUM(s.bytes_added), 0)
+                     FROM snapshots s
+                     JOIN jobs j ON j.id = s.job_id
+                    WHERE COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text
+                      AND s.status::text IN ('COMPLETED','PARTIAL','IN_PROGRESS')
+                      AND s.created_at > b.created_at)              AS bytes_done,
+                  (SELECT array_agg(DISTINCT j.id)
+                     FROM jobs j
+                    WHERE COALESCE(j.spec::jsonb->>'batch_id','') = b.id::text) AS job_ids,
+                  (SELECT COUNT(*)
+                     FROM batch_pending_users bpu
+                    WHERE bpu.batch_id = b.id
+                      AND bpu.state = 'WAITING_DISCOVERY')          AS waiting_discovery_count
+                FROM backup_batches b
+                WHERE b.id::text = ANY(:bids)
+            """), {"bids": batched_group_keys})).all()
+            items.extend(shape_activity_row(r) for r in bb_rows)
+
+        if legacy_groups:
+            items.extend(_group_batch_jobs(
+                legacy_groups, status_reverse_map, group_storage,
+            ))
         # Per-group collapse reduces the post-pagination total.
         job_total -= max(0, len(batch_jobs) - len(groups))
 

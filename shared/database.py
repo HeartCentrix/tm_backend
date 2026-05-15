@@ -932,6 +932,22 @@ async def init_db() -> None:
             PRIMARY KEY (resource_id, folder_id)
         )
         """,
+        # batch_pending_users — per-user deferred-backup state when
+        # discovery hasn't completed at batch creation. Closes the
+        # race where a `/backup-all` click for newly-SLA'd users
+        # produced a backup_batches row stuck at IN_PROGRESS forever
+        # (no Tier-2 children → finalizer gate-1 never passes). See
+        # docs/superpowers/specs/2026-05-15-backup-batch-race-fix-design.md.
+        """
+        CREATE TABLE IF NOT EXISTS batch_pending_users (
+            batch_id    UUID NOT NULL REFERENCES backup_batches(id) ON DELETE CASCADE,
+            user_id     UUID NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+            state       TEXT NOT NULL,
+            deadline_at TIMESTAMP NOT NULL,
+            updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (batch_id, user_id)
+        )
+        """,
         # sharepoint_drive_delta — per-drive Graph delta tokens for
         # SHAREPOINT_SITE resources. Same fix for the same RMW
         # pattern in resources.extra_data['drive_delta_tokens_by_site'].
@@ -996,6 +1012,9 @@ async def init_db() -> None:
         # backup_batches — operator-intent row for one Backup-all click.
         "CREATE INDEX IF NOT EXISTS ix_backup_batches_tenant_started ON backup_batches (tenant_id, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS ix_backup_batches_status_inprogress ON backup_batches (status) WHERE status = 'IN_PROGRESS'",
+        # batch_pending_users — per-user index for the watchdog sweep
+        # and the discovery-worker's per-user UPDATE path.
+        "CREATE INDEX IF NOT EXISTS ix_batch_pending_users_user ON batch_pending_users(user_id)",
         # Teams-chat packed-blob content-hash dedup. When two users share a
         # chat, their backups hit the same message bytes — this tenant-scoped
         # checksum index lets the writer reuse an existing blob_path instead

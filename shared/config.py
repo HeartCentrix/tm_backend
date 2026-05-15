@@ -273,6 +273,15 @@ class Settings:
         self.BATCH_STALL_TIMEOUT_HOURS = int(
             os.getenv("BATCH_STALL_TIMEOUT_HOURS", "24")
         )
+        # Watchdog deadline for batch_pending_users rows. Beyond this,
+        # the scheduler's watchdog flips WAITING_DISCOVERY → DISCOVERY_FAILED
+        # so the batch can finalize as PARTIAL instead of hanging when
+        # discovery never publishes a terminal state (worker crash, queue
+        # stuck, publish failure). See spec
+        # docs/superpowers/specs/2026-05-15-backup-batch-race-fix-design.md.
+        self.DISCOVERY_DEADLINE_MIN = int(
+            os.getenv("DISCOVERY_DEADLINE_MIN", "60"),
+        )
         # Per-worker global cap on concurrent mail-restore tasks across all
         # in-flight jobs. Keeps Graph traffic bounded even if many jobs run at once.
         self.MAIL_RESTORE_GLOBAL_POOL = int(os.getenv("MAIL_RESTORE_GLOBAL_POOL", "32"))

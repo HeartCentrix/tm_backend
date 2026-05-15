@@ -712,6 +712,42 @@ class MailFolderFingerprint(Base):
     )
 
 
+class BatchPendingUser(Base):
+    """Per-user state in a backup batch when the user's backup is deferred
+    until their Tier-2 discovery completes.
+
+    A user is `deferred` when batch creation finds no Tier-2 children
+    for them. Discovery is published with `thenBackup=True` and the
+    same batch_id; this row tracks the state machine until discovery
+    publishes a terminal state.
+
+    States:
+        WAITING_DISCOVERY  — published; discovery has not returned
+        BACKUP_ENQUEUED    — discovery returned ≥1 child; backup posted
+        NO_CONTENT         — discovery returned 0 children (terminal)
+        DISCOVERY_FAILED   — discovery raised or watchdog deadline hit (terminal)
+
+    The finalizer accepts any terminal state as a gate-1 pass for that
+    user. See docs/superpowers/specs/2026-05-15-backup-batch-race-fix-design.md.
+    """
+    __tablename__ = "batch_pending_users"
+    batch_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("backup_batches.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("resources.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    state = Column(Text, nullable=False)
+    deadline_at = Column(DateTime, nullable=False)
+    updated_at = Column(
+        DateTime, default=utcnow, onupdate=utcnow, nullable=False,
+    )
+
+
 class SharePointDriveDelta(Base):
     """Per-drive delta token for SharePoint sites.
 

@@ -519,8 +519,22 @@ async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
     entra_ids = [str(r.id) for r in entra_rows]
     non_entra = [s for s in scope_str if s not in set(entra_ids)]
 
-    # Gate 1: every ENTRA_USER must have at least one Tier-2 child
-    # (otherwise discovery hasn't finished yet → wait).
+    # Gate 1: every ENTRA_USER in scope must be reachable from EITHER
+    #   (a) at least one non-archived Tier-2 child resource, OR
+    #   (b) a batch_pending_users row in a terminal state
+    #       (NO_CONTENT / DISCOVERY_FAILED / BACKUP_ENQUEUED).
+    # BACKUP_ENQUEUED still requires the resulting backup snapshots
+    # to terminalize, which gate 2 (snapshots present) handles
+    # downstream — so flipping a row to BACKUP_ENQUEUED simultaneously
+    # creates new Tier-2 children, and (a) becomes true on the next
+    # finalizer tick. NO_CONTENT / DISCOVERY_FAILED users contribute
+    # no work and (b) is what lets the batch finalize as PARTIAL.
+    #
+    # Backward-compat: batches predating the pending-rows fix have
+    # no batch_pending_users entries; the LEFT JOIN returns NULL and
+    # we fall back to the original "must have Tier-2 children" rule —
+    # zero regression for in-flight pre-deploy batches.
+    # See docs/superpowers/specs/2026-05-15-backup-batch-race-fix-design.md.
     if entra_ids:
         missing_t2 = (await session.execute(text("""
             SELECT s.user_id
@@ -528,9 +542,13 @@ async def _finalize_batch_if_complete(batch_id, session) -> Optional[str]:
               LEFT JOIN resources r
                 ON r.parent_resource_id = s.user_id
                AND r.archived_at IS NULL
-             GROUP BY s.user_id
-             HAVING COUNT(r.id) = 0
-        """), {"ids": entra_ids})).all()
+              LEFT JOIN batch_pending_users bpu
+                ON bpu.user_id  = s.user_id
+               AND bpu.batch_id = cast(:bid AS uuid)
+             GROUP BY s.user_id, bpu.state
+            HAVING COUNT(r.id) = 0
+               AND (bpu.state IS NULL OR bpu.state = 'WAITING_DISCOVERY')
+        """), {"ids": entra_ids, "bid": str(batch_id)})).all()
         if missing_t2:
             return None
 

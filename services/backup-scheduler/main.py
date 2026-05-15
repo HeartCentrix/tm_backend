@@ -1137,6 +1137,43 @@ async def startup():
         _sweep_tier2_gaps, "interval", seconds=_TIER2_BACKSTOP_S,
     )
 
+    # batch_pending_users watchdog — flip stuck WAITING_DISCOVERY rows
+    # to DISCOVERY_FAILED once their deadline_at expires. Expected
+    # path is the discovery-worker writing BACKUP_ENQUEUED / NO_CONTENT /
+    # DISCOVERY_FAILED inline as discovery completes; this sweeper
+    # covers the case where the worker never processed the message
+    # (down, queue stuck, publish failed). Without it, a batch could
+    # pin IN_PROGRESS forever on a WAITING_DISCOVERY row that no one
+    # is going to touch. WHERE state='WAITING_DISCOVERY' makes the
+    # UPDATE race-commute with the discovery-worker write — whichever
+    # runs first wins, the other is a no-op.
+    # See docs/superpowers/specs/2026-05-15-backup-batch-race-fix-design.md.
+    async def _sweep_pending_user_deadlines():
+        try:
+            async with async_session_factory() as session:
+                result = await session.execute(text("""
+                    UPDATE batch_pending_users
+                       SET state = 'DISCOVERY_FAILED', updated_at = NOW()
+                     WHERE state = 'WAITING_DISCOVERY'
+                       AND deadline_at < NOW()
+                """))
+                await session.commit()
+                if result.rowcount and result.rowcount > 0:
+                    print(
+                        f"[batch-watchdog] flipped {result.rowcount} rows "
+                        f"from WAITING_DISCOVERY to DISCOVERY_FAILED "
+                        f"(deadline expired)"
+                    )
+        except Exception as exc:
+            print(f"[batch-watchdog] sweeper failed (non-fatal): {exc}")
+
+    scheduler.add_job(
+        _sweep_pending_user_deadlines, "interval", seconds=60,
+        id="batch_pending_user_watchdog",
+        replace_existing=True,
+        max_instances=1,
+    )
+
     # backup_batches finalizer sweep — gated by
     # BATCH_ROW_REDESIGN_ENABLED. Re-runs the strict 4-condition gate
     # for every IN_PROGRESS batch (catches lost finalize events), and

@@ -18,6 +18,7 @@ from shared.schemas import (
     JobResponse, JobListResponse, TriggerBackupRequest, TriggerBulkBackupRequest, TriggerDatasourceBackupRequest
 )
 from shared.message_bus import message_bus, create_backup_message, create_restore_message
+from shared.batch_pending import classify_scope, BatchPendingState
 from shared.audit import emit_backup_triggered
 
 
@@ -211,6 +212,102 @@ async def _create_batch_backup_jobs(
             # if the row never lands; flag-on path will surface this via
             # the validation check below.
             print(f"[JOB_SERVICE] backup_batches INSERT failed (non-fatal): {_e}")
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
+        # ── Classify scope: ready vs deferred ──────────────────────
+        # `tier2_owners`: scoped ENTRA_USERs that already have at
+        # least one non-archived Tier-2 child resource. Discovery has
+        # completed for these (or wasn't needed). Anything not in this
+        # set is `deferred` — discovery hasn't produced children yet,
+        # so per-user backup needs to wait. The new
+        # batch_pending_users row tracks each deferred user's state
+        # machine; the discovery-worker's `thenBackup=True` chain (see
+        # spec §3) enqueues the backup once discovery completes.
+        # Closes the 2026-05-15 incident where 45 of 54 SLA'd users
+        # had no Tier-2 children at click time so their backup never
+        # ran and the batch hung at IN_PROGRESS forever.
+        try:
+            tier2_rows = (await db.execute(text("""
+                SELECT DISTINCT parent_resource_id
+                  FROM resources
+                 WHERE parent_resource_id = ANY(cast(:ids AS uuid[]))
+                   AND archived_at IS NULL
+            """), {"ids": [str(x) for x in scope_ids]})).all()
+            tier2_owners = {row[0] for row in tier2_rows if row[0] is not None}
+
+            ready, deferred = classify_scope(scope_ids, tier2_owners)
+
+            if deferred:
+                from datetime import datetime as _dt, timedelta as _td
+                deadline = _dt.utcnow() + _td(
+                    minutes=settings.DISCOVERY_DEADLINE_MIN,
+                )
+                # One INSERT per deferred user. ON CONFLICT keeps this
+                # idempotent under bulk-trigger redelivery (RabbitMQ
+                # visibility-timeout / NACK can replay the message).
+                # Sequential INSERTs over a small list (<10k) — no
+                # need for an executemany dance.
+                for uid in deferred:
+                    await db.execute(text("""
+                        INSERT INTO batch_pending_users
+                            (batch_id, user_id, state, deadline_at)
+                        VALUES
+                            (cast(:bid AS uuid), cast(:uid AS uuid),
+                             :st, :dl)
+                        ON CONFLICT (batch_id, user_id) DO NOTHING
+                    """), {
+                        "bid": batch_id,
+                        "uid": str(uid),
+                        "st": BatchPendingState.WAITING_DISCOVERY,
+                        "dl": deadline,
+                    })
+                await db.commit()
+
+                # Publish chained discovery per tenant. `thenBackup=True`
+                # tells discovery-worker to POST /backups/trigger-bulk
+                # for the children it creates, propagating batch_id so
+                # those backups land in the same Activity row.
+                # resources_map keys are strings (Dict[str, Resource]),
+                # but `deferred` holds UUID objects (from Resource.id).
+                # Stringify the lookup key — direct `.get(uid)` would
+                # miss every entry and silently drop all chained
+                # discovery publishes.
+                by_tenant: dict = {}
+                for uid in deferred:
+                    res = resources_map.get(str(uid))
+                    if res is None:
+                        continue
+                    by_tenant.setdefault(str(res.tenant_id), []).append(str(uid))
+                for tid, uids in by_tenant.items():
+                    try:
+                        await message_bus.publish("discovery.tier2", {
+                            "tenantId": tid,
+                            "userResourceIds": uids,
+                            "source": "BULK_TRIGGER",
+                            "thenBackup": True,
+                            "batchId": batch_id,
+                        }, priority=5)
+                    except Exception as _pub_err:
+                        # Non-fatal: scheduler watchdog flips the
+                        # pending rows to DISCOVERY_FAILED after
+                        # deadline_at so the batch can still
+                        # terminalize as PARTIAL.
+                        print(
+                            f"[JOB_SERVICE] chained discovery.tier2 "
+                            f"publish failed for tenant={tid}: "
+                            f"{_pub_err} — watchdog will reclaim "
+                            f"(deadline_at={deadline.isoformat()})"
+                        )
+        except Exception as _cls_err:
+            # Non-fatal — ready path still runs; watchdog picks up
+            # the missing pending rows after deadline.
+            print(
+                f"[JOB_SERVICE] batch classify+publish failed "
+                f"(non-fatal): {_cls_err}"
+            )
             try:
                 await db.rollback()
             except Exception:

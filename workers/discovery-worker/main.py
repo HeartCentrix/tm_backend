@@ -1288,21 +1288,59 @@ async def _consume_tier2_discovery():
                     graph = GraphClient(client_id, client_secret, ext_tenant_id)
 
                     all_child_ids: list[str] = []
+                    # Per-user outcome (matches shared.batch_pending.BatchPendingState
+                    # strings). Used below to write batch_pending_users
+                    # terminal states for chained-from-batch discovery —
+                    # closes the 2026-05-15 race where the batch
+                    # could pin IN_PROGRESS forever on users whose
+                    # discovery never completed.
+                    per_user_outcome: dict = {}
                     for uid in user_ids:
                         user = await db.get(Resource, uid)
                         if user is None or user.type != ResourceType.ENTRA_USER:
                             logger.info("[tier2-discovery] skipping %s (not an ENTRA_USER)", uid)
+                            # No outcome row: only ENTRA_USERs are batch
+                            # scope candidates.
                             continue
                         with graph_priority(queue_priority):
                             try:
                                 children = await ensure_tier2_children(db, user, graph, commit=False)
                             except Exception as gex:
                                 logger.exception("[tier2-discovery] discovery failed for user %s: %s", uid, gex)
+                                per_user_outcome[str(uid)] = "DISCOVERY_FAILED"
                                 continue
-                        all_child_ids.extend(
-                            str(c.id) for c in children
+                        live_children = [
+                            c for c in children
                             if c.status != ResourceStatus.INACCESSIBLE
+                        ]
+                        all_child_ids.extend(str(c.id) for c in live_children)
+                        # NO_CONTENT iff discovery returned zero live
+                        # Tier-2 children — finalizer treats this as a
+                        # terminal gate-1 pass for the user. Otherwise
+                        # BACKUP_ENQUEUED (the thenBackup chain below
+                        # actually posts to /backups/trigger-bulk).
+                        per_user_outcome[str(uid)] = (
+                            "BACKUP_ENQUEUED" if live_children else "NO_CONTENT"
                         )
+
+                    # Flip pending rows from WAITING_DISCOVERY → terminal
+                    # state for batch-chained discovery only. The
+                    # WHERE state='WAITING_DISCOVERY' clause makes the
+                    # UPDATE race-commute with the watchdog sweeper —
+                    # whichever runs first wins, the other is a no-op.
+                    if forward_batch_id and per_user_outcome:
+                        for uid_str, outcome in per_user_outcome.items():
+                            await db.execute(text("""
+                                UPDATE batch_pending_users
+                                   SET state = :st, updated_at = NOW()
+                                 WHERE batch_id = cast(:bid AS uuid)
+                                   AND user_id  = cast(:uid AS uuid)
+                                   AND state    = 'WAITING_DISCOVERY'
+                            """), {
+                                "st": outcome,
+                                "bid": forward_batch_id,
+                                "uid": uid_str,
+                            })
                     # Commit all users in one transaction — keeps the batch
                     # atomic and amortises the WAL flush across N users.
                     await db.commit()
