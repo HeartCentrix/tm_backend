@@ -47,6 +47,7 @@ class RollupCounts:
     snap_pending: int
     parts_pending: int
     missing_t2: int
+    expected_total: int = 0
 
 
 def derive_batch_status(
@@ -230,17 +231,44 @@ def build_batch_rollup_query(
         LEFT JOIN snapshot_partitions sp ON sp.job_id = ANY(b.job_ids)
         GROUP BY 1
     ),
+    tier1_scope AS (
+        -- The CLICK-TIME scope: batch_resource_ids of the Tier-1 jobs
+        -- in this batch (spec.tier2 missing or 'false'). Stable across
+        -- polls because Tier-1 jobs aren't recreated and their
+        -- batch_resource_ids never mutate after insert. This is what
+        -- ``progress denominator`` must be derived from — using the
+        -- growing union of all jobs' resource_ids gives a denominator
+        -- that drops when Tier-2 jobs land, producing the visible
+        -- progress-bar bounce (2026-05-15 incident: "16 % → 90 % →
+        -- 30 % → 99 %"). For a Tier-2-only batch (no Tier-1 job —
+        -- e.g. PREEMPTIVE single-resource), scope_ids is empty; the
+        -- ``total_expected`` CTE below falls back to all_res_ids.
+        SELECT
+            COALESCE(j.spec->>'batch_id', j.id::text) AS batch_id,
+            COALESCE(
+                ARRAY_AGG(DISTINCT bid) FILTER (WHERE bid IS NOT NULL),
+                ARRAY[]::uuid[]
+            ) AS scope_ids
+        FROM filtered_jobs j
+        LEFT JOIN LATERAL unnest(COALESCE(j.batch_resource_ids, ARRAY[]::uuid[])) AS bid ON TRUE
+        WHERE COALESCE(j.spec->>'tier2', 'false') = 'false'
+        GROUP BY 1
+    ),
     expected_t2 AS (
         -- Per batch, the Cartesian product of (ENTRA_USERs in the
-        -- batch's batch_resource_ids) × (their Tier-2 child resources
-        -- from `resources.parent_resource_id`). One row per (batch,
+        -- Tier-1 scope) × (their Tier-2 child resources from
+        -- ``resources.parent_resource_id``). One row per (batch,
         -- child) tells us which Tier-2 children we EXPECT to see
         -- regardless of whether the Tier-2 Jobs have spawned yet.
+        -- Joining against ``tier1_scope`` (not ``batch_res``) keeps
+        -- this count stable as Tier-2 jobs land — those add USER_*
+        -- ids to ``batch_res.all_res_ids`` but never to the Tier-1
+        -- scope, so the expected-child set doesn't drift.
         SELECT
-            br.batch_id,
+            ts.batch_id,
             r2.id AS child_resource_id
-        FROM batch_res br
-        CROSS JOIN LATERAL unnest(br.all_res_ids) AS bid
+        FROM tier1_scope ts
+        CROSS JOIN LATERAL unnest(ts.scope_ids) AS bid
         JOIN resources r1 ON r1.id = bid AND r1.type::text = 'ENTRA_USER'
         JOIN resources r2 ON r2.parent_resource_id = r1.id
                          AND r2.type::text IN (
@@ -286,6 +314,25 @@ def build_batch_rollup_query(
         JOIN resources r ON r.id = bid AND r.type::text = 'ENTRA_USER'
         GROUP BY 1
         HAVING COUNT(*) = 1
+    ),
+    total_expected AS (
+        -- Stable progress denominator. Computed from click-time scope
+        -- so it doesn't drift as Tier-2 jobs land:
+        --   |tier1_scope.scope_ids|  (the Tier-1 ENTRA_USER snapshots
+        --                             we expect to produce)
+        -- + COUNT(expected_t2)      (the Tier-2 child snapshots we
+        --                             expect per ENTRA_USER × workload)
+        -- For Tier-2-only batches (no Tier-1 job — e.g. PREEMPTIVE
+        -- single-resource), tier1_scope is empty and the fallback in
+        -- ``shape_batch_row`` uses snap_total instead. See
+        -- docs/superpowers/specs/2026-05-15-activity-batch-rollup-design.md.
+        SELECT
+            b.batch_id,
+            COALESCE(array_length(ts.scope_ids, 1), 0)
+            + COALESCE((SELECT COUNT(*) FROM expected_t2 e WHERE e.batch_id = b.batch_id), 0)
+              AS expected_count
+        FROM batches b
+        LEFT JOIN tier1_scope ts ON ts.batch_id = b.batch_id
     )
     SELECT
         b.batch_id,
@@ -309,6 +356,7 @@ def build_batch_rollup_query(
         COALESCE(sr.snap_pending, 0)        AS snap_pending,
         COALESCE(pr.parts_pending, 0)       AS parts_pending,
         COALESCE(f.missing_t2, 0)           AS missing_t2,
+        COALESCE(te.expected_count, 0)      AS expected_count,
         sres.single_resource_name           AS single_resource_name,
         sres.single_resource_type           AS single_resource_type,
         eo.entra_user_name                  AS entra_user_name,
@@ -320,6 +368,7 @@ def build_batch_rollup_query(
     LEFT JOIN entra_count ec ON ec.batch_id = b.batch_id
     LEFT JOIN single_res  sres ON sres.batch_id = b.batch_id
     LEFT JOIN entra_one   eo ON eo.batch_id = b.batch_id
+    LEFT JOIN total_expected te ON te.batch_id = b.batch_id
     ORDER BY b.started_at DESC NULLS LAST
     LIMIT :size OFFSET :off
     """
@@ -354,6 +403,7 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
         snap_pending=int(row.snap_pending or 0),
         parts_pending=int(row.parts_pending or 0),
         missing_t2=int(row.missing_t2 or 0),
+        expected_total=int(getattr(row, "expected_count", 0) or 0),
     )
     status, warnings = derive_batch_status(counts)
 
@@ -409,22 +459,39 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
     else:
         obj_label = "Bulk Operation"
 
-    # progress_pct: terminal/total ratio of child snapshots. We have no
-    # bytes_expected column today (every prior attempt set it equal to
-    # bytes_added, which trivially divides to 100 % the moment ANY
-    # bytes land — that produced the 2026-05-15 incident where the
-    # list row's progress bar / detail-panel header both showed 100 %
-    # while the `details` line (using this same snap-ratio formula)
-    # still said "Progress: 71 % …". Single source of truth fixes the
-    # cross-field inconsistency. Client still clamps monotonically.
+    # progress_pct: terminal / expected. The denominator is the
+    # CLICK-TIME scope (``expected_total`` — Tier-1 ENTRA_USER count
+    # + their Tier-2 child resource count) so it does NOT drift as
+    # Tier-2 Jobs spawn and snapshots land. This keeps the percentage
+    # monotonically non-decreasing during a healthy run — the
+    # 2026-05-15 incident "16% → 90% → 30% → 99%" was caused by the
+    # old denominator ``snap_total + missing_t2`` shrinking each time
+    # a Tier-2 Job moved a child from "missing" to "observed".
+    #
+    # Fallback: for Tier-2-only batches (e.g. PREEMPTIVE single-resource
+    # — no Tier-1 job, so ``tier1_scope`` is empty) ``expected_total``
+    # is 0; we fall back to ``snap_total`` so the bar still progresses
+    # 0→100 % rather than sticking at 0.
+    #
+    # No 99 % ceiling needed: with a stable denominator the only way
+    # to reach 100 % is via the terminal-status branch below, which
+    # also handles the Tier-1→Tier-2 handoff (``missing_t2`` keeps
+    # status="In Progress" until Tier-2 Jobs spawn).
     bytes_added = int(row.bytes_added or 0)
-    if counts.snap_total > 0:
+    denom = counts.expected_total if counts.expected_total > 0 else counts.snap_total
+    if denom > 0:
         terminal = counts.snap_done + counts.snap_partial + counts.snap_failed
-        progress_pct = min(100, int(100 * terminal / counts.snap_total))
+        progress_pct = min(100, int(100 * terminal / denom))
     else:
         progress_pct = 0
     if status in ("Done", "Failed", "Canceled"):
         progress_pct = 100
+    elif progress_pct >= 100:
+        # Defensive: while still "In Progress", clamp below 100 so the
+        # status and percent agree. Can only fire if terminal snapshots
+        # exceed the click-time scope — possible if the operator re-runs
+        # the same batch_id (extremely rare) or the scope mid-resizes.
+        progress_pct = 99
 
     # Phase chip — v1 collapses to in_progress / done. Refining to
     # discovering / urgent / heavy needs Tier-1 vs Tier-2 Job-type
