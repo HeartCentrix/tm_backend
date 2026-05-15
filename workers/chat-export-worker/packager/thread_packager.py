@@ -45,23 +45,57 @@ class ThreadPackager:
         tsafe = _safe_name(self.thread_name)
 
         def _add(path: str, data: bytes):
+            """Write small in-memory artifacts (HTML, JSON, CSS, manifest).
+
+            For large attachments use _add_stream instead so we don't
+            buffer the whole blob in RAM.
+            """
             nonlocal total_bytes
             zf.writestr(path, data)
             per_file.append({"path": path, "sha256": sha256(data).hexdigest(), "bytes": len(data)})
             total_bytes += len(data)
 
-        async def _read(src_path: str) -> tuple[bytes, bool]:
+        async def _add_stream(path: str, src_path: str) -> tuple[int, bool]:
+            """Stream bytes from blob storage straight into a ZIP entry.
+
+            Computes sha256 + total bytes on the fly so per_file stays
+            consistent with _add. Returns (bytes_written, missing).
+            Memory footprint per call is bounded to one chunk
+            (~4 MiB by default) plus zipfile's per-entry buffer.
+            """
+            nonlocal total_bytes
+            h = sha256()
+            total = 0
             try:
                 ait, _ct, _sz = await self.attachment_source.open(src_path)
-                buf = b""
-                async for chunk in ait: buf += chunk
-                return buf, False
+                with zf.open(path, mode="w", force_zip64=True) as entry:
+                    async for chunk in ait:
+                        if not chunk:
+                            continue
+                        entry.write(chunk)
+                        h.update(chunk)
+                        total += len(chunk)
+                per_file.append({
+                    "path": path, "sha256": h.hexdigest(), "bytes": total,
+                })
+                total_bytes += total
+                return total, False
             except Exception as e:
                 placeholder = (
                     f"[ATTACHMENT_MISSING]\nblob_path: {src_path}\nerror: {e!r}\n"
                     "This attachment was not available at export time.\n"
                 ).encode()
-                return placeholder, True
+                # Caller picks the .MISSING.txt path; we just record
+                # the placeholder bytes against THIS entry.
+                with zf.open(path, mode="w") as entry:
+                    entry.write(placeholder)
+                per_file.append({
+                    "path": path,
+                    "sha256": sha256(placeholder).hexdigest(),
+                    "bytes": len(placeholder),
+                })
+                total_bytes += len(placeholder)
+                return len(placeholder), True
 
         inline_count = 0; attachment_count = 0
         for m in messages:
@@ -69,24 +103,51 @@ class ThreadPackager:
                        else f"per-message/{tsafe}/{_safe_name(m.external_id)}/attachments")
             new_atts = []
             for att in attachment_map.get(m.external_id, []):
-                data, missing = await _read(att["blob_path"])
-                target_name = _safe_name(att["name"]) + (".MISSING.txt" if missing else "")
-                target = f"{att_dir}/{target_name}"
-                _add(target, data)
+                # Pick the target name BEFORE streaming. We need to
+                # decide .MISSING.txt vs the real name up-front
+                # because zipfile.open() commits the entry path the
+                # moment it's opened. If the stream fails mid-flight
+                # we keep the real name and just emit a short
+                # placeholder under it — the operator can tell from
+                # the file size (and from manifest.json) that it's
+                # not the real attachment.
+                clean_name = _safe_name(att["name"])
+                target = f"{att_dir}/{clean_name}"
+                written, missing = await _add_stream(target, att["blob_path"])
+                if missing:
+                    # Append a .MISSING marker file next to it so
+                    # operators can spot the gap at a glance — the
+                    # zero-byte original is kept under the real name
+                    # for path consistency with the HTML <a href>.
+                    marker_text = (
+                        f"Attachment file {clean_name!r} could not be retrieved "
+                        f"from storage at export time.\nblob_path: {att['blob_path']}\n"
+                    ).encode()
+                    _add(f"{target}.MISSING.txt", marker_text)
+                if self.layout == "single_thread":
+                    href = f"./{target}"
+                else:
+                    href = f"./attachments/{clean_name}"
                 new_atts.append(AttachmentRef(
-                    name=target_name, local_path=f"./{target}",
+                    name=clean_name, local_path=href,
                     content_type="text/plain" if missing else att.get("content_type"),
-                    size=len(data),
+                    size=written,
                 ))
                 attachment_count += 1
             m.attachments = new_atts
             for hc in hosted_map.get(m.external_id, []):
-                data, missing = await _read(hc["blob_path"])
+                ext = hc.get("ext", ".bin")
+                target = f"{att_dir}/inline/{hc['hc_id']}{ext}"
+                written, missing = await _add_stream(target, hc["blob_path"])
                 if missing:
-                    target = f"{att_dir}/inline/{hc['hc_id']}.MISSING.txt"
-                else:
-                    target = f"{att_dir}/inline/{hc['hc_id']}{hc.get('ext', '.bin')}"
-                _add(target, data); inline_count += 1
+                    _add(
+                        f"{att_dir}/inline/{hc['hc_id']}.MISSING.txt",
+                        (
+                            f"Inline image {hc['hc_id']} could not be retrieved.\n"
+                            f"blob_path: {hc['blob_path']}\n"
+                        ).encode(),
+                    )
+                inline_count += 1
 
         _add("styles.css", _STYLES.read_bytes())
 
@@ -111,7 +172,16 @@ class ThreadPackager:
                     from workers.chat_export_worker.render.pdf_renderer import render_message_pdf
                     _add(f"{folder}/{base}.pdf", render_message_pdf(m, self.thread_name))
 
+        # Compute the Merkle-style zip sha256 over every content file
+        # FIRST, so activity.log / activity.json can carry the real
+        # value instead of a "(pending)" placeholder. The manifest is
+        # then written including itself in `files` but its own row
+        # contains the final per-file sha256 — only the manifest's
+        # zip_sha is excluded from its own hash (chicken-and-egg).
         gen_at = datetime.now(timezone.utc)
+        zip_sha = sha256(
+            b"".join(f["sha256"].encode() for f in per_file)
+        ).hexdigest()
         kwargs = dict(
             messages=messages,
             user_email=ctx.get("user_email", ""),
@@ -121,11 +191,10 @@ class ThreadPackager:
             snapshot_at=ctx.get("snapshot_at"),
             format=self.format,
             attachments=attachment_count, inline_images=inline_count,
-            size_bytes=total_bytes, sha256="(pending)", generated_at=gen_at,
+            size_bytes=total_bytes, sha256=zip_sha, generated_at=gen_at,
         )
         _add("_meta/activity.log", build_activity_text(**kwargs).encode())
         _add("_meta/activity.json", build_activity_json(**kwargs).encode())
-        zip_sha = sha256(b"".join(f["sha256"].encode() for f in per_file)).hexdigest()
         _add("_meta/manifest.json", build_manifest(
             job_id=ctx.get("job_id", "unknown"),
             generated_at=gen_at, files=per_file, zip_sha256=zip_sha,

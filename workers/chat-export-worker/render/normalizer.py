@@ -43,6 +43,34 @@ class Reaction:
     at: Optional[str]
 
 
+# Microsoft Graph chat reactions arrive as named strings ("like",
+# "heart", "laugh", ...) under reactionType. We render the actual
+# Unicode glyph instead — operators reading an export want to see 👍
+# not the word "like". Unknown / custom reactions fall through as
+# the raw string so the data is never lost.
+_REACTION_GLYPH = {
+    "like":      "👍",
+    "heart":     "❤️",
+    "laugh":     "😂",
+    "surprised": "😮",
+    "sad":       "😢",
+    "angry":     "😠",
+    "thumbsup":  "👍",
+    "thumbsdown":"👎",
+    "yes":       "✅",
+    "no":        "❌",
+    "checkmark": "✅",
+    "question":  "❓",
+}
+
+
+def _reaction_glyph(reaction_type: str) -> str:
+    return _REACTION_GLYPH.get(
+        (reaction_type or "").strip().lower(),
+        reaction_type or "",
+    )
+
+
 @dataclass
 class AttachmentRef:
     name: str
@@ -151,6 +179,22 @@ def _sanitize(html: str) -> str:
     )
 
 
+def _plaintext_to_html(text: str) -> str:
+    """Escape an HTML-unsafe plain-text body and turn newlines into <br>.
+
+    Pinned by tests in tests/workers/test_chat_export_paths.py — the
+    pre-fix path collapsed multi-line plain-text messages into a
+    single visual line in the export because newlines weren't
+    converted before the body was wrapped in <p>.
+    """
+    escaped = ihtml.escape(text or "")
+    # Fold CRLF / CR to LF first so we don't double-emit <br> on
+    # Windows-origin pastes.
+    escaped = escaped.replace("\r\n", "\n").replace("\r", "\n")
+    escaped = escaped.replace("\n", "<br>")
+    return f"<p>{escaped}</p>"
+
+
 def _event_from_meta(ed: Optional[dict]) -> Optional[EventDetail]:
     if not ed:
         return None
@@ -193,8 +237,10 @@ def normalize_messages(
         body_raw = (raw.get("body") or {}).get("content") or meta.get("body", {}).get("content_preview") or ""
         body_is_html = (raw.get("body") or {}).get("contentType") == "html" or meta.get("body", {}).get("content_type") == "html"
         hosted = hosted_by_msg.get(meta.get("message_id") or g(it, "external_id"), [])
-        body_rewritten = _rewrite_inline_imgs(body_raw, hosted) if body_is_html else ihtml.escape(body_raw)
-        body_safe = _sanitize(body_rewritten) if body_is_html else f"<p>{ihtml.escape(body_raw)}</p>"
+        if body_is_html:
+            body_safe = _sanitize(_rewrite_inline_imgs(body_raw, hosted))
+        else:
+            body_safe = _plaintext_to_html(body_raw)
 
         # Prefer the normalized `from` the extractor produces; fall back to the
         # raw Graph shape (meta.raw.from.user) since backup-worker often stores
@@ -225,7 +271,7 @@ def normalize_messages(
         ]
         reactions = [
             Reaction(
-                emoji=r.get("reactionType") or "",
+                emoji=_reaction_glyph(r.get("reactionType")),
                 display_name=(r.get("user") or {}).get("user", {}).get("displayName"),
                 at=r.get("createdDateTime"),
             )

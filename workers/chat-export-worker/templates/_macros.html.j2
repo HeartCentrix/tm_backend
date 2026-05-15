@@ -43,14 +43,14 @@
 {%- elif m.deleted_at -%}
   <div class="bubble"><div class="avatar" style="background:{{ m.sender_color }}">{{ m.sender_initials }}</div>
   <div class="bubble-main"><div class="head"><span class="sender">{{ m.sender_name }}</span>
-  <span class="time">{{ m.created_at.strftime('%Y-%m-%d %H:%M UTC') }}</span></div>
+  <span class="time">{% if m.created_at and m.created_at.year > 1 %}{{ m.created_at.strftime('%Y-%m-%d %H:%M UTC') }}{% else %}(no timestamp){% endif %}</span></div>
   <div class="body deleted">This message was deleted</div></div></div>
 {%- else -%}
   <div class="bubble"><div class="avatar" style="background:{{ m.sender_color }}">{{ m.sender_initials }}</div>
     <div class="bubble-main">
       <div class="head">
         <span class="sender">{{ m.sender_name }}</span>
-        <span class="time">{{ m.created_at.strftime('%Y-%m-%d %H:%M UTC') }}</span>
+        <span class="time">{% if m.created_at and m.created_at.year > 1 %}{{ m.created_at.strftime('%Y-%m-%d %H:%M UTC') }}{% else %}(no timestamp){% endif %}</span>
         {%- if m.last_edited_at -%}<span class="edited">(edited)</span>{%- endif -%}
       </div>
       {%- if m.quoted_parent -%}

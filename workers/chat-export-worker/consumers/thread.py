@@ -24,7 +24,7 @@ from workers.chat_export_worker.progress import publish
 from workers.chat_export_worker.scope import resolve
 from workers.chat_export_worker.render.normalizer import normalize_messages
 from workers.chat_export_worker.packager.thread_packager import (
-    ThreadPackager, AttachmentSource,
+    ThreadPackager, AttachmentSource, _safe_name,
 )
 
 log = logging.getLogger("chat-export.thread")
@@ -33,39 +33,51 @@ log = logging.getLogger("chat-export.thread")
 class BlobAttachmentSource(AttachmentSource):
     """Stream bytes from the shared tenant blob store.
 
-    Adapts to whichever helper the existing codebase exposes for blob
-    reads. Pattern returned: (async_iter, content_type, content_length).
+    True streaming via `download_blob_stream` — yields ~4 MiB chunks
+    from the Azure SDK so the worker's RAM footprint stays bounded
+    regardless of the attachment size. Pre-fix this method buffered
+    the entire blob into memory before returning, which on a 310 MB
+    chat attachment would spike RAM by exactly that much. With the
+    streaming path the peak is one chunk (~4 MiB) plus the ZIP
+    entry's compression buffer (~16 KiB).
     """
 
     async def open(self, blob_path: str):
         from shared.azure_storage import azure_storage_manager
 
-        # Prefer a streaming API if present.
+        # Prefer the project's open_stream helper if it ever lands.
+        # Today it doesn't exist, so we fall through to the
+        # download_blob_stream path on the default shard.
         if hasattr(azure_storage_manager, "open_stream"):
             return await azure_storage_manager.open_stream(blob_path)
 
-        # Fallback: use the default shard to download bytes.
         shard = azure_storage_manager.get_default_shard()
         # blob_path in DB is of the form "<container>/<path>" or just "<path>".
-        # Our chat blobs are persisted under the tenant's default container;
-        # backup-worker stores full paths like "users/.../messages/<id>/hosted/<hc>".
-        # The shard uses a single container — download_blob takes (container, path).
+        # backup-worker writes chat blobs under "tenant-data" by default;
+        # exports / chat-blobs are alternate prefixes seen in old data.
         container = "tenant-data"
         path = blob_path
         if "/" in blob_path:
             head, tail = blob_path.split("/", 1)
-            # Heuristic: if the first segment looks like a known container prefix,
-            # treat it as the container name. Otherwise keep the default.
             if head in {"tenant-data", "exports", "chat-blobs"}:
                 container, path = head, tail
-        data = await shard.download_blob(container, path)
-        if data is None:
-            data = b""
 
-        async def _gen():
-            yield data
+        # Probe size up-front (informational only — the consumer
+        # doesn't currently use it but downstream callers might).
+        size = 0
+        try:
+            props = await shard.get_blob_properties(container, path)
+            if props:
+                size = int(props.get("size") or 0)
+        except Exception:
+            pass
 
-        return _gen(), "application/octet-stream", len(data)
+        async def _stream():
+            async for chunk in shard.download_blob_stream(container, path):
+                if chunk:
+                    yield chunk
+
+        return _stream(), "application/octet-stream", size
 
 
 async def _update_job(sess, job_id, **values):
@@ -135,14 +147,39 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
          "messagesTotal": len(scope.messages)},
     )
 
-    hosted_by_msg = {
-        mid: [
-            {"hc_id": h["hc_id"],
-             "local_path": f"./{scope.thread_path.split('/')[-1]}-attachments/inline/{h['hc_id']}{h.get('ext', '.bin')}"}
-            for h in hs
-        ]
-        for mid, hs in scope.hosted_map.items()
-    }
+    # Inline image src rewriter: the path stored here is the path the
+    # rendered HTML's <img src=...> will use. It MUST match the path
+    # the packager writes the file at, OTHERWISE every inline image
+    # in the export is a broken image link.
+    #
+    # Two layout-dependent shapes (mirrors packager._add paths exactly):
+    #   single_thread (HTML at zip root, /{tsafe}.html):
+    #     <img src="./{tsafe}-attachments/inline/{hc_id}{ext}">
+    #   per_message (HTML at /per-message/{tsafe}/{ext_id}/{ext_id}.html):
+    #     <img src="./attachments/inline/{hc_id}{ext}">
+    #
+    # tsafe MUST be _safe_name(thread_name) — the same sanitiser the
+    # packager applies. Pre-fix code used `thread_path.split('/')[-1]`
+    # raw, which left colons / slashes / spaces unsanitised in the
+    # src URL while the packager wrote to the sanitised path on disk.
+    # Teams chats like "Group: A, B, C" hit this every time.
+    thread_name = scope.thread_path.rsplit("/", 1)[-1]
+    tsafe = _safe_name(thread_name)
+    hosted_by_msg: dict = {}
+    for mid, hs in scope.hosted_map.items():
+        msg_tsafe = _safe_name(mid)
+        for h in hs:
+            if scope.layout == "single_thread":
+                local_path = f"./{tsafe}-attachments/inline/{h['hc_id']}{h.get('ext', '.bin')}"
+            else:
+                # per_message: HTML lives in
+                # per-message/{tsafe}/{ext_id}/, attachments dir
+                # is one level deeper. Relative-from-HTML.
+                local_path = f"./attachments/inline/{h['hc_id']}{h.get('ext', '.bin')}"
+            hosted_by_msg.setdefault(mid, []).append({
+                "hc_id": h["hc_id"],
+                "local_path": local_path,
+            })
 
     render_messages = normalize_messages(
         scope.messages,
