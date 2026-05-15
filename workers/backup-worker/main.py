@@ -1769,6 +1769,93 @@ class BackupWorker:
                 f"{type(e).__name__}: {e}"
             )
 
+    async def _load_mail_folder_fingerprints(
+        self, resource_id: uuid.UUID,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Read all per-folder fingerprints for one mailbox resource.
+
+        Returns `{folder_id: {"fp": "total|unread|size", "baseline_at": dt}}`.
+        Replaces the whole-mailbox JSON dict at
+        `resource.extra_data["mail_folder_fingerprints"]`. The dict
+        was unsafe under partition fanout: sibling shards' writes
+        for folders this shard didn't own clobbered each other and
+        caused skip-by-fp to skip the entire allowlist. Per-row state
+        makes the writes commute. Empty dict on first run / table
+        miss; the caller falls back to the legacy dict during the
+        dual-read transition.
+        """
+        try:
+            async with async_session_factory() as session:
+                rows = (await session.execute(
+                    text(
+                        """
+                        SELECT folder_id, total_item_count,
+                               unread_item_count, size_in_bytes,
+                               baseline_at
+                          FROM mail_folder_fingerprint
+                         WHERE resource_id = :rid
+                        """
+                    ),
+                    {"rid": str(resource_id)},
+                )).fetchall()
+            return {
+                str(r[0]): {
+                    "fp": f"{int(r[1])}|{int(r[2])}|{int(r[3])}",
+                    "baseline_at": r[4],
+                }
+                for r in rows
+            }
+        except Exception as e:
+            # Table may not exist on a stale deploy; fail open so the
+            # caller falls back to extra_data.mail_folder_fingerprints.
+            print(
+                f"[{self.worker_id}] [mail_fp] load failed for "
+                f"resource={resource_id}: {type(e).__name__}: {e}"
+            )
+            return {}
+
+    async def _upsert_mail_folder_fingerprint(
+        self,
+        resource_id: uuid.UUID,
+        folder_id: str,
+        total: int,
+        unread: int,
+        size: int,
+    ) -> None:
+        """Atomic per-row UPSERT of one folder's fingerprint.
+
+        `baseline_at` advances to NOW() on every successful UPSERT;
+        the 3-day full-rescan window is therefore per folder, not
+        mailbox-wide.
+        """
+        try:
+            async with async_session_factory() as session:
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO mail_folder_fingerprint
+                            (resource_id, folder_id,
+                             total_item_count, unread_item_count,
+                             size_in_bytes, baseline_at)
+                        VALUES (:rid, :fid, :t, :u, :s, NOW())
+                        ON CONFLICT (resource_id, folder_id) DO UPDATE
+                           SET total_item_count  = EXCLUDED.total_item_count,
+                               unread_item_count = EXCLUDED.unread_item_count,
+                               size_in_bytes     = EXCLUDED.size_in_bytes,
+                               baseline_at       = NOW()
+                        """
+                    ),
+                    {"rid": str(resource_id), "fid": folder_id,
+                     "t": int(total), "u": int(unread), "s": int(size)},
+                )
+                await session.commit()
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [mail_fp] upsert failed "
+                f"(resource={resource_id}, folder={folder_id[:8] if folder_id else 'NA'}): "
+                f"{type(e).__name__}: {e}"
+            )
+
     async def _load_sharepoint_drive_deltas(
         self, resource_id: uuid.UUID,
     ) -> Dict[str, str]:
@@ -2970,67 +3057,73 @@ class BackupWorker:
                     # Skip a folder's per-delta call when its
                     # totalItemCount/unreadItemCount/sizeInBytes triple
                     # matches the fingerprint we stored at the end of the
-                    # previous successful USER_MAIL run. Graph guarantees
-                    # at least one of these changes when ANY message in
-                    # the folder is added, removed, or has its is_read
-                    # flag toggled, so identical fingerprints = no work.
+                    # previous successful USER_MAIL run for THAT folder.
+                    # Graph guarantees at least one of these changes when
+                    # ANY message in the folder is added, removed, or has
+                    # its is_read flag toggled, so identical fingerprints
+                    # = no work.
                     #
                     # 3-day safety net via USER_MAIL_FULL_RESCAN_DAYS:
                     # forces every folder to drain at least once per
                     # window, catching any silent Graph counter drift.
+                    # The window is **per folder** — a folder rescanned
+                    # today does not reset the clock for a folder stale
+                    # since 6 days ago.
+                    #
+                    # State source: `mail_folder_fingerprint` table
+                    # (one row per (resource, folder)). Atomic per-row
+                    # UPSERTs make this safe under partition fanout —
+                    # the legacy whole-mailbox dict had a cross-shard
+                    # clobber that silently dropped every folder owned
+                    # by the second-finishing shard. See
+                    # docs/superpowers/specs/2026-05-15-mail-folder-
+                    # fingerprint-table-design.md for the incident.
+                    fp_table = await self._load_mail_folder_fingerprints(
+                        resource.id,
+                    )
+                    # Dual-read fallback (one-release transition off the
+                    # extra_data dict). Used only when the new table has
+                    # no row for a given folder. Drop the fallback when
+                    # release N+1 ships.
                     _ed_mail = dict(resource.extra_data or {})
-                    _mail_fps_prev: Dict[str, str] = (
+                    _legacy_fps: Dict[str, str] = (
                         _ed_mail.get("mail_folder_fingerprints") or {}
                     )
-                    _mail_baseline_iso = _ed_mail.get(
+                    _legacy_baseline_iso = _ed_mail.get(
                         "mail_folder_baseline_at",
                     )
-                    _mail_baseline_dt: Optional[datetime] = None
-                    if _mail_baseline_iso:
+                    _legacy_baseline_dt: Optional[datetime] = None
+                    if _legacy_baseline_iso:
                         try:
-                            _mail_baseline_dt = datetime.fromisoformat(
-                                str(_mail_baseline_iso).replace("Z", "")
+                            _legacy_baseline_dt = datetime.fromisoformat(
+                                str(_legacy_baseline_iso).replace("Z", "")
                             )
                         except Exception:
-                            _mail_baseline_dt = None
+                            _legacy_baseline_dt = None
                     _mail_rescan_days = int(
                         os.getenv("USER_MAIL_FULL_RESCAN_DAYS", "3"),
                     )
-                    _mail_force_full = (
-                        _mail_baseline_dt is None
-                        or (
-                            datetime.utcnow() - _mail_baseline_dt
-                        ).total_seconds() > _mail_rescan_days * 86400
-                    )
+                    _rescan_secs = _mail_rescan_days * 86400
 
                     _all_folder_ids = list(folder_tree.keys()) or [None]
-                    mail_folder_ids: List[Optional[str]] = []
-                    _mail_folders_skipped: List[str] = []
-                    for _fid in _all_folder_ids:
-                        if not _fid:
-                            mail_folder_ids.append(_fid)
-                            continue
-                        if _mail_force_full:
-                            mail_folder_ids.append(_fid)
-                            continue
-                        fp_now = folder_fingerprints_now.get(_fid)
-                        fp_prev = _mail_fps_prev.get(_fid)
-                        if fp_now and fp_prev and fp_now == fp_prev:
-                            _mail_folders_skipped.append(_fid)
-                        else:
-                            mail_folder_ids.append(_fid)
-                    _mail_skip_mode = (
-                        "full-rescan" if _mail_force_full
-                        else (
-                            f"baseline={_mail_baseline_dt.isoformat()}"
-                            if _mail_baseline_dt else "first-run"
-                        )
+                    (
+                        mail_folder_ids,
+                        _mail_folders_skipped,
+                        _fp_fallback_count,
+                    ) = self._compute_mail_skip_by_fp(
+                        all_folder_ids=_all_folder_ids,
+                        fp_table=fp_table,
+                        legacy_fps=_legacy_fps,
+                        legacy_baseline_dt=_legacy_baseline_dt,
+                        fingerprints_now=folder_fingerprints_now,
+                        rescan_seconds=_rescan_secs,
                     )
                     print(
                         f"[{self.worker_id}] [USER_MAIL] skip-by-fp: "
                         f"{len(_mail_folders_skipped)} folders unchanged, "
                         f"{len([f for f in mail_folder_ids if f])} to drain "
-                        f"(mode={_mail_skip_mode})"
+                        f"(table_rows={len(fp_table)}, "
+                        f"legacy_fallback={_fp_fallback_count})"
                     )
 
                     # ── Cross-replica partition split (Phase 3.2b) ──
@@ -3421,10 +3514,6 @@ class BackupWorker:
                     # only pull new messages per folder. Merge with
                     # existing so a failed folder doesn't wipe tokens
                     # we still hold for the rest.
-                    #
-                    # Also refresh mail_folder_fingerprints + advance
-                    # mail_folder_baseline_at so the next incremental can
-                    # skip unchanged folders via Layer C.
                     # Atomic per-row UPSERT into mail_folder_delta for
                     # every token the run produced. Idempotent against
                     # the per-folder checkpoint above — same row, same
@@ -3435,6 +3524,43 @@ class BackupWorker:
                                 resource.id, _fid, _tok,
                             )
 
+                    # Refresh fingerprints via atomic per-row UPSERTs —
+                    # ONLY for folders this run actually drained. The
+                    # legacy whole-tree dict write clobbered sibling
+                    # shards' state: a partitioned mailbox where shard 0
+                    # drains Inbox and shard 1 drains the rest would
+                    # have shard 0 write fingerprints for all 40 folders
+                    # at end of its run, then shard 1's skip-by-fp would
+                    # match every fingerprint and skip its allowlist
+                    # entirely. Writing only `drained` keeps sibling
+                    # shards' rows untouched.
+                    _drained_fids = (
+                        set(f for f in mail_folder_ids if f)
+                        - set(_mail_folders_skipped)
+                    )
+                    for _fid in _drained_fids:
+                        _fp_str = folder_fingerprints_now.get(_fid)
+                        if not _fp_str:
+                            continue
+                        try:
+                            _t_s, _u_s, _b_s = _fp_str.split("|")
+                            await self._upsert_mail_folder_fingerprint(
+                                resource.id, _fid,
+                                int(_t_s), int(_u_s), int(_b_s),
+                            )
+                        except Exception as _fp_err:
+                            print(
+                                f"[{self.worker_id}] [USER_MAIL] fp upsert "
+                                f"failed for folder {_fid[:8]}: {_fp_err}"
+                            )
+
+                    # Dual-write to the legacy dict (one-release
+                    # transition for safe rollback). Mirror only the
+                    # folders THIS shard drained — never write rows for
+                    # sibling-owned folders, since that's the exact
+                    # clobber that caused the original bug. The new
+                    # table is authoritative; this is purely a rollback
+                    # safety net and will be removed in release N+1.
                     try:
                         async with async_session_factory() as _s:
                             r = await _s.get(Resource, resource.id)
@@ -3451,27 +3577,32 @@ class BackupWorker:
                                     )
                                     merged.update(mail_new_tokens)
                                     ed["mail_delta_tokens_by_folder"] = merged
-                                # Merge fingerprints: skipped folders keep
-                                # their prior value; drained folders pick up
-                                # the freshly observed value. Folders that
-                                # vanished (deleted by user) drop off.
-                                merged_fps = {
-                                    fid: folder_fingerprints_now.get(
-                                        fid,
-                                        _mail_fps_prev.get(fid),
+                                if _drained_fids:
+                                    merged_fps = dict(
+                                        ed.get(
+                                            "mail_folder_fingerprints",
+                                        ) or {},
                                     )
-                                    for fid in folder_fingerprints_now.keys()
-                                }
-                                ed["mail_folder_fingerprints"] = merged_fps
-                                ed["mail_folder_baseline_at"] = (
-                                    datetime.utcnow().isoformat()
-                                )
+                                    for _fid in _drained_fids:
+                                        _fp_str = folder_fingerprints_now.get(_fid)
+                                        if _fp_str:
+                                            merged_fps[_fid] = _fp_str
+                                    ed["mail_folder_fingerprints"] = merged_fps
+                                    # Whole-mailbox baseline retained for
+                                    # the dual-read window only — kept
+                                    # current so a release-N rollback
+                                    # still has a working clock. Authoritative
+                                    # baseline is per-row `baseline_at` in
+                                    # mail_folder_fingerprint.
+                                    ed["mail_folder_baseline_at"] = (
+                                        datetime.utcnow().isoformat()
+                                    )
                                 r.extra_data = ed
                                 await _s.commit()
                     except Exception as _e:
                         print(
                             f"[{self.worker_id}] [USER_MAIL] delta/fp "
-                            f"persist failed: {_e}"
+                            f"legacy persist failed: {_e}"
                         )
 
                     # When streaming persist ran per-folder inline, reduce
@@ -17013,6 +17144,70 @@ class BackupWorker:
                 }
                 for r in rows
             ]
+
+    @staticmethod
+    def _compute_mail_skip_by_fp(
+        all_folder_ids: List[Optional[str]],
+        fp_table: Dict[str, Dict[str, Any]],
+        legacy_fps: Dict[str, str],
+        legacy_baseline_dt: Optional[datetime],
+        fingerprints_now: Dict[str, str],
+        rescan_seconds: int,
+        now_dt: Optional[datetime] = None,
+    ) -> Tuple[List[Optional[str]], List[str], int]:
+        """Pure decision: which folders to drain vs skip via fingerprint.
+
+        Extracted so the skip logic can be unit-tested without DB
+        access — this is the function that, when wrong, silently
+        loses every folder owned by the second-finishing partition
+        shard (see specs/2026-05-15-mail-folder-fingerprint-table-design.md).
+
+        Inputs are dicts and timestamps; no IO, no clock surprises
+        if `now_dt` is supplied (tests pin time).
+
+        Returns (folders_to_drain, folders_skipped, legacy_fallback_count).
+          - `folders_to_drain` preserves a leading `None` placeholder
+            when `all_folder_ids` starts with None (used by the drain
+            path to mean "no folder tree, scan /messages root").
+          - A folder skips iff:
+                fp_table OR legacy has a fingerprint string for it,
+                its `baseline_at` is < rescan_seconds old,
+                AND fingerprints_now[fid] == fp_prev.
+            Otherwise the folder is included in `folders_to_drain`.
+          - Per-folder `baseline_at`: a sibling shard touching a
+            DIFFERENT folder cannot influence this comparison. That
+            is the structural property the JSON-dict version lacked.
+        """
+        now_dt = now_dt or datetime.utcnow()
+        to_drain: List[Optional[str]] = []
+        skipped: List[str] = []
+        fallback_count = 0
+        for fid in all_folder_ids:
+            if not fid:
+                to_drain.append(fid)
+                continue
+            row = fp_table.get(fid)
+            if row:
+                fp_prev = row.get("fp")
+                base_prev = row.get("baseline_at")
+            else:
+                fp_prev = legacy_fps.get(fid)
+                base_prev = legacy_baseline_dt
+                if fp_prev:
+                    fallback_count += 1
+            force_full = (
+                base_prev is None
+                or (now_dt - base_prev).total_seconds() > rescan_seconds
+            )
+            fp_now = fingerprints_now.get(fid)
+            if (
+                not force_full
+                and fp_now and fp_prev and fp_now == fp_prev
+            ):
+                skipped.append(fid)
+            else:
+                to_drain.append(fid)
+        return to_drain, skipped, fallback_count
 
     @staticmethod
     def _compile_exclusions(exclusions: List[Dict[str, Any]]) -> Dict[str, Any]:

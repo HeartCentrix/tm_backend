@@ -911,6 +911,27 @@ async def init_db() -> None:
             PRIMARY KEY (resource_id, folder_id)
         )
         """,
+        # mail_folder_fingerprint — per-folder Graph stats fingerprint
+        # for USER_MAIL skip-by-fp. Replaces the whole-mailbox JSON
+        # dict in resources.extra_data['mail_folder_fingerprints'] +
+        # 'mail_folder_baseline_at'. The dict was clobbered by sibling
+        # MAIL_FOLDERS partition shards: the second-finishing shard
+        # re-read the first shard's fingerprint writes for folders it
+        # didn't own and skipped its allowlist via skip-by-fp. One row
+        # per (resource, folder) makes writes commute. `baseline_at`
+        # is per folder so the 3-day full-rescan window doesn't reset
+        # mailbox-wide on every drain.
+        """
+        CREATE TABLE IF NOT EXISTS mail_folder_fingerprint (
+            resource_id UUID NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+            folder_id TEXT NOT NULL,
+            total_item_count INTEGER NOT NULL DEFAULT 0,
+            unread_item_count INTEGER NOT NULL DEFAULT 0,
+            size_in_bytes BIGINT NOT NULL DEFAULT 0,
+            baseline_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (resource_id, folder_id)
+        )
+        """,
         # sharepoint_drive_delta — per-drive Graph delta tokens for
         # SHAREPOINT_SITE resources. Same fix for the same RMW
         # pattern in resources.extra_data['drive_delta_tokens_by_site'].

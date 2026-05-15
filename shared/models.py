@@ -680,6 +680,38 @@ class MailFolderDelta(Base):
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
 
 
+class MailFolderFingerprint(Base):
+    """Per-folder Graph fingerprint for USER_MAIL skip-by-fp.
+
+    Mirrors `MailFolderDelta`. Replaces the whole-mailbox JSON dict
+    that used to live in `resource.extra_data["mail_folder_fingerprints"]`
+    + `mail_folder_baseline_at`. The dict was clobbered when sibling
+    MAIL_FOLDERS partition shards finished sequentially: the
+    second-finishing shard re-read the first shard's fingerprint
+    writes for folders it did not own, matched them against an
+    unchanged Graph view, and skipped its entire allowlist —
+    silently dropping every non-Inbox folder from the snapshot.
+
+    One row per (resource, folder) makes writes commute under PG
+    row-level locks. `baseline_at` becomes per folder so the
+    3-day full-rescan window applies to the folder that actually
+    drained instead of resetting mailbox-wide on any drain.
+    """
+    __tablename__ = "mail_folder_fingerprint"
+    resource_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("resources.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    folder_id = Column(Text, primary_key=True)
+    total_item_count = Column(Integer, nullable=False, default=0)
+    unread_item_count = Column(Integer, nullable=False, default=0)
+    size_in_bytes = Column(BigInteger, nullable=False, default=0)
+    baseline_at = Column(
+        DateTime, default=utcnow, onupdate=utcnow, nullable=False,
+    )
+
+
 class SharePointDriveDelta(Base):
     """Per-drive delta token for SharePoint sites.
 
