@@ -369,14 +369,16 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
     else:
         obj_label = "Bulk Operation"
 
-    # progress_pct: bytes-weighted when totals known, else fall back to
-    # the terminal/total ratio of child snapshots. Server returns a
-    # single number; the client clamps it monotonically across polls.
+    # progress_pct: terminal/total ratio of child snapshots. We have no
+    # bytes_expected column today (every prior attempt set it equal to
+    # bytes_added, which trivially divides to 100 % the moment ANY
+    # bytes land — that produced the 2026-05-15 incident where the
+    # list row's progress bar / detail-panel header both showed 100 %
+    # while the `details` line (using this same snap-ratio formula)
+    # still said "Progress: 71 % …". Single source of truth fixes the
+    # cross-field inconsistency. Client still clamps monotonically.
     bytes_added = int(row.bytes_added or 0)
-    bytes_expected = bytes_added  # No bytes_expected column today.
-    if bytes_expected > 0:
-        progress_pct = min(100, int(100 * bytes_added / bytes_expected))
-    elif counts.snap_total > 0:
+    if counts.snap_total > 0:
         terminal = counts.snap_done + counts.snap_partial + counts.snap_failed
         progress_pct = min(100, int(100 * terminal / counts.snap_total))
     else:
@@ -407,7 +409,10 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
         "finish_time":    finish_iso,
         "details":        _format_details(status, bytes_added, counts),
         "data_backed_up": bytes_added,
-        "total_data":     bytes_expected,
+        # No true bytes_expected today — emit 0 instead of echoing
+        # bytes_added (which forced any "X of Y bytes" UI to a fake
+        # 100 %). Clients already treat 0 as "unknown total".
+        "total_data":     0,
         "phase":          phase,
         "counts": {
             "total":       counts.snap_total,
