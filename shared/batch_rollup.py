@@ -429,7 +429,16 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
 
 
 def _format_details(status: str, bytes_added: int, counts: RollupCounts) -> str:
-    """Human-readable summary line — mirrors the legacy ``_group_batch_jobs``."""
+    """Human-readable summary line.
+
+    Percent is intentionally NOT included for "In Progress" rows: the
+    UI already renders the percent in the dedicated progress bar (row)
+    and the detail-panel header, both driven by the ``progress_pct``
+    field. Carrying a second percent here produced visible
+    mismatches across polls (row text said 78 % while the bar showed
+    83 % because the client clamps the bar monotonically). Single
+    source of truth = no mismatch possible.
+    """
     if status == "Done":
         if bytes_added > 0:
             return f"{_fmt_bytes(bytes_added)} backed up"
@@ -438,12 +447,10 @@ def _format_details(status: str, bytes_added: int, counts: RollupCounts) -> str:
         return "Failed"
     if status == "Canceled":
         return "Cancelled"
-    # In Progress
-    if counts.snap_total > 0:
-        terminal = counts.snap_done + counts.snap_partial + counts.snap_failed
-        pct = int(100 * terminal / counts.snap_total) if counts.snap_total else 0
-        return f"Progress: {pct}% ({_fmt_bytes(bytes_added)} so far)"
-    return "Progress: 0%"
+    # In Progress — bytes-only progress hint, no percent.
+    if bytes_added > 0:
+        return f"{_fmt_bytes(bytes_added)} so far"
+    return "In progress"
 
 
 def _fmt_bytes(n: int) -> str:

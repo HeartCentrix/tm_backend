@@ -78,17 +78,17 @@ def shape_activity_row(row) -> Dict[str, Any]:
     elif row.status == "PARTIAL":
         details = f"Partial — {_fmt_bytes(bytes_done)} backed up"
     else:
-        # IN_PROGRESS — include progress and discovery sub-hint when
-        # relevant. The sub-hint surfaces stuck users so the operator
-        # knows the batch isn't hung silently.
+        # IN_PROGRESS — bytes-only progress hint, no percent. The UI
+        # already renders the percent in the dedicated progress bar +
+        # detail-panel header (driven by progressPct). Carrying a
+        # second percent here produced visible mismatches across
+        # polls (row text 78 % vs bar 83 % vs detail 84 %); strip it
+        # so the dedicated bar is the single source of truth.
         bits = []
-        if progress_pct is not None:
-            bits.append(f"Progress: {progress_pct}%")
-            if bytes_done:
-                bits.append(
-                    f"({_fmt_bytes(bytes_done)} of "
-                    f"{_fmt_bytes(bytes_expected)})"
-                )
+        if bytes_done and bytes_expected:
+            bits.append(
+                f"{_fmt_bytes(bytes_done)} of {_fmt_bytes(bytes_expected)}"
+            )
         elif bytes_done:
             bits.append(f"{_fmt_bytes(bytes_done)} so far")
         else:
