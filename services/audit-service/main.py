@@ -1564,7 +1564,11 @@ async def get_batch_children(batch_id: str):
     async with async_session_factory() as db:
         # Read-only endpoint. Cap lock waits so we never deadlock with the
         # finalize worker holding ExclusiveLock on snapshots/snapshot_partitions.
-        await db.execute(text("SET LOCAL lock_timeout = '2s'"))
+        # 5s is the sweet spot — long enough to ride out a typical
+        # _finalize_partitioned_snapshot transaction (3-4s), short enough
+        # to fail fast if something's genuinely stuck. parts_q below catches
+        # the timeout and continues without partition rollup.
+        await db.execute(text("SET LOCAL lock_timeout = '5s'"))
         await db.execute(text("SET LOCAL statement_timeout = '15s'"))
         await db.execute(text("SET LOCAL TRANSACTION READ ONLY"))
 
@@ -1634,25 +1638,47 @@ async def get_batch_children(batch_id: str):
         snap_ids = [v["snapshotId"] for v in snap_by_rid.values()]
         parts_by_sid: Dict[str, Dict[str, int]] = {}
         if snap_ids:
-            parts_q = await db.execute(text("""
-                SELECT
-                  snapshot_id::text                                   AS sid,
-                  COUNT(*)                                            AS total,
-                  COUNT(*) FILTER (WHERE status::text = 'COMPLETED')  AS done,
-                  COUNT(*) FILTER (WHERE status::text NOT IN ('COMPLETED','FAILED'))
-                                                                      AS pending,
-                  COUNT(*) FILTER (WHERE status::text = 'FAILED')     AS failed
-                FROM snapshot_partitions
-                WHERE snapshot_id = ANY(CAST(:sids AS UUID[]))
-                GROUP BY 1
-            """), {"sids": snap_ids})
-            for pr in parts_q.all():
-                parts_by_sid[pr.sid] = {
-                    "total":   int(pr.total or 0),
-                    "done":    int(pr.done or 0),
-                    "pending": int(pr.pending or 0),
-                    "failed":  int(pr.failed or 0),
-                }
+            # snapshot_partitions FOR UPDATE is held by the worker mid-finalize.
+            # The drilldown's SET LOCAL lock_timeout='2s' guards the endpoint
+            # from blocking the read pool — when it fires here, omit the
+            # partition rollup section and keep the rest of the modal usable.
+            # Partition counts are nice-to-have; resource list + per-leaf
+            # status are the load-bearing data.
+            try:
+                parts_q = await db.execute(text("""
+                    SELECT
+                      snapshot_id::text                                   AS sid,
+                      COUNT(*)                                            AS total,
+                      COUNT(*) FILTER (WHERE status::text = 'COMPLETED')  AS done,
+                      COUNT(*) FILTER (WHERE status::text NOT IN ('COMPLETED','FAILED'))
+                                                                          AS pending,
+                      COUNT(*) FILTER (WHERE status::text = 'FAILED')     AS failed
+                    FROM snapshot_partitions
+                    WHERE snapshot_id = ANY(CAST(:sids AS UUID[]))
+                    GROUP BY 1
+                """), {"sids": snap_ids})
+                for pr in parts_q.all():
+                    parts_by_sid[pr.sid] = {
+                        "total":   int(pr.total or 0),
+                        "done":    int(pr.done or 0),
+                        "pending": int(pr.pending or 0),
+                        "failed":  int(pr.failed or 0),
+                    }
+            except Exception as part_exc:
+                # LockNotAvailableError most likely — worker holds FOR UPDATE
+                # during finalize. Log and continue without partition data.
+                exc_name = type(part_exc).__name__
+                print(
+                    f"[drilldown] snapshot_partitions read skipped due to "
+                    f"{exc_name}: {str(part_exc)[:200]}"
+                )
+                # Rollback the failed sub-statement so the connection stays
+                # usable for the rest of the handler (Postgres aborts the
+                # transaction on lock_timeout, so we open a clean session).
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
 
         tier1: List[Dict[str, Any]] = []
         children_by_parent: Dict[Any, List[Dict[str, Any]]] = {}
