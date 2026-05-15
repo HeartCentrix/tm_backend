@@ -1619,9 +1619,20 @@ async def get_batch_children(batch_id: str):
         #   - resources directly listed in the batch (Tier-1)
         #   - their Tier-2 children
         all_rid_strs = [str(rid) for rid, *_ in rs]
+        # Use bytes_total (cumulative storage for the resource) not
+        # bytes_added (delta). An incremental that adds 0 bytes leaves
+        # bytes_added=0 even though the resource has multi-GB of data.
+        # Same for item_count — fall back to new_item_count when 0
+        # (different workloads populate these differently). The user-
+        # facing semantics is "how much of this user's <type> data is
+        # in TMvault now", which maps to bytes_total.
         snaps_q = await db.execute(text("""
             SELECT DISTINCT ON (resource_id)
-                   id, resource_id, status::text, item_count, bytes_added
+                   id,
+                   resource_id,
+                   status::text                          AS status,
+                   GREATEST(item_count, new_item_count)  AS item_count,
+                   GREATEST(bytes_total, bytes_added)    AS bytes_added
             FROM snapshots
             WHERE resource_id = ANY(CAST(:rids AS UUID[]))
             ORDER BY resource_id, created_at DESC
