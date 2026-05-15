@@ -778,7 +778,11 @@ async def _list_activities_batch(
                         avg_prior = details.get("avg_prior_item_count")
                         current = details.get("current_item_count")
                         drop_pct = details.get("drop_pct")
-                        if anomaly == "ITEM_COUNT_DROP" and avg_prior is not None and current is not None:
+                        deleted_items = details.get("deleted_item_count")
+                        if anomaly == "ITEM_MASS_DELETION" and deleted_items is not None and avg_prior is not None:
+                            pct = f" ({drop_pct}% of live inventory)" if drop_pct is not None else ""
+                            message = f"Ransomware signal: {deleted_items} items deleted{pct}."
+                        elif anomaly == "ITEM_COUNT_DROP" and avg_prior is not None and current is not None:
                             pct = f" ({drop_pct}% drop)" if drop_pct is not None else ""
                             message = f"Ransomware signal: item count dropped from avg {avg_prior} to {current}{pct}."
                         else:
@@ -1439,7 +1443,11 @@ async def list_activities(
                     avg_prior = details.get("avg_prior_item_count")
                     current = details.get("current_item_count")
                     drop_pct = details.get("drop_pct")
-                    if anomaly == "ITEM_COUNT_DROP" and avg_prior is not None and current is not None:
+                    deleted_items = details.get("deleted_item_count")
+                    if anomaly == "ITEM_MASS_DELETION" and deleted_items is not None and avg_prior is not None:
+                        pct = f" ({drop_pct}% of live inventory)" if drop_pct is not None else ""
+                        message = f"Ransomware signal: {deleted_items} items deleted{pct}."
+                    elif anomaly == "ITEM_COUNT_DROP" and avg_prior is not None and current is not None:
                         pct = f" ({drop_pct}% drop)" if drop_pct is not None else ""
                         message = f"Ransomware signal: item count dropped from avg {avg_prior} to {current}{pct}."
                     else:

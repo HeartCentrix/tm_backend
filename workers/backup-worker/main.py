@@ -17046,18 +17046,44 @@ class BackupWorker:
     # Anomaly thresholds — generous defaults so we don't flood ops with false
     # positives on small mailboxes / new resources. Tunable via env at deploy.
     ANOMALY_MIN_PRIOR_SNAPSHOTS = int(os.environ.get("ANOMALY_MIN_PRIOR_SNAPSHOTS", "3"))
-    ANOMALY_DROP_RATIO = float(os.environ.get("ANOMALY_DROP_RATIO", "0.5"))  # current < 50% of avg
     ANOMALY_MIN_AVG_ITEMS = int(os.environ.get("ANOMALY_MIN_AVG_ITEMS", "20"))  # ignore tiny resources
+    # v2 (deletion-evidence) thresholds. The detector fires ONLY when
+    # the snapshot recorded explicit deletion evidence — tombstone rows
+    # in snapshot_items.is_deleted OR a persisted
+    # snapshot.extra_data["deleted_item_count"] counter from the
+    # handler. Both an absolute floor and a fraction of the prior live
+    # inventory must be exceeded.
+    ANOMALY_MIN_DELETED_ITEMS = int(os.environ.get("ANOMALY_MIN_DELETED_ITEMS", "50"))
+    ANOMALY_DELETION_FRACTION = float(os.environ.get("ANOMALY_DELETION_FRACTION", "0.30"))
+    # Legacy ratio kept for env-var compatibility only; no longer used.
+    ANOMALY_DROP_RATIO = float(os.environ.get("ANOMALY_DROP_RATIO", "0.5"))
 
     async def _check_snapshot_anomaly(self, snapshot: Snapshot) -> None:
-        """Compare this snapshot's item_count against the rolling average of
-        the last N completed snapshots for the same resource. If it dropped
-        sharply, raise an Alert and tag the most recent prior snapshot as
-        last_clean — that's the recovery point an operator should restore from
-        if this turns out to be ransomware/mass-deletion.
+        """Raise a RANSOMWARE_SIGNAL alert when this snapshot recorded a
+        mass deletion. Deletion-evidence-only; net-add count drops are
+        no longer a signal.
 
-        Heuristic v1: item_count drop ratio. v2 will incorporate is_deleted
-        markers + content_hash churn for finer-grained detection."""
+        v1 (deprecated 2026-05-15) compared per-snapshot item_count vs
+        a rolling average of the prior 5. That ratio is unreliable
+        because handlers write inconsistent semantics into item_count
+        (some store the full retained inventory, some store delta-only)
+        and the first 1-2 snapshots are always a "baseline" full-pull
+        whose size dwarfs subsequent quiet deltas. Every healthy quiet
+        incremental tripped the detector (2026-05-15 incident: 10
+        false-positive RANSOMWARE_SIGNAL rows for Hemant's mail,
+        Vinay's OneDrive, several calendar resources, etc. after a
+        no-change 8-hour window).
+
+        v2 fires iff explicit deletion evidence for THIS snapshot
+        exceeds BOTH an absolute floor (ANOMALY_MIN_DELETED_ITEMS) and
+        a fraction (ANOMALY_DELETION_FRACTION) of the prior live
+        inventory. Deletion sources (priority order):
+          1. snapshot.extra_data["deleted_item_count"] — handler counter
+          2. COUNT(snapshot_items WHERE is_deleted=true) for this sid
+
+        No deletion evidence → no alert. Silent is correct for "no
+        evidence of deletion"; handlers that want ransomware coverage
+        on their workload must persist a deletion count."""
         from shared.models import Alert
         async with async_session_factory() as session:
             stmt = (
@@ -17074,60 +17100,35 @@ class BackupWorker:
             if len(prior) < self.ANOMALY_MIN_PRIOR_SNAPSHOTS:
                 return  # not enough history to judge
 
-            current = snapshot.item_count or 0
-
-            # Healthy no-op incremental: when current=0 AND the resource has a
-            # saved cursor/deltaLink/skip-baseline, this snapshot represents
-            # "delta returned nothing changed" — not data loss. Without this
-            # guard the detector flags every quiet day as ransomware because
-            # `avg_prior` reflects earlier full-pull snapshots whose item
-            # counts are 1-4 orders of magnitude above a real delta.
-            #
-            # Cursor keys cover both legacy single-token storage AND the
-            # current per-folder maps:
-            #   - mail_delta_token            (legacy MAILBOX/SHARED/ROOM)
-            #   - mail_delta_tokens_by_folder (USER_MAIL per-folder, current)
-            #   - mail_folder_fingerprints    (USER_MAIL fingerprint cache,
-            #                                  pre-mail_folder_fingerprint table)
-            #   - mail_folder_baseline_at     (USER_MAIL baseline timestamp)
-            #   - delta_token                 (generic incremental cursor)
-            #   - chat_delta_tokens           (USER_CHATS per-chat map)
-            #   - chat_skip_baseline_at       (USER_CHATS skip baseline)
-            #   - onedrive_delta_link         (USER_ONEDRIVE / ONEDRIVE)
-            #   - drive_delta_tokens_by_site  (SHAREPOINT_SITE per-site map)
-            # Plus a row-existence probe against the new
-            # `mail_folder_fingerprint` table (introduced 2026-05-15) which
-            # replaces the in-metadata `mail_folder_fingerprints` map for
-            # USER_MAIL — old guard missed this entirely so every quiet mail
-            # delta tripped the detector (see Hemant Singh false positives
-            # in 2026-05-15 incident analysis).
-            if current == 0:
-                resource_for_guard = await session.get(Resource, snapshot.resource_id)
-                extra = (resource_for_guard.extra_data or {}) if resource_for_guard else {}
-                if _resource_has_incremental_cursor(extra):
-                    return  # incremental no-op — not an anomaly
-                # Fingerprint-table probe — USER_MAIL with rows in
-                # mail_folder_fingerprint is on the new per-folder delta
-                # path even if metadata hasn't backfilled the legacy keys
-                # above. One indexed PK-lookup, cheap.
+            # v2: deletion-evidence first. Bail with no alert when the
+            # snapshot didn't record any deletion — no signal, no
+            # alarm. See class docstring for the rationale.
+            extra = snapshot.extra_data or {}
+            deleted_items = int(extra.get("deleted_item_count") or 0)
+            if deleted_items <= 0:
                 try:
-                    fp_row = (await session.execute(text("""
-                        SELECT 1 FROM mail_folder_fingerprint
-                         WHERE resource_id = cast(:rid AS uuid)
-                         LIMIT 1
-                    """), {"rid": str(snapshot.resource_id)})).first()
-                    if fp_row:
-                        return
+                    row = (await session.execute(text("""
+                        SELECT COUNT(*) FROM snapshot_items
+                         WHERE snapshot_id = :sid
+                           AND is_deleted = true
+                    """), {"sid": str(snapshot.id)})).first()
+                    deleted_items = int(row[0]) if row and row[0] else 0
                 except Exception:
-                    pass  # table may not exist yet on pre-deploy envs
+                    deleted_items = 0
+            if deleted_items <= 0:
+                return
 
-            avg = sum((p.item_count or 0) for p in prior) / len(prior)
-            if avg < self.ANOMALY_MIN_AVG_ITEMS:
+            avg_prior = sum((p.item_count or 0) for p in prior) / len(prior)
+            if avg_prior < self.ANOMALY_MIN_AVG_ITEMS:
                 return  # resource too small to be meaningful
+            if deleted_items < self.ANOMALY_MIN_DELETED_ITEMS:
+                return  # absolute floor
+            deletion_fraction = deleted_items / avg_prior if avg_prior else 0.0
+            if deletion_fraction < self.ANOMALY_DELETION_FRACTION:
+                return  # relative floor
 
-            ratio = current / avg if avg else 1.0
-            if ratio >= self.ANOMALY_DROP_RATIO:
-                return  # within normal variance
+            current = snapshot.item_count or 0
+            drop_pct = int(round(deletion_fraction * 100))
 
             # Anomaly — raise alert + mark prior snapshot as last_clean
             resource = await session.get(Resource, snapshot.resource_id)
@@ -17145,9 +17146,9 @@ class BackupWorker:
                 type="BACKUP_ANOMALY",
                 severity="HIGH",
                 message=(
-                    f"Snapshot item count dropped {int((1 - ratio) * 100)}% "
-                    f"vs prior average ({current} vs avg {int(avg)}). "
-                    f"Possible mass deletion / ransomware. Last clean snapshot: {last_clean.id}."
+                    f"Mass deletion detected: {deleted_items} items deleted "
+                    f"({drop_pct}% of avg {int(avg_prior)} live items). "
+                    f"Possible ransomware. Last clean snapshot: {last_clean.id}."
                 ),
                 resource_id=resource.id if resource else None,
                 resource_type=resource.type.value if resource else None,
@@ -17157,8 +17158,9 @@ class BackupWorker:
                     "snapshot_id": str(snapshot.id),
                     "last_clean_snapshot_id": str(last_clean.id),
                     "current_item_count": current,
-                    "avg_prior_item_count": int(avg),
-                    "drop_ratio": round(ratio, 3),
+                    "avg_prior_item_count": int(avg_prior),
+                    "deleted_item_count": deleted_items,
+                    "deletion_fraction": round(deletion_fraction, 3),
                     "prior_snapshot_ids": [str(p.id) for p in prior],
                 },
             )
@@ -17166,8 +17168,8 @@ class BackupWorker:
             await session.commit()
             print(
                 f"[{self.worker_id}] [ANOMALY] resource={resource.display_name if resource else snapshot.resource_id} "
-                f"snapshot={snapshot.id} dropped to {current} items (avg {int(avg)}, ratio {ratio:.2f}). "
-                f"Marked {last_clean.id} as last_clean."
+                f"snapshot={snapshot.id} deleted={deleted_items} "
+                f"({drop_pct}% of avg {int(avg_prior)}). Marked {last_clean.id} as last_clean."
             )
 
             # Mirror the anomaly to the audit trail. RANSOMWARE_SIGNAL is the
@@ -17196,15 +17198,21 @@ class BackupWorker:
                     snapshot_id=str(snapshot.id),
                     details={
                         "alert_id": str(alert.id),
-                        "anomaly_type": "ITEM_COUNT_DROP",
+                        "anomaly_type": "ITEM_MASS_DELETION",
                         "current_item_count": current,
-                        "avg_prior_item_count": int(avg),
-                        "drop_ratio": round(ratio, 3),
-                        "drop_pct": int((1 - ratio) * 100),
+                        "avg_prior_item_count": int(avg_prior),
+                        "deleted_item_count": deleted_items,
+                        "deletion_fraction": round(deletion_fraction, 3),
+                        # drop_pct kept for audit-service's existing
+                        # "{N}% drop" formatter in main.py:782 — now
+                        # carries the deletion fraction so the
+                        # operator sees a percentage on the alert row.
+                        "drop_pct": drop_pct,
                         "last_clean_snapshot_id": str(last_clean.id),
                         "prior_snapshot_ids": [str(p.id) for p in prior],
                         "thresholds": {
-                            "drop_ratio": self.ANOMALY_DROP_RATIO,
+                            "min_deleted_items": self.ANOMALY_MIN_DELETED_ITEMS,
+                            "deletion_fraction": self.ANOMALY_DELETION_FRACTION,
                             "min_prior_snapshots": self.ANOMALY_MIN_PRIOR_SNAPSHOTS,
                             "min_avg_items": self.ANOMALY_MIN_AVG_ITEMS,
                         },
