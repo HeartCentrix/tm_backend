@@ -1810,8 +1810,18 @@ async def get_batch_children(batch_id: str):
                    s.id,
                    s.resource_id,
                    s.status::text                                AS status,
-                   COALESCE(NULLIF(s.new_item_count, 0),
-                            s.item_count)                        AS item_count,
+                   -- Delta-first display so the per-resource grid shows
+                   -- "what THIS backup added", not the cumulative
+                   -- inventory. Previously this used NULLIF(new_item_count, 0)
+                   -- which collapsed a real 0-delta back to s.item_count
+                   -- (29 k cached chats) — making a clean no-op
+                   -- incremental look identical to a full re-fetch and
+                   -- driving the "why is dedup not working" reports
+                   -- (2026-05-15 incident). Fallback only when
+                   -- new_item_count is genuinely NULL (handler never
+                   -- ran the settle path).
+                   COALESCE(s.new_item_count, s.item_count)      AS item_count,
+                   COALESCE(s.item_count, 0)                     AS item_count_total,
                    s.bytes_added                                 AS bytes_added,
                    s.bytes_total                                 AS bytes_total
               FROM snapshots s
@@ -1823,11 +1833,15 @@ async def get_batch_children(batch_id: str):
         snap_by_rid: Dict[Any, Dict[str, Any]] = {}
         for sr in snaps_q.all():
             snap_by_rid[sr.resource_id] = {
-                "snapshotId": str(sr.id),
-                "status":     sr.status,
-                "itemCount":  int(sr.item_count or 0),
-                "bytesAdded": int(sr.bytes_added or 0),
-                "bytesTotal": int(sr.bytes_total or 0),
+                "snapshotId":     str(sr.id),
+                "status":         sr.status,
+                # itemCount = delta added this run (0 on a clean no-op
+                # incremental). itemCountTotal = lifetime retained
+                # inventory (for "we hold 29 k chats" context).
+                "itemCount":      int(sr.item_count or 0),
+                "itemCountTotal": int(getattr(sr, "item_count_total", 0) or 0),
+                "bytesAdded":     int(sr.bytes_added or 0),
+                "bytesTotal":     int(sr.bytes_total or 0),
             }
 
         snap_ids = [v["snapshotId"] for v in snap_by_rid.values()]
