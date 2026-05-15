@@ -2463,9 +2463,24 @@ async def list_snapshot_onedrive(
       - `created_desc`  → newest file first (Graph createdDateTime)
       - `modified_desc` → most-recently-edited first (Graph lastModifiedDateTime)
       - default / anything else → name A→Z (case-insensitive)
+
+    Sibling-snapshot aggregation: OneDrive uses delta backups, so an
+    initial full-pull captures every file and every subsequent run
+    only re-emits changed files. Without sibling aggregation, opening
+    Recovery on the latest delta snapshot (item_count=0) returned an
+    empty file list even though the resource has thousands of files
+    via the initial snapshot — symptom in the 2026-05-15 case was
+    Amit's My Drive root showing folder rows (from /folders, which
+    already aggregates) but zero files. Mirror the pattern used by
+    /mail, /chats, /calendar and /contacts.
     """
+    sibling_ids = await _resolve_sibling_snapshot_ids(
+        db, snapshot_id, target_child_type=ResourceType.USER_ONEDRIVE,
+    )
+    if not sibling_ids:
+        sibling_ids = [UUID(snapshot_id)]
     filters = [
-        SnapshotItem.snapshot_id == UUID(snapshot_id),
+        SnapshotItem.snapshot_id.in_(sibling_ids),
         SnapshotItem.item_type.in_(ONEDRIVE_ITEM_TYPES),
     ]
     if folder is not None:
@@ -2473,25 +2488,40 @@ async def list_snapshot_onedrive(
     if search:
         filters.append(SnapshotItem.name.ilike(f"%{search}%"))
 
-    stmt = select(SnapshotItem).where(*filters)
-    if sort == "created_desc":
-        # SQLAlchemy JSON (not JSONB) — use json_extract_path_text.
-        stmt = stmt.order_by(
-            func.json_extract_path_text(SnapshotItem.extra_data, "raw", "createdDateTime").desc()
-        )
-    elif sort == "modified_desc":
-        stmt = stmt.order_by(
-            func.json_extract_path_text(SnapshotItem.extra_data, "raw", "lastModifiedDateTime").desc()
-        )
-    else:
-        stmt = stmt.order_by(func.lower(SnapshotItem.name).asc())
+    # Pull all matching rows then dedup by external_id (newest-wins)
+    # before sorting + paginating. Matches the /mail pattern. For a
+    # typical user OneDrive (~500-5,000 files) this is bounded enough
+    # to stay in memory; the alternative SQL-side DISTINCT ON would
+    # be cleaner but doesn't compose with the JSON-path sorts below.
+    all_rows = (await db.execute(
+        select(SnapshotItem).where(*filters)
+    )).scalars().all()
+    seen: set = set()
+    deduped: list = []
+    for it in all_rows:
+        key = it.external_id or str(it.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(it)
 
-    total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
-    items = (await db.execute(stmt.offset((page-1)*size).limit(size))).scalars().all()
+    def _sort_key(it):
+        raw = (it.extra_data or {}).get("raw") or {}
+        if sort == "created_desc":
+            return raw.get("createdDateTime") or ""
+        if sort == "modified_desc":
+            return raw.get("lastModifiedDateTime") or ""
+        return (it.name or "").lower()
+
+    reverse = sort in ("created_desc", "modified_desc")
+    deduped.sort(key=_sort_key, reverse=reverse)
+    total = len(deduped)
+    offset = (page - 1) * size
+    items = deduped[offset: offset + size]
     return {
         "content": [_item_to_response(i) for i in items],
         "totalElements": total,
-        "totalPages": max(1, (total+size-1)//size),
+        "totalPages": max(1, (total + size - 1) // size),
         "size": size,
         "number": page,
     }
@@ -2511,12 +2541,23 @@ async def list_onedrive_ids_by_prefix(
 
     Kept as a separate lightweight endpoint so the bulk-select doesn't
     have to page through the main /onedrive response and re-assemble it
-    on the client."""
+    on the client.
+
+    Sibling-snapshot aggregation: matches /onedrive so a bulk-select
+    against the latest empty delta snapshot doesn't return 0 ids —
+    falls through to the prior snapshots that actually hold the files.
+    Dedup is by external_id, newest-wins (returns the ID from the
+    latest snapshot that still holds that file)."""
+    sibling_ids = await _resolve_sibling_snapshot_ids(
+        db, snapshot_id, target_child_type=ResourceType.USER_ONEDRIVE,
+    )
+    if not sibling_ids:
+        sibling_ids = [UUID(snapshot_id)]
     prefix = folder_prefix
     if prefix == "/" or prefix == "":
         # Root select → every file in the drive.
         filters = [
-            SnapshotItem.snapshot_id == UUID(snapshot_id),
+            SnapshotItem.snapshot_id.in_(sibling_ids),
             SnapshotItem.item_type.in_(ONEDRIVE_ITEM_TYPES),
         ]
     else:
@@ -2525,12 +2566,28 @@ async def list_onedrive_ids_by_prefix(
         # a literal `_` doesn't accidentally match sibling paths.
         escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         filters = [
-            SnapshotItem.snapshot_id == UUID(snapshot_id),
+            SnapshotItem.snapshot_id.in_(sibling_ids),
             SnapshotItem.item_type.in_(ONEDRIVE_ITEM_TYPES),
             (SnapshotItem.folder_path == prefix) | (SnapshotItem.folder_path.like(f"{escaped}/%", escape="\\")),
         ]
-    rows = (await db.execute(select(SnapshotItem.id).where(*filters))).all()
-    return {"ids": [str(r[0]) for r in rows], "count": len(rows)}
+    rows = (await db.execute(
+        select(SnapshotItem.id, SnapshotItem.external_id, SnapshotItem.created_at)
+        .where(*filters)
+        .order_by(SnapshotItem.external_id, SnapshotItem.created_at.desc())
+    )).all()
+    # Newest-wins dedup by external_id. Rows without external_id are
+    # passed through (e.g. legacy ones); they can't collide with each
+    # other meaningfully since `id` is unique anyway.
+    seen: set = set()
+    deduped_ids: list = []
+    for row_id, ext_id, _created in rows:
+        key = ext_id if ext_id else str(row_id)
+        if ext_id and key in seen:
+            continue
+        if ext_id:
+            seen.add(key)
+        deduped_ids.append(str(row_id))
+    return {"ids": deduped_ids, "count": len(deduped_ids)}
 
 
 @app.get("/api/v1/resources/snapshots/{snapshot_id}/files")
