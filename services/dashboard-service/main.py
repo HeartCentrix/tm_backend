@@ -4,9 +4,44 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 from uuid import UUID
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date as _date
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, Depends, Query, HTTPException
+
+
+def _resolve_tz(tz_name: Optional[str]) -> ZoneInfo:
+    """Resolve an IANA tz string from the `tz` query param.
+
+    Default to UTC. Invalid names fall back to UTC rather than 4xx
+    because dashboards are read-only and a typo'd tz should not break
+    the operator's view — they'll just see UTC-bucketed data and
+    notice the mismatch.
+
+    Bucketing in client tz means an operator in IST (UTC+5:30) sees
+    the day boundary at midnight IST instead of midnight UTC. Without
+    this, a backup at 22:31 UTC (04:01 IST next day) lands in the
+    previous calendar day, confusing the operator.
+    """
+    if not tz_name:
+        return ZoneInfo("UTC")
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        log.warning("dashboard: unknown tz %r — falling back to UTC", tz_name)
+        return ZoneInfo("UTC")
+
+
+def _bucket_date(dt: datetime, tz: ZoneInfo) -> _date:
+    """Return the calendar date of `dt` as observed in tz.
+
+    `dt` may be naive (treated as UTC since the DB stores TIMESTAMP
+    WITHOUT TIME ZONE in UTC) or aware. Aware values are converted;
+    naive values are localized to UTC first.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).date()
 from sqlalchemy import select, func, text, and_, or_
 
 from shared.database import get_db, close_db, AsyncSession, engine
@@ -384,10 +419,20 @@ async def get_24hour_status(
 async def get_7day_status(
     tenantId: Optional[str] = Query(None),
     serviceType: Optional[str] = Query(None),
+    tz: Optional[str] = Query(
+        None,
+        description=(
+            "IANA timezone (e.g. Asia/Kolkata) to bucket daily counts. "
+            "Frontend should pass "
+            "Intl.DateTimeFormat().resolvedOptions().timeZone. "
+            "Defaults to UTC."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     service_key = parse_service_type(serviceType)
     service_resource_types = resource_types_for_service(service_key)
+    client_tz = _resolve_tz(tz)
 
     # Use naive datetime to match TIMESTAMP WITHOUT TIME ZONE
     seven_days_ago = datetime.utcnow() - timedelta(days=7)
@@ -436,13 +481,19 @@ async def get_7day_status(
         anchor = earliest_at.get(key)
         if anchor is None:
             continue
-        date_str = anchor.date().isoformat()
+        # Bucket in client's tz so a 22:31 UTC backup lands in the
+        # operator's "today" (04:01 IST = 2026-05-15), not "yesterday"
+        # (2026-05-14). Frontend passes its browser tz; default UTC.
+        date_str = _bucket_date(anchor, client_tz).isoformat()
         daily_tally[date_str][outcome] += 1
 
-    # Fill all 7 days, padding missing days with zeros.
+    # Fill all 7 days, padding missing days with zeros. The "today"
+    # anchor must also be in client tz — otherwise we'd pad based on
+    # UTC's today and the bucketed rows wouldn't line up.
+    today_in_tz = _bucket_date(datetime.utcnow(), client_tz)
     daily_status = []
     for i in range(7):
-        date = (datetime.utcnow() - timedelta(days=6-i)).date()
+        date = today_in_tz - timedelta(days=6-i)
         date_str = date.isoformat()
         bucket = daily_tally.get(date_str, {"success": 0, "warnings": 0, "failures": 0})
         daily_status.append({
@@ -583,10 +634,18 @@ async def get_protection_status(
 async def get_backup_size(
     tenantId: Optional[str] = Query(None),
     serviceType: Optional[str] = Query(None),
+    tz: Optional[str] = Query(
+        None,
+        description=(
+            "IANA timezone to bucket daily growth in. "
+            "Defaults to UTC."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     service_key = parse_service_type(serviceType)
     service_resource_types = resource_types_for_service(service_key)
+    client_tz = _resolve_tz(tz)
 
     filters = []
     if tenantId:
@@ -606,29 +665,33 @@ async def get_backup_size(
     )).scalar() or 0)
 
     # Per-day growth based on when each resource was last backed up.
-    # Resources last backed up BEFORE the 30-day window seed day 0 as a baseline.
-    today = datetime.utcnow().date()
+    # Window anchored to client tz so the 30-day frame and per-day
+    # bucket boundaries align with the operator's calendar. Without
+    # this, a backup at 22:31 UTC (04:01 IST) lands in the previous
+    # IST day on the chart.
+    today = _bucket_date(datetime.utcnow(), client_tz)
     window_start = today - timedelta(days=29)
     window_start_ts = datetime.combine(window_start, datetime.min.time())
 
-    day_bucket = func.date_trunc("day", Resource.last_backup_at).label("day")
+    # Pull raw last_backup_at timestamps + bytes; bucket in Python by
+    # client_tz instead of Postgres date_trunc (which buckets in the
+    # DB session's tz, not the operator's).
     per_day_rows = (await db.execute(
-        select(day_bucket, func.sum(Resource.storage_bytes))
+        select(Resource.last_backup_at, Resource.storage_bytes)
         .where(
             exclude_tier2_storage_dupes_clause(),
             Resource.last_backup_at.isnot(None),
             Resource.last_backup_at >= window_start_ts,
             *filters,
         )
-        .group_by(day_bucket)
     )).all()
     per_day_map: dict = {}
     for row in per_day_rows:
-        day_val = row[0]
-        if day_val is None:
+        ts = row[0]
+        if ts is None:
             continue
-        day_key = day_val.date() if hasattr(day_val, "date") else day_val
-        per_day_map[day_key] = int(row[1] or 0)
+        day_key = _bucket_date(ts, client_tz)
+        per_day_map[day_key] = per_day_map.get(day_key, 0) + int(row[1] or 0)
 
     baseline = int((await db.execute(
         select(func.sum(Resource.storage_bytes)).where(
