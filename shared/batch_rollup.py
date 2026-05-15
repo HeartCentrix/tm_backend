@@ -155,18 +155,15 @@ def build_batch_rollup_query(
             COUNT(*)                                               AS job_count,
             -- PG has no MIN/MAX for uuid; array_agg + [1] pulls the
             -- single resource_id when job_count=1.
-            (ARRAY_AGG(j.resource_id))[1]                          AS single_resource_id
+            (ARRAY_AGG(j.resource_id))[1]                          AS single_resource_id,
+            -- Any Job in this batch fired by the anomaly-detector
+            -- "preemptive" sweep? Used to relabel the Activity row so
+            -- the operator sees "Preemptive — <resource>" instead of
+            -- a generic "1 resource Done" that looks like a phantom
+            -- duplicate of their manual click.
+            BOOL_OR(j.spec->>'triggered_by' = 'PREEMPTIVE')        AS any_preemptive
         FROM filtered_jobs j
         GROUP BY 1, 2
-    ),
-    single_res AS (
-        SELECT
-            b.batch_id,
-            r.display_name AS single_resource_name,
-            r.type::text   AS single_resource_type
-        FROM batches b
-        LEFT JOIN resources r ON r.id = b.single_resource_id
-        WHERE b.job_count = 1 AND b.single_resource_id IS NOT NULL
     ),
     batch_res AS (
         -- Flatten batch_resource_ids per batch via lateral unnest.
@@ -182,6 +179,30 @@ def build_batch_rollup_query(
         FROM filtered_jobs j
         LEFT JOIN LATERAL unnest(COALESCE(j.batch_resource_ids, ARRAY[]::uuid[])) AS bid ON TRUE
         GROUP BY 1
+    ),
+    single_res AS (
+        -- A batch is "single-resource" if either (a) the only Job in
+        -- it carries a non-NULL j.resource_id, OR (b) the only Job is
+        -- a BATCH-shape row whose batch_resource_ids has exactly one
+        -- entry (the preemptive / per-resource trigger-bulk shape).
+        -- Without the (b) branch, single-element batch rows displayed
+        -- "1 resource" instead of the real resource name (the 2026-
+        -- 05-15 PREEMPTIVE phantom-duplicate symptom).
+        SELECT
+            b.batch_id,
+            r.display_name AS single_resource_name,
+            r.type::text   AS single_resource_type
+        FROM batches b
+        LEFT JOIN batch_res br ON br.batch_id = b.batch_id
+        LEFT JOIN resources r ON r.id = COALESCE(
+            b.single_resource_id,
+            CASE
+                WHEN b.job_count = 1
+                 AND COALESCE(array_length(br.all_res_ids, 1), 0) = 1
+                THEN br.all_res_ids[1]
+            END
+        )
+        WHERE b.job_count = 1
     ),
     snap_roll AS (
         SELECT
@@ -290,7 +311,8 @@ def build_batch_rollup_query(
         COALESCE(f.missing_t2, 0)           AS missing_t2,
         sres.single_resource_name           AS single_resource_name,
         sres.single_resource_type           AS single_resource_type,
-        eo.entra_user_name                  AS entra_user_name
+        eo.entra_user_name                  AS entra_user_name,
+        COALESCE(b.any_preemptive, false)   AS any_preemptive
     FROM batches b
     LEFT JOIN snap_roll   sr ON sr.batch_id = b.batch_id
     LEFT JOIN parts_roll  pr ON pr.batch_id = b.batch_id
@@ -354,11 +376,29 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
     # post-fan-out leaf count — that's noise from the user's POV.
     # For non-bulk single-Job backups (per-resource "Backup now"),
     # prefer the resource display name to match legacy UX.
+    #
+    # PREEMPTIVE (anomaly-driven) Jobs get a "Preemptive — <name>"
+    # label so the operator can tell them apart from manual clicks at
+    # a glance. Before this, a preemptive backup of e.g. Hemant's mail
+    # rendered as "BACKUP · 1 resource · Done" which looked like a
+    # phantom duplicate of the parent bulk row.
     entra = int(row.entra_user_count or 0)
     total = int(row.total_resource_count or 0)
     single_name = getattr(row, "single_resource_name", None)
+    single_type = getattr(row, "single_resource_type", None)
     entra_name = getattr(row, "entra_user_name", None)
-    if entra == 1 and entra_name:
+    any_preemptive = bool(getattr(row, "any_preemptive", False))
+    if any_preemptive:
+        # Preemptive sweeps are always per-resource (one Job, one
+        # batch_resource_id). Fall back gracefully if name resolution
+        # failed (e.g. resource hard-deleted).
+        if single_name and single_type:
+            obj_label = f"Preemptive — {single_type} · {single_name}"
+        elif single_name:
+            obj_label = f"Preemptive — {single_name}"
+        else:
+            obj_label = "Preemptive backup"
+    elif entra == 1 and entra_name:
         obj_label = entra_name
     elif entra > 1:
         obj_label = f"{entra} users"
