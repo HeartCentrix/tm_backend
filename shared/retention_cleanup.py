@@ -21,13 +21,17 @@ Legal hold + immutability:
 
 from __future__ import annotations
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
+import logging
 import uuid
 
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import SlaPolicy, Snapshot, Resource, ResourceStatus, SnapshotItem, Tenant
+
+
+logger = logging.getLogger(__name__)
 
 
 def _is_archived(resource: Resource) -> bool:
@@ -174,14 +178,131 @@ def _gfs_keep_ids(snapshots: List[Snapshot], policy: SlaPolicy) -> Set[uuid.UUID
 
 
 async def _delete_snapshots(session: AsyncSession, snap_ids: Set[uuid.UUID]) -> int:
-    """Delete snapshot rows and their items. Blob cleanup is handled by Azure
-    lifecycle policies (applied separately) — we just drop the DB rows here."""
+    """Delete snapshot rows and their items.
+
+    Blob cleanup is handled by Azure lifecycle policies / SeaweedFS
+    GC (applied separately) — we just drop the DB rows here.
+
+    Reuse-chain safety: if any snapshot in ``snap_ids`` is the chain
+    root for live descendants, we must FIRST rehydrate the rows into
+    the next surviving descendant; otherwise the descendant snapshots
+    would resolve to a dead pointer and lose their inventory. The
+    rehydration step is atomic with the delete via the surrounding
+    session transaction.
+
+    Returns the count of Snapshot rows actually deleted.
+    """
     if not snap_ids:
         return 0
     ids = list(snap_ids)
+    # Per-id rehydration sweep BEFORE the bulk delete. Most ids will
+    # have no descendants (the common case is full snapshots aging
+    # out), so the EXISTS probe short-circuits cheaply.
+    for sid in ids:
+        await _rehydrate_reuse_heir(session, sid, doomed_ids=snap_ids)
     await session.execute(delete(SnapshotItem).where(SnapshotItem.snapshot_id.in_(ids)))
     result = await session.execute(delete(Snapshot).where(Snapshot.id.in_(ids)))
     return result.rowcount or 0
+
+
+async def _rehydrate_reuse_heir(
+    session: AsyncSession,
+    doomed_id: uuid.UUID,
+    *,
+    doomed_ids: Set[uuid.UUID],
+) -> Optional[uuid.UUID]:
+    """If ``doomed_id`` is the chain root for any descendant that is
+    NOT itself doomed, transfer its ``snapshot_items`` rows into the
+    earliest surviving descendant ("heir"), repoint every other
+    descendant at the heir, and promote the heir to a full snapshot.
+
+    Idempotent and safe under retry: ON CONFLICT DO NOTHING on the
+    item copy, and the UPDATE-WHERE-still-points-here pattern means a
+    re-run after a partial failure converges.
+
+    Returns the heir's id (when rehydration happened) or None
+    (doomed_id had no surviving descendants).
+    """
+    # 1. Lock the heir candidate set. Use FOR UPDATE so a concurrent
+    # backup-worker that's mid-settle and trying to point at this
+    # chain blocks until we commit; on commit, its validation trigger
+    # will see the new state (doomed row gone OR chain re-rooted) and
+    # either succeed or fail loudly. Either way no corruption.
+    heir_row = (await session.execute(text("""
+        SELECT id
+          FROM snapshots
+         WHERE reuse_chain_root_id = CAST(:did AS UUID)
+           AND id != CAST(:did AS UUID)
+           AND id <> ALL(CAST(:doomed AS UUID[]))
+           AND status::text = 'COMPLETED'
+         ORDER BY COALESCE(started_at, created_at) ASC
+         LIMIT 1
+         FOR UPDATE
+    """), {
+        "did": str(doomed_id),
+        "doomed": [str(x) for x in doomed_ids],
+    })).first()
+    if heir_row is None:
+        return None
+    heir_id = heir_row.id
+
+    # 2. Copy the doomed row's snapshot_items into the heir. ON
+    # CONFLICT keeps the copy idempotent under retry: a partial
+    # earlier run that wrote some rows + crashed leaves the heir's
+    # already-copied rows alone on the next attempt.
+    await session.execute(text("""
+        INSERT INTO snapshot_items
+            (id, snapshot_id, tenant_id, external_id, parent_external_id,
+             item_type, name, folder_path, content_hash, content_checksum,
+             content_size, blob_path, encryption_key_id, backup_version,
+             metadata, is_deleted, indexed_at, backend_id, created_at)
+        SELECT gen_random_uuid(),
+               CAST(:heir AS UUID),
+               tenant_id, external_id, parent_external_id,
+               item_type, name, folder_path, content_hash, content_checksum,
+               content_size, blob_path, encryption_key_id, backup_version,
+               metadata, is_deleted, indexed_at, backend_id, NOW()
+          FROM snapshot_items
+         WHERE snapshot_id = CAST(:did AS UUID)
+        ON CONFLICT DO NOTHING
+    """), {"heir": str(heir_id), "did": str(doomed_id)})
+
+    # 3. Repoint every still-live descendant. Any descendant that
+    # currently points its reuse_of_snapshot_id straight at the doomed
+    # row gets pointed at the heir instead. Every descendant's
+    # reuse_chain_root_id moves to the heir. The heir itself is
+    # excluded from this UPDATE (it's about to be promoted in step 4).
+    await session.execute(text("""
+        UPDATE snapshots
+           SET reuse_of_snapshot_id = CASE
+                   WHEN reuse_of_snapshot_id = CAST(:did AS UUID) THEN CAST(:heir AS UUID)
+                   ELSE reuse_of_snapshot_id
+               END,
+               reuse_chain_root_id = CAST(:heir AS UUID)
+         WHERE reuse_chain_root_id = CAST(:did AS UUID)
+           AND id != CAST(:heir AS UUID)
+    """), {"did": str(doomed_id), "heir": str(heir_id)})
+
+    # 4. Promote the heir to a full snapshot. Validation trigger
+    # tolerates both columns going to NULL.
+    await session.execute(text("""
+        UPDATE snapshots
+           SET reuse_of_snapshot_id = NULL,
+               reuse_chain_root_id  = NULL,
+               extra_data = COALESCE(extra_data::jsonb, '{}'::jsonb)
+                          || jsonb_build_object(
+                                'reuse_rehydrated_from', CAST(:did AS TEXT),
+                                'reuse_rehydrated_at',   to_char(NOW() AT TIME ZONE 'UTC',
+                                                                'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+                             )
+         WHERE id = CAST(:heir AS UUID)
+    """), {"did": str(doomed_id), "heir": str(heir_id)})
+
+    logger.info(
+        "[retention] rehydrated reuse heir snapshot=%s ← from doomed=%s",
+        heir_id, doomed_id,
+    )
+    return heir_id
 
 
 async def enforce_retention_for_tenant(session: AsyncSession, tenant_id: uuid.UUID) -> Dict[str, int]:

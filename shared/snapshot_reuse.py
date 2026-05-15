@@ -1,0 +1,155 @@
+"""Snapshot-reuse chain helpers.
+
+A "reuse" snapshot owns zero ``snapshot_items`` rows; it points (via
+``reuse_of_snapshot_id``) at the immediately-prior stable snapshot of
+the same resource, and (via ``reuse_chain_root_id``) at the terminal
+full snapshot whose rows actually represent the inventory.
+
+Every reader of ``snapshot_items`` must resolve through
+``resolve_snapshot_items_target`` before issuing the query, so the
+chain is transparent to callers. For pre-deploy snapshots and every
+full (non-reuse) snapshot, both columns are NULL and the resolver
+returns ``snapshot_id`` unchanged — behaviour is identical to today.
+
+Design: docs/superpowers/specs/2026-05-15-snapshot-reuse-pointer-design.md
+"""
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass
+from typing import Optional, Union
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+UUIDLike = Union[str, uuid.UUID]
+
+
+class SnapshotNotFound(Exception):
+    """Raised when a resolver is asked about a snapshot id that no
+    longer exists. Callers should surface 404 to the operator rather
+    than silently returning an empty row set — empty inventories are a
+    legitimate state for first backups, so distinguishing missing from
+    empty is load-bearing for the Recovery UI."""
+
+
+@dataclass(frozen=True)
+class SnapshotReuseInfo:
+    """Resolver result. ``target_id`` is what the caller should query
+    against ``snapshot_items`` (and any other per-snapshot detail
+    tables that own rows for the inventory). ``is_reuse`` lets the
+    caller distinguish "this snapshot wrote its own rows" from "this
+    snapshot reuses an ancestor's rows" for log lines / metrics.
+    """
+    target_id: uuid.UUID
+    is_reuse: bool
+    chain_depth: int  # 0 for a full snapshot, ≥1 for a reuse
+
+
+async def resolve_snapshot_items_target(
+    session: AsyncSession,
+    snapshot_id: UUIDLike,
+) -> SnapshotReuseInfo:
+    """Return the snapshot id whose ``snapshot_items`` rows represent
+    the inventory for ``snapshot_id``.
+
+    Implementation: one indexed PK lookup. The chain root id is
+    denormalised (``reuse_chain_root_id``) so this is *not* a recursive
+    walk. Full snapshots have NULL ``reuse_chain_root_id`` and resolve
+    to themselves.
+
+    Raises ``SnapshotNotFound`` if the row doesn't exist. Callers that
+    legitimately query stale ids (e.g. just-cancelled snapshots) must
+    catch and translate.
+    """
+    sid = _coerce_uuid(snapshot_id)
+    row = (await session.execute(text("""
+        SELECT id,
+               reuse_of_snapshot_id,
+               reuse_chain_root_id
+          FROM snapshots
+         WHERE id = :sid
+    """), {"sid": str(sid)})).first()
+    if row is None:
+        raise SnapshotNotFound(str(sid))
+    if row.reuse_chain_root_id is None:
+        return SnapshotReuseInfo(
+            target_id=_coerce_uuid(row.id),
+            is_reuse=False,
+            chain_depth=0,
+        )
+    # The chain_depth field is informational; we only need a single
+    # extra row read to compute it for log/telemetry contexts that
+    # care, so query when asked. Most read sites won't inspect it.
+    depth = await _measure_chain_depth(session, sid)
+    return SnapshotReuseInfo(
+        target_id=_coerce_uuid(row.reuse_chain_root_id),
+        is_reuse=True,
+        chain_depth=depth,
+    )
+
+
+async def resolve_many(
+    session: AsyncSession,
+    snapshot_ids: list[UUIDLike],
+) -> dict[uuid.UUID, uuid.UUID]:
+    """Bulk variant: returns ``{snapshot_id: target_id}`` for every
+    input id. One query for the lot — used by the Recovery grid + the
+    Activity per-resource panel which already fan out across N
+    snapshots. Missing ids are silently dropped from the result; the
+    caller is expected to compare keys against its input set when that
+    distinction matters.
+    """
+    if not snapshot_ids:
+        return {}
+    ids_str = [str(_coerce_uuid(s)) for s in snapshot_ids]
+    rows = (await session.execute(text("""
+        SELECT id,
+               COALESCE(reuse_chain_root_id, id) AS target_id
+          FROM snapshots
+         WHERE id = ANY(CAST(:sids AS UUID[]))
+    """), {"sids": ids_str})).all()
+    return {
+        _coerce_uuid(r.id): _coerce_uuid(r.target_id)
+        for r in rows
+    }
+
+
+async def _measure_chain_depth(
+    session: AsyncSession,
+    snapshot_id: uuid.UUID,
+) -> int:
+    """Recursive CTE over the reuse chain. Bounded by
+    ``SNAPSHOT_REUSE_MAX_CHAIN_DEPTH`` (set by the settle path so a
+    runaway chain can never form); we still cap at 1024 here so a
+    misconfigured deployment can't hang a read.
+    """
+    row = (await session.execute(text("""
+        WITH RECURSIVE chain AS (
+            SELECT id, reuse_of_snapshot_id, 0 AS depth
+              FROM snapshots
+             WHERE id = :sid
+            UNION ALL
+            SELECT s.id, s.reuse_of_snapshot_id, c.depth + 1
+              FROM snapshots s
+              JOIN chain c ON s.id = c.reuse_of_snapshot_id
+             WHERE c.depth < 1024
+        )
+        SELECT MAX(depth) AS depth FROM chain
+    """), {"sid": str(snapshot_id)})).first()
+    return int(row.depth or 0) if row else 0
+
+
+def _coerce_uuid(value: UUIDLike) -> uuid.UUID:
+    if isinstance(value, uuid.UUID):
+        return value
+    return uuid.UUID(str(value))
+
+
+__all__ = [
+    "SnapshotReuseInfo",
+    "SnapshotNotFound",
+    "resolve_snapshot_items_target",
+    "resolve_many",
+]

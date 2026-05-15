@@ -520,6 +520,30 @@ class Snapshot(Base):
     # Storage backend that holds this snapshot's blobs (2026-04-21).
     # NOT NULL enforced after backfill migration.
     backend_id = Column(UUID(as_uuid=True), ForeignKey("storage_backends.id"), nullable=False)
+    # Snapshot-reuse chain (2026-05-15 design — see
+    # docs/superpowers/specs/2026-05-15-snapshot-reuse-pointer-design.md).
+    # A "reuse" snapshot owns ZERO snapshot_items rows; reads resolve
+    # via reuse_chain_root_id to the row-bearing ancestor. NULL on
+    # pre-deploy snapshots and on every full (non-reuse) snapshot —
+    # behaviour is unchanged for those rows. Validation trigger
+    # (shared/database.py:snapshots_reuse_validate) enforces same-
+    # tenant/same-resource/COMPLETED/earlier-started_at on the
+    # parent so a chain can never cross isolation boundaries.
+    reuse_of_snapshot_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("snapshots.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    # Denormalised: terminal ancestor in the chain. Lets the read-path
+    # resolver be one indexed lookup instead of a recursive walk. Equal
+    # to reuse_of_snapshot_id when the parent is a full snapshot;
+    # inherits the parent's reuse_chain_root_id otherwise. Always NULL
+    # together with reuse_of_snapshot_id.
+    reuse_chain_root_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("snapshots.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     created_at = Column(DateTime, default=utcnow)
 
     __table_args__ = (

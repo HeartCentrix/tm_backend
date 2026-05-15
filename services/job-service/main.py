@@ -724,6 +724,60 @@ async def _revert_snapshot_storage(db: AsyncSession, snapshot) -> dict:
     tenant_short = tenant_id_str.replace("-", "")[:8]
     container = f"backup-{resource_type}-{tenant_short}"
 
+    # Reuse-chain awareness (2026-05-15 design). If THIS snapshot is a
+    # reuse row (owns zero snapshot_items, points at an ancestor), the
+    # cancel is a row-only delete — no blobs were written, no items to
+    # revert. We must still re-point any *descendant* whose chain root
+    # was this row at the same ancestor we used, so the chain stays
+    # connected. Pre-deploy snapshots have NULL reuse_* columns and
+    # take the existing full-revert path.
+    reuse_row = (await db.execute(
+        text(
+            "SELECT reuse_of_snapshot_id, reuse_chain_root_id "
+            "FROM snapshots WHERE id = :sid"
+        ),
+        {"sid": snapshot.id},
+    )).first()
+    is_reuse = bool(reuse_row and reuse_row.reuse_of_snapshot_id is not None)
+    if is_reuse:
+        # Descendants get re-anchored to OUR chain root (which is
+        # itself a non-doomed full snapshot of the same resource — the
+        # validation trigger guarantees that). reuse_of_snapshot_id
+        # for descendants that pointed straight at us moves up by
+        # one step to our parent.
+        await db.execute(text("""
+            UPDATE snapshots
+               SET reuse_of_snapshot_id = CASE
+                       WHEN reuse_of_snapshot_id = CAST(:sid AS UUID)
+                       THEN CAST(:parent AS UUID)
+                       ELSE reuse_of_snapshot_id
+                   END,
+                   reuse_chain_root_id = CAST(:root AS UUID)
+             WHERE reuse_chain_root_id = CAST(:root AS UUID)
+               AND reuse_of_snapshot_id IS NOT NULL
+               AND id != CAST(:sid AS UUID)
+        """), {
+            "sid": str(snapshot.id),
+            "parent": str(reuse_row.reuse_of_snapshot_id),
+            "root":   str(reuse_row.reuse_chain_root_id),
+        })
+        await db.execute(
+            text("DELETE FROM snapshots WHERE id = :sid"),
+            {"sid": snapshot.id},
+        )
+        _log.info(
+            "cancel-revert: reuse-snapshot row-only delete sid=%s "
+            "(no blob revert, no items_reverted)",
+            snapshot.id,
+        )
+        return {
+            "items_reverted": 0,
+            "bytes_reverted": 0,
+            "blobs_deleted": 0,
+            "blob_errors":   0,
+            "reuse_snapshot": True,
+        }
+
     items = (await db.execute(
         text(
             "SELECT id, blob_path, backend_id, COALESCE(content_size,0) "
@@ -749,6 +803,15 @@ async def _revert_snapshot_storage(db: AsyncSession, snapshot) -> dict:
                 "cancel-revert: delete failed backend=%s path=%s: %s",
                 backend_id, blob_path, exc,
             )
+
+    # Reuse-chain safety: if this full snapshot is the chain root for
+    # live descendants, rehydrate the heir BEFORE wiping items so no
+    # descendant resolves to a dead pointer. Same helper retention
+    # uses — single source of truth for the rehydration sequence.
+    from shared.retention_cleanup import _rehydrate_reuse_heir
+    await _rehydrate_reuse_heir(
+        db, snapshot.id, doomed_ids={snapshot.id},
+    )
 
     # Wipe snapshot_items first (FK: snapshot_items.snapshot_id → snapshots)
     await db.execute(

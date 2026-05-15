@@ -1158,6 +1158,16 @@ async def init_db() -> None:
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_error TEXT;",
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS dr_replication_attempts INTEGER DEFAULT 0;",
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS extra_data JSON DEFAULT '{}';",
+        # Snapshot-reuse chain (2026-05-15 design). Two nullable
+        # self-references on snapshots.id with ON DELETE RESTRICT so
+        # the retention path is forced through the rehydration
+        # sequence (shared/retention_cleanup.py::_rehydrate_reuse_heir)
+        # — direct DELETE of a snapshot that still has descendants
+        # errors out at the DB level, which is the safety net we want.
+        # Both columns are NULL together (full snapshot) or NOT NULL
+        # together (reuse snapshot); validation trigger below enforces.
+        "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS reuse_of_snapshot_id UUID REFERENCES snapshots(id) ON DELETE RESTRICT;",
+        "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS reuse_chain_root_id UUID REFERENCES snapshots(id) ON DELETE RESTRICT;",
         "ALTER TABLE resource_discovery_staging ADD COLUMN IF NOT EXISTS azure_subscription_id VARCHAR;",
         "ALTER TABLE resource_discovery_staging ADD COLUMN IF NOT EXISTS azure_resource_group VARCHAR;",
         "ALTER TABLE resource_discovery_staging ADD COLUMN IF NOT EXISTS azure_region VARCHAR;",
@@ -1290,6 +1300,76 @@ async def init_db() -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS ix_snapshots_job_resource_inprogress "
         "ON snapshots (job_id, resource_id) "
         "WHERE status = 'IN_PROGRESS'::snapshotstatus",
+        # Snapshot-reuse chain indexes. Both partial so they cost nothing
+        # for the (overwhelming) NULL majority of rows. Built only after
+        # alter_statements so the columns exist.
+        "CREATE INDEX IF NOT EXISTS ix_snapshots_reuse_of_id "
+        "ON snapshots (reuse_of_snapshot_id) "
+        "WHERE reuse_of_snapshot_id IS NOT NULL;",
+        "CREATE INDEX IF NOT EXISTS ix_snapshots_reuse_chain_root "
+        "ON snapshots (reuse_chain_root_id) "
+        "WHERE reuse_chain_root_id IS NOT NULL;",
+        # Validation trigger: enforce that any reuse_of_snapshot_id
+        # points at a COMPLETED snapshot of the SAME resource taken
+        # strictly earlier. PG can't express this in a CHECK
+        # constraint (no cross-row predicates). Trigger runs on every
+        # INSERT/UPDATE that touches the column; NULL is a fast
+        # bypass. The reuse_chain_root_id must also be either NULL
+        # (when reuse_of_snapshot_id is NULL) or point at a full
+        # snapshot of the same resource.
+        """CREATE OR REPLACE FUNCTION validate_snapshot_reuse_target()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.reuse_of_snapshot_id IS NULL
+               AND NEW.reuse_chain_root_id IS NULL THEN
+                RETURN NEW;
+            END IF;
+            IF NEW.reuse_of_snapshot_id IS NULL
+               OR  NEW.reuse_chain_root_id IS NULL THEN
+                RAISE EXCEPTION
+                    'snapshot % reuse columns must both be NULL or both NOT NULL',
+                    NEW.id;
+            END IF;
+            -- Parent must be a COMPLETED snapshot of the same resource
+            -- taken strictly earlier than this one.
+            PERFORM 1
+               FROM snapshots p
+              WHERE p.id = NEW.reuse_of_snapshot_id
+                AND p.resource_id = NEW.resource_id
+                AND p.status = 'COMPLETED'::snapshotstatus
+                AND COALESCE(p.started_at, p.created_at)
+                  < COALESCE(NEW.started_at, NEW.created_at);
+            IF NOT FOUND THEN
+                RAISE EXCEPTION
+                    'reuse_of_snapshot_id % invalid for snapshot % '
+                    '(must be COMPLETED, same resource, earlier started_at)',
+                    NEW.reuse_of_snapshot_id, NEW.id;
+            END IF;
+            -- Chain root must point at a full snapshot of the same
+            -- resource (reuse_of_snapshot_id IS NULL on that row).
+            -- When the parent itself is a full snapshot the chain
+            -- root equals the parent; otherwise it inherits.
+            PERFORM 1
+               FROM snapshots r
+              WHERE r.id = NEW.reuse_chain_root_id
+                AND r.resource_id = NEW.resource_id
+                AND r.reuse_of_snapshot_id IS NULL;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION
+                    'reuse_chain_root_id % invalid for snapshot % '
+                    '(must be a full snapshot of the same resource)',
+                    NEW.reuse_chain_root_id, NEW.id;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;""",
+        # Trigger is dropped+recreated so re-runs pick up function
+        # changes without leaving a stale binding.
+        "DROP TRIGGER IF EXISTS snapshots_reuse_validate ON snapshots;",
+        "CREATE TRIGGER snapshots_reuse_validate "
+        "BEFORE INSERT OR UPDATE OF reuse_of_snapshot_id, reuse_chain_root_id "
+        "ON snapshots FOR EACH ROW "
+        "EXECUTE FUNCTION validate_snapshot_reuse_target();",
     ]
 
     alter_statements = [

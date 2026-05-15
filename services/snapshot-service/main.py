@@ -15,6 +15,7 @@ from sqlalchemy.orm import aliased
 
 from shared.database import get_db, init_db, close_db, AsyncSession
 from shared.models import Snapshot, SnapshotItem, Resource, SnapshotType, SnapshotStatus, ResourceType, Job
+from shared.snapshot_reuse import resolve_snapshot_items_target, SnapshotNotFound
 from shared.config import settings
 from shared.power_bi_snapshot import assemble_power_bi_items
 from shared.azure_storage import azure_storage_manager, workload_candidates_for_resource_type
@@ -703,15 +704,24 @@ async def list_snapshot_items(
             number=page,
         )
 
-    filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
+    # Resolve through the reuse chain so a reuse snapshot returns
+    # the chain root's items. Pre-deploy snapshots and full
+    # (non-reuse) snapshots have NULL reuse_chain_root_id and the
+    # resolver returns the input id unchanged.
+    try:
+        _resolved = await resolve_snapshot_items_target(db, snapshot_id)
+        _target = _resolved.target_id
+    except SnapshotNotFound:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    filters = [SnapshotItem.snapshot_id == _target]
     if itemType:
         filters.append(SnapshotItem.item_type == itemType)
-    
+
     total = (await db.execute(select(func.count(SnapshotItem.id)).where(*filters))).scalar() or 0
     stmt = select(SnapshotItem).where(*filters).offset((page-1)*size).limit(size)
     result = await db.execute(stmt)
     items = result.scalars().all()
-    
+
     return SnapshotItemListResponse(
         content=[_item_to_response(item) for item in items],
         totalPages=max(1, (total + size - 1) // size),
@@ -747,7 +757,16 @@ async def browse_snapshot_items(
             number=page,
         )
 
-    filters = [SnapshotItem.snapshot_id == UUID(snapshot_id)]
+    # Resolve through the reuse chain (see sibling list_snapshot_items
+    # comment). 404 a missing snapshot rather than returning an
+    # empty list — an empty result for a missing id would be silently
+    # confusing in the Recovery UI.
+    try:
+        _resolved = await resolve_snapshot_items_target(db, snapshot_id)
+        _target = _resolved.target_id
+    except SnapshotNotFound:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    filters = [SnapshotItem.snapshot_id == _target]
     if itemType:
         filters.append(SnapshotItem.item_type == itemType)
 
