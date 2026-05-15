@@ -125,6 +125,22 @@ def test_sharepoint_per_site_map_recognised():
     assert has_cursor({"drive_delta_tokens_by_site": {"site-1": "tok"}}) is True
 
 
+def test_calendar_delta_tokens_recognised():
+    """USER_CALENDAR default-calendar delta tokens."""
+    assert has_cursor({"calendar_delta_tokens": {"default-cal-id": "deltaLink"}}) is True
+
+
+def test_calendar_subcalendar_fetched_at_recognised():
+    """USER_CALENDAR sub-calendar throttle stamps. A resource with
+    fetched_at stamps is on the throttled incremental path even if
+    the default calendar hasn't produced its first delta yet."""
+    assert has_cursor({
+        "calendar_subcalendar_fetched_at": {
+            "us-holidays-cal-id": "2026-05-15T12:00:00+00:00",
+        }
+    }) is True
+
+
 def test_unknown_key_returns_false():
     """A new incremental path that forgot to add its cursor key here
     is the regression we want to catch. Test pins the closed set."""
@@ -154,5 +170,7 @@ def test_all_recognised_keys_are_in_constant():
         "chat_skip_baseline_at",
         "onedrive_delta_link",
         "drive_delta_tokens_by_site",
+        "calendar_delta_tokens",
+        "calendar_subcalendar_fetched_at",
     }
     assert expected.issubset(set(KEYS))

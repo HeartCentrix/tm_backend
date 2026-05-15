@@ -1068,6 +1068,8 @@ INCREMENTAL_CURSOR_KEYS: tuple = (
     "chat_skip_baseline_at",         # USER_CHATS skip baseline
     "onedrive_delta_link",           # USER_ONEDRIVE / ONEDRIVE
     "drive_delta_tokens_by_site",    # SHAREPOINT_SITE per-site map
+    "calendar_delta_tokens",         # USER_CALENDAR default-calendar map
+    "calendar_subcalendar_fetched_at",  # USER_CALENDAR sub-calendar throttle
 )
 
 
@@ -1082,6 +1084,42 @@ def _resource_has_incremental_cursor(extra_data: dict) -> bool:
     if not extra_data:
         return False
     return any(extra_data.get(k) for k in INCREMENTAL_CURSOR_KEYS)
+
+
+def _should_skip_subcalendar(
+    *,
+    last_fetched_iso,
+    now_dt,
+    refresh_hours: float,
+) -> bool:
+    """Decide whether a non-default calendar's fetch should be skipped.
+
+    Microsoft Graph exposes /calendarView/delta only on the user's
+    default calendar; secondary calendars (Birthdays, US Holidays,
+    shared, group) have no delta — pre-fix code re-pulled the same
+    events every backup. 2026-05-15 case: Amit's "Calendar/United
+    States holidays" wrote 74 identical events (195 KiB) on every run.
+    Throttle: skip when the previous fetch was within `refresh_hours`.
+
+    `last_fetched_iso` may be None (never fetched) or an ISO timestamp.
+    Bad/unparseable values return False so the calendar is fetched
+    fresh — never silently swallow a corruption.
+
+    `now_dt` MUST be timezone-aware; `last_fetched_iso` is normalised
+    to UTC if naive.
+    """
+    if not last_fetched_iso:
+        return False
+    try:
+        last_fetched_dt = datetime.fromisoformat(
+            str(last_fetched_iso).replace("Z", "+00:00")
+        )
+        if last_fetched_dt.tzinfo is None:
+            last_fetched_dt = last_fetched_dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return False
+    elapsed_h = (now_dt - last_fetched_dt).total_seconds() / 3600.0
+    return elapsed_h < refresh_hours
 from shared.message_bus import (
     message_bus,
     create_onedrive_partition_message,
@@ -3822,6 +3860,24 @@ class BackupWorker:
                     cal_delta_map: Dict[str, str] = dict((resource.extra_data or {}).get("calendar_delta_tokens") or {})
                     new_delta_map: Dict[str, str] = {}
 
+                    # Sub-calendar throttle map (per calendar id → last
+                    # fetched_at ISO). Secondary calendars (Birthdays,
+                    # US Holidays, shared, group) have no delta endpoint
+                    # so each backup run was re-pulling identical events
+                    # — Amit's "Calendar/United States holidays" was
+                    # writing the same 74 events / 195 KiB every run.
+                    # Throttle: skip a sub-calendar's fetch if its last
+                    # successful fetch was within CALENDAR_SUBCALENDAR_REFRESH_HOURS
+                    # (default 24h, configurable via env). Default
+                    # calendar is unaffected — its delta is cheap.
+                    sub_fetched_map: Dict[str, str] = dict(
+                        (resource.extra_data or {}).get("calendar_subcalendar_fetched_at") or {}
+                    )
+                    new_sub_fetched_map: Dict[str, str] = {}
+                    SUB_REFRESH_HOURS = float(os.environ.get(
+                        "CALENDAR_SUBCALENDAR_REFRESH_HOURS", "24",
+                    ))
+
                     # 1) Enumerate calendars owned by the user.
                     try:
                         cal_page = await graph_client._get(
@@ -3869,6 +3925,27 @@ class BackupWorker:
                             )
                             stream_params = None
                         else:
+                            # Sub-calendar throttle: skip the fetch if the
+                            # previous fetched_at is within the refresh
+                            # window. Items from the prior snapshot remain
+                            # in the vault and are recoverable.
+                            last_fetched_iso = sub_fetched_map.get(cal_id)
+                            if _should_skip_subcalendar(
+                                last_fetched_iso=last_fetched_iso,
+                                now_dt=now_utc,
+                                refresh_hours=SUB_REFRESH_HOURS,
+                            ):
+                                print(
+                                    f"[{self.worker_id}]   [USER_CALENDAR] "
+                                    f"skipping sub-calendar {cal_name} "
+                                    f"({user_id}) — last fetched at "
+                                    f"{last_fetched_iso} "
+                                    f"(refresh window {SUB_REFRESH_HOURS:.0f}h)"
+                                )
+                                # Preserve the existing fetched_at so the
+                                # next persist-merge doesn't drop it.
+                                new_sub_fetched_map[cal_id] = last_fetched_iso
+                                continue
                             stream_url = (
                                 f"{graph_client.GRAPH_URL}/users/{user_id}"
                                 f"/calendars/{cal_id}/calendarView"
@@ -3910,18 +3987,36 @@ class BackupWorker:
                         if cap:
                             new_delta_map[cal_id] = cap
 
-                    # Persist the per-calendar delta tokens for next run. We
-                    # merge with existing map so a failed calendar doesn't
-                    # wipe tokens we still hold for others.
-                    if new_delta_map:
+                        # Stamp this sub-calendar's fetched_at so the
+                        # throttle on the next run knows to skip it.
+                        # Default calendar uses delta — no need to
+                        # stamp; its absence keeps the existing
+                        # "always run on default" behaviour intact.
+                        if not is_default:
+                            new_sub_fetched_map[cal_id] = now_utc.replace(
+                                tzinfo=timezone.utc,
+                            ).isoformat()
+
+                    # Persist the per-calendar delta tokens AND
+                    # sub-calendar fetched_at stamps for next run. We
+                    # merge each map with existing data so a failed
+                    # calendar doesn't wipe tokens we still hold for
+                    # others, and a skipped sub-calendar (throttled)
+                    # keeps its prior fetched_at intact.
+                    if new_delta_map or new_sub_fetched_map:
                         try:
                             async with async_session_factory() as _s:
                                 r = await _s.get(Resource, resource.id)
                                 if r is not None:
                                     ed = dict(r.extra_data or {})
-                                    merged = dict(ed.get("calendar_delta_tokens") or {})
-                                    merged.update(new_delta_map)
-                                    ed["calendar_delta_tokens"] = merged
+                                    if new_delta_map:
+                                        merged_deltas = dict(ed.get("calendar_delta_tokens") or {})
+                                        merged_deltas.update(new_delta_map)
+                                        ed["calendar_delta_tokens"] = merged_deltas
+                                    if new_sub_fetched_map:
+                                        merged_sub = dict(ed.get("calendar_subcalendar_fetched_at") or {})
+                                        merged_sub.update(new_sub_fetched_map)
+                                        ed["calendar_subcalendar_fetched_at"] = merged_sub
                                     r.extra_data = ed
                                     await _s.commit()
                         except Exception as _e:

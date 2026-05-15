@@ -1776,24 +1776,42 @@ async def get_batch_children(batch_id: str):
         #   - resources directly listed in the batch (Tier-1)
         #   - their Tier-2 children
         all_rid_strs = [str(rid) for rid, *_ in rs]
-        # Use bytes_total (cumulative storage for the resource) not
-        # bytes_added (delta). An incremental that adds 0 bytes leaves
-        # bytes_added=0 even though the resource has multi-GB of data.
-        # Same for item_count — fall back to new_item_count when 0
-        # (different workloads populate these differently). The user-
-        # facing semantics is "how much of this user's <type> data is
-        # in TMvault now", which maps to bytes_total.
+        # Per-batch scope: return ONLY snapshots tied to this batch's
+        # jobs (via spec.batch_id or, for legacy single-Job rows, the
+        # job_id itself). The pre-fix query returned the LATEST snapshot
+        # per resource regardless of which batch was clicked — so
+        # backups 1, 2 and 3 all showed Batch 3's numbers, which
+        # misled operators into thinking work happened that didn't
+        # (and vice versa). 2026-05-15 incident: user saw the same
+        # 1109/43.7 MiB for Amit's mail across three consecutive
+        # batches even though batch 2 added 0 bytes.
+        #
+        # Fields returned:
+        #   - itemCount  = items added IN THIS batch
+        #                  (new_item_count when set; falls back to
+        #                  item_count for full snapshots)
+        #   - bytesAdded = bytes added IN THIS batch (bytes_added,
+        #                  the real delta — not the cumulative
+        #                  bytes_total)
+        #   - bytesTotal = cumulative bytes for this resource in vault
+        #                  (handy for "how much have we backed up so
+        #                  far for this user" context — UI surfaces
+        #                  alongside bytesAdded)
         snaps_q = await db.execute(text("""
-            SELECT DISTINCT ON (resource_id)
-                   id,
-                   resource_id,
-                   status::text                          AS status,
-                   GREATEST(item_count, new_item_count)  AS item_count,
-                   GREATEST(bytes_total, bytes_added)    AS bytes_added
-            FROM snapshots
-            WHERE resource_id = ANY(CAST(:rids AS UUID[]))
-            ORDER BY resource_id, created_at DESC
-        """), {"rids": all_rid_strs})
+            SELECT DISTINCT ON (s.resource_id)
+                   s.id,
+                   s.resource_id,
+                   s.status::text                                AS status,
+                   COALESCE(NULLIF(s.new_item_count, 0),
+                            s.item_count)                        AS item_count,
+                   s.bytes_added                                 AS bytes_added,
+                   s.bytes_total                                 AS bytes_total
+              FROM snapshots s
+              JOIN jobs j ON j.id = s.job_id
+             WHERE s.resource_id = ANY(CAST(:rids AS UUID[]))
+               AND COALESCE(j.spec::jsonb->>'batch_id', j.id::text) = :bid
+          ORDER BY s.resource_id, s.created_at DESC
+        """), {"rids": all_rid_strs, "bid": batch_id})
         snap_by_rid: Dict[Any, Dict[str, Any]] = {}
         for sr in snaps_q.all():
             snap_by_rid[sr.resource_id] = {
@@ -1801,6 +1819,7 @@ async def get_batch_children(batch_id: str):
                 "status":     sr.status,
                 "itemCount":  int(sr.item_count or 0),
                 "bytesAdded": int(sr.bytes_added or 0),
+                "bytesTotal": int(sr.bytes_total or 0),
             }
 
         snap_ids = [v["snapshotId"] for v in snap_by_rid.values()]
