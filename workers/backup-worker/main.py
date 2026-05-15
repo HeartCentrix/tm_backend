@@ -1048,6 +1048,40 @@ from shared.models import (
     Resource, Tenant, Job, Snapshot, SnapshotItem, SnapshotPartition,
     SlaPolicy, ResourceType, ResourceStatus, JobStatus, SnapshotType, SnapshotStatus
 )
+
+
+# Cursor keys the anomaly detector recognises as "this resource is on
+# an incremental backup path, so a 0-item snapshot is a quiet delta —
+# not a mass deletion". Keep this list in sync with the per-resource-
+# type writers (mail/chats/onedrive/sharepoint) — adding a new
+# incremental path without adding its cursor key here will resurrect
+# the 2026-05-15 Hemant Singh false-positive class of bug.
+#
+# Pinned by tests/workers/test_anomaly_cursor_guard.py.
+INCREMENTAL_CURSOR_KEYS: tuple = (
+    "mail_delta_token",              # legacy MAILBOX/SHARED/ROOM
+    "mail_delta_tokens_by_folder",   # USER_MAIL per-folder map (current)
+    "mail_folder_fingerprints",      # USER_MAIL legacy fingerprint cache
+    "mail_folder_baseline_at",       # USER_MAIL baseline timestamp
+    "delta_token",                   # generic incremental cursor
+    "chat_delta_tokens",             # USER_CHATS per-chat map
+    "chat_skip_baseline_at",         # USER_CHATS skip baseline
+    "onedrive_delta_link",           # USER_ONEDRIVE / ONEDRIVE
+    "drive_delta_tokens_by_site",    # SHAREPOINT_SITE per-site map
+)
+
+
+def _resource_has_incremental_cursor(extra_data: dict) -> bool:
+    """Return True iff `extra_data` carries any incremental-backup cursor.
+
+    Pure function — used by the anomaly detector to skip the
+    "item_count dropped" alert on legitimate quiet deltas. See
+    INCREMENTAL_CURSOR_KEYS for the recognised keys and why each
+    matters.
+    """
+    if not extra_data:
+        return False
+    return any(extra_data.get(k) for k in INCREMENTAL_CURSOR_KEYS)
 from shared.message_bus import (
     message_bus,
     create_onedrive_partition_message,
@@ -1377,7 +1411,18 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
 
 
 class AuditLogger:
-    """Logs backup events via HTTP POST and RabbitMQ"""
+    """Logs backup events via HTTP POST to audit-service.
+
+    Single path — HTTP only. The previous implementation also published
+    to the `audit.events` RabbitMQ queue, and audit-service's
+    consume_audit_events() consumer wrote the same payload into
+    audit_events a second time. That caused exact duplicate rows for
+    every BACKUP / RANSOMWARE_SIGNAL log (4 RANSOMWARE_SIGNAL rows for
+    2 alerts in the 2026-05-15 Hemant Singh false-positive case).
+    Other workers (discovery-worker, chat-export-worker,
+    azure-workload-worker, restore-worker, shared/audit.py) all use
+    HTTP only — this aligns backup-worker with that convention.
+    """
 
     def __init__(self):
         self.audit_url = f"{settings.AUDIT_SERVICE_URL}/api/v1/audit/log"
@@ -1388,27 +1433,6 @@ class AuditLogger:
                 await client.post(self.audit_url, json=kwargs)
         except Exception as e:
             print(f"[AuditLogger] HTTP failed: {e}")
-
-        try:
-            from shared.message_bus import create_audit_event_message
-            message = create_audit_event_message(
-                action=kwargs.get("action", "UNKNOWN"),
-                tenant_id=kwargs.get("tenant_id", ""),
-                org_id=kwargs.get("org_id"),
-                actor_type=kwargs.get("actor_type", "SYSTEM"),
-                actor_id=kwargs.get("actor_id"),
-                actor_email=kwargs.get("actor_email"),
-                resource_id=kwargs.get("resource_id"),
-                resource_type=kwargs.get("resource_type"),
-                resource_name=kwargs.get("resource_name"),
-                outcome=kwargs.get("outcome", "SUCCESS"),
-                job_id=kwargs.get("job_id"),
-                snapshot_id=kwargs.get("snapshot_id"),
-                details=kwargs.get("details", {}),
-            )
-            await message_bus.publish("audit.events", message, priority=5)
-        except Exception as e:
-            print(f"[AuditLogger] Queue failed: {e}")
 
 
 class BackupWorker:
@@ -16963,18 +16987,44 @@ class BackupWorker:
             # guard the detector flags every quiet day as ransomware because
             # `avg_prior` reflects earlier full-pull snapshots whose item
             # counts are 1-4 orders of magnitude above a real delta.
+            #
+            # Cursor keys cover both legacy single-token storage AND the
+            # current per-folder maps:
+            #   - mail_delta_token            (legacy MAILBOX/SHARED/ROOM)
+            #   - mail_delta_tokens_by_folder (USER_MAIL per-folder, current)
+            #   - mail_folder_fingerprints    (USER_MAIL fingerprint cache,
+            #                                  pre-mail_folder_fingerprint table)
+            #   - mail_folder_baseline_at     (USER_MAIL baseline timestamp)
+            #   - delta_token                 (generic incremental cursor)
+            #   - chat_delta_tokens           (USER_CHATS per-chat map)
+            #   - chat_skip_baseline_at       (USER_CHATS skip baseline)
+            #   - onedrive_delta_link         (USER_ONEDRIVE / ONEDRIVE)
+            #   - drive_delta_tokens_by_site  (SHAREPOINT_SITE per-site map)
+            # Plus a row-existence probe against the new
+            # `mail_folder_fingerprint` table (introduced 2026-05-15) which
+            # replaces the in-metadata `mail_folder_fingerprints` map for
+            # USER_MAIL — old guard missed this entirely so every quiet mail
+            # delta tripped the detector (see Hemant Singh false positives
+            # in 2026-05-15 incident analysis).
             if current == 0:
                 resource_for_guard = await session.get(Resource, snapshot.resource_id)
                 extra = (resource_for_guard.extra_data or {}) if resource_for_guard else {}
-                INCREMENTAL_CURSOR_KEYS = (
-                    "mail_delta_token",
-                    "delta_token",
-                    "chat_delta_tokens",
-                    "chat_skip_baseline_at",
-                    "onedrive_delta_link",
-                )
-                if any(extra.get(k) for k in INCREMENTAL_CURSOR_KEYS):
+                if _resource_has_incremental_cursor(extra):
                     return  # incremental no-op — not an anomaly
+                # Fingerprint-table probe — USER_MAIL with rows in
+                # mail_folder_fingerprint is on the new per-folder delta
+                # path even if metadata hasn't backfilled the legacy keys
+                # above. One indexed PK-lookup, cheap.
+                try:
+                    fp_row = (await session.execute(text("""
+                        SELECT 1 FROM mail_folder_fingerprint
+                         WHERE resource_id = cast(:rid AS uuid)
+                         LIMIT 1
+                    """), {"rid": str(snapshot.resource_id)})).first()
+                    if fp_row:
+                        return
+                except Exception:
+                    pass  # table may not exist yet on pre-deploy envs
 
             avg = sum((p.item_count or 0) for p in prior) / len(prior)
             if avg < self.ANOMALY_MIN_AVG_ITEMS:

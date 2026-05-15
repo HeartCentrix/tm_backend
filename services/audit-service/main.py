@@ -108,10 +108,38 @@ def _compute_details(job: Job) -> str:
     return f"Progress: {pct}%"
 
 
+def _render_object_label(
+    *,
+    is_preemptive: bool,
+    preemptive_name: Optional[str],
+    total_resources: int,
+) -> str:
+    """Pure helper for the Activity-row 'object' field.
+
+    Rules (pinned by tests in tests/services/test_group_batch_jobs_labels.py):
+      - PREEMPTIVE + name → "Preemptive — <name>"
+      - PREEMPTIVE + no name → "Preemptive backup"
+      - 1 resource → "1 resource"   (singular)
+      - N resources → "N resources" (plural)
+      - 0 resources → "Bulk Operation"
+    """
+    if is_preemptive:
+        return (
+            f"Preemptive — {preemptive_name}"
+            if preemptive_name
+            else "Preemptive backup"
+        )
+    if total_resources:
+        suffix = "" if total_resources == 1 else "s"
+        return f"{total_resources} resource{suffix}"
+    return "Bulk Operation"
+
+
 def _group_batch_jobs(
     groups: Dict[Tuple[Any, str, str], List[Job]],
     status_reverse_map: Dict[Any, str],
     group_storage: Optional[Dict[Tuple[Any, str, str], Tuple[int, int]]] = None,
+    preemptive_names: Optional[Dict[Tuple[Any, str, str], str]] = None,
 ) -> List[Dict[str, Any]]:
     """Collapse partitioned batch Jobs into one Activity row per click.
 
@@ -130,10 +158,23 @@ def _group_batch_jobs(
     rows: List[Dict[str, Any]] = []
     if group_storage is None:
         group_storage = {}
+    if preemptive_names is None:
+        preemptive_names = {}
     for group_key, children in groups.items():
         if not children:
             continue
         _tenant, _trigger, _created = group_key
+        # PREEMPTIVE jobs are auto-fired by the anomaly detector
+        # (BACKUP_ANOMALY alert → trigger_preemptive_backup_for_resource).
+        # They target exactly one resource and the operator never
+        # initiated them — surfacing as a generic "N resources" row in
+        # the tasks tab gave operators no signal that this was an
+        # automated response. Detect by spec.triggered_by and override
+        # the object label below.
+        is_preemptive_group = any(
+            (c.spec or {}).get("triggered_by") == "PREEMPTIVE"
+            for c in children
+        )
 
         statuses = [c.status for c in children]
         any_active = any(
@@ -200,6 +241,13 @@ def _group_batch_jobs(
                 details = f"{_fmt_bytes(data_backed_up or total_data)} backed up"
             elif data_backed_up > 0:
                 details = f"{_fmt_bytes(data_backed_up)} backed up"
+            elif is_preemptive_group:
+                # Preemptive backup that finished with zero bytes is
+                # the common "anomaly detector false positive" shape —
+                # detector saw the delta-snapshot's item_count=0 and
+                # compared it to full-snapshot averages. Surface that
+                # to the operator so they don't chase a phantom event.
+                details = "No new data (anomaly response)"
             else:
                 details = "Completed"
         elif group_status == "Failed":
@@ -249,7 +297,11 @@ def _group_batch_jobs(
             "jobIds": job_ids_sorted,
             "start_time": start_iso,
             "operation": first.type.value if hasattr(first.type, "value") else str(first.type),
-            "object": f"{total_resources} resources" if total_resources else "Bulk Operation",
+            "object": _render_object_label(
+                is_preemptive=is_preemptive_group,
+                preemptive_name=preemptive_names.get(group_key),
+                total_resources=total_resources,
+            ),
             "status": group_status,
             "finish_time": finish_iso,
             "details": details,
@@ -1340,8 +1392,40 @@ async def list_activities(
             items.extend(shape_activity_row(r) for r in bb_rows)
 
         if legacy_groups:
+            # Pre-fetch resource display_name for PREEMPTIVE groups so the
+            # Activity row can show "Preemptive — Mail — Hemant Singh"
+            # instead of "1 resource". Preemptive jobs target exactly one
+            # resource: spec.triggered_by == "PREEMPTIVE" + a single ID
+            # in Job.batch_resource_ids. Collect the (group_key →
+            # resource_id) map first, then bulk-resolve display_name in
+            # one IN(...) query — bounded by the legacy_groups page
+            # size, no N+1.
+            preemptive_ids_by_group: Dict[Tuple[Any, str, str], Any] = {}
+            for gk, jobs_in_group in legacy_groups.items():
+                if any(
+                    (c.spec or {}).get("triggered_by") == "PREEMPTIVE"
+                    for c in jobs_in_group
+                ):
+                    for c in jobs_in_group:
+                        bri = list(c.batch_resource_ids or [])
+                        if bri:
+                            preemptive_ids_by_group[gk] = bri[0]
+                            break
+            preemptive_names: Dict[Tuple[Any, str, str], str] = {}
+            if preemptive_ids_by_group:
+                wanted_ids = list({rid for rid in preemptive_ids_by_group.values()})
+                name_rows = (await db.execute(
+                    select(Resource.id, Resource.display_name).where(
+                        Resource.id.in_(wanted_ids),
+                    )
+                )).all()
+                name_map = {rid: dn or str(rid) for (rid, dn) in name_rows}
+                for gk, rid in preemptive_ids_by_group.items():
+                    if rid in name_map:
+                        preemptive_names[gk] = name_map[rid]
             items.extend(_group_batch_jobs(
                 legacy_groups, status_reverse_map, group_storage,
+                preemptive_names=preemptive_names,
             ))
         # Per-group collapse reduces the post-pagination total.
         job_total -= max(0, len(batch_jobs) - len(groups))
