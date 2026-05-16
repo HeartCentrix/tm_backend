@@ -149,7 +149,14 @@ class ThreadPackager:
                     )
                 inline_count += 1
 
-        _add("styles.css", _STYLES.read_bytes())
+        # styles.css is only used by HTML exports — the rendered HTML
+        # references it via <link rel="stylesheet">. PDF embeds the CSS
+        # at render time inside the PDF stream (see pdf_renderer.py),
+        # and JSON is a pure data file. Including styles.css in PDF/JSON
+        # zips was dead weight + confusing ("why is there a CSS file in
+        # my PDF export?"). Add it only when it will actually be used.
+        if self.format == "HTML":
+            _add("styles.css", _STYLES.read_bytes())
 
         if self.layout == "single_thread":
             if self.format == "HTML":

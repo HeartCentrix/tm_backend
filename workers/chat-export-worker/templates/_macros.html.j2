@@ -1,6 +1,11 @@
+{# Chat-export macros — emit the same DOM shape the web app's
+   <ChatPreview> renders (tm_vault/src/pages/Recovery.tsx:300-389).
+   Class names are 1:1 with Recovery.css so the styles.css that
+   ships in the zip styles them identically. #}
+
 {% macro fmt_bytes(n) -%}
 {%- if n < 1024 -%}{{ n }} B
-{%- elif n < 1048576 -%}{{ "%.1f"|format(n / 1024.0) }} KB
+{%- elif n < 1048576 -%}{{ "%.0f"|format(n / 1024.0) }} KB
 {%- elif n < 1073741824 -%}{{ "%.1f"|format(n / 1048576.0) }} MB
 {%- else -%}{{ "%.2f"|format(n / 1073741824.0) }} GB
 {%- endif -%}
@@ -37,44 +42,69 @@
 </div>
 {%- endmacro %}
 
+{# bubble(m): renders ONE message in the same shape as the web
+   ChatPreview component. The outer .chat-preview wrapper gives
+   each bubble its own padded block (the web's preview pane shows
+   one at a time; in an export we stack them). System events
+   skip the bubble shell entirely and render as a centered pill. #}
 {% macro bubble(m) -%}
 {%- if m.event -%}
   {{ event_pill(m) }}
-{%- elif m.deleted_at -%}
-  <div class="bubble"><div class="avatar" style="background:{{ m.sender_color }}">{{ m.sender_initials }}</div>
-  <div class="bubble-main"><div class="head"><span class="sender">{{ m.sender_name }}</span>
-  <span class="time">{% if m.created_at and m.created_at.year > 1 %}{{ m.created_at.strftime('%Y-%m-%d %H:%M UTC') }}{% else %}(no timestamp){% endif %}</span></div>
-  <div class="body deleted">This message was deleted</div></div></div>
 {%- else -%}
-  <div class="bubble"><div class="avatar" style="background:{{ m.sender_color }}">{{ m.sender_initials }}</div>
-    <div class="bubble-main">
-      <div class="head">
-        <span class="sender">{{ m.sender_name }}</span>
-        <span class="time">{% if m.created_at and m.created_at.year > 1 %}{{ m.created_at.strftime('%Y-%m-%d %H:%M UTC') }}{% else %}(no timestamp){% endif %}</span>
-        {%- if m.last_edited_at -%}<span class="edited">(edited)</span>{%- endif -%}
+<div class="chat-preview">
+  <div class="chat-bubble-wrap{% if m.deleted_at %} deleted{% endif %}">
+    <div class="chat-avatar">{{ m.sender_initials }}</div>
+    <div class="chat-bubble">
+      <div class="chat-bubble-header">
+        <span class="chat-sender">{{ m.sender_name }}</span>
+        {%- if m.created_at and m.created_at.year > 1 -%}
+        <span class="chat-time">{{ m.created_at.strftime('%b %-d, %Y, %-I:%M %p UTC') }}</span>
+        {%- else -%}
+        <span class="chat-time">(no timestamp)</span>
+        {%- endif -%}
+        {%- if m.is_reply -%}<span class="chat-reply-badge">Reply</span>{%- endif -%}
+        {%- if m.last_edited_at -%}<span class="chat-edited">(edited)</span>{%- endif -%}
       </div>
       {%- if m.quoted_parent -%}
-      <div class="quote">
-        <div><span class="qsender">In reply to {{ m.quoted_parent.sender_name }}</span></div>
-        <div>{{ m.quoted_parent.snippet }}</div>
+      <div class="chat-quote-stack">
+        <div class="chat-quote">
+          <div class="chat-quote-sender">{{ m.quoted_parent.sender_name or 'In reply to' }} wrote:</div>
+          <div class="chat-quote-body">{{ m.quoted_parent.snippet }}</div>
+        </div>
       </div>
       {%- endif -%}
-      <div class="body">{{ m.body_html | safe }}</div>
+      {%- if m.deleted_at -%}
+      <div class="chat-deleted">This message was deleted</div>
+      {%- else -%}
+      <div class="chat-body">{{ m.body_html | safe }}</div>
+      {%- endif -%}
       {%- if m.attachments -%}
-      <div class="attachments">
+      <div class="chat-attachments">
         {% for a in m.attachments -%}
-        <a class="chip" href="{{ a.local_path }}"><span>📎 {{ a.name }}</span><span class="size">({{ fmt_bytes(a.size) }})</span></a>
+        <a class="chat-attachment-chip" href="{{ a.local_path }}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          <span>{{ a.name or 'Attachment' }}</span>
+          {%- if a.size -%}<span class="size">· {{ fmt_bytes(a.size) }}</span>{%- endif -%}
+        </a>
+        {%- endfor %}
+      </div>
+      {%- endif -%}
+      {%- if m.mentions -%}
+      <div class="chat-mentions">
+        {% for mn in m.mentions -%}
+        <span class="chat-mention">@{{ mn.user_display_name or mn.text or 'mention' }}</span>
         {%- endfor %}
       </div>
       {%- endif -%}
       {%- if m.reactions -%}
-      <div class="reactions">
+      <div class="chat-reactions">
         {% for r in m.reactions -%}
-        <span class="r">{{ r.emoji }}</span>
+        <span class="chat-reaction-chip" title="{{ r.display_name or '' }}">{{ r.emoji }}</span>
         {%- endfor %}
       </div>
       {%- endif -%}
     </div>
   </div>
+</div>
 {%- endif -%}
 {%- endmacro %}

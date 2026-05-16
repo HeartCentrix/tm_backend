@@ -1,50 +1,239 @@
-:root { --bg:#f5f5f7; --fg:#1f2328; --muted:#6b7280; --bubble:#ffffff; --border:#e5e7eb;
-        --mention:#fde68a; --quote:#f3f4f6; --event:#eef2ff; --deleted:#fca5a5; }
+/* Chat export styles — mirror the web app's <ChatPreview> in
+   tm_vault/src/pages/Recovery.tsx / Recovery.css so the downloaded
+   HTML / PDF looks identical to what the user sees in-app. Class
+   names match 1:1 with the web component (.chat-preview,
+   .chat-bubble, .chat-avatar, .chat-quote, .chat-attachment-chip,
+   .chat-mention, …) — only differences: a thread-level header at
+   the top, an event-pill style for system messages (calls /
+   members added / renamed), and a per-message margin so multiple
+   bubbles flow in a list instead of one preview at a time. */
+
 * { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 14px; line-height: 1.5; }
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #ffffff;
+  color: #1e293b;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
 .container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
-.thread-header { padding: 16px; background: var(--bubble); border: 1px solid var(--border);
-  border-radius: 10px; margin-bottom: 16px; }
-.thread-header h1 { margin: 0 0 4px; font-size: 18px; }
-.thread-header .meta { color: var(--muted); font-size: 12px; }
 
-.bubble { display: grid; grid-template-columns: 40px 1fr; gap: 10px;
-  padding: 10px 12px; background: var(--bubble); border: 1px solid var(--border);
-  border-radius: 10px; margin: 8px 0; }
-.avatar { width: 40px; height: 40px; border-radius: 50%; display: flex;
-  align-items: center; justify-content: center; font-weight: 600; color: #fff; font-size: 13px; }
-.bubble-main .head { display: flex; align-items: baseline; gap: 8px; }
-.sender { font-weight: 600; }
-.time { color: var(--muted); font-size: 12px; }
-.edited { color: var(--muted); font-size: 11px; margin-left: 4px; }
-.body { margin-top: 4px; }
-.body p { margin: 4px 0; }
-.body img { max-width: 100%; height: auto; border-radius: 6px; }
-.mention { background: var(--mention); padding: 0 4px; border-radius: 4px; }
+.thread-header {
+  padding: 16px 20px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  margin-bottom: 20px;
+}
+.thread-header h1 {
+  margin: 0 0 4px;
+  font-size: 18px;
+  font-weight: 600;
+  color: #0f172a;
+}
+.thread-header .meta {
+  color: #64748b;
+  font-size: 12px;
+}
 
-.quote { border-left: 3px solid var(--border); padding: 6px 10px; background: var(--quote);
-  border-radius: 6px; margin-bottom: 6px; font-size: 12px; color: var(--muted); }
-.quote .qsender { font-weight: 600; color: var(--fg); }
+/* === Chat preview — mirrors web ChatPreview (.chat-preview) ===== */
+.chat-preview {
+  padding: 12px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
 
-.attachments { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
-.chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px;
-  background: #eef2ff; color: #1e3a8a; border-radius: 999px; font-size: 12px;
-  text-decoration: none; }
-.chip .size { color: var(--muted); }
+.chat-context-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
 
-.reactions { margin-top: 4px; font-size: 12px; color: var(--muted); }
-.reactions .r { margin-right: 8px; }
+.chat-bubble-wrap {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.chat-bubble-wrap.deleted { opacity: 0.5; }
 
-.deleted { font-style: italic; color: var(--muted); opacity: 0.6; }
+.chat-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: #6366f1;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
 
-.event-pill { text-align: center; padding: 6px 12px; margin: 8px auto;
-  background: var(--event); color: #4338ca; border-radius: 999px; font-size: 12px;
-  max-width: 75%; }
+.chat-bubble {
+  flex: 1;
+  background: #f1f5f9;
+  border-radius: 0 12px 12px 12px;
+  padding: 12px 16px;
+  min-width: 0;
+}
+
+.chat-bubble-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.chat-sender {
+  font-size: 13px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.chat-time {
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.chat-reply-badge {
+  font-size: 10px;
+  background: #e0f2fe;
+  color: #0369a1;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-weight: 500;
+}
+
+.chat-edited {
+  font-size: 10px;
+  color: #94a3b8;
+  font-style: italic;
+}
+
+.chat-body {
+  font-size: 14px;
+  line-height: 1.5;
+  color: #1e293b;
+  word-break: break-word;
+}
+.chat-body p { margin: 0 0 4px; }
+.chat-body img { max-width: 100%; height: auto; border-radius: 6px; }
+.chat-body a { color: #4f46e5; }
+
+.chat-quote-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.chat-quote {
+  border-left: 3px solid #D31245;
+  background: #f1f5f9;
+  padding: 6px 10px;
+  border-radius: 0 6px 6px 0;
+  font-size: 13px;
+  color: #334155;
+}
+.chat-quote-sender {
+  font-weight: 600;
+  color: #b00f39;
+  margin-bottom: 2px;
+  font-size: 12px;
+}
+.chat-quote-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-deleted {
+  font-size: 13px;
+  color: #94a3b8;
+  font-style: italic;
+}
+
+.chat-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.chat-attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: #475569;
+  text-decoration: none;
+}
+.chat-attachment-chip .size { color: #94a3b8; margin-left: 4px; }
+
+.chat-mentions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+}
+.chat-mention {
+  font-size: 12px;
+  color: #6366f1;
+  background: #eef2ff;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-weight: 500;
+}
+
+.chat-reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.chat-reaction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 1px 7px;
+  font-size: 12px;
+  color: #475569;
+}
+
+/* === System events (call started / members added / renamed) ===
+   These rows don't appear inside <ChatPreview> in the web app
+   (they render as compact .chat-item-system rows in the list);
+   we surface them inline here as centered pills so the export
+   reads as a continuous transcript. */
+.event-pill {
+  text-align: center;
+  padding: 6px 12px;
+  margin: 12px auto;
+  background: #eef2ff;
+  color: #4338ca;
+  border-radius: 999px;
+  font-size: 12px;
+  max-width: 75%;
+}
 
 @media print {
+  body { background: #fff; }
   .container { max-width: 100%; padding: 0; }
-  .bubble { break-inside: avoid; }
+  .chat-preview { break-inside: avoid; }
   a { color: inherit; text-decoration: none; }
   @page { size: A4; margin: 15mm; }
   .thread-header h1 { font-size: 14pt; }
