@@ -975,6 +975,35 @@ async def init_db() -> None:
             PRIMARY KEY (job_id, resource_id)
         )
         """,
+        # Distributed reconciliation (2026-05-16 design).
+        # worker_heartbeats — liveness signal. Workers UPSERT every 10s;
+        # sweeper considers a worker dead after 60s of silence. Used to
+        # decide whether a held lease is "alive" or orphan.
+        """
+        CREATE TABLE IF NOT EXISTS worker_heartbeats (
+            worker_id    UUID PRIMARY KEY,
+            replica_id   TEXT NOT NULL,
+            service_name TEXT NOT NULL,
+            pid          INTEGER,
+            queues       TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+            last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            version      TEXT
+        )
+        """,
+        # work_dead_letter — append-only audit trail for poison-pill
+        # messages (>3 requeues) and route-loop violations. Operator
+        # alert source; not consumed by any worker.
+        """
+        CREATE TABLE IF NOT EXISTS work_dead_letter (
+            id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            work_kind    TEXT NOT NULL,
+            work_id      UUID NOT NULL,
+            reason       TEXT NOT NULL,
+            last_payload JSON,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
     ]
 
     index_statements = [
@@ -1168,6 +1197,28 @@ async def init_db() -> None:
         # together (reuse snapshot); validation trigger below enforces.
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS reuse_of_snapshot_id UUID REFERENCES snapshots(id) ON DELETE RESTRICT;",
         "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS reuse_chain_root_id UUID REFERENCES snapshots(id) ON DELETE RESTRICT;",
+        # Distributed reconciliation lease columns (2026-05-16 design).
+        # Three columns per work table: who holds the lease, when it
+        # expires, and a monotonic fence token. The fence token defends
+        # against resurrected stale workers writing over the
+        # reconciler's decision — every status write a worker makes
+        # carries WHERE lease_token = :my_token, so a worker whose
+        # lease was reassigned writes 0 rows and aborts cleanly.
+        # Defaults are nullable lease + token=0 so existing rows stay
+        # behaviour-compatible (sweep predicate covers them via the
+        # 15-min age fallback in Step C — see spec section 7.3).
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_owner_id UUID;",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_token BIGINT NOT NULL DEFAULT 0;",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS requeue_count INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS lease_owner_id UUID;",
+        "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;",
+        "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS lease_token BIGINT NOT NULL DEFAULT 0;",
+        "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS requeue_count INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE snapshot_partitions ADD COLUMN IF NOT EXISTS lease_owner_id UUID;",
+        "ALTER TABLE snapshot_partitions ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;",
+        "ALTER TABLE snapshot_partitions ADD COLUMN IF NOT EXISTS lease_token BIGINT NOT NULL DEFAULT 0;",
+        "ALTER TABLE snapshot_partitions ADD COLUMN IF NOT EXISTS requeue_count INTEGER NOT NULL DEFAULT 0;",
         "ALTER TABLE resource_discovery_staging ADD COLUMN IF NOT EXISTS azure_subscription_id VARCHAR;",
         "ALTER TABLE resource_discovery_staging ADD COLUMN IF NOT EXISTS azure_resource_group VARCHAR;",
         "ALTER TABLE resource_discovery_staging ADD COLUMN IF NOT EXISTS azure_region VARCHAR;",
@@ -1309,6 +1360,26 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS ix_snapshots_reuse_chain_root "
         "ON snapshots (reuse_chain_root_id) "
         "WHERE reuse_chain_root_id IS NOT NULL;",
+        # Reconciliation sweeper hot-path indexes — partial on the
+        # status enum so the index is tiny (only in-flight rows). Must
+        # live in post_alter_index_statements because the WHERE
+        # predicate references the *status enum cast, which is only
+        # available after alter_statements.
+        "CREATE INDEX IF NOT EXISTS ix_jobs_running_lease "
+        "ON jobs (lease_expires_at) "
+        "WHERE status = 'RUNNING'::jobstatus;",
+        "CREATE INDEX IF NOT EXISTS ix_snapshots_inprog_lease "
+        "ON snapshots (lease_expires_at) "
+        "WHERE status = 'IN_PROGRESS'::snapshotstatus;",
+        # snapshot_partitions.status is plain VARCHAR today (no enum
+        # type), so the partial index doesn't need an enum cast.
+        "CREATE INDEX IF NOT EXISTS ix_snapshot_partitions_inprog_lease "
+        "ON snapshot_partitions (lease_expires_at) "
+        "WHERE status IN ('QUEUED','IN_PROGRESS');",
+        "CREATE INDEX IF NOT EXISTS ix_worker_heartbeats_last_seen "
+        "ON worker_heartbeats (last_seen_at);",
+        "CREATE INDEX IF NOT EXISTS ix_work_dead_letter_kind_created "
+        "ON work_dead_letter (work_kind, created_at DESC);",
         # Validation trigger: enforce that any reuse_of_snapshot_id
         # points at a COMPLETED snapshot of the SAME resource taken
         # strictly earlier. PG can't express this in a CHECK

@@ -1521,6 +1521,53 @@ class BackupWorker:
         if azure_storage_manager.shards:
             print(f"[{self.worker_id}] Azure Storage: {len(azure_storage_manager.shards)} shard(s) ready")
         print(f"[{self.worker_id}] Backup worker initialized (concurrency={settings.BACKUP_CONCURRENCY})")
+        # Liveness heartbeat for the reconciliation sweeper. UPSERTs
+        # worker_heartbeats every 10 s; tombstoned on shutdown so the
+        # sweeper picks up any in-flight work immediately rather than
+        # waiting the full 60 s staleness window.
+        try:
+            from shared.heartbeat import HeartbeatThread
+            self._heartbeat = HeartbeatThread(
+                worker_id=self.worker_id,
+                service_name=os.getenv("RAILWAY_SERVICE_NAME", "backup_worker"),
+                queues=[self._backup_queue_name],
+            )
+            await self._heartbeat.start()
+        except Exception as exc:
+            self._heartbeat = None
+            print(f"[{self.worker_id}] heartbeat init failed (continuing): {exc}")
+        # LeaseExtender — one background task per worker that bumps
+        # lease_expires_at on every row this worker currently holds.
+        # Defense against the worker getting stuck on a long-running
+        # task that exceeds LEASE_TTL_S, which would cause the
+        # reconciler to mistake us for dead and steal our work.
+        try:
+            from shared.lease import LeaseExtender
+            if self._heartbeat is not None:
+                self._lease_extender = LeaseExtender(
+                    owner_id=self._heartbeat.worker_uuid,
+                    session_factory=async_session_factory,
+                )
+                await self._lease_extender.start()
+            else:
+                self._lease_extender = None
+        except Exception as exc:
+            self._lease_extender = None
+            print(f"[{self.worker_id}] lease extender init failed (continuing): {exc}")
+        # Startup reclaim — re-publish any work this replica owned
+        # before its last restart. Closes the redeploy gap to <1s
+        # instead of waiting up to LEASE_TTL_S for the sweeper.
+        try:
+            from shared.reclaim import reclaim_for_replica
+            if self._heartbeat is not None:
+                n = await reclaim_for_replica(
+                    replica_id=self._heartbeat.replica_id,
+                    worker_uuid=self._heartbeat.worker_uuid,
+                )
+                if n > 0:
+                    print(f"[{self.worker_id}] [RECLAIM] {n} work items re-released for sweeper")
+        except Exception as exc:
+            print(f"[{self.worker_id}] startup reclaim failed (continuing): {exc}")
 
     async def start(self):
         """Start consuming from all backup queues"""
@@ -17874,15 +17921,27 @@ class BackupWorker:
             if prior is not None:
                 return prior
 
+            # Stamp the reconciliation lease at creation time. The
+            # worker_uuid mirrors the heartbeat row; the sweeper joins
+            # on that to decide whether the lease belongs to a live
+            # worker. ``lease_token=1`` initialises the fence; every
+            # subsequent reconciler sweep bumps it so a resurrected
+            # stale worker's writes are rejected.
+            _now = datetime.utcnow()
+            _lease_owner = getattr(getattr(self, "_heartbeat", None), "worker_uuid", None)
+            _lease_expires = _now + timedelta(seconds=int(os.getenv("LEASE_TTL_S", "60")))
             snapshot = Snapshot(
                 id=uuid.uuid4(),
                 resource_id=resource.id,
                 job_id=job_id,
                 type=snapshot_type,
                 status=SnapshotStatus.IN_PROGRESS,
-                started_at=datetime.utcnow(),
+                started_at=_now,
                 snapshot_label=message.get("snapshotLabel", "scheduled"),
                 extra_data=extra_data or {},
+                lease_owner_id=_lease_owner,
+                lease_expires_at=_lease_expires if _lease_owner else None,
+                lease_token=1 if _lease_owner else 0,
             )
             session.add(snapshot)
             try:
@@ -18161,10 +18220,27 @@ class BackupWorker:
 async def main():
     from shared.storage.startup import startup_router, shutdown_router
     await startup_router()
+    worker = BackupWorker()
     try:
-        worker = BackupWorker()
         await worker.start()
     finally:
+        # Tombstone heartbeat so the reconciliation sweeper picks up
+        # any in-flight work immediately rather than waiting the full
+        # liveness window. Best-effort; swallow errors. Stop the
+        # lease-extender first so it can't refresh expiries after the
+        # tombstone has fired.
+        le = getattr(worker, "_lease_extender", None)
+        if le is not None:
+            try:
+                await le.stop()
+            except Exception as exc:
+                print(f"[main] lease extender stop failed: {exc}")
+        hb = getattr(worker, "_heartbeat", None)
+        if hb is not None:
+            try:
+                await hb.stop()
+            except Exception as exc:
+                print(f"[main] heartbeat stop failed: {exc}")
         await shutdown_router()
 
 

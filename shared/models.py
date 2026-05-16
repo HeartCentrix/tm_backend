@@ -464,6 +464,12 @@ class Job(Base):
     # Storage toggle retry plumbing (2026-04-21)
     retry_reason = Column(Text)
     pre_toggle_job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id"))
+    # Distributed reconciliation lease (2026-05-16 design). See
+    # docs/superpowers/specs/2026-05-16-distributed-reconciliation-design.md.
+    lease_owner_id = Column(UUID(as_uuid=True), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    lease_token = Column(BigInteger, nullable=False, default=0)
+    requeue_count = Column(Integer, nullable=False, default=0)
 
 
 class BackupBatch(Base):
@@ -544,6 +550,11 @@ class Snapshot(Base):
         ForeignKey("snapshots.id", ondelete="RESTRICT"),
         nullable=True,
     )
+    # Reconciliation lease (2026-05-16 design).
+    lease_owner_id = Column(UUID(as_uuid=True), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    lease_token = Column(BigInteger, nullable=False, default=0)
+    requeue_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=utcnow)
 
     __table_args__ = (
@@ -653,6 +664,16 @@ class SnapshotPartition(Base):
     files_uploaded = Column(Integer, nullable=False, default=0)
     bytes_uploaded = Column(BigInteger, nullable=False, default=0)
     failure_state = Column(JSON)
+    # Reconciliation lease (2026-05-16 design). ``retry_count`` already
+    # exists for the legacy partition stale-sweep; ``requeue_count``
+    # added here mirrors the lease design's per-table circuit-breaker
+    # name. We keep both columns: retry_count is bumped by the
+    # partition stale-sweep, requeue_count by the reconciler sweep —
+    # so a noisy partition can hit either path's cap.
+    lease_owner_id = Column(UUID(as_uuid=True), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    lease_token = Column(BigInteger, nullable=False, default=0)
+    requeue_count = Column(Integer, nullable=False, default=0)
 
     __table_args__ = (
         # One row per (snapshot, shard-index). Re-publish of the same

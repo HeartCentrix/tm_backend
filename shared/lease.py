@@ -1,0 +1,324 @@
+"""Atomic lease claim + renewal with fence tokens.
+
+A *lease* is a (lease_owner_id, lease_expires_at, lease_token) triple
+stored on every work row (``jobs``, ``snapshots``, ``snapshot_partitions``).
+The fence token is a monotonic counter — bumped on every claim and on
+every reconciler sweep — that defends against a resurrected stale
+worker writing over fresh state. Any state UPDATE the worker issues
+carries ``WHERE lease_token = :my_token``, so a worker whose lease was
+re-taken writes 0 rows and aborts cleanly.
+
+Design ref: docs/superpowers/specs/2026-05-16-distributed-reconciliation-design.md §6.
+
+This module is the SQL primitives only — wiring into the per-handler
+message path is done by the worker (see ``with_lease`` context manager).
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import uuid
+from dataclasses import dataclass
+from typing import Optional
+
+from sqlalchemy import text
+
+
+LEASE_TTL_S = int(os.getenv("LEASE_TTL_S", "60"))
+LEASE_RENEW_S = int(os.getenv("LEASE_RENEW_S", "30"))
+
+
+# Tables that carry lease columns. Hard-coded set guards against
+# accidental call against an unrelated table.
+_LEASED_TABLES = frozenset({"jobs", "snapshots", "snapshot_partitions"})
+
+
+@dataclass(frozen=True)
+class Lease:
+    """A held lease. ``token`` is the fence value to be carried in
+    every subsequent write."""
+    table: str
+    work_id: str
+    owner_id: str
+    token: int
+
+    def fence_clause(self) -> str:
+        """SQL fragment for state writes:
+            ``AND lease_token = :__lease_token``
+        Bind ``__lease_token`` separately in the params dict."""
+        return "AND lease_token = :__lease_token"
+
+    def fence_params(self) -> dict:
+        return {"__lease_token": self.token}
+
+
+def _check_table(table: str) -> None:
+    if table not in _LEASED_TABLES:
+        raise ValueError(f"lease: unsupported table {table!r}")
+
+
+async def claim(
+    session,
+    *,
+    table: str,
+    work_id,
+    owner_id: str,
+    in_progress_status: str,
+    ttl_seconds: int = LEASE_TTL_S,
+) -> Optional[Lease]:
+    """Atomically claim work row ``work_id`` in ``table``.
+
+    Returns a ``Lease`` on success, ``None`` if another live worker
+    already holds it.
+
+    ``in_progress_status`` differs per table:
+       - jobs: 'RUNNING'
+       - snapshots: 'IN_PROGRESS'
+       - snapshot_partitions: 'IN_PROGRESS'
+
+    Race semantics: the UPDATE filters on ``(lease_expires_at IS NULL OR
+    lease_expires_at < NOW())`` so a held-and-fresh lease cannot be
+    stolen. The token is incremented in the same UPDATE so the loser
+    of the race never sees a usable token.
+    """
+    _check_table(table)
+    sql = text(
+        f"""
+        UPDATE {table}
+           SET lease_owner_id   = cast(:owner AS uuid),
+               lease_expires_at = NOW() + (:ttl * INTERVAL '1 second'),
+               lease_token      = lease_token + 1
+         WHERE id = cast(:wid AS uuid)
+           AND status::text = :in_prog
+           AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+         RETURNING lease_token
+        """
+    )
+    row = (
+        await session.execute(
+            sql,
+            {
+                "owner": str(owner_id),
+                "ttl": ttl_seconds,
+                "wid": str(work_id),
+                "in_prog": in_progress_status,
+            },
+        )
+    ).first()
+    if not row:
+        return None
+    await session.commit()
+    return Lease(
+        table=table,
+        work_id=str(work_id),
+        owner_id=str(owner_id),
+        token=int(row.lease_token),
+    )
+
+
+async def renew(
+    session,
+    lease: Lease,
+    *,
+    ttl_seconds: int = LEASE_TTL_S,
+) -> bool:
+    """Extend the lease. Returns True if still ours; False if stolen
+    (fence mismatch or row was already finalized by the reconciler)."""
+    _check_table(lease.table)
+    row = (
+        await session.execute(
+            text(
+                f"""
+                UPDATE {lease.table}
+                   SET lease_expires_at = NOW() + (:ttl * INTERVAL '1 second')
+                 WHERE id = cast(:wid AS uuid)
+                   AND lease_owner_id = cast(:owner AS uuid)
+                   AND lease_token = :tok
+                 RETURNING id
+                """
+            ),
+            {
+                "wid": lease.work_id,
+                "owner": lease.owner_id,
+                "tok": lease.token,
+                "ttl": ttl_seconds,
+            },
+        )
+    ).first()
+    if row:
+        await session.commit()
+        return True
+    return False
+
+
+async def release(session, lease: Lease) -> None:
+    """Clear the lease without changing status. Called after a clean
+    finalize; the status write already advanced the row out of the
+    IN_PROGRESS branch."""
+    _check_table(lease.table)
+    await session.execute(
+        text(
+            f"""
+            UPDATE {lease.table}
+               SET lease_owner_id   = NULL,
+                   lease_expires_at = NULL
+             WHERE id = cast(:wid AS uuid)
+               AND lease_token = :tok
+            """
+        ),
+        {"wid": lease.work_id, "tok": lease.token},
+    )
+    await session.commit()
+
+
+class LeaseRenewer:
+    """Async context manager: spawns a background task that calls
+    ``renew(lease)`` every ``LEASE_RENEW_S`` seconds. If the renewer
+    detects fence-loss it sets ``stolen`` and stops — handler should
+    check ``renewer.stolen`` before issuing terminal writes.
+
+    Usage::
+
+        lease = await claim(session, table="snapshots", work_id=sid, ...)
+        if lease is None:
+            return  # another worker has it
+        async with LeaseRenewer(lease, session_factory=async_session_factory):
+            ...do work...
+            await session.execute(
+                text("UPDATE snapshots SET status='COMPLETED' WHERE id=:sid "
+                     + lease.fence_clause()),
+                {"sid": sid, **lease.fence_params()},
+            )
+    """
+
+    def __init__(
+        self,
+        lease: Lease,
+        *,
+        session_factory,
+        interval_s: int = LEASE_RENEW_S,
+    ):
+        self.lease = lease
+        self._session_factory = session_factory
+        self.interval_s = interval_s
+        self.stolen = False
+        self._task: Optional[asyncio.Task] = None
+        self._stop = asyncio.Event()
+
+    async def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.interval_s)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                async with self._session_factory() as session:
+                    ok = await renew(session, self.lease)
+                if not ok:
+                    self.stolen = True
+                    print(
+                        f"[LEASE] stolen on {self.lease.table}/"
+                        f"{self.lease.work_id} (token={self.lease.token})"
+                    )
+                    return
+            except Exception as exc:
+                # Renewal failure is non-fatal — TTL is generous enough
+                # to survive a single skipped tick. The sweeper will
+                # take over if we lose enough cycles to expire.
+                print(f"[LEASE] renew failed: {exc}")
+
+    async def __aenter__(self) -> "LeaseRenewer":
+        self._task = asyncio.create_task(self._loop(), name="lease-renew")
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._stop.set()
+        if self._task is not None:
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(self._task, timeout=2.0)
+
+
+def new_owner_uuid() -> uuid.UUID:
+    """Convenience for callers that need a fresh owner id (typically
+    derived once per worker at boot, mirroring the heartbeat row)."""
+    return uuid.uuid4()
+
+
+class LeaseExtender:
+    """Background task: bump ``lease_expires_at`` every ``interval_s``
+    seconds on every row that this worker currently owns across
+    ``jobs``, ``snapshots``, and ``snapshot_partitions``.
+
+    Cheaper than a per-handler ``LeaseRenewer`` because one query per
+    table covers however many rows the worker holds. Loses fence-token
+    precision — if the reconciler bumps a token mid-renew the renewer
+    can't tell which specific row was stolen — but the eventual write
+    from the actual handler still carries the lease_token it stamped
+    at claim time, so a stolen row's terminal write fails as expected.
+
+    Started once per worker after heartbeat init. Stopped on shutdown.
+    """
+
+    def __init__(
+        self,
+        *,
+        owner_id: uuid.UUID,
+        session_factory,
+        interval_s: int = LEASE_RENEW_S,
+        ttl_seconds: int = LEASE_TTL_S,
+    ):
+        self.owner_id = str(owner_id)
+        self._session_factory = session_factory
+        self.interval_s = interval_s
+        self.ttl_seconds = ttl_seconds
+        self._task: Optional[asyncio.Task] = None
+        self._stop = asyncio.Event()
+
+    async def _bump_once(self) -> None:
+        async with self._session_factory() as session:
+            for table, in_prog in (
+                ("snapshots", "IN_PROGRESS"),
+                ("snapshot_partitions", "IN_PROGRESS"),
+                ("jobs", "RUNNING"),
+            ):
+                await session.execute(
+                    text(
+                        f"""
+                        UPDATE {table}
+                           SET lease_expires_at = NOW() + (:ttl * INTERVAL '1 second')
+                         WHERE lease_owner_id = cast(:owner AS uuid)
+                           AND status::text = :sts
+                        """
+                    ),
+                    {"owner": self.owner_id, "ttl": self.ttl_seconds, "sts": in_prog},
+                )
+            await session.commit()
+
+    async def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.interval_s)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._bump_once()
+            except Exception as exc:
+                print(f"[LEASE_EXTENDER] bump failed: {exc}")
+
+    async def start(self) -> None:
+        if self._task is not None:
+            return
+        self._task = asyncio.create_task(self._loop(), name="lease-extender")
+        print(
+            f"[LEASE_EXTENDER] started owner={self.owner_id} "
+            f"interval={self.interval_s}s ttl={self.ttl_seconds}s"
+        )
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(self._task, timeout=2.0)

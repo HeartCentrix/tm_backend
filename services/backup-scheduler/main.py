@@ -1353,6 +1353,13 @@ async def startup():
     # Start discovery reconciler (runs every 5 min, independent of APScheduler)
     await start_reconciler_loop()
 
+    # Distributed-reconciliation orphan sweeper (2026-05-16). Closes
+    # backup work rows whose owning worker died (redeploy, OOM,
+    # network-split) so the Activity feed doesn't sit at "99 % In
+    # Progress" forever. See
+    # docs/superpowers/specs/2026-05-16-distributed-reconciliation-design.md.
+    await start_orphan_sweeper_loop()
+
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -2181,6 +2188,78 @@ async def start_reconciler_loop():
                 print(f"[RECONCILER] Reconciler loop error: {e}")
 
     asyncio.create_task(_reconciler())
+
+
+# Sweep interval for the distributed-reconciliation orphan sweeper.
+# 60 s matches the lease TTL so a worker that misses one heartbeat
+# tick already has its lease seen as expiring at roughly the same
+# moment the sweeper runs — minimises detection latency.
+ORPHAN_SWEEP_INTERVAL_S = int(os.environ.get("ORPHAN_SWEEP_INTERVAL_S", "60"))
+
+
+async def start_orphan_sweeper_loop():
+    """Distributed-reconciliation orphan sweeper.
+
+    Each tick:
+      1. Calls ``shared.reconciler.sweep_orphans`` to bottom-up
+         finalize stuck partitions / snapshots / jobs whose owning
+         worker is dead.
+      2. Re-publishes AMQP messages for any partitions the sweep
+         re-queued (snapshot_partitions.status flipped back to
+         QUEUED).
+      3. After every sweep cycle, calls the existing batch finalizer
+         (``_finalize_batch_if_complete``) for any backup_batches row
+         that the rollup now sees as fully terminal — so the Activity
+         row closes on the same tick instead of waiting for the next
+         operator click.
+
+    Idempotent under multiple scheduler replicas: every state write
+    in sweep_orphans uses WHERE clauses on the expected status so
+    races resolve cleanly.
+    """
+    async def _sweep_tick():
+        from shared.reconciler import sweep_orphans, republish_partition_messages
+        from shared.batch_rollup import _finalize_batch_if_complete
+
+        try:
+            async with async_session_factory() as session:
+                stats = await sweep_orphans(session)
+            if stats.requeue_payloads:
+                try:
+                    await republish_partition_messages(stats, message_bus=message_bus)
+                except Exception as exc:
+                    print(f"[ORPHAN_SWEEPER] partition republish failed: {exc}")
+
+            # If we just finalised any job/snapshot, give the batch
+            # finalizer a chance to close any backup_batches row that
+            # was waiting on them. Cheap: only runs when we touched
+            # something.
+            if stats.snapshots_finalized or stats.jobs_finalized:
+                try:
+                    async with async_session_factory() as session:
+                        rows = (await session.execute(text("""
+                            SELECT id FROM backup_batches
+                             WHERE status = 'IN_PROGRESS'
+                             ORDER BY created_at DESC
+                             LIMIT 50
+                        """))).all()
+                        for row in rows:
+                            await _finalize_batch_if_complete(row.id, session)
+                except Exception as exc:
+                    print(f"[ORPHAN_SWEEPER] batch finalize cascade failed: {exc}")
+        except Exception as exc:
+            print(f"[ORPHAN_SWEEPER] tick failed: {exc}")
+
+    async def _loop():
+        # Stagger 5 s after boot so we don't race the schema migration
+        # the first time this code lands on a fresh DB.
+        await asyncio.sleep(5)
+        while True:
+            await _sweep_tick()
+            await asyncio.sleep(ORPHAN_SWEEP_INTERVAL_S)
+
+    asyncio.create_task(_loop())
+    print(f"[ORPHAN_SWEEPER] loop started — interval={ORPHAN_SWEEP_INTERVAL_S}s")
 
 
 # ── R3.2: Backup verification cron ──
