@@ -3393,13 +3393,86 @@ class GraphClient:
         notifications), the bytes only live in the RFC822 envelope.
         Python's email.parser walks the multipart tree and recovers
         each inline part keyed by Content-ID.
+
+        Retry contract: 429/503 honor Retry-After (capped at 120s),
+        refresh token between attempts, mark the app throttled in
+        multi_app_manager so other apps in the rotation absorb load.
+        Transient httpx errors (read/connect timeout, RemoteProtocolError)
+        also retry with capped exponential backoff. Permanent 4xx
+        (400/401/403/404/410/423) raise immediately — they will not
+        succeed on retry and the caller needs to record the failure.
+        Without this, every 429 silently dropped the inline image for
+        that email; at TM scale (heavy mailboxes + tenant-wide throttle)
+        that meant most enterprise inline logos/signatures vanished.
         """
         url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}/$value"
         token = await self._get_token()
-        async with self._http_session() as client:
-            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
-            resp.raise_for_status()
-            return resp.content
+        max_attempts = 5
+        backoff_s = 2.0
+        last_err: Optional[Exception] = None
+        for attempt in range(max_attempts):
+            try:
+                async with self._http_session() as client:
+                    resp = await client.get(
+                        url, headers={"Authorization": f"Bearer {token}"},
+                    )
+                    if resp.status_code in (429, 503):
+                        retry_after = _parse_retry_after(resp, default=30.0, cap=120.0)
+                        try:
+                            from shared.multi_app_manager import multi_app_manager
+                            multi_app_manager.mark_throttled(
+                                self.client_id, int(retry_after),
+                            )
+                        except Exception:
+                            pass
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(retry_after)
+                            # Refresh token — it may have expired during sleep
+                            # and a stale token would 401 the retry.
+                            token = await self._get_token()
+                            continue
+                        resp.raise_for_status()
+                    resp.raise_for_status()
+                    try:
+                        from shared.multi_app_manager import multi_app_manager
+                        _lat_ms = (
+                            float(resp.elapsed.total_seconds() * 1000)
+                            if getattr(resp, "elapsed", None) else 0.0
+                        )
+                        multi_app_manager.mark_success(self.client_id, _lat_ms)
+                    except Exception:
+                        pass
+                    return resp.content
+            except httpx.HTTPStatusError as he:
+                # Permanent 4xx — no retry, raise to caller for failure
+                # recording. 408 is treated transient (request timeout).
+                status = he.response.status_code if he.response is not None else 0
+                if status in (400, 401, 403, 404, 410, 423):
+                    raise
+                last_err = he
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(backoff_s)
+                    backoff_s = min(30.0, backoff_s * 2)
+                    token = await self._get_token()
+                    continue
+                raise
+            except (
+                httpx.ReadTimeout,
+                httpx.ConnectTimeout,
+                httpx.RemoteProtocolError,
+                httpx.PoolTimeout,
+            ) as e:
+                last_err = e
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(backoff_s)
+                    backoff_s = min(30.0, backoff_s * 2)
+                    token = await self._get_token()
+                    continue
+                raise
+        # Should be unreachable — loop always returns or raises.
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("get_message_mime_source: exhausted retries")
 
     async def get_hosted_content(
         self, chat_id: str, message_id: str, hc_id: str, chunk_size: int = 1024 * 1024
@@ -3417,38 +3490,123 @@ class GraphClient:
         by the Teams-chat backfill script.
 
         Returns: (async_iter_bytes, content_type, content_length).
+
+        Retry contract: 429/503 honor Retry-After (capped at 120s),
+        refresh token between attempts, mark the app throttled. Stream
+        + client contexts are torn down between attempts and rebuilt
+        fresh on retry (httpx stream cannot be replayed). Permanent
+        4xx (400/401/403/404/410/423) raise immediately. Without this
+        retry, every 429 during a hostedContents drain silently dropped
+        the inline image (sticker / emoji / pasted screenshot) from
+        the chat — same durability bug as get_message_mime_source.
         """
         url = f"{self.GRAPH_URL}/chats/{chat_id}/messages/{message_id}/hostedContents/{hc_id}/$value"
         token = await self._get_token()
-        client_cm = httpx.AsyncClient(timeout=300.0, follow_redirects=True)
-        client = await client_cm.__aenter__()
-        try:
-            stream_cm = client.stream(
-                "GET", url, headers={"Authorization": f"Bearer {token}"}
-            )
-            resp = await stream_cm.__aenter__()
-        except BaseException:
-            await client_cm.__aexit__(None, None, None)
-            raise
-
-        try:
-            resp.raise_for_status()
-            ctype = resp.headers.get("Content-Type", "application/octet-stream")
-            size = int(resp.headers.get("Content-Length", "0") or 0)
-        except BaseException:
-            await stream_cm.__aexit__(None, None, None)
-            await client_cm.__aexit__(None, None, None)
-            raise
-
-        async def _iter() -> AsyncGenerator[bytes, None]:
+        max_attempts = 5
+        backoff_s = 2.0
+        last_err: Optional[Exception] = None
+        for attempt in range(max_attempts):
+            client_cm = httpx.AsyncClient(timeout=300.0, follow_redirects=True)
+            client = await client_cm.__aenter__()
+            stream_cm = None
+            resp = None
             try:
-                async for chunk in resp.aiter_bytes(chunk_size):
-                    yield chunk
-            finally:
-                await stream_cm.__aexit__(None, None, None)
+                stream_cm = client.stream(
+                    "GET", url, headers={"Authorization": f"Bearer {token}"},
+                )
+                resp = await stream_cm.__aenter__()
+                # 429/503: tear down stream + client, honor Retry-After, retry.
+                if resp.status_code in (429, 503):
+                    retry_after = _parse_retry_after(resp, default=30.0, cap=120.0)
+                    try:
+                        from shared.multi_app_manager import multi_app_manager
+                        multi_app_manager.mark_throttled(
+                            self.client_id, int(retry_after),
+                        )
+                    except Exception:
+                        pass
+                    await stream_cm.__aexit__(None, None, None)
+                    await client_cm.__aexit__(None, None, None)
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(retry_after)
+                        token = await self._get_token()
+                        continue
+                    # Surface the throttle to the caller after exhausting.
+                    raise httpx.HTTPStatusError(
+                        f"throttled after {max_attempts} attempts",
+                        request=resp.request, response=resp,
+                    )
+                resp.raise_for_status()
+                ctype = resp.headers.get("Content-Type", "application/octet-stream")
+                size = int(resp.headers.get("Content-Length", "0") or 0)
+            except httpx.HTTPStatusError as he:
+                # Permanent 4xx — no retry.
+                if stream_cm is not None:
+                    await stream_cm.__aexit__(None, None, None)
                 await client_cm.__aexit__(None, None, None)
+                status = he.response.status_code if he.response is not None else 0
+                if status in (400, 401, 403, 404, 410, 423):
+                    raise
+                last_err = he
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(backoff_s)
+                    backoff_s = min(30.0, backoff_s * 2)
+                    token = await self._get_token()
+                    continue
+                raise
+            except (
+                httpx.ReadTimeout,
+                httpx.ConnectTimeout,
+                httpx.RemoteProtocolError,
+                httpx.PoolTimeout,
+            ) as e:
+                if stream_cm is not None:
+                    await stream_cm.__aexit__(None, None, None)
+                await client_cm.__aexit__(None, None, None)
+                last_err = e
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(backoff_s)
+                    backoff_s = min(30.0, backoff_s * 2)
+                    token = await self._get_token()
+                    continue
+                raise
+            except BaseException:
+                if stream_cm is not None:
+                    await stream_cm.__aexit__(None, None, None)
+                await client_cm.__aexit__(None, None, None)
+                raise
 
-        return _iter(), ctype, size
+            try:
+                from shared.multi_app_manager import multi_app_manager
+                _lat_ms = (
+                    float(resp.elapsed.total_seconds() * 1000)
+                    if getattr(resp, "elapsed", None) else 0.0
+                )
+                multi_app_manager.mark_success(self.client_id, _lat_ms)
+            except Exception:
+                pass
+
+            # Capture context managers in the closure so they outlive this
+            # function. The caller MUST fully consume / aclose() the
+            # generator to release them.
+            _stream_cm = stream_cm
+            _client_cm = client_cm
+            _resp = resp
+
+            async def _iter() -> AsyncGenerator[bytes, None]:
+                try:
+                    async for chunk in _resp.aiter_bytes(chunk_size):
+                        yield chunk
+                finally:
+                    await _stream_cm.__aexit__(None, None, None)
+                    await _client_cm.__aexit__(None, None, None)
+
+            return _iter(), ctype, size
+
+        # Should be unreachable — loop always returns or raises.
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("get_hosted_content: exhausted retries")
 
     # Worker-lifetime cache of source URLs that resolved to a permanent
     # 4xx (400/401/403/404/410/423). Backed by a plain dict so subsequent
