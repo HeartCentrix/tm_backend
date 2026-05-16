@@ -155,8 +155,14 @@ async def sweep_orphans(session) -> SweepStats:
     # ------------------------------------------------------------------
     # A snapshot is orphan when:
     #   - status = IN_PROGRESS
-    #   - no live worker owns the lease (heartbeat stale OR lease NULL/expired
-    #     AND legacy-age window exceeded)
+    #   - EITHER no live worker owns the lease (lease expired / legacy
+    #     age exceeded / no live heartbeat), OR all of its partitions
+    #     have already reached terminal — in which case no worker
+    #     handler is going to advance it (in particular, partitions
+    #     marked FAILED by STEP A's poison-pill branch never get a
+    #     finalize call). The fast-path on all-terminal-partitions
+    #     prevents 5k-user runs from waiting out the full lease TTL
+    #     after the reconciler itself poisons the last partition.
     #   - no in-flight partitions remain
     snap_rows = (
         await session.execute(
@@ -182,6 +188,11 @@ async def sweep_orphans(session) -> SweepStats:
                                 WHERE sp.snapshot_id = s.id
                            ) THEN 'COMPLETED'::snapshotstatus
                            WHEN (
+                               SELECT bool_and(sp.status = 'FAILED')
+                                 FROM snapshot_partitions sp
+                                WHERE sp.snapshot_id = s.id
+                           ) THEN 'FAILED'::snapshotstatus
+                           WHEN (
                                SELECT bool_or(sp.status = 'FAILED')
                                  FROM snapshot_partitions sp
                                 WHERE sp.snapshot_id = s.id
@@ -193,19 +204,39 @@ async def sweep_orphans(session) -> SweepStats:
                        lease_expires_at = NULL,
                        lease_token      = s.lease_token + 1
                  WHERE s.status = 'IN_PROGRESS'::snapshotstatus
-                   AND (
-                       (s.lease_expires_at IS NOT NULL AND s.lease_expires_at < NOW())
-                       OR (s.lease_owner_id IS NULL AND s.started_at < NOW() - (:legacy_s * INTERVAL '1 second'))
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM worker_heartbeats wh
-                        WHERE wh.worker_id = s.lease_owner_id
-                          AND wh.last_seen_at > NOW() - (:stale_s * INTERVAL '1 second')
-                   )
                    AND NOT EXISTS (
                        SELECT 1 FROM snapshot_partitions sp
                         WHERE sp.snapshot_id = s.id
                           AND sp.status IN ('QUEUED','IN_PROGRESS')
+                   )
+                   AND (
+                       -- Fast path: snapshot is partitioned AND all
+                       -- partitions terminal. Skip lease check — no
+                       -- worker handler will call finalize on a
+                       -- partition that the reconciler itself moved
+                       -- to FAILED via poison-pill (STEP A above).
+                       EXISTS (
+                           SELECT 1 FROM snapshot_partitions sp
+                            WHERE sp.snapshot_id = s.id
+                       )
+                       OR (
+                           -- Slow path (non-partitioned snapshot):
+                           -- require lease/age based staleness so we
+                           -- don't race a live worker.
+                           (
+                               (s.lease_expires_at IS NOT NULL
+                                AND s.lease_expires_at < NOW())
+                               OR (s.lease_owner_id IS NULL
+                                   AND s.started_at <
+                                       NOW() - (:legacy_s * INTERVAL '1 second'))
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM worker_heartbeats wh
+                                WHERE wh.worker_id = s.lease_owner_id
+                                  AND wh.last_seen_at >
+                                      NOW() - (:stale_s * INTERVAL '1 second')
+                           )
+                       )
                    )
                 RETURNING s.id, s.status::text
                 """
@@ -238,6 +269,17 @@ async def sweep_orphans(session) -> SweepStats:
                 --   zero COMPLETED (all PARTIAL/FAILED)   → FAILED
                 -- snapshotstatus enum: IN_PROGRESS, COMPLETED, FAILED,
                 -- PARTIAL, PENDING_DELETION. No QUEUED, no CANCELLED.
+                -- Lease check intentionally dropped: the outer WHERE
+                -- already requires every child snapshot to be terminal,
+                -- so there is no live work for the lease holder to do
+                -- on this job. The worker that completed the last
+                -- snapshot normally calls _finalize_bulk_parent_if_complete;
+                -- this branch is the safety net for when STEP B above
+                -- flipped a partitioned snapshot terminal on the
+                -- reconciler's behalf and no worker was left to bubble
+                -- up to the job. (Without this, a poisoned-partition
+                -- batch parent would wait out the full lease TTL at
+                -- 5k-user scale.)
                 UPDATE jobs j
                    SET status = CASE
                            WHEN EXISTS (
@@ -252,15 +294,6 @@ async def sweep_orphans(session) -> SweepStats:
                        lease_expires_at = NULL,
                        lease_token      = j.lease_token + 1
                  WHERE j.status = 'RUNNING'::jobstatus
-                   AND (
-                       (j.lease_expires_at IS NOT NULL AND j.lease_expires_at < NOW())
-                       OR j.created_at < NOW() - (:legacy_s * INTERVAL '1 second')
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM worker_heartbeats wh
-                        WHERE wh.worker_id = j.lease_owner_id
-                          AND wh.last_seen_at > NOW() - (:stale_s * INTERVAL '1 second')
-                   )
                    AND NOT EXISTS (
                        SELECT 1 FROM snapshots s
                         WHERE s.job_id = j.id
