@@ -1670,6 +1670,14 @@ async def list_snapshot_messages(
         "  si.tenant_id AS si_tenant_id, "
         "  si.item_type, si.folder_path, si.content_size, si.is_deleted, "
         "  si.created_at AS si_created_at, "
+        # si.metadata holds the full Graph payload for chat messages
+        # written via the newer TEAMS_CHAT_EXPORT path
+        # (workers/backup-worker/main.py:14341-14376). When the LEFT
+        # JOIN to chat_thread_messages returns NULL — which it does
+        # for the entire snapshot when the chat-export-worker pipeline
+        # didn't populate that table — we hydrate body / sender /
+        # raw from si.metadata.raw instead.
+        "  si.metadata AS si_metadata, "
         "  ct.chat_topic, ct.chat_type, ct.member_names_json, "
         "  ctm.body_content, ctm.body_content_type, "
         "  ctm.from_user_id, ctm.from_display_name, "
@@ -1834,7 +1842,33 @@ async def list_snapshot_messages(
         pass
 
     def _fmt(r) -> Dict[str, Any]:
+        # Two-tier hydration:
+        #   tier 1 — chat_thread_messages (ctm) row (the canonical
+        #            singleton store, populated by chat-export-worker)
+        #   tier 2 — snapshot_items.metadata.raw (the per-row Graph
+        #            payload stamped by backup-worker's
+        #            TEAMS_CHAT_EXPORT path)
+        # The new fallback recovers chat data on snapshots where the
+        # chat-export-worker pipeline didn't run / failed but the
+        # backup-worker still captured the full message into
+        # snapshot_items.metadata. All ~19k messages on snapshot
+        # f9e39faa-* are in this state.
         raw = r.metadata_raw if isinstance(r.metadata_raw, dict) else {}
+        si_meta = getattr(r, "si_metadata", None)
+        # JSON column can come back as dict (driver) or str (older PG
+        # driver setting). Parse defensively; never raise on bad JSON.
+        if isinstance(si_meta, str):
+            try:
+                import json as _json
+                si_meta = _json.loads(si_meta)
+            except Exception:
+                si_meta = None
+        if not isinstance(si_meta, dict):
+            si_meta = {}
+        si_raw = si_meta.get("raw") if isinstance(si_meta.get("raw"), dict) else {}
+        if not raw and si_raw:
+            raw = si_raw
+
         # Fill in displayName for any user id we know in eventDetail (and
         # in from.user for safety). Mutates a shallow copy so we don't
         # poison the SQLAlchemy ORM cache.
@@ -1848,7 +1882,12 @@ async def list_snapshot_messages(
                     _fill_user_names(raw["from"])
             except Exception:
                 pass
+
+        # body — prefer ctm.body_content; fall back to raw.body.content
         body_text = r.body_content or ""
+        if not body_text and isinstance(raw.get("body"), dict):
+            body_text = raw["body"].get("content") or ""
+
         # Rewrite inline-image URLs from Graph's auth-only hostedContents
         # endpoint to our snapshot-service proxy, which serves the bytes
         # we captured at backup time. Without this rewrite the browser
@@ -1858,26 +1897,61 @@ async def list_snapshot_messages(
         )
         if tenant_id_for_body and body_text and "hostedContents" in body_text:
             body_text = _rewrite_hosted_content_urls(body_text, tenant_id_for_body)
+
+        # sender / senderEmail — prefer ctm columns; fall back to raw.from
+        sender = r.from_display_name or ""
+        if not sender and isinstance(raw.get("from"), dict):
+            _from_user = raw["from"].get("user") or {}
+            sender = _from_user.get("displayName") or ""
+        sender_email = ""
+        if isinstance(raw.get("from"), dict):
+            sender_email = (raw["from"].get("user") or {}).get(
+                "userPrincipalName"
+            ) or ""
+
+        # body content type — prefer ctm column; fall back to raw.body.contentType
+        body_ct = r.body_content_type or ""
+        if not body_ct and isinstance(raw.get("body"), dict):
+            body_ct = raw["body"].get("contentType") or ""
+        body_ct = body_ct or "html"
+
+        # date — ctm.created_date_time, else raw.createdDateTime, else si.created_at
+        if r.created_date_time:
+            date_iso = r.created_date_time.isoformat()
+        elif raw.get("createdDateTime"):
+            date_iso = str(raw.get("createdDateTime"))
+        elif r.si_created_at:
+            date_iso = r.si_created_at.isoformat()
+        else:
+            date_iso = None
+
+        # chatTopic — _compose_chat_name when ct row matched; else use
+        # si.metadata.chatTopic which TEAMS_CHAT_EXPORT stamps alongside raw
+        if r.parent_external_id:
+            chat_topic_out = _compose_chat_name(
+                str(r.parent_external_id or ""),
+                r.chat_topic,
+                r.chat_type,
+                r.member_names_json,
+            )
+        else:
+            chat_topic_out = (
+                r.chat_topic
+                or (si_meta.get("chatTopic") if isinstance(si_meta, dict) else None)
+                or ""
+            )
+
         return {
             "id": str(r.id),
             "snapshotId": str(r.snapshot_id),
             "externalId": r.external_id,
             "itemType": r.item_type,
-            "sender": r.from_display_name or "",
-            "senderEmail": (raw.get("from") or {}).get("user", {}).get("userPrincipalName")
-                            if isinstance(raw.get("from"), dict) else "",
+            "sender": sender,
+            "senderEmail": sender_email,
             "body": body_text,
-            "bodyContentType": r.body_content_type or "html",
-            "date": (
-                r.created_date_time.isoformat() if r.created_date_time
-                else (r.si_created_at.isoformat() if r.si_created_at else None)
-            ),
-            "chatTopic": _compose_chat_name(
-                str(r.parent_external_id or ""),
-                r.chat_topic,
-                r.chat_type,
-                r.member_names_json,
-            ) if r.parent_external_id else (r.chat_topic or ""),
+            "bodyContentType": body_ct,
+            "date": date_iso,
+            "chatTopic": chat_topic_out,
             "channelName": "",
             "folderPath": r.folder_path,
             "attachments": raw.get("attachments", []) if isinstance(raw, dict) else [],
@@ -1886,7 +1960,7 @@ async def list_snapshot_messages(
             "isReply": r.item_type == "TEAMS_MESSAGE_REPLY",
             "contentSize": r.content_size or 0,
             "createdAt": r.si_created_at.isoformat() if r.si_created_at else "",
-            "name": r.from_display_name or "",
+            "name": sender,
             "metadata": {"raw": raw},
         }
 
