@@ -313,22 +313,94 @@ async def sweep_orphans(session) -> SweepStats:
     ).all()
     stats.jobs_finalized = len(job_rows)
 
+    # ------------------------------------------------------------------
+    # STEP D — terminal-snapshot integrity sweep
+    # ------------------------------------------------------------------
+    # Catches snapshots that were flipped COMPLETED via a path that
+    # observed all-COMPLETED partitions at the moment of the CTE — but
+    # whose partitions later regressed (e.g. via a race between the
+    # finalize CTE read and a concurrent _mark_partition_terminal
+    # commit; or via STEP A's poison-pill which marks late partitions
+    # FAILED after the parent snapshot has already terminalised).
+    # Observed in prod 2026-05-16: Vinay/Ranjeet CHATS had snap.status =
+    # COMPLETED with all 4 partitions FAILED, item_count populated. The
+    # CTE in _finalize_partitioned_snapshot guards against forward race
+    # (IN_PROGRESS only) but cannot retroactively correct a terminal
+    # row. This step closes that gap.
+    #
+    # Idempotent: only writes when the derived status differs from the
+    # stored status, and only for snapshots that have partition rows.
+    # Single GROUP BY pass — cheaper than 4 correlated subqueries per
+    # candidate at 5k-user prod scale (~30k snapshots/batch). Filters
+    # out partitions that are still pending and snapshots already in
+    # the right state inside the same statement.
+    snap_integrity_rows = (
+        await session.execute(
+            text(
+                """
+                WITH part_agg AS (
+                    SELECT sp.snapshot_id,
+                           COUNT(*)                                      AS n,
+                           bool_or(sp.status IN ('QUEUED','IN_PROGRESS')) AS any_pending,
+                           bool_and(sp.status = 'COMPLETED')             AS all_completed,
+                           bool_and(sp.status = 'FAILED')                AS all_failed,
+                           bool_or(sp.status = 'FAILED')                 AS any_failed
+                      FROM snapshot_partitions sp
+                     GROUP BY sp.snapshot_id
+                )
+                UPDATE snapshots s
+                   SET status = CASE
+                           WHEN pa.all_completed THEN 'COMPLETED'::snapshotstatus
+                           WHEN pa.all_failed    THEN 'FAILED'::snapshotstatus
+                           WHEN pa.any_failed    THEN 'PARTIAL'::snapshotstatus
+                           ELSE s.status
+                       END,
+                       lease_owner_id   = NULL,
+                       lease_expires_at = NULL,
+                       lease_token      = s.lease_token + 1
+                  FROM part_agg pa
+                 WHERE s.id = pa.snapshot_id
+                   AND pa.n > 0
+                   AND NOT pa.any_pending
+                   AND s.status IN ('COMPLETED'::snapshotstatus,
+                                    'PARTIAL'::snapshotstatus,
+                                    'FAILED'::snapshotstatus)
+                   AND s.status != (CASE
+                           WHEN pa.all_completed THEN 'COMPLETED'::snapshotstatus
+                           WHEN pa.all_failed    THEN 'FAILED'::snapshotstatus
+                           WHEN pa.any_failed    THEN 'PARTIAL'::snapshotstatus
+                           ELSE s.status
+                       END)
+                RETURNING s.id, s.status::text AS new_status
+                """
+            ),
+        )
+    ).all()
+    snaps_corrected = len(snap_integrity_rows)
+    for r in snap_integrity_rows:
+        print(
+            f"[RECONCILER][INTEGRITY] snapshot={r.id} status "
+            f"corrected → {r.new_status}"
+        )
+
     if DRY_RUN:
         await session.rollback()
         print(
             f"[RECONCILER][DRY] parts_requeue={stats.partitions_requeued} "
             f"parts_dlq={stats.partitions_dlq} "
             f"snaps_final={stats.snapshots_finalized} "
+            f"snaps_corrected={snaps_corrected} "
             f"jobs_final={stats.jobs_finalized}"
         )
         return stats
 
     await session.commit()
-    if stats.total():
+    if stats.total() or snaps_corrected:
         print(
             f"[RECONCILER] parts_requeue={stats.partitions_requeued} "
             f"parts_dlq={stats.partitions_dlq} "
             f"snaps_final={stats.snapshots_finalized} "
+            f"snaps_corrected={snaps_corrected} "
             f"jobs_final={stats.jobs_finalized}"
         )
     return stats
