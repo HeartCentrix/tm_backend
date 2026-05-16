@@ -1645,6 +1645,12 @@ class BackupWorker:
         # SharePoint partition lane — drive shards are I/O-heavy.
         if getattr(settings, "SP_PARTITION_ENABLED", False):
             queues.append(("backup.sharepoint_partition", 2))
+        # Groups (Teams channels) partition lane — fat-team channel
+        # shards. Channels carry message + reply payloads but most are
+        # smaller per-shard than SP drives; prefetch=2 keeps a replica
+        # from monopolizing more than two shards at once.
+        if getattr(settings, "GROUPS_PARTITION_ENABLED", False):
+            queues.append(("backup.groups_partition", 2))
 
         tasks = []
         for queue_name, prefetch in queues:
@@ -2120,6 +2126,13 @@ class BackupWorker:
         # partitionFilter.driveIds carrying this shard's allowlist.
         if message.get("messageType") == "BACKUP_SHAREPOINT_PARTITION":
             await self._process_sharepoint_partition_message(message)
+            return
+        # Groups (Teams channel) partition shards (Phase 3.4). Coordinator
+        # in `_backup_teams_resource` decides fanout from channel
+        # enumeration; consumer re-enters with partitionFilter.channelIds
+        # carrying this shard's allowlist.
+        if message.get("messageType") == "BACKUP_GROUPS_PARTITION":
+            await self._process_groups_partition_message(message)
             return
 
         job_id = uuid.UUID(message["jobId"])
@@ -8516,6 +8529,148 @@ class BackupWorker:
                     f"{type(pub_exc).__name__}: {pub_exc}"
                 )
 
+    # ------------------------------------------------------------------
+    # GROUPS partition helpers (Phase 3.4 — Tier-1 channel sharding)
+    # ------------------------------------------------------------------
+    def _should_partition_groups(
+        self,
+        channels: List[Dict[str, Any]],
+    ) -> bool:
+        """Decide whether a Team's channel set warrants cross-replica
+        sharding. Single threshold (count) — channels don't expose a
+        size metric the way drives expose quota.used, so we shard
+        purely on cardinality. Below threshold, the existing
+        asyncio.gather inside _backup_teams_resource is plenty.
+        """
+        real_channels = [c for c in channels if c.get("id")]
+        if not real_channels:
+            return False
+        try:
+            if not settings.GROUPS_PARTITION_ENABLED:
+                return False
+            min_channels = int(settings.GROUPS_PARTITION_MIN_CHANNELS)
+        except AttributeError:
+            return False
+        return len(real_channels) >= min_channels
+
+    def _bin_pack_groups_channels(
+        self,
+        channels: List[Dict[str, Any]],
+        n_shards: int,
+    ) -> List[List[str]]:
+        """Round-robin pack channel ids into N shards. Deterministic on
+        coordinator redelivery (sort by id first). No size oracle
+        available for channels — round-robin gives near-equal counts
+        per shard which is the best proxy for equal drain time.
+        """
+        if n_shards <= 0:
+            n_shards = 1
+        channel_ids: List[str] = sorted(
+            c.get("id") for c in channels if c.get("id")
+        )
+        shards: List[List[str]] = [[] for _ in range(n_shards)]
+        for i, cid in enumerate(channel_ids):
+            shards[i % n_shards].append(cid)
+        return shards
+
+    async def _fanout_groups_partitions(
+        self,
+        *,
+        snapshot: Snapshot,
+        resource: Resource,
+        tenant: Tenant,
+        channels: List[Dict[str, Any]],
+        team_id: str,
+        job_id: uuid.UUID,
+    ) -> None:
+        """Pack channels into N shards, insert one snapshot_partitions
+        row per shard, mark snapshot.extra_data partitioned=True,
+        publish N backup.groups_partition messages. Mirrors the
+        SharePoint fanout.
+        """
+        from shared.message_bus import create_groups_partition_message
+        channel_ids_all: List[str] = [
+            c.get("id") for c in channels if c.get("id")
+        ]
+        per_shard = max(1, int(settings.GROUPS_PARTITION_CHANNELS_PER_SHARD))
+        max_shards = max(1, int(settings.GROUPS_PARTITION_MAX_SHARDS))
+        n_shards = max(
+            2,
+            min(
+                max_shards,
+                (len(channel_ids_all) + per_shard - 1) // per_shard or 1,
+            ),
+        )
+
+        shards = self._bin_pack_groups_channels(channels, n_shards)
+        shards = [s for s in shards if s]
+        if len(shards) < 2:
+            shards = [channel_ids_all]
+
+        partition_msgs: List[Tuple[str, str, List[str]]] = []
+        async with async_session_factory() as session:
+            snap = await session.get(Snapshot, snapshot.id)
+            if snap is not None:
+                ed = dict(snap.extra_data or {})
+                ed["partitioned"] = True
+                ed["partition_type"] = "GROUPS_CHANNELS"
+                ed["partition_count"] = len(shards)
+                ed["partition_total_channels"] = len(channel_ids_all)
+                snap.extra_data = ed
+            for idx, shard_cids in enumerate(shards):
+                partition_id = uuid.uuid4()
+                row = SnapshotPartition(
+                    id=partition_id,
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    resource_id=resource.id,
+                    job_id=job_id,
+                    partition_type="GROUPS_CHANNELS",
+                    drive_id=None,
+                    partition_index=idx,
+                    file_ids=None,
+                    payload={
+                        "channel_ids": shard_cids,
+                        "team_id": team_id,
+                    },
+                    total_files=len(shard_cids),
+                    total_bytes_est=0,
+                    status="QUEUED",
+                )
+                session.add(row)
+                partition_msgs.append(
+                    (str(partition_id), str(snapshot.id), shard_cids),
+                )
+            await session.commit()
+
+        print(
+            f"[{self.worker_id}] [GROUPS] "
+            f"{resource.display_name or resource.id}: "
+            f"PARTITION fanout — {len(shards)} shards, "
+            f"{len(channel_ids_all)} channels."
+        )
+
+        for partition_id, snap_id_str, shard_cids in partition_msgs:
+            msg = create_groups_partition_message(
+                partition_id=partition_id,
+                snapshot_id=snap_id_str,
+                job_id=str(job_id),
+                tenant_id=str(tenant.id),
+                resource_id=str(resource.id),
+                channel_ids=shard_cids,
+                team_id=team_id,
+            )
+            try:
+                await message_bus.publish(
+                    "backup.groups_partition", msg, priority=3,
+                )
+            except Exception as pub_exc:
+                print(
+                    f"[{self.worker_id}] [GROUPS] partition "
+                    f"publish failed (partition={partition_id}): "
+                    f"{type(pub_exc).__name__}: {pub_exc}"
+                )
+
     async def _claim_partition(
         self, partition_id: uuid.UUID, worker_id: str,
     ) -> Optional[Dict[str, Any]]:
@@ -10018,6 +10173,216 @@ class BackupWorker:
             print(
                 f"[{self.worker_id}] [PARTITION] {partition_id} "
                 f"sharepoint shard failed: {type(e).__name__}: {e}"
+            )
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={
+                    "reason": type(e).__name__,
+                    "message": str(e)[:500],
+                },
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "reason": type(e).__name__,
+                    "message": str(e)[:500],
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
+            raise
+        finally:
+            try:
+                await self._finalize_partitioned_snapshot(
+                    snapshot_id, tenant=tenant, resource=resource,
+                    job_id=job_id,
+                )
+            except Exception as fin_exc:
+                print(
+                    f"[{self.worker_id}] [PARTITION FINALIZE] "
+                    f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
+                )
+
+    async def _process_groups_partition_message(
+        self, message: Dict[str, Any],
+    ) -> None:
+        """Handler for one `backup.groups_partition` message.
+
+        Re-enters `backup_teams_single` for the TEAMS_CHANNEL resource
+        with a partitionFilter.channelIds envelope so the channel-drain
+        loop only walks this shard's allowlist. Mailbox + SharePoint
+        sub-backups are SKIPPED in consumer mode — the coordinator
+        already started them (mailbox synchronously, SP via its own
+        partition fanout).
+        """
+        partition_id = uuid.UUID(str(message["partitionId"]))
+        claim = await self._claim_partition(partition_id, self.worker_id)
+        if claim is None:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} — "
+                f"claim refused (already owned or terminal); ack-drop"
+            )
+            return
+
+        snapshot_id = uuid.UUID(str(claim["snapshot_id"]))
+        tenant_id = uuid.UUID(str(claim["tenant_id"]))
+        resource_id = uuid.UUID(str(claim["resource_id"]))
+        job_id = uuid.UUID(str(claim["job_id"]))
+        partition_type = str(
+            claim.get("partition_type") or "GROUPS_CHANNELS",
+        )
+        partition_index = claim.get("partition_index")
+        payload = claim.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        shard_channel_ids: List[str] = list(
+            payload.get("channel_ids") or [],
+        )
+        team_id = str(payload.get("team_id") or "")
+        total_channels = claim.get("total_files") or len(shard_channel_ids)
+
+        started_at = time.monotonic()
+        await self._emit_partition_audit(
+            "PARTITION_STARTED", "IN_PROGRESS",
+            tenant_id=str(tenant_id), resource_id=str(resource_id),
+            snapshot_id=snapshot_id, job_id=job_id,
+            partition_id=partition_id, partition_type=partition_type,
+            details={
+                "partition_index": partition_index,
+                "total_channels": total_channels,
+                "team_id": team_id,
+            },
+        )
+
+        if not shard_channel_ids:
+            await self._mark_partition_terminal(
+                partition_id, status="COMPLETED",
+                files_uploaded=0, bytes_uploaded=0,
+            )
+            await self._emit_partition_audit(
+                "PARTITION_COMPLETED", "SUCCESS",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "files_uploaded": 0, "bytes_uploaded": 0,
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                    "empty_shard": True,
+                },
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        if await _is_job_cancelled(job_id):
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "job_cancelled"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "job_cancelled"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        async with async_session_factory() as session:
+            resource = await session.get(Resource, resource_id)
+            tenant = await session.get(Tenant, tenant_id)
+            snapshot = await session.get(Snapshot, snapshot_id)
+
+        if resource is None or tenant is None or snapshot is None:
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "snapshot_or_resource_gone"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "snapshot_or_resource_gone"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        graph_client = await self.get_graph_client(
+            tenant, handler_key="TEAMS_CHANNEL",
+        )
+        if graph_client is None:
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "no_graph_client"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "no_graph_client"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        synth_msg: Dict[str, Any] = {
+            "jobId": str(job_id),
+            "resourceId": str(resource_id),
+            "tenantId": str(tenant_id),
+            "type": "INCREMENTAL",
+            "priority": 3,
+            "partitionFilter": {"channelIds": shard_channel_ids},
+            "partitionId": str(partition_id),
+            "partitionIndex": partition_index,
+        }
+
+        tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
+
+        try:
+            async with tenant_sem:
+                teams_result = await self.backup_teams_single(
+                    graph_client, resource, snapshot, tenant, synth_msg,
+                )
+            shard_items = int(
+                (teams_result or {}).get("item_count") or 0
+            )
+            shard_bytes = int(
+                (teams_result or {}).get("bytes_added") or 0
+            )
+            await self._mark_partition_terminal(
+                partition_id, status="COMPLETED",
+                files_uploaded=shard_items,
+                bytes_uploaded=shard_bytes,
+            )
+            await self._emit_partition_audit(
+                "PARTITION_COMPLETED", "SUCCESS",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "files_uploaded": shard_items,
+                    "bytes_uploaded": shard_bytes,
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} "
+                f"groups shard failed: {type(e).__name__}: {e}"
             )
             await self._mark_partition_terminal(
                 partition_id, status="FAILED",
@@ -13021,8 +13386,18 @@ class BackupWorker:
         return len(all_rows), total_bytes
 
     async def _backup_teams_resource(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
-                                     graph_client: GraphClient, job_id: uuid.UUID) -> Dict:
-        """Backup Teams channels/chats with full SnapshotItem records"""
+                                     graph_client: GraphClient, job_id: uuid.UUID,
+                                     *, message: Optional[Dict[str, Any]] = None) -> Dict:
+        """Backup Teams channels/chats with full SnapshotItem records.
+
+        Partition-aware: `message["partitionFilter"]["channelIds"]`, when
+        present, scopes the channel drain to a single shard's allowlist
+        and SKIPS the mailbox + SharePoint sub-backups (the coordinator
+        already kicked those off). Coordinator mode (no partitionFilter)
+        evaluates `_should_partition_groups`; when the team is wide
+        enough it publishes per-shard messages and short-circuits the
+        channel loop, then continues with mailbox + SP inline.
+        """
         print(f"[{self.worker_id}] [TEAMS_CHANNEL START] {resource.display_name} ({resource.external_id})")
         item_count = 0
         bytes_added = 0
@@ -13030,6 +13405,16 @@ class BackupWorker:
         container = azure_storage_manager.get_container_name(str(tenant.id), "teams")
 
         team_id = resource.external_id
+
+        # Partition filter — set when this call is a partition consumer.
+        _gp_filter = (message or {}).get("partitionFilter") or {}
+        _gp_allowed_channel_ids: Optional[Set[str]] = (
+            set(_gp_filter.get("channelIds") or [])
+            if _gp_filter.get("channelIds") is not None
+            else None
+        )
+        _gp_is_consumer = _gp_allowed_channel_ids is not None
+        _gp_coordinator_fanout = False
 
         if resource.type.value == "TEAMS_CHANNEL":
             print(f"[{self.worker_id}]   [CHANNELS] Fetching channels...")
@@ -13045,7 +13430,40 @@ class BackupWorker:
                     return {"item_count": 0, "bytes_added": 0}
                 raise
             ch_list = channels.get("value", [])
-            print(f"[{self.worker_id}]   [CHANNELS] Found {len(ch_list)} channels — backing up ALL in parallel")
+
+            # ── Phase 3.4: per-channel partition fork ──
+            if _gp_is_consumer:
+                # Consumer: scope to this shard's allowlist; skip the
+                # mailbox + SP sub-backups (coordinator handles those).
+                before = len(ch_list)
+                ch_list = [
+                    c for c in ch_list
+                    if c.get("id") in _gp_allowed_channel_ids
+                ]
+                print(
+                    f"[{self.worker_id}]   [GROUPS_PARTITION] consumer "
+                    f"draining {len(ch_list)}/{before} channels in this shard"
+                )
+            elif self._should_partition_groups(ch_list):
+                # Coordinator: fan out the channel work across replicas
+                # and short-circuit the inline parallel-gather. Mailbox
+                # + SP still run inline below — those don't ride this
+                # lane. _finalize_partitioned_snapshot owns the terminal
+                # flip; the outer single-backup path treats `partitioned`
+                # the same way it treats SharePoint coordinator returns.
+                await self._fanout_groups_partitions(
+                    snapshot=snapshot, resource=resource, tenant=tenant,
+                    channels=ch_list, team_id=team_id, job_id=job_id,
+                )
+                print(
+                    f"[{self.worker_id}]   [GROUPS_PARTITION] coordinator "
+                    f"fanned out {len(ch_list)} channels; skipping inline "
+                    f"channel drain (mailbox + SP still run inline)"
+                )
+                ch_list = []
+                _gp_coordinator_fanout = True
+            else:
+                print(f"[{self.worker_id}]   [CHANNELS] Found {len(ch_list)} channels — backing up ALL in parallel")
 
             async def backup_one_channel(ch: Dict) -> tuple:
                 ch_id = ch.get("id")
@@ -13136,70 +13554,90 @@ class BackupWorker:
                     item_count += r[0]
                     bytes_added += r[1]
 
-            # A TEAMS_CHANNEL row's external_id is the team (M365 group) id.
-            # Fan out to the group mailbox + the team's SharePoint site so
-            # the Recovery view's Site + Mail tabs have data alongside the
-            # channel messages. Each sub-backup guards its own exceptions
-            # so a single-permission-denied step doesn't abort the rest.
-            #
-            # Group mailbox.
-            try:
-                # New signature: (count, bytes). Items persist inline
-                # via _bulk_upsert_snapshot_items.
-                mbx_count, mbx_bytes = await self.backup_group_mailbox_content(
-                    resource, tenant, snapshot, graph_client,
-                )
-                item_count += mbx_count
-                bytes_added += mbx_bytes
-            except Exception as mbx_exc:
-                logger.warning(
-                    "[%s] Team group-mailbox backup skipped for %s: %s",
-                    self.worker_id, resource.display_name, mbx_exc,
-                )
+            # Partition consumer mode: channels-only. The coordinator
+            # already kicked off the mailbox + SP sub-backups (mailbox
+            # inline, SP via its own partition fanout) — skip both here
+            # so shards don't duplicate that work or race on the
+            # update_resource_backup_info stamping.
+            if not _gp_is_consumer:
+                # A TEAMS_CHANNEL row's external_id is the team (M365 group) id.
+                # Fan out to the group mailbox + the team's SharePoint site so
+                # the Recovery view's Site + Mail tabs have data alongside the
+                # channel messages. Each sub-backup guards its own exceptions
+                # so a single-permission-denied step doesn't abort the rest.
+                #
+                # Group mailbox.
+                try:
+                    # New signature: (count, bytes). Items persist inline
+                    # via _bulk_upsert_snapshot_items.
+                    mbx_count, mbx_bytes = await self.backup_group_mailbox_content(
+                        resource, tenant, snapshot, graph_client,
+                    )
+                    item_count += mbx_count
+                    bytes_added += mbx_bytes
+                except Exception as mbx_exc:
+                    logger.warning(
+                        "[%s] Team group-mailbox backup skipped for %s: %s",
+                        self.worker_id, resource.display_name, mbx_exc,
+                    )
 
-            # SharePoint team-site content (incl. subsites — backup_sharepoint
-            # enumerates them internally).
-            try:
-                site_resp = await graph_client._get(
-                    f"{graph_client.GRAPH_URL}/groups/{team_id}/sites/root",
-                )
-                raw_site_id = site_resp.get("id", "")
-                if raw_site_id:
-                    site_ext_id = raw_site_id.replace(",", "/")
-                    from types import SimpleNamespace as _SN
-                    site_proxy = _SN(
-                        id=resource.id,
-                        tenant_id=resource.tenant_id,
-                        type=_SN(value="SHAREPOINT_SITE"),
-                        display_name=f"{resource.display_name} (team site)",
-                        external_id=site_ext_id,
-                        extra_data=(resource.extra_data or {}),
-                        sla_policy_id=resource.sla_policy_id,
+                # SharePoint team-site content (incl. subsites — backup_sharepoint
+                # enumerates them internally).
+                try:
+                    site_resp = await graph_client._get(
+                        f"{graph_client.GRAPH_URL}/groups/{team_id}/sites/root",
                     )
-                    sp_result = await self.backup_sharepoint(
-                        graph_client, site_proxy, snapshot, tenant, message,
+                    raw_site_id = site_resp.get("id", "")
+                    if raw_site_id:
+                        site_ext_id = raw_site_id.replace(",", "/")
+                        from types import SimpleNamespace as _SN
+                        site_proxy = _SN(
+                            id=resource.id,
+                            tenant_id=resource.tenant_id,
+                            type=_SN(value="SHAREPOINT_SITE"),
+                            display_name=f"{resource.display_name} (team site)",
+                            external_id=site_ext_id,
+                            extra_data=(resource.extra_data or {}),
+                            sla_policy_id=resource.sla_policy_id,
+                        )
+                        sp_result = await self.backup_sharepoint(
+                            graph_client, site_proxy, snapshot, tenant, message,
+                        )
+                        bytes_added += int(sp_result.get("bytes_added", 0))
+                        item_count += int(sp_result.get("item_count", 0))
+                except Exception as sp_exc:
+                    logger.warning(
+                        "[%s] Team site SP backup skipped for %s: %s",
+                        self.worker_id, resource.display_name, sp_exc,
                     )
-                    bytes_added += int(sp_result.get("bytes_added", 0))
-                    item_count += int(sp_result.get("item_count", 0))
-            except Exception as sp_exc:
-                logger.warning(
-                    "[%s] Team site SP backup skipped for %s: %s",
-                    self.worker_id, resource.display_name, sp_exc,
-                )
 
         elif resource.type.value == "TEAMS_CHAT":
             item_count, bytes_added = await self._backup_single_chat(resource, tenant, snapshot, graph_client)
 
         print(f"[{self.worker_id}] [TEAMS COMPLETE] {resource.display_name} — {item_count} messages, {bytes_added} bytes")
-        
-        # Update resource backup info (storage_bytes, last_backup_*)
-        async with async_session_factory() as sess:
-            await self.update_resource_backup_info(sess, resource, job_id, snapshot.id, {
-                "item_count": item_count,
-                "bytes_added": bytes_added,
-            })
-        
-        return {"item_count": item_count, "bytes_added": bytes_added}
+
+        # Skip the resource backup-info stamp on partition CONSUMERS —
+        # each shard would otherwise overwrite the others (last-writer
+        # wins) and report a partial count as the resource's totals.
+        # The coordinator's mailbox+SP totals + every shard's reported
+        # counts get reconciled via _finalize_partitioned_snapshot.
+        if not _gp_is_consumer:
+            async with async_session_factory() as sess:
+                await self.update_resource_backup_info(sess, resource, job_id, snapshot.id, {
+                    "item_count": item_count,
+                    "bytes_added": bytes_added,
+                })
+
+        result: Dict[str, Any] = {
+            "item_count": item_count,
+            "bytes_added": bytes_added,
+        }
+        if _gp_coordinator_fanout:
+            # Tells the outer single-backup path the snapshot owns its
+            # terminal flip via _finalize_partitioned_snapshot, not via
+            # BACKUP_COMPLETED here.
+            result["partitioned"] = True
+        return result
 
     async def _backup_team_channels(self, resource: Resource, tenant: Tenant, snapshot: Snapshot,
                                     graph_client: GraphClient, team_id: str) -> tuple[int, int]:
@@ -13249,15 +13687,24 @@ class BackupWorker:
                 await sess.commit()
             total_items += len(channel_info_rows)
 
-        for ch in ch_list:
+        # Parallelize channel drain across one worker. Mirrors the
+        # TEAMS_CHANNEL handler's asyncio.gather pattern in
+        # _backup_teams_resource — channels are independent so there's
+        # no reason to walk them serially. Cross-worker partitioning is
+        # a separate concern (see _fanout_groups_partitions); this
+        # change unconditionally helps the M365_GROUP path which always
+        # runs as a single coordinator.
+        async def _drain_one_channel(ch: Dict[str, Any]) -> Tuple[int, int]:
             ch_id = ch.get("id")
             ch_name = ch.get("displayName", ch_id)
             try:
                 msgs = await graph_client.get_channel_messages(team_id, ch_id)
             except Exception as exc:
-                logger.warning("[%s] Channel messages fetch failed for %s/%s: %s",
-                               self.worker_id, resource.display_name, ch_name, exc)
-                continue
+                logger.warning(
+                    "[%s] Channel messages fetch failed for %s/%s: %s",
+                    self.worker_id, resource.display_name, ch_name, exc,
+                )
+                return 0, 0
             msg_list = msgs.get("value", [])
 
             upload_tasks = []
@@ -13291,6 +13738,8 @@ class BackupWorker:
                         print(f"[{self.worker_id}]   [CHANNEL_REPLY FAIL] {ch_name}/{msg_id}: {exc}")
 
             upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+            local_items = 0
+            local_bytes = 0
             db_items: List[SnapshotItem] = []
             for (mid, mdata, mbytes, mhash, mbp, cid, cname), res in zip(item_metas, upload_results):
                 if isinstance(res, dict) and res.get("success"):
@@ -13308,12 +13757,22 @@ class BackupWorker:
                         extra_data={"raw": mdata, "channelId": cid, "channelName": cname, "isReply": is_reply},
                         content_checksum=mhash,
                     ))
-                    total_bytes += len(mbytes)
+                    local_bytes += len(mbytes)
             if db_items:
                 async with async_session_factory() as sess:
                     sess.add_all(db_items)
                     await sess.commit()
-                total_items += len(db_items)
+                local_items = len(db_items)
+            return local_items, local_bytes
+
+        ch_results = await asyncio.gather(
+            *[_drain_one_channel(ch) for ch in ch_list],
+            return_exceptions=True,
+        )
+        for r in ch_results:
+            if isinstance(r, tuple):
+                total_items += r[0]
+                total_bytes += r[1]
 
         print(f"[{self.worker_id}]   [CHANNELS] {resource.display_name}: persisted {total_items} messages, {total_bytes} bytes")
         return total_items, total_bytes
@@ -15194,7 +15653,9 @@ class BackupWorker:
     async def backup_teams_single(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                                   tenant: Tenant, message: Dict) -> Dict:
         """Single-resource Teams backup (matches handler signature)"""
-        return await self._backup_teams_resource(resource, tenant, snapshot, graph_client, None)
+        return await self._backup_teams_resource(
+            resource, tenant, snapshot, graph_client, None, message=message,
+        )
 
     async def backup_teams_chat_single(self, graph_client: GraphClient, resource: Resource, snapshot: Snapshot,
                                        tenant: Tenant, message: Dict) -> Dict:

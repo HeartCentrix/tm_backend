@@ -330,6 +330,38 @@ def create_sharepoint_partition_message(
     }
 
 
+def create_groups_partition_message(
+    *,
+    partition_id: str,
+    snapshot_id: str,
+    job_id: str,
+    tenant_id: str,
+    resource_id: str,
+    channel_ids: list,
+    team_id: str,
+) -> dict:
+    """Envelope for one shard of a partitioned Teams-channel snapshot.
+
+    The consumer atomically claims the snapshot_partitions row, then
+    drains only the channels in `channel_ids` for `team_id`. Mirrors
+    the SharePoint partition envelope — `team_id` plays the role
+    `site_id` plays for SP partitions (lets the consumer scope the
+    drain even when the M365_GROUP path supplies a proxy resource
+    with a different external_id).
+    """
+    return {
+        "messageType": "BACKUP_GROUPS_PARTITION",
+        "partitionId": partition_id,
+        "snapshotId": snapshot_id,
+        "jobId": job_id,
+        "tenantId": tenant_id,
+        "resourceId": resource_id,
+        "channelIds": channel_ids,
+        "teamId": team_id,
+        "createdAt": datetime.utcnow().isoformat(),
+    }
+
+
 def create_onedrive_partition_message(
     *,
     partition_id: str,

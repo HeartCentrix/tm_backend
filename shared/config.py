@@ -499,6 +499,25 @@ class Settings:
             str(20 * 1024 * 1024 * 1024),
         ))
 
+        # ── Phase 3.4: Groups & Teams partition (by channel list) ──
+        # When a single Team has many channels, _backup_teams_resource
+        # parallelizes them via asyncio.gather on ONE worker — fine until
+        # one worker's bandwidth/Graph-quota becomes the cap. The
+        # partition lane lets a fat team's channels split across N
+        # worker replicas the same way SP splits one site's drives.
+        self.GROUPS_PARTITION_ENABLED = os.getenv(
+            "GROUPS_PARTITION_ENABLED", "true",
+        ).lower() in ("true", "1", "yes")
+        self.GROUPS_PARTITION_MIN_CHANNELS = int(os.getenv(
+            "GROUPS_PARTITION_MIN_CHANNELS", "8",
+        ))
+        self.GROUPS_PARTITION_MAX_SHARDS = int(os.getenv(
+            "GROUPS_PARTITION_MAX_SHARDS", "4",
+        ))
+        self.GROUPS_PARTITION_CHANNELS_PER_SHARD = int(os.getenv(
+            "GROUPS_PARTITION_CHANNELS_PER_SHARD", "4",
+        ))
+
         # ── Generic partition resilience knobs ──
         # Per-tenant concurrency cap on partition shards (across all
         # partition_types). Prevents one tenant's whale OneDrive +
