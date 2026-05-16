@@ -536,6 +536,8 @@ async def _create_batch_backup_jobs(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from shared.storage.startup import startup_router, shutdown_router
+    from shared import core_metrics
+    core_metrics.init()
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
     await message_bus.connect()

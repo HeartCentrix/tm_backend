@@ -1425,6 +1425,8 @@ async def run_all_discoveries():
 
 async def main():
     from shared.storage.startup import startup_router
+    from shared import core_metrics
+    core_metrics.init()
     await startup_router()
     logger.info("=== Discovery Worker Starting ===")
     logger.info("DB: %s@%s:%s/%s", settings.DB_USERNAME, settings.DB_HOST, settings.DB_PORT, settings.DB_NAME)

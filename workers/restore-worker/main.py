@@ -4549,6 +4549,8 @@ worker = RestoreWorker()
 async def main():
     """Start the restore worker"""
     from shared.storage.startup import startup_router, shutdown_router
+    from shared import core_metrics
+    core_metrics.init()
     print("Starting restore worker...")
     await startup_router()
     try:

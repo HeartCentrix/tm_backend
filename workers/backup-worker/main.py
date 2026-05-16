@@ -19625,6 +19625,8 @@ class BackupWorker:
 
 async def main():
     from shared.storage.startup import startup_router, shutdown_router
+    from shared import core_metrics
+    core_metrics.init()
     await startup_router()
     worker = BackupWorker()
     try:

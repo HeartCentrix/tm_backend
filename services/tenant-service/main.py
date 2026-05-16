@@ -123,6 +123,8 @@ async def run_tenant_discovery(db: AsyncSession, tenant: Tenant) -> int:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Keep startup lightweight so worker boot does not block tenant reads.
+    from shared import core_metrics
+    core_metrics.init()
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
     yield
