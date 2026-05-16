@@ -1834,37 +1834,96 @@ class GraphClient:
             "chats": ("USER_CHATS", f"Chats — {display}"),
         }
 
-        async def _safe(name: str, coro):
-            try:
-                return await coro
-            except Exception as e:
-                msg = str(e)
-                if "404" in msg or "403" in msg or "423" in msg:
-                    # Emit a license-missing marker instead of dropping
-                    # the row. The persist side stores it with
-                    # status=INACCESSIBLE + license_missing flag so the
-                    # UI can show "No <license> license" without
-                    # changing backup scope (INACCESSIBLE rows aren't
-                    # backed up).
-                    kind, label = _KIND.get(name, ("USER_UNKNOWN", name))
-                    return {
-                        "external_id": f"{user_external_id}:{name}",
-                        "display_name": label,
-                        "email": email,
-                        "type": kind,
-                        "parent_external_id": user_external_id,
-                        "metadata": {
-                            "user_id": user_external_id,
-                            "license_missing": True,
-                            "license_hint": _LICENSE_HINT.get(name),
-                            "probe_status": (
-                                "404" if "404" in msg else
-                                "403" if "403" in msg else "423"
-                            ),
-                        },
-                    }
-                print(f"[GraphClient] discover_user_content {name} failed for {display}: {e}")
-                return None
+        # Transient errors from Graph or the network are surfaced
+        # here as `httpx.HTTPStatusError` (5xx), `httpx.TimeoutException`,
+        # or `httpx.ConnectError`. Permanent errors (404/403/423) carry
+        # license / consent meaning and must NOT be retried — they
+        # produce a stable INACCESSIBLE marker row instead.
+        _PERMANENT_STATUSES = ("400", "401", "403", "404", "410", "423")
+        _TRANSIENT_STATUSES = ("500", "502", "503", "504")
+
+        def _classify(err_msg: str) -> str:
+            """Return 'permanent', 'transient', or 'unknown' based on
+            the error text. We grep for the status code rather than
+            isinstance-check because Graph wraps responses at multiple
+            layers — the string remains the most reliable signal."""
+            for s in _PERMANENT_STATUSES:
+                if s in err_msg:
+                    return "permanent"
+            for s in _TRANSIENT_STATUSES:
+                if s in err_msg:
+                    return "transient"
+            low = err_msg.lower()
+            if "timeout" in low or "timed out" in low or "connecterror" in low \
+               or "remoteprotocolerror" in low or "connection" in low:
+                return "transient"
+            return "unknown"
+
+        async def _safe(name: str, coro_factory):
+            """Run a discovery probe with bounded retry on transients.
+
+            `coro_factory` is a zero-arg async callable that returns a
+            FRESH coroutine each call — we cannot retry the same
+            coroutine object once it has been awaited. Backoff: 0.5s,
+            1.5s (cumulative <3s before final failure) — enough to ride
+            past most 504 blips without dragging out a 5,000-user
+            discovery sweep. Permanent 4xx exits immediately so a
+            no-license user doesn't pay the retry budget.
+            """
+            import asyncio as _aio
+            kind, label = _KIND.get(name, ("USER_UNKNOWN", name))
+            backoffs = (0.5, 1.5)  # 2 retries -> 3 attempts total
+            last_err = None
+            for attempt in range(len(backoffs) + 1):
+                try:
+                    return await coro_factory()
+                except Exception as e:
+                    last_err = e
+                    cls = _classify(str(e))
+                    if cls == "permanent":
+                        return {
+                            "external_id": f"{user_external_id}:{name}",
+                            "display_name": label,
+                            "email": email,
+                            "type": kind,
+                            "parent_external_id": user_external_id,
+                            "metadata": {
+                                "user_id": user_external_id,
+                                "license_missing": True,
+                                "license_hint": _LICENSE_HINT.get(name),
+                                "probe_status": next(
+                                    (s for s in _PERMANENT_STATUSES if s in str(e)),
+                                    "4xx",
+                                ),
+                            },
+                        }
+                    if attempt < len(backoffs):
+                        await _aio.sleep(backoffs[attempt])
+                        continue
+                    break
+
+            # All retries exhausted on a transient (or unknown) error.
+            # Do NOT silently drop the resource — emit a pending marker
+            # so the row still appears in the resource list. The persist
+            # layer treats `discovery_pending` as INACCESSIBLE (backup
+            # skips it), and the next discovery cycle will overwrite this
+            # marker with the real metadata once Graph recovers.
+            print(
+                f"[GraphClient] discover_user_content {name} failed for "
+                f"{display} after {len(backoffs)+1} attempts: {last_err}"
+            )
+            return {
+                "external_id": f"{user_external_id}:{name}",
+                "display_name": label,
+                "email": email,
+                "type": kind,
+                "parent_external_id": user_external_id,
+                "metadata": {
+                    "user_id": user_external_id,
+                    "discovery_pending": True,
+                    "last_discovery_error": str(last_err)[:300],
+                },
+            }
 
         # Mail — folder count + storage estimate.
         async def _mail():
@@ -1975,12 +2034,15 @@ class GraphClient:
                 },
             }
 
+        # Pass factories (not awaited coroutines) so _safe can retry
+        # transient failures with a fresh coroutine each attempt — you
+        # cannot await the same coroutine twice.
         results = await asyncio.gather(
-            _safe("mail", _mail()),
-            _safe("onedrive", _onedrive()),
-            _safe("contacts", _contacts()),
-            _safe("calendar", _calendar()),
-            _safe("chats", _chats()),
+            _safe("mail", _mail),
+            _safe("onedrive", _onedrive),
+            _safe("contacts", _contacts),
+            _safe("calendar", _calendar),
+            _safe("chats", _chats),
         )
         return [r for r in results if r]
 

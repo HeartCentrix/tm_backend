@@ -107,8 +107,17 @@ async def ensure_tier2_children(
 
         meta = c.get("metadata") or {}
         is_license_missing = bool(meta.get("license_missing"))
+        # `discovery_pending` is the new marker for transient Graph
+        # failures (504/timeout) after retries are exhausted. We still
+        # land an INACCESSIBLE row so the resource appears in the list
+        # and backup fan-out skips it; the next discovery cycle will
+        # overwrite metadata with real data once Graph recovers. Without
+        # this, a single transient blip would silently lose a user's
+        # entire workload (the bug that hit Amit's USER_CHATS).
+        is_discovery_pending = bool(meta.get("discovery_pending"))
         child_status = (
-            ResourceStatus.INACCESSIBLE if is_license_missing
+            ResourceStatus.INACCESSIBLE
+            if (is_license_missing or is_discovery_pending)
             else ResourceStatus.DISCOVERED
         )
 
@@ -128,6 +137,18 @@ async def ensure_tier2_children(
             # channel_delta_tokens, chat cursors). Graph discovery keys
             # (drive_id, user_id, …) are stable and won't collide.
             existing.extra_data = {**(existing.extra_data or {}), **meta}
+            # If we just recovered from a transient discovery error,
+            # drop the stale pending markers — otherwise they'd stick
+            # in extra_data forever and the row would look "broken" in
+            # the UI even though it's healthy now. Only clear when the
+            # current probe was actually successful (i.e. neither flag
+            # is set in this round's meta).
+            if not is_license_missing and not is_discovery_pending:
+                existing.extra_data.pop("discovery_pending", None)
+                existing.extra_data.pop("last_discovery_error", None)
+                existing.extra_data.pop("license_missing", None)
+                existing.extra_data.pop("license_hint", None)
+                existing.extra_data.pop("probe_status", None)
             existing.external_id = c["external_id"]
             # Re-inherit parent SLA so a parent re-policy reaches children
             # on next discovery sweep without manual fan-out.
