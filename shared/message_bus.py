@@ -104,6 +104,15 @@ class MessageBus:
                     "backup.sharepoint_partition",
                     routing_key="backup.sharepoint_partition",
                 )
+                # Phase 3.4: Groups (Teams channels) partition queue.
+                # Shards carry a `channel_ids: [...]` allowlist for one
+                # team; workers re-enter backup_teams_single scoped to
+                # those channels. Mailbox + SP sub-backups are owned
+                # by the coordinator and skipped on consumer entries.
+                await self._declare_queue(
+                    "backup.groups_partition",
+                    routing_key="backup.groups_partition",
+                )
                 await self._declare_queue("restore.urgent", routing_key="restore.urgent")
                 await self._declare_queue("restore.normal", routing_key="restore.normal")
                 await self._declare_queue("restore.low", routing_key="restore.low")
