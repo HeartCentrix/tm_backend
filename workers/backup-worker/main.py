@@ -5478,9 +5478,27 @@ class BackupWorker:
                                 drain_succeeded = False
                                 _err_str = f"HTTP {status} {type(he).__name__}"
                                 _err_class = _classify_chat_drain_error(status, he)
+                                # Extract the actual Graph error body so the
+                                # operator can see WHICH scope/policy Graph
+                                # is complaining about (e.g. "Forbidden:
+                                # Application missing ChatMessage.Read.All",
+                                # "Protected APIs are not approved for this
+                                # tenant", etc.). httpx's default str(he) is
+                                # just "Client error '403 Forbidden' for url
+                                # ..." which is useless for diagnosis. Body
+                                # truncated to 800 chars so log lines stay
+                                # readable. Best-effort: if the body isn't
+                                # JSON, capture the raw text.
+                                _err_body = ""
+                                try:
+                                    if he.response is not None:
+                                        _err_body = (he.response.text or "")[:800]
+                                except Exception:
+                                    _err_body = ""
                                 new_failures[cid] = {
                                     "count": _prior_count + 1,
                                     "last_error": _err_str,
+                                    "last_error_body": _err_body,
                                     "error_class": _err_class,
                                     "granted_scopes_at_failure": _current_fp,
                                     "shard_app_id": _shard_client.client_id,
@@ -5500,6 +5518,11 @@ class BackupWorker:
                                     f"consecutive-failure #{_prior_count + 1}, "
                                     f"cursor preserved — will retry next backup)"
                                 )
+                                if _err_body:
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] chat "
+                                        f"{cid[:8]} graph-error-body: {_err_body}"
+                                    )
                                 break
                             except Exception as e:
                                 # Network / SDK errors — _iter_pages already
