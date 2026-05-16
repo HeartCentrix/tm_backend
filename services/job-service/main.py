@@ -358,6 +358,19 @@ async def _create_batch_backup_jobs(
     dedup_skipped: List[str] = []
     try:
         requested_ids = list(resources_map.keys())
+        # Two-layer dedup against in-flight work for the same resource:
+        #   (a) IN_PROGRESS snapshots in last 1h — catches the case
+        #       where a worker has already created the per-resource
+        #       snapshot row;
+        #   (b) QUEUED / RUNNING jobs in this batch with overlapping
+        #       batch_resource_ids — catches the earlier window
+        #       *before* any snapshot exists, e.g. when the same
+        #       trigger-bulk request lands twice ~seconds apart from
+        #       a redelivered discovery.tier2 message (2026-05-16
+        #       incident — discovery_worker fired ``/trigger-bulk``
+        #       twice for the same batch, producing duplicate Tier-2
+        #       Jobs whose worker fan-out raced and left half-empty
+        #       snapshot rows in the Activity breakdown).
         inflight_rows = (await db.execute(
             text(
                 """
@@ -366,9 +379,18 @@ async def _create_batch_backup_jobs(
                 WHERE s.resource_id = ANY(:rids)
                   AND s.status = 'IN_PROGRESS'
                   AND s.started_at > NOW() - INTERVAL '1 hour'
+                UNION
+                SELECT DISTINCT bid AS resource_id, j.id AS job_id
+                  FROM tm_vault.jobs j
+                  CROSS JOIN LATERAL unnest(
+                      COALESCE(j.batch_resource_ids, ARRAY[]::uuid[])
+                  ) AS bid
+                 WHERE j.status::text IN ('QUEUED','RUNNING')
+                   AND bid = ANY(cast(:rids AS uuid[]))
+                   AND COALESCE(j.spec->>'batch_id', '') = COALESCE(:bid, '')
                 """
             ),
-            {"rids": requested_ids},
+            {"rids": requested_ids, "bid": batch_id or ''},
         )).all()
         if inflight_rows:
             inflight_resource_ids = {str(r[0]) for r in inflight_rows}
@@ -1278,6 +1300,21 @@ async def trigger_datasource_backup(request: TriggerDatasourceBackupRequest, db:
     # ENTRA_USER backups start immediately + child backups arrive on the
     # next pass — all under one Activity row because of the (tenant_id,
     # triggered_by, created_at) grouping rule.
+    # Tier-2 gap-fill enqueue is delegated to `_create_batch_backup_jobs`
+    # below, which already publishes ``discovery.tier2`` for the
+    # ``deferred`` users (classify_scope output) AFTER inserting their
+    # ``batch_pending_users`` rows — the correct ordering, since the
+    # discovery-worker's terminal-state UPDATE on batch_pending_users
+    # requires the row to exist. This outer block used to ALSO publish
+    # the same message (for ``users_missing_tier2``, an identical set
+    # derived independently), which produced two ``discovery.tier2``
+    # deliveries per click → two ``/trigger-bulk`` calls → duplicate
+    # Tier-2 jobs and duplicate snapshots per (user, workload). The
+    # 2026-05-16 incident surfaced this as half-empty snapshot rows
+    # in the Activity breakdown (one snapshot drained the data, the
+    # other was a no-op race). Only the inner publish is kept; we
+    # still compute ``users_missing_tier2`` here purely to drive the
+    # ``BULK_BACKUP_PENDING_DISCOVERY`` audit event below.
     users_missing_tier2: List[Resource] = []
     if service_key == "m365":
         from shared.tier2_discovery import find_users_missing_tier2
@@ -1286,32 +1323,6 @@ async def trigger_datasource_backup(request: TriggerDatasourceBackupRequest, db:
             users_missing_tier2 = await find_users_missing_tier2(
                 db, user_resource_ids=sla_user_ids, require_sla=True,
             )
-        if users_missing_tier2 and settings.RABBITMQ_ENABLED:
-            try:
-                await message_bus.publish(
-                    "discovery.tier2",
-                    {
-                        "tenantId": str(tenant_uuid),
-                        "userResourceIds": [str(u.id) for u in users_missing_tier2],
-                        "source": "BULK_TRIGGER",
-                        "thenBackup": True,
-                        "fullBackup": bool(request.fullBackup or False),
-                        # Same batch_id used for the parent-resource Jobs
-                        # below. The discovery-worker passes this through
-                        # to trigger-bulk so child Jobs join the same group.
-                        "batchId": batch_id,
-                    },
-                    priority=8,
-                )
-                print(
-                    f"[JOB_SERVICE] Tier-2 gap-fill: enqueued discovery.tier2 for "
-                    f"{len(users_missing_tier2)} user(s) under tenant {tenant_uuid}",
-                )
-            except Exception as e:
-                # Discovery enqueue failing must NOT block the immediate
-                # parent-resource backup. Log and continue with whatever we
-                # can back up right now.
-                print(f"[JOB_SERVICE] Tier-2 gap-fill publish failed (non-fatal): {e}")
 
     resources_map = {str(resource.id): resource for resource in resources}
     jobs = await _create_batch_backup_jobs(
