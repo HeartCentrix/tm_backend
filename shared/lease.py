@@ -25,8 +25,12 @@ from typing import Optional
 from sqlalchemy import text
 
 
-LEASE_TTL_S = int(os.getenv("LEASE_TTL_S", "60"))
-LEASE_RENEW_S = int(os.getenv("LEASE_RENEW_S", "30"))
+# 5k-user prod scale: CHATS partitions with 403 backoffs and heavy
+# OneDrive shards routinely run 5+ minutes per partition. Renew at
+# TTL/5 so a single missed tick (network blip, DB stall, pool wait)
+# does not orphan a live worker's lease to the sweeper.
+LEASE_TTL_S = int(os.getenv("LEASE_TTL_S", "600"))
+LEASE_RENEW_S = int(os.getenv("LEASE_RENEW_S", "120"))
 
 
 # Tables that carry lease columns. Hard-coded set guards against
