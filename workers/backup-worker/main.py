@@ -5592,9 +5592,27 @@ class BackupWorker:
                                 drain_succeeded = False
                                 _err_str = f"HTTP {status} {type(he).__name__}"
                                 _err_class = _classify_chat_drain_error(status, he)
+                                # Extract the actual Graph error body so the
+                                # operator can see WHICH scope/policy Graph
+                                # is complaining about (e.g. "Forbidden:
+                                # Application missing ChatMessage.Read.All",
+                                # "Protected APIs are not approved for this
+                                # tenant", etc.). httpx's default str(he) is
+                                # just "Client error '403 Forbidden' for url
+                                # ..." which is useless for diagnosis. Body
+                                # truncated to 800 chars so log lines stay
+                                # readable. Best-effort: if the body isn't
+                                # JSON, capture the raw text.
+                                _err_body = ""
+                                try:
+                                    if he.response is not None:
+                                        _err_body = (he.response.text or "")[:800]
+                                except Exception:
+                                    _err_body = ""
                                 new_failures[cid] = {
                                     "count": _prior_count + 1,
                                     "last_error": _err_str,
+                                    "last_error_body": _err_body,
                                     "error_class": _err_class,
                                     "granted_scopes_at_failure": _current_fp,
                                     "shard_app_id": _shard_client.client_id,
@@ -5614,6 +5632,11 @@ class BackupWorker:
                                     f"consecutive-failure #{_prior_count + 1}, "
                                     f"cursor preserved — will retry next backup)"
                                 )
+                                if _err_body:
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] chat "
+                                        f"{cid[:8]} graph-error-body: {_err_body}"
+                                    )
                                 break
                             except Exception as e:
                                 # Network / SDK errors — _iter_pages already
@@ -9116,9 +9139,39 @@ class BackupWorker:
         ONEDRIVE_PARTITION_STALE_SWEEP_MIN is treated as abandoned, so
         the scheduler-side sweep doesn't have to be the only path that
         unsticks dead claims.
+
+        Lease ownership: in addition to the legacy ``worker_id`` /
+        ``started_at`` stamps (kept for log/UI compatibility), this also
+        sets ``lease_owner_id`` to the worker's heartbeat UUID and
+        ``lease_expires_at = NOW() + LEASE_TTL_S``. The shared
+        ``LeaseExtender`` background task (started at worker init) then
+        renews the lease every LEASE_RENEW_S seconds for as long as this
+        worker is alive — even if a single drain takes 30+ minutes
+        because of slow Graph responses, 403 burn-through, or large
+        attachment uploads. Without this, ``reconciler.sweep_orphans``
+        (STEP A) sees ``lease_expires_at IS NULL`` and treats every
+        live partition as stale once enqueued_at > 5 min, requeues it,
+        and after 3 requeues poisons it to FAILED — even though the
+        original worker was still drainfully working. Observed
+        2026-05-16: 18 CHATS partitions across 5 users marked FAILED
+        this way mid-drain.
         """
         stale_min = int(settings.ONEDRIVE_PARTITION_STALE_SWEEP_MIN)
         worker_region = os.getenv("WORKER_REGION", "default")
+        # heartbeat.worker_uuid is the lease-tracking UUID; the legacy
+        # `worker_id` string column is kept as a human-readable tag.
+        # When heartbeat init has failed (extremely rare), fall back to
+        # NULL lease ownership — the row is still claimed but the
+        # LeaseExtender won't auto-renew it, so the existing 30-min
+        # ONEDRIVE_PARTITION_STALE_SWEEP_MIN guard is the only
+        # protection against ghost-claims. Acceptable degradation.
+        try:
+            from shared.lease import LEASE_TTL_S
+        except Exception:
+            LEASE_TTL_S = 600  # mirror default in shared/lease.py
+        owner_uuid: Optional[str] = None
+        if getattr(self, "_heartbeat", None) is not None:
+            owner_uuid = str(self._heartbeat.worker_uuid)
         async with async_session_factory() as session:
             row = (await session.execute(
                 text(
@@ -9127,7 +9180,16 @@ class BackupWorker:
                        SET status        = 'IN_PROGRESS',
                            worker_id     = :wid,
                            worker_region = :wregion,
-                           started_at    = NOW()
+                           started_at    = NOW(),
+                           lease_owner_id   = CASE
+                               WHEN :owner_uuid IS NULL THEN lease_owner_id
+                               ELSE cast(:owner_uuid AS uuid)
+                           END,
+                           lease_expires_at = CASE
+                               WHEN :owner_uuid IS NULL THEN lease_expires_at
+                               ELSE NOW() + (:lease_ttl * INTERVAL '1 second')
+                           END,
+                           lease_token   = lease_token + 1
                      WHERE id = :pid
                        AND (
                             status = 'QUEUED'
@@ -9145,7 +9207,9 @@ class BackupWorker:
                 ),
                 {"pid": str(partition_id), "wid": worker_id,
                  "wregion": worker_region,
-                 "stale": stale_min},
+                 "stale": stale_min,
+                 "owner_uuid": owner_uuid,
+                 "lease_ttl": LEASE_TTL_S},
             )).first()
             await session.commit()
         if row is None:
