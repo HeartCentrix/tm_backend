@@ -152,19 +152,58 @@ async def run_toggle(payload: dict) -> None:
         await _set_active(db, to_id)
 
         # Phase 7 — smoke
+        # Catch every exception, not just AssertionError. The data-plane
+        # store classes (azure/seaweedfs/s3) raise ``BackendUnreachable
+        # Error``, ``ClientError``, network timeouts, etc. on failed
+        # PutObject — none of which subclass AssertionError. Before this
+        # widened catch, a non-AssertionError exception in run_smoke
+        # propagated up, the orchestrator crashed, and the event row
+        # was left wedged in status='workers_restarted' with no rollback
+        # ever firing — exactly the 2026-05-16 "flipping forever"
+        # incident triggered by SeaweedFS running out of volume capacity.
+        #
+        # In addition to marking the event ``failed``, we now revert
+        # ``active_backend_id`` to ``from_id`` so the data plane keeps
+        # serving from the previously-known-good backend instead of
+        # pointing at the broken target. Phase 6 cutover commits
+        # active_backend_id BEFORE smoke runs, so without this revert
+        # a smoke failure would silently leave the system pointed at
+        # the failed backend.
         log.info("phase 7: smoke")
         try:
             # Reload router so get_store_by_id picks up any config mutations.
             await router._reload_from_db()
             await run_smoke(db, new_backend_id=to_id, old_backend_id=from_id)
             await _update_event(db, event_id, status="smoke_passed")
-        except AssertionError as e:
-            log.error("smoke failed: %s", e)
-            await _update_event(
-                db, event_id, status="failed",
-                error_message=f"smoke: {e}",
-                completed_at=datetime.now(timezone.utc),
-            )
+        except Exception as e:
+            log.error("smoke failed (%s): %s", type(e).__name__, e)
+            # Revert the cutover from Phase 6 — active_backend_id was
+            # already flipped to ``to_id`` and that's now pointing at a
+            # broken backend. Restore from_id so writes keep working.
+            try:
+                await _set_active(db, from_id)
+            except Exception as set_err:
+                log.error("revert active_backend_id failed: %s", set_err)
+            # Standard rollback path: clear transition_state and mark
+            # the event row failed. ``rollback`` is idempotent w.r.t.
+            # the _update_event we'd otherwise call directly.
+            try:
+                await rollback(
+                    db, event_id=event_id, phase="smoke",
+                    error=f"{type(e).__name__}: {e}",
+                )
+            except Exception as rb_err:
+                # Best-effort: even if rollback() itself fails, force a
+                # terminal event status so the UI cooldown banner
+                # unblocks. Without this, an outage in the rollback path
+                # could re-wedge the row.
+                log.error("rollback() failed during smoke handler: %s", rb_err)
+                await _update_event(
+                    db, event_id, status="failed",
+                    error_message=f"smoke: {type(e).__name__}: {e} "
+                                  f"(rollback also failed: {rb_err})",
+                    completed_at=datetime.now(timezone.utc),
+                )
             return
 
         # Phase 8 — open
