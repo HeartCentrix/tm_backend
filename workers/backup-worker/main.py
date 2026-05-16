@@ -5761,41 +5761,33 @@ class BackupWorker:
                                     f"{persist_err}"
                                 )
 
-                            # Resume checkpoint: write THIS chat's drain
-                            # cursor + last_drained_at into chat_threads
-                            # right now, before draining the next chat.
-                            # If the worker dies, the next session reads
-                            # chat_threads.drain_cursor and queries Graph
-                            # with `lastModifiedDateTime gt <stamp>` — so
-                            # this chat skips straight to "what's new"
-                            # instead of re-pulling everything. Chats
-                            # that haven't checkpointed yet get a full
-                            # re-drain, which is idempotent thanks to
-                            # UNIQUE (chat_thread_id, message_external_id)
-                            # on chat_thread_messages.
-                            #
-                            # Skip the cursor advancement when drain
-                            # failed mid-flight (max_stamp is set but
-                            # drain_succeeded=False) — but DO bump
-                            # last_drained_at + failure state so other
-                            # backups see freshness + know why this
-                            # chat failed.
-                            try:
-                                await _mark_chat_thread_drained(
-                                    thread_id=thread_id,
-                                    drain_cursor=(
-                                        max_stamp if drain_succeeded else None
-                                    ),
-                                    failure_state=new_failures.get(cid),
-                                )
-                            except Exception as _ck_err:
-                                # Advisory checkpoint — a DB hiccup here
-                                # must not abort the drain.
-                                print(
-                                    f"[{self.worker_id}] [USER_CHATS] "
-                                    f"chat {cid[:8]} chat_threads "
-                                    f"checkpoint failed: {_ck_err}"
-                                )
+                        # Resume checkpoint: write THIS chat's drain
+                        # cursor + last_drained_at into chat_threads
+                        # unconditionally — including failed drains where
+                        # msgs_local=[] (e.g. 403 on first page). Prior
+                        # placement inside `if _streaming_enabled and
+                        # msgs_local` silently skipped the write for every
+                        # permission-denied chat, so drain_failure_state
+                        # was never persisted and smart-skip never fired.
+                        # Skip the cursor advancement when drain failed
+                        # (drain_succeeded=False) but always bump
+                        # last_drained_at + failure_state.
+                        try:
+                            await _mark_chat_thread_drained(
+                                thread_id=thread_id,
+                                drain_cursor=(
+                                    max_stamp if drain_succeeded else None
+                                ),
+                                failure_state=new_failures.get(cid),
+                            )
+                        except Exception as _ck_err:
+                            # Advisory checkpoint — a DB hiccup here
+                            # must not abort the drain.
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] "
+                                f"chat {cid[:8]} chat_threads "
+                                f"checkpoint failed: {_ck_err}"
+                            )
 
                         # Fire hostedContent fetch for this chat's msgs
                         # as a background task — runs in parallel with
