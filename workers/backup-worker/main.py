@@ -6755,10 +6755,18 @@ class BackupWorker:
                     snap.new_item_count = delta_items
                     snap.bytes_total = bytes_total
                     snap.bytes_added = delta_bytes
-                    snap.status = SnapshotStatus.COMPLETED
-                    snap.completed_at = datetime.utcnow()
-                    if snap.started_at:
-                        snap.duration_secs = int((snap.completed_at - snap.started_at).total_seconds())
+                    # Partitioned snapshots defer terminal status to
+                    # _finalize_partitioned_snapshot (last-finisher). Flipping
+                    # COMPLETED here races sibling partition consumers still
+                    # draining — causes bad_completed in DB and UI showing ✓
+                    # before all partitions finish. Update counts only; let the
+                    # last finisher own the status flip.
+                    _snap_extra = snap.extra_data or {}
+                    if not _snap_extra.get("partitioned"):
+                        snap.status = SnapshotStatus.COMPLETED
+                        snap.completed_at = datetime.utcnow()
+                        if snap.started_at:
+                            snap.duration_secs = int((snap.completed_at - snap.started_at).total_seconds())
                     await session.commit()
 
                     await self.update_resource_backup_info(session, resource, job_id, snapshot.id, {
