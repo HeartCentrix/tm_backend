@@ -179,16 +179,21 @@ class StorageRouter:
         reload_interval_s = 60.0
         while True:
             try:
-                # Make sure the shared connection is alive and re-attach
-                # listeners if we just reconnected.
-                async with self._conn_lock:
-                    conn = await self._ensure_conn()
-
                 def _on_notify(*_args):
                     asyncio.create_task(self._reload_from_db())
 
-                await conn.add_listener("system_config_changed", _on_notify)
-                await conn.add_listener("storage_backends_changed", _on_notify)
+                # Make sure the shared connection is alive and re-attach
+                # listeners. add_listener issues a LISTEN SQL on the conn,
+                # so it must be lock-guarded — otherwise a NOTIFY that
+                # arrives between the two add_listener calls (or during
+                # the second one) schedules _reload_from_db, which then
+                # tries to use the same conn mid-LISTEN and crashes with
+                # asyncpg InterfaceError: "another operation is in
+                # progress" (2026-05-16 logs).
+                async with self._conn_lock:
+                    conn = await self._ensure_conn()
+                    await conn.add_listener("system_config_changed", _on_notify)
+                    await conn.add_listener("storage_backends_changed", _on_notify)
 
                 while True:
                     await asyncio.sleep(reload_interval_s)
