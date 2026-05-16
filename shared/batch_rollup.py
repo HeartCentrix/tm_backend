@@ -382,17 +382,33 @@ def build_batch_rollup_query(
                 WHERE r.type::text = 'ENTRA_USER'
                   AND s.status::text IN ('COMPLETED','PARTIAL','FAILED')
             )                                              AS tier1_terminal,
-            -- Tier-2 expected count: prefer the resolved expected_t2
-            -- count (accurate post-discovery). If zero (pre-discovery
-            -- window), estimate as |tier1 users| × 5 workloads so the
-            -- bar has a stable denominator during the Tier-1→Tier-2
-            -- handoff.
+            -- Tier-2 expected count: must always be ≥
+            -- (terminal + in_flight) so the progress fraction
+            -- can't exceed 1.0. Previously this used only
+            -- ``GREATEST(expected_t2_count, users × 5)`` as a
+            -- pre-discovery floor — but the worker spawns more
+            -- Tier-2 snapshots than the canonical 5 per user when
+            -- it issues retries OR when a workload type is split
+            -- across multiple snapshots (e.g. shared mailbox, extra
+            -- OneDrives). Result (2026-05-16): denom stuck at 45
+            -- while terminal hit 68 → bar overshoots and gets
+            -- clamped to 99 % when only ~80 % of the work is done.
+            --
+            -- Fix: bound the denominator below by the actual count
+            -- of Tier-2 snapshots ever observed (terminal +
+            -- in_flight). Keeps the bar honest: it can only hit
+            -- 100 % once every Tier-2 snapshot is terminal.
             GREATEST(
                 COALESCE((
                     SELECT COUNT(*) FROM expected_t2 e
                      WHERE e.batch_id = b.batch_id
                 ), 0),
-                COALESCE(array_length(ts.scope_ids, 1), 0) * 5
+                COALESCE(array_length(ts.scope_ids, 1), 0) * 5,
+                COUNT(*) FILTER (
+                    WHERE r.type::text IN (
+                        'USER_MAIL','USER_ONEDRIVE','USER_CHATS',
+                        'USER_CALENDAR','USER_CONTACTS')
+                )
             )                                              AS tier2_total,
             COUNT(*) FILTER (
                 WHERE r.type::text IN (
