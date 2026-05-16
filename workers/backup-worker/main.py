@@ -18302,7 +18302,29 @@ class BackupWorker:
             return 0
 
     async def complete_snapshot(self, session: AsyncSession, snapshot: Snapshot, result: Dict):
-        """Mark snapshot as completed with result data"""
+        """Mark snapshot as completed with result data.
+
+        Partitioned-snapshot guard: when the coordinator role finishes
+        (it INSERTs partition rows and returns a placeholder
+        ``result={}`` so audit doesn't fire BACKUP_COMPLETED), this
+        function MUST NOT flip ``snapshot.status`` or stamp counts/
+        completed_at — those belong to the last-finisher
+        ``_finalize_partitioned_snapshot``. Without the guard the
+        placeholder's ``files_failed=0`` falls through to the
+        status-flip branch below and marks the snapshot COMPLETED
+        BEFORE any partition consumer has drained a single message,
+        leaving an integrity mismatch (snap=COMPLETED with children
+        IN_PROGRESS/FAILED). Observed 2026-05-16: bad_completed
+        climbing to 6+ during the partition wave because every
+        partitioned snapshot hit this path. Reconciler STEP D
+        eventually corrects it but the snapshot row spends ~60s in
+        a contradictory state, and any consumer reading status
+        during that window gets a wrong answer.
+        """
+        extra = snapshot.extra_data or {}
+        if extra.get("partitioned") is True:
+            # Last-finisher owns this snapshot's terminal state.
+            return
         now = datetime.utcnow()
         snapshot.completed_at = now
         snapshot.item_count = result.get("item_count", 0)

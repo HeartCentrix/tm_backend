@@ -25,6 +25,20 @@ from sqlalchemy import text
 RECONCILER_BATCH = int(os.getenv("RECONCILER_BATCH", "200"))
 RECONCILER_MAX_REQUEUE = int(os.getenv("RECONCILER_MAX_REQUEUE", "3"))
 HEARTBEAT_STALE_S = int(os.getenv("HEARTBEAT_STALE_S", "60"))
+# Minimum age before a partition is eligible for requeue. Was hard-coded
+# to 5 minutes — too aggressive at 5k-user prod scale where a single
+# CHATS shard can sit in RMQ behind the running batch for 6+ minutes
+# (workers limited to ~12 concurrent drains across 4+2 replicas, and
+# partitioned snapshots commonly have 4 shards each). 5 min meant the
+# reconciler bumped requeue_count on partitions that simply hadn't been
+# popped yet, and after 3 bumps (= 15 min) they were poisoned to FAILED
+# without any worker ever having touched them. 15 min lets a slow drain
+# queue clear naturally before the recovery path kicks in. Real worker
+# deaths are detected separately via lease_expires_at expiry (10 min
+# TTL), so this knob only governs the rare "message lost in RMQ" case.
+RECONCILER_PART_STALE_MIN = int(
+    os.getenv("RECONCILER_PART_STALE_MIN", "15"),
+)
 # Age fallback for legacy rows that don't have leases stamped yet.
 # Once every writer is lease-aware this becomes belt-and-braces, but
 # it's the primary path on the day this PR lands (current in-flight
@@ -64,6 +78,16 @@ async def sweep_orphans(session) -> SweepStats:
         await session.execute(
             text(
                 """
+                -- enqueued_at is reset to NOW() on each requeue (see the
+                -- UPDATE below) so the staleness window starts over per
+                -- requeue cycle. Without that reset the criterion stayed
+                -- TRUE forever once it first matched, and every reconciler
+                -- tick (60 s) would bump requeue_count + 1 — three ticks
+                -- = poison-pill regardless of whether the message had
+                -- actually been picked up. Observed 2026-05-16 prod: 22
+                -- partitions hit rq>=1 within ~7 min of being enqueued
+                -- (workers still busy on prior partitions), and 2 hit
+                -- rq=3 = FAILED without any worker ever touching them.
                 WITH stale AS (
                     SELECT sp.id, sp.snapshot_id, sp.partition_type,
                            sp.partition_index, sp.drive_id, sp.file_ids,
@@ -78,7 +102,7 @@ async def sweep_orphans(session) -> SweepStats:
                             sp.lease_expires_at IS NULL
                          OR sp.lease_expires_at < NOW()
                        )
-                       AND sp.enqueued_at < NOW() - INTERVAL '5 minutes'
+                       AND sp.enqueued_at < NOW() - (:part_stale * INTERVAL '1 minute')
                        AND sp.requeue_count < :max_rq
                      ORDER BY sp.enqueued_at
                      LIMIT :batch
@@ -89,7 +113,8 @@ async def sweep_orphans(session) -> SweepStats:
                        lease_owner_id = NULL,
                        lease_expires_at = NULL,
                        lease_token    = sp.lease_token + 1,
-                       requeue_count  = sp.requeue_count + 1
+                       requeue_count  = sp.requeue_count + 1,
+                       enqueued_at    = NOW()
                   FROM stale
                  WHERE sp.id = stale.id
                 RETURNING sp.id, sp.snapshot_id, sp.partition_type,
@@ -101,6 +126,7 @@ async def sweep_orphans(session) -> SweepStats:
                 "stale_s": HEARTBEAT_STALE_S,
                 "max_rq": RECONCILER_MAX_REQUEUE,
                 "batch": RECONCILER_BATCH,
+                "part_stale": RECONCILER_PART_STALE_MIN,
             },
         )
     ).all()
