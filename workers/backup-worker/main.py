@@ -8862,6 +8862,54 @@ class BackupWorker:
                 if (preempted and new_status == "COMPLETED"
                     and snap.status == SnapshotStatus.PARTIAL):
                     snap.status = SnapshotStatus.COMPLETED
+                # 2026-05-16 integrity fix — re-derive status from the
+                # CURRENT partition counts and override snap.status if
+                # it disagrees. The initial CTE above can flip a
+                # snapshot to COMPLETED when partitions appear all-
+                # COMPLETED at that moment, but if a sibling partition's
+                # status mutates between the CTE and this commit (e.g.
+                # reconciler poison-pill, late _mark_partition_terminal
+                # FAILED commit), the snap.status stays stale. By re-
+                # checking AT WRITE TIME inside the same transaction as
+                # item_count/bytes, the parent reflects the latest
+                # partition state. Observed bug: Vinay/Ranjeet CHATS
+                # snap=COMPLETED with all 4 partitions FAILED.
+                derived_row = (await session.execute(
+                    text(
+                        """
+                        SELECT
+                          COUNT(*) AS n,
+                          COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
+                          COUNT(*) FILTER (WHERE status = 'FAILED')    AS failed,
+                          COUNT(*) FILTER (WHERE status IN ('QUEUED','IN_PROGRESS')) AS pending
+                          FROM snapshot_partitions
+                         WHERE snapshot_id = :sid
+                        """
+                    ),
+                    {"sid": str(snapshot_id)},
+                )).first()
+                _d_n = int(getattr(derived_row, "n", 0) or 0)
+                _d_completed = int(getattr(derived_row, "completed", 0) or 0)
+                _d_failed = int(getattr(derived_row, "failed", 0) or 0)
+                _d_pending = int(getattr(derived_row, "pending", 0) or 0)
+                if _d_n > 0 and _d_pending == 0:
+                    if _d_completed == _d_n:
+                        _derived_status = SnapshotStatus.COMPLETED
+                    elif _d_failed == _d_n:
+                        _derived_status = SnapshotStatus.FAILED
+                    elif _d_failed > 0:
+                        _derived_status = SnapshotStatus.PARTIAL
+                    else:
+                        _derived_status = SnapshotStatus.COMPLETED
+                    if snap.status != _derived_status:
+                        print(
+                            f"[{self.worker_id}] [PARTITION FINALIZE] "
+                            f"integrity correction snapshot={snapshot_id}: "
+                            f"{snap.status} → {_derived_status.value} "
+                            f"(c={_d_completed} f={_d_failed} n={_d_n})"
+                        )
+                        snap.status = _derived_status
+                        new_status = _derived_status.value
                 # Mark so a second pre-empted entry returns early.
                 snap.extra_data = {
                     **(snap.extra_data or {}),
