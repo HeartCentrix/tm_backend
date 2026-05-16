@@ -113,6 +113,18 @@ class MessageBus:
                     "backup.groups_partition",
                     routing_key="backup.groups_partition",
                 )
+                # Phase 3.5: Entra directory partition queue. Shards
+                # carry a `category_ids: ["USERS","GROUPS",...]`
+                # allowlist; workers re-enter backup_entra_directory
+                # scoped to those categories. Each of the 8 directory
+                # categories (Users / Groups / Roles / Security /
+                # Audit / Applications / Intune / Admin Units) is an
+                # independent Graph fetch + persist so partitioning
+                # them across replicas is a near-pure speedup.
+                await self._declare_queue(
+                    "backup.entra_partition",
+                    routing_key="backup.entra_partition",
+                )
                 await self._declare_queue("restore.urgent", routing_key="restore.urgent")
                 await self._declare_queue("restore.normal", routing_key="restore.normal")
                 await self._declare_queue("restore.low", routing_key="restore.low")
@@ -367,6 +379,39 @@ def create_groups_partition_message(
         "resourceId": resource_id,
         "channelIds": channel_ids,
         "teamId": team_id,
+        "createdAt": datetime.utcnow().isoformat(),
+    }
+
+
+def create_entra_partition_message(
+    *,
+    partition_id: str,
+    snapshot_id: str,
+    job_id: str,
+    tenant_id: str,
+    resource_id: str,
+    category_ids: list,
+    directory_id: str,
+) -> dict:
+    """Envelope for one shard of a partitioned Entra directory snapshot.
+
+    The consumer atomically claims the snapshot_partitions row, then
+    drains only the categories in `category_ids` for the directory
+    resource (ENTRA_DIRECTORY). Categories are one of:
+    USERS / GROUPS / ROLES / SECURITY / AUDIT / APPLICATIONS /
+    INTUNE / ADMIN_UNITS. `directory_id` mirrors `team_id` /
+    `site_id` semantics — pass the ENTRA_DIRECTORY resource's
+    external_id so consumers can re-target if needed.
+    """
+    return {
+        "messageType": "BACKUP_ENTRA_PARTITION",
+        "partitionId": partition_id,
+        "snapshotId": snapshot_id,
+        "jobId": job_id,
+        "tenantId": tenant_id,
+        "resourceId": resource_id,
+        "categoryIds": category_ids,
+        "directoryId": directory_id,
         "createdAt": datetime.utcnow().isoformat(),
     }
 

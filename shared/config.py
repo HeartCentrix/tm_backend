@@ -518,6 +518,28 @@ class Settings:
             "GROUPS_PARTITION_CHANNELS_PER_SHARD", "4",
         ))
 
+        # ── Phase 3.5: Entra directory partition (by category list) ──
+        # `backup_entra_directory` captures 8 independent Graph
+        # categories (Users / Groups / Roles / Security / Audit /
+        # Applications / Intune / Administrative Units) inline and
+        # serially. On a 10k-user tenant the Users + Groups fetches
+        # alone dominate — Groups is especially slow because every
+        # group triggers per-group owners + first-page-members calls.
+        # The partition lane splits the 8 categories into shards so
+        # different replicas can drain them concurrently.
+        self.ENTRA_PARTITION_ENABLED = os.getenv(
+            "ENTRA_PARTITION_ENABLED", "true",
+        ).lower() in ("true", "1", "yes")
+        self.ENTRA_PARTITION_MIN_CATEGORIES = int(os.getenv(
+            "ENTRA_PARTITION_MIN_CATEGORIES", "4",
+        ))
+        self.ENTRA_PARTITION_MAX_SHARDS = int(os.getenv(
+            "ENTRA_PARTITION_MAX_SHARDS", "4",
+        ))
+        self.ENTRA_PARTITION_CATEGORIES_PER_SHARD = int(os.getenv(
+            "ENTRA_PARTITION_CATEGORIES_PER_SHARD", "2",
+        ))
+
         # ── Generic partition resilience knobs ──
         # Per-tenant concurrency cap on partition shards (across all
         # partition_types). Prevents one tenant's whale OneDrive +

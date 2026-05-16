@@ -1662,6 +1662,12 @@ class BackupWorker:
         # from monopolizing more than two shards at once.
         if getattr(settings, "GROUPS_PARTITION_ENABLED", False):
             queues.append(("backup.groups_partition", 2))
+        # Entra directory partition lane — directory-category shards.
+        # Most categories are I/O-light (one Graph page each) but the
+        # Groups category fans out to per-group owner+member calls
+        # which can dominate. Prefetch=2 keeps replicas balanced.
+        if getattr(settings, "ENTRA_PARTITION_ENABLED", False):
+            queues.append(("backup.entra_partition", 2))
 
         tasks = []
         for queue_name, prefetch in queues:
@@ -2156,6 +2162,13 @@ class BackupWorker:
         # carrying this shard's allowlist.
         if message.get("messageType") == "BACKUP_GROUPS_PARTITION":
             await self._process_groups_partition_message(message)
+            return
+        # Entra directory partition shards (Phase 3.5). Coordinator in
+        # `backup_entra_directory` decides fanout from category set;
+        # consumer re-enters with partitionFilter.categoryIds carrying
+        # this shard's allowlist.
+        if message.get("messageType") == "BACKUP_ENTRA_PARTITION":
+            await self._process_entra_partition_message(message)
             return
 
         # Defensive: a malformed envelope (no recognised messageType AND
@@ -8721,6 +8734,158 @@ class BackupWorker:
                     f"{type(pub_exc).__name__}: {pub_exc}"
                 )
 
+    # ------------------------------------------------------------------
+    # ENTRA partition helpers (Phase 3.5 — directory-category sharding)
+    # ------------------------------------------------------------------
+    # The 8 directory categories — one per top-level section in the
+    # Recovery view. Order matters only for stable bin-packing; runtime
+    # order inside a shard is irrelevant.
+    ENTRA_DIRECTORY_CATEGORIES: List[str] = [
+        "USERS", "GROUPS", "ROLES", "SECURITY",
+        "AUDIT", "APPLICATIONS", "INTUNE", "ADMIN_UNITS",
+    ]
+
+    def _should_partition_entra(
+        self,
+        categories: Optional[List[str]] = None,
+    ) -> bool:
+        """Decide whether an Entra directory snapshot warrants
+        category sharding. With 8 categories and ~10k-user tenants
+        the default threshold (4) effectively means "always partition
+        unless the operator disabled it". For tiny tenants, the
+        non-partitioned inline path stays cheaper than the broker
+        round-trip.
+        """
+        try:
+            if not settings.ENTRA_PARTITION_ENABLED:
+                return False
+            min_categories = int(settings.ENTRA_PARTITION_MIN_CATEGORIES)
+        except AttributeError:
+            return False
+        cats = categories if categories is not None else self.ENTRA_DIRECTORY_CATEGORIES
+        return len(cats) >= min_categories
+
+    def _bin_pack_entra_categories(
+        self,
+        categories: List[str],
+        n_shards: int,
+    ) -> List[List[str]]:
+        """Round-robin pack categories into N shards. The Groups
+        category is the slowest (per-group owner+member fan-out) —
+        place it first so its shard starts immediately while others
+        absorb the lighter categories. Deterministic on coordinator
+        redelivery.
+        """
+        if n_shards <= 0:
+            n_shards = 1
+        ordered = sorted(
+            categories,
+            key=lambda c: (
+                0 if c == "GROUPS" else
+                1 if c == "USERS" else
+                2 if c == "AUDIT" else
+                3
+            ),
+        )
+        shards: List[List[str]] = [[] for _ in range(n_shards)]
+        for i, cat in enumerate(ordered):
+            shards[i % n_shards].append(cat)
+        return shards
+
+    async def _fanout_entra_partitions(
+        self,
+        *,
+        snapshot: Snapshot,
+        resource: Resource,
+        tenant: Tenant,
+        categories: List[str],
+        directory_id: str,
+        job_id: uuid.UUID,
+    ) -> None:
+        """Pack categories into N shards, insert one snapshot_partitions
+        row per shard, mark snapshot.extra_data partitioned=True,
+        publish N backup.entra_partition messages.
+        """
+        from shared.message_bus import create_entra_partition_message
+        per_shard = max(1, int(settings.ENTRA_PARTITION_CATEGORIES_PER_SHARD))
+        max_shards = max(1, int(settings.ENTRA_PARTITION_MAX_SHARDS))
+        n_shards = max(
+            2,
+            min(
+                max_shards,
+                (len(categories) + per_shard - 1) // per_shard or 1,
+            ),
+        )
+
+        shards = self._bin_pack_entra_categories(categories, n_shards)
+        shards = [s for s in shards if s]
+        if len(shards) < 2:
+            shards = [list(categories)]
+
+        partition_msgs: List[Tuple[str, str, List[str]]] = []
+        async with async_session_factory() as session:
+            snap = await session.get(Snapshot, snapshot.id)
+            if snap is not None:
+                ed = dict(snap.extra_data or {})
+                ed["partitioned"] = True
+                ed["partition_type"] = "ENTRA_CATEGORIES"
+                ed["partition_count"] = len(shards)
+                ed["partition_total_categories"] = len(categories)
+                snap.extra_data = ed
+            for idx, shard_cats in enumerate(shards):
+                partition_id = uuid.uuid4()
+                row = SnapshotPartition(
+                    id=partition_id,
+                    snapshot_id=snapshot.id,
+                    tenant_id=tenant.id,
+                    resource_id=resource.id,
+                    job_id=job_id,
+                    partition_type="ENTRA_CATEGORIES",
+                    drive_id=None,
+                    partition_index=idx,
+                    file_ids=None,
+                    payload={
+                        "category_ids": shard_cats,
+                        "directory_id": directory_id,
+                    },
+                    total_files=len(shard_cats),
+                    total_bytes_est=0,
+                    status="QUEUED",
+                )
+                session.add(row)
+                partition_msgs.append(
+                    (str(partition_id), str(snapshot.id), shard_cats),
+                )
+            await session.commit()
+
+        print(
+            f"[{self.worker_id}] [ENTRA_DIR] "
+            f"{resource.display_name or resource.id}: "
+            f"PARTITION fanout — {len(shards)} shards, "
+            f"{len(categories)} categories ({', '.join(categories)})."
+        )
+
+        for partition_id, snap_id_str, shard_cats in partition_msgs:
+            msg = create_entra_partition_message(
+                partition_id=partition_id,
+                snapshot_id=snap_id_str,
+                job_id=str(job_id),
+                tenant_id=str(tenant.id),
+                resource_id=str(resource.id),
+                category_ids=shard_cats,
+                directory_id=directory_id,
+            )
+            try:
+                await message_bus.publish(
+                    "backup.entra_partition", msg, priority=3,
+                )
+            except Exception as pub_exc:
+                print(
+                    f"[{self.worker_id}] [ENTRA_DIR] partition "
+                    f"publish failed (partition={partition_id}): "
+                    f"{type(pub_exc).__name__}: {pub_exc}"
+                )
+
     async def _claim_partition(
         self, partition_id: uuid.UUID, worker_id: str,
     ) -> Optional[Dict[str, Any]]:
@@ -10433,6 +10598,216 @@ class BackupWorker:
             print(
                 f"[{self.worker_id}] [PARTITION] {partition_id} "
                 f"groups shard failed: {type(e).__name__}: {e}"
+            )
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={
+                    "reason": type(e).__name__,
+                    "message": str(e)[:500],
+                },
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "reason": type(e).__name__,
+                    "message": str(e)[:500],
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
+            raise
+        finally:
+            try:
+                await self._finalize_partitioned_snapshot(
+                    snapshot_id, tenant=tenant, resource=resource,
+                    job_id=job_id,
+                )
+            except Exception as fin_exc:
+                print(
+                    f"[{self.worker_id}] [PARTITION FINALIZE] "
+                    f"unhandled: {type(fin_exc).__name__}: {fin_exc}"
+                )
+
+    async def _process_entra_partition_message(
+        self, message: Dict[str, Any],
+    ) -> None:
+        """Handler for one `backup.entra_partition` message.
+
+        Re-enters `backup_entra_directory` for the ENTRA_DIRECTORY
+        resource with a partitionFilter.categoryIds envelope so only
+        this shard's categories run.
+        """
+        partition_id = uuid.UUID(str(message["partitionId"]))
+        claim = await self._claim_partition(partition_id, self.worker_id)
+        if claim is None:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} — "
+                f"claim refused (already owned or terminal); ack-drop"
+            )
+            return
+
+        snapshot_id = uuid.UUID(str(claim["snapshot_id"]))
+        tenant_id = uuid.UUID(str(claim["tenant_id"]))
+        resource_id = uuid.UUID(str(claim["resource_id"]))
+        job_id = uuid.UUID(str(claim["job_id"]))
+        partition_type = str(
+            claim.get("partition_type") or "ENTRA_CATEGORIES",
+        )
+        partition_index = claim.get("partition_index")
+        payload = claim.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        shard_category_ids: List[str] = list(
+            payload.get("category_ids") or [],
+        )
+        directory_id = str(payload.get("directory_id") or "")
+        total_categories = (
+            claim.get("total_files") or len(shard_category_ids)
+        )
+
+        started_at = time.monotonic()
+        await self._emit_partition_audit(
+            "PARTITION_STARTED", "IN_PROGRESS",
+            tenant_id=str(tenant_id), resource_id=str(resource_id),
+            snapshot_id=snapshot_id, job_id=job_id,
+            partition_id=partition_id, partition_type=partition_type,
+            details={
+                "partition_index": partition_index,
+                "total_categories": total_categories,
+                "categories": shard_category_ids,
+                "directory_id": directory_id,
+            },
+        )
+
+        if not shard_category_ids:
+            await self._mark_partition_terminal(
+                partition_id, status="COMPLETED",
+                files_uploaded=0, bytes_uploaded=0,
+            )
+            await self._emit_partition_audit(
+                "PARTITION_COMPLETED", "SUCCESS",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "files_uploaded": 0, "bytes_uploaded": 0,
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                    "empty_shard": True,
+                },
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        if await _is_job_cancelled(job_id):
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "job_cancelled"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "job_cancelled"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        async with async_session_factory() as session:
+            resource = await session.get(Resource, resource_id)
+            tenant = await session.get(Tenant, tenant_id)
+            snapshot = await session.get(Snapshot, snapshot_id)
+
+        if resource is None or tenant is None or snapshot is None:
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "snapshot_or_resource_gone"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "snapshot_or_resource_gone"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        graph_client = await self.get_graph_client(
+            tenant, handler_key="ENTRA_DIRECTORY",
+        )
+        if graph_client is None:
+            await self._mark_partition_terminal(
+                partition_id, status="FAILED",
+                failure_state={"reason": "no_graph_client"},
+            )
+            await self._emit_partition_audit(
+                "PARTITION_FAILED", "FAILURE",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={"reason": "no_graph_client"},
+            )
+            await self._finalize_partitioned_snapshot(
+                snapshot_id, job_id=job_id,
+            )
+            return
+
+        synth_msg: Dict[str, Any] = {
+            "jobId": str(job_id),
+            "resourceId": str(resource_id),
+            "tenantId": str(tenant_id),
+            "type": "INCREMENTAL",
+            "priority": 3,
+            "partitionFilter": {"categoryIds": shard_category_ids},
+            "partitionId": str(partition_id),
+            "partitionIndex": partition_index,
+        }
+
+        tenant_sem = await self._acquire_tenant_slot(str(tenant_id))
+
+        try:
+            async with tenant_sem:
+                entra_result = await self.backup_entra_directory(
+                    graph_client, resource, snapshot, tenant, synth_msg,
+                )
+            shard_items = int(
+                (entra_result or {}).get("item_count") or 0
+            )
+            shard_bytes = int(
+                (entra_result or {}).get("bytes_added") or 0
+            )
+            await self._mark_partition_terminal(
+                partition_id, status="COMPLETED",
+                files_uploaded=shard_items,
+                bytes_uploaded=shard_bytes,
+            )
+            await self._emit_partition_audit(
+                "PARTITION_COMPLETED", "SUCCESS",
+                tenant_id=str(tenant_id), resource_id=str(resource_id),
+                snapshot_id=snapshot_id, job_id=job_id,
+                partition_id=partition_id, partition_type=partition_type,
+                details={
+                    "files_uploaded": shard_items,
+                    "bytes_uploaded": shard_bytes,
+                    "duration_secs": round(time.monotonic() - started_at, 2),
+                },
+            )
+        except Exception as e:
+            print(
+                f"[{self.worker_id}] [PARTITION] {partition_id} "
+                f"entra shard failed: {type(e).__name__}: {e}"
             )
             await self._mark_partition_terminal(
                 partition_id, status="FAILED",
@@ -15730,7 +16105,52 @@ class BackupWorker:
         require AuditLog.Read.All) is swallowed so a single missing
         permission doesn't fail the whole snapshot.
         """
-        print(f"[{self.worker_id}] [ENTRA_DIR START] {resource.display_name}")
+        # Partition filter (consumer mode) — when present, scopes the
+        # 8-category drain to a single shard's allowlist. When absent,
+        # the function evaluates _should_partition_entra and either
+        # fans out (coordinator) or runs the full 8-category inline
+        # path (tiny tenants below the partition threshold).
+        _ep_filter = (message or {}).get("partitionFilter") or {}
+        _ep_allowed_categories: Optional[Set[str]] = (
+            set(_ep_filter.get("categoryIds") or [])
+            if _ep_filter.get("categoryIds") is not None
+            else None
+        )
+        _ep_is_consumer = _ep_allowed_categories is not None
+        _ep_coordinator_fanout = False
+
+        # Coordinator branch — fan out if enabled. job_id lives on the
+        # snapshot's job_id column; we don't take it from the function
+        # signature (handler signatures use `message` instead).
+        if not _ep_is_consumer and self._should_partition_entra():
+            await self._fanout_entra_partitions(
+                snapshot=snapshot, resource=resource, tenant=tenant,
+                categories=list(self.ENTRA_DIRECTORY_CATEGORIES),
+                directory_id=resource.external_id or "",
+                job_id=snapshot.job_id,
+            )
+            print(
+                f"[{self.worker_id}] [ENTRA_DIR] "
+                f"{resource.display_name}: partitioned — coordinator "
+                f"returning, awaiting partition consumers."
+            )
+            return {
+                "item_count": 0,
+                "bytes_added": 0,
+                "partitioned": True,
+            }
+
+        # All categories or shard subset.
+        _ep_categories: Set[str] = (
+            _ep_allowed_categories
+            if _ep_allowed_categories is not None
+            else set(self.ENTRA_DIRECTORY_CATEGORIES)
+        )
+        print(
+            f"[{self.worker_id}] [ENTRA_DIR START] {resource.display_name} "
+            f"— categories: {sorted(_ep_categories)}"
+        )
+
         total_items = 0
         total_bytes = 0
 
@@ -15784,116 +16204,124 @@ class BackupWorker:
         # 1) Users — pull the field set the Recovery "Users" view needs
         #    (UPN, mail, proxyAddresses for "Other emails", userType +
         #    externalUserState for Guest/External flags, Object ID = id).
-        users = await _safe_fetch(f"{base}/users", {
-            "$top": "999",
-            "$select": "id,displayName,userPrincipalName,mail,proxyAddresses,otherMails,userType,externalUserState,accountEnabled,jobTitle,department,createdDateTime,givenName,surname,mobilePhone,businessPhones",
-        })
-        await _persist_batch("ENTRA_DIR_USER", "Users", users)
+        if "USERS" in _ep_categories:
+            users = await _safe_fetch(f"{base}/users", {
+                "$top": "999",
+                "$select": "id,displayName,userPrincipalName,mail,proxyAddresses,otherMails,userType,externalUserState,accountEnabled,jobTitle,department,createdDateTime,givenName,surname,mobilePhone,businessPhones",
+            })
+            await _persist_batch("ENTRA_DIR_USER", "Users", users)
 
         # 2) Groups — with ownership + membership for the detail panel.
         #    Also fetch per-group owners + first-page members so the
         #    Recovery right-pane can render them without N×M refetches.
-        groups = await _safe_fetch(f"{base}/groups", {"$top": "999", "$select": "id,displayName,mail,description,groupTypes,securityEnabled,mailEnabled,visibility,membershipRule,createdDateTime"})
-        for g in groups:
-            gid = g.get("id")
-            if not gid:
-                continue
-            owners = await _safe_fetch(f"{base}/groups/{gid}/owners", {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"})
-            members = await _safe_fetch(f"{base}/groups/{gid}/members", {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"})
-            g["_owners"] = owners
-            g["_members"] = members
-            g["_memberCount"] = len(members)
-        await _persist_batch("ENTRA_DIR_GROUP", "Groups", groups)
+        if "GROUPS" in _ep_categories:
+            groups = await _safe_fetch(f"{base}/groups", {"$top": "999", "$select": "id,displayName,mail,description,groupTypes,securityEnabled,mailEnabled,visibility,membershipRule,createdDateTime"})
+            for g in groups:
+                gid = g.get("id")
+                if not gid:
+                    continue
+                owners = await _safe_fetch(f"{base}/groups/{gid}/owners", {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"})
+                members = await _safe_fetch(f"{base}/groups/{gid}/members", {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"})
+                g["_owners"] = owners
+                g["_members"] = members
+                g["_memberCount"] = len(members)
+            await _persist_batch("ENTRA_DIR_GROUP", "Groups", groups)
 
         # 3) Roles — $expand=rolePermissions so the right pane's
         #    Privileges list is captured. directoryRoles (activated) is
         #    kept in addition to roleDefinitions for parity with AFI.
-        roles_active = await _safe_fetch(f"{base}/directoryRoles")
-        roles_catalog = await _safe_fetch(f"{base}/roleManagement/directory/roleDefinitions", {"$top": "999", "$expand": "rolePermissions"})
-        await _persist_batch("ENTRA_DIR_ROLE", "Roles", roles_active + roles_catalog)
+        if "ROLES" in _ep_categories:
+            roles_active = await _safe_fetch(f"{base}/directoryRoles")
+            roles_catalog = await _safe_fetch(f"{base}/roleManagement/directory/roleDefinitions", {"$top": "999", "$expand": "rolePermissions"})
+            await _persist_batch("ENTRA_DIR_ROLE", "Roles", roles_active + roles_catalog)
 
         # 4) Security — AFI shows 5 buckets: Conditional Access,
         #    Authentication Contexts, Authentication Strengths, Named
         #    Locations, Policies. Each item carries a `_sec_bucket`
         #    field so the frontend can split them in the left rail.
-        sec_items: List[Dict[str, Any]] = []
-        for bucket, url in [
-            ("Conditional Access", f"{base}/identity/conditionalAccess/policies"),
-            ("Authentication Contexts", f"{base}/identity/conditionalAccess/authenticationContextClassReferences"),
-            ("Authentication Strengths", f"{base}/identity/conditionalAccess/authenticationStrength/policies"),
-            ("Named Locations", f"{base}/identity/conditionalAccess/namedLocations"),
-            ("Policies", f"{base}/policies/identitySecurityDefaultsEnforcementPolicy"),
-        ]:
-            data = await _safe_fetch(url, {"$top": "500"})
-            # identitySecurityDefaultsEnforcementPolicy returns a single
-            # object, not a list — wrap it so _persist_batch sees a row.
-            if not data and bucket == "Policies":
-                try:
-                    single = await graph_client._get(url)
-                    if single and isinstance(single, dict) and single.get("id"):
-                        data = [single]
-                except Exception:
-                    data = []
-            for d in data:
-                d["_sec_bucket"] = bucket
-            sec_items.extend(data)
-        # Risky users + security alerts complement the above.
-        risky_users = await _safe_fetch(f"{base}/identityProtection/riskyUsers", {"$top": "500"})
-        for r in risky_users:
-            r["_sec_bucket"] = "Risky Users"
-        alerts = await _safe_fetch(f"{base}/security/alerts_v2", {"$top": "500"})
-        for a in alerts:
-            a["_sec_bucket"] = "Alerts"
-        sec_items.extend(risky_users + alerts)
-        await _persist_batch("ENTRA_DIR_SECURITY", "Security", sec_items)
+        if "SECURITY" in _ep_categories:
+            sec_items: List[Dict[str, Any]] = []
+            for bucket, url in [
+                ("Conditional Access", f"{base}/identity/conditionalAccess/policies"),
+                ("Authentication Contexts", f"{base}/identity/conditionalAccess/authenticationContextClassReferences"),
+                ("Authentication Strengths", f"{base}/identity/conditionalAccess/authenticationStrength/policies"),
+                ("Named Locations", f"{base}/identity/conditionalAccess/namedLocations"),
+                ("Policies", f"{base}/policies/identitySecurityDefaultsEnforcementPolicy"),
+            ]:
+                data = await _safe_fetch(url, {"$top": "500"})
+                # identitySecurityDefaultsEnforcementPolicy returns a single
+                # object, not a list — wrap it so _persist_batch sees a row.
+                if not data and bucket == "Policies":
+                    try:
+                        single = await graph_client._get(url)
+                        if single and isinstance(single, dict) and single.get("id"):
+                            data = [single]
+                    except Exception:
+                        data = []
+                for d in data:
+                    d["_sec_bucket"] = bucket
+                sec_items.extend(data)
+            # Risky users + security alerts complement the above.
+            risky_users = await _safe_fetch(f"{base}/identityProtection/riskyUsers", {"$top": "500"})
+            for r in risky_users:
+                r["_sec_bucket"] = "Risky Users"
+            alerts = await _safe_fetch(f"{base}/security/alerts_v2", {"$top": "500"})
+            for a in alerts:
+                a["_sec_bucket"] = "Alerts"
+            sec_items.extend(risky_users + alerts)
+            await _persist_batch("ENTRA_DIR_SECURITY", "Security", sec_items)
 
         # 5) Audit — directory audit + sign-in logs. Tag each row so
         #    the frontend can split into Audit Logs vs Sign-In Logs.
-        dir_audits = await _safe_fetch(f"{base}/auditLogs/directoryAudits", {"$top": "500"})
-        for a in dir_audits:
-            a["_audit_bucket"] = "Audit Logs"
-        signins = await _safe_fetch(f"{base}/auditLogs/signIns", {"$top": "500"})
-        for s in signins:
-            s["_audit_bucket"] = "Sign-In Logs"
-        await _persist_batch("ENTRA_DIR_AUDIT", "Audit", dir_audits + signins)
+        if "AUDIT" in _ep_categories:
+            dir_audits = await _safe_fetch(f"{base}/auditLogs/directoryAudits", {"$top": "500"})
+            for a in dir_audits:
+                a["_audit_bucket"] = "Audit Logs"
+            signins = await _safe_fetch(f"{base}/auditLogs/signIns", {"$top": "500"})
+            for s in signins:
+                s["_audit_bucket"] = "Sign-In Logs"
+            await _persist_batch("ENTRA_DIR_AUDIT", "Audit", dir_audits + signins)
 
         # 6) Applications — split into App Registrations vs Enterprise
         #    Applications via `_app_bucket`. Capture requiredResourceAccess
         #    on /applications so the Permissions block renders.
-        apps = await _safe_fetch(f"{base}/applications", {"$top": "999", "$select": "id,appId,displayName,createdDateTime,requiredResourceAccess,signInAudience,identifierUris,publisherDomain"})
-        for a in apps:
-            a["_app_bucket"] = "App Registrations"
-        sps = await _safe_fetch(f"{base}/servicePrincipals", {"$top": "999", "$select": "id,appId,displayName,servicePrincipalType,appRoles,oauth2PermissionScopes,createdDateTime"})
-        for s in sps:
-            s["_app_bucket"] = "Enterprise Applications"
-        await _persist_batch("ENTRA_DIR_APPLICATION", "Applications", apps + sps)
+        if "APPLICATIONS" in _ep_categories:
+            apps = await _safe_fetch(f"{base}/applications", {"$top": "999", "$select": "id,appId,displayName,createdDateTime,requiredResourceAccess,signInAudience,identifierUris,publisherDomain"})
+            for a in apps:
+                a["_app_bucket"] = "App Registrations"
+            sps = await _safe_fetch(f"{base}/servicePrincipals", {"$top": "999", "$select": "id,appId,displayName,servicePrincipalType,appRoles,oauth2PermissionScopes,createdDateTime"})
+            for s in sps:
+                s["_app_bucket"] = "Enterprise Applications"
+            await _persist_batch("ENTRA_DIR_APPLICATION", "Applications", apps + sps)
 
         # 7) Intune — AFI's "Devices" bucket matches /devices (Entra AD
         #    devices) rather than Intune /managedDevices (which needs a
         #    separate license). Compliance + Configuration policies
         #    still come from Intune and may 400 without the license.
-        entra_devices = await _safe_fetch(f"{base}/devices", {"$top": "500", "$select": "id,displayName,accountEnabled,operatingSystem,operatingSystemVersion,trustType,registrationDateTime,isCompliant,isManaged"})
-        for d in entra_devices:
-            d["_intune_bucket"] = "Devices"
-            # Owner lookup — first registered user per device.
-            try:
-                owners = await _safe_fetch(f"{base}/devices/{d.get('id')}/registeredOwners", {"$top": "1", "$select": "id,displayName,userPrincipalName"})
-                if owners:
-                    d["_owner_display"] = owners[0].get("displayName")
-                    d["_owner_upn"] = owners[0].get("userPrincipalName")
-            except Exception:
-                pass
-        comp_policies = await _safe_fetch(f"{base}/deviceManagement/deviceCompliancePolicies", {"$top": "500"})
-        for c in comp_policies:
-            c["_intune_bucket"] = "Compliance Policies"
-        conf_policies = await _safe_fetch(f"{base}/deviceManagement/deviceConfigurations", {"$top": "500"})
-        for c in conf_policies:
-            c["_intune_bucket"] = "Configuration Profiles"
-        await _persist_batch("ENTRA_DIR_INTUNE", "Intune", entra_devices + comp_policies + conf_policies)
+        if "INTUNE" in _ep_categories:
+            entra_devices = await _safe_fetch(f"{base}/devices", {"$top": "500", "$select": "id,displayName,accountEnabled,operatingSystem,operatingSystemVersion,trustType,registrationDateTime,isCompliant,isManaged"})
+            for d in entra_devices:
+                d["_intune_bucket"] = "Devices"
+                # Owner lookup — first registered user per device.
+                try:
+                    owners = await _safe_fetch(f"{base}/devices/{d.get('id')}/registeredOwners", {"$top": "1", "$select": "id,displayName,userPrincipalName"})
+                    if owners:
+                        d["_owner_display"] = owners[0].get("displayName")
+                        d["_owner_upn"] = owners[0].get("userPrincipalName")
+                except Exception:
+                    pass
+            comp_policies = await _safe_fetch(f"{base}/deviceManagement/deviceCompliancePolicies", {"$top": "500"})
+            for c in comp_policies:
+                c["_intune_bucket"] = "Compliance Policies"
+            conf_policies = await _safe_fetch(f"{base}/deviceManagement/deviceConfigurations", {"$top": "500"})
+            for c in conf_policies:
+                c["_intune_bucket"] = "Configuration Profiles"
+            await _persist_batch("ENTRA_DIR_INTUNE", "Intune", entra_devices + comp_policies + conf_policies)
 
         # 8) Administrative Units.
-        admin_units = await _safe_fetch(f"{base}/directory/administrativeUnits", {"$top": "500"})
-        await _persist_batch("ENTRA_DIR_ADMIN_UNIT", "Administrative Units", admin_units)
+        if "ADMIN_UNITS" in _ep_categories:
+            admin_units = await _safe_fetch(f"{base}/directory/administrativeUnits", {"$top": "500"})
+            await _persist_batch("ENTRA_DIR_ADMIN_UNIT", "Administrative Units", admin_units)
 
         print(f"[{self.worker_id}] [ENTRA_DIR COMPLETE] {resource.display_name} — {total_items} items, {total_bytes} bytes")
         return {"item_count": total_items, "bytes_added": total_bytes}
