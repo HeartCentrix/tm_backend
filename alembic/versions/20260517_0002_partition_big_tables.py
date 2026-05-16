@@ -16,7 +16,7 @@ Partition keys (single-tenant, chosen for even distribution):
 
   snapshot_items        PARTITION BY HASH (snapshot_id)   16 partitions
   chat_thread_messages  PARTITION BY HASH (chat_thread_id) 8 partitions
-  audit_events          PARTITION BY RANGE (created_at)   monthly
+  audit_events          PARTITION BY RANGE (occurred_at)   monthly
 
 Why not tenant_id? Single-tenant today; partitioning on a constant
 column buys nothing. When multi-tenant lands, a follow-up migration
@@ -169,10 +169,15 @@ def _upgrade_snapshot_items(connection) -> None:
     op.execute("ALTER TABLE snapshot_items_new RENAME TO snapshot_items")
     # 5. Foreign keys (PG re-applies on rename, but we lost the
     #    snapshot_id FK during the partition-shell create — recreate it).
+    # Match models.py exactly: FK without ON DELETE CASCADE. Snapshot
+    # deletion is handled by application-level backup_cleanup, not by
+    # FK cascade — preserving the same semantics that ``create_all``
+    # would produce so this migration is a structural change only,
+    # not a behavioral one.
     op.execute(
         "ALTER TABLE snapshot_items "
         "ADD CONSTRAINT snapshot_items_snapshot_id_fkey "
-        "FOREIGN KEY (snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE"
+        "FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)"
     )
     op.execute(
         "ALTER TABLE snapshot_items "
@@ -284,30 +289,49 @@ def _downgrade_chat_thread_messages() -> None:
 # ────────────────────────────────────────────────────────────────────
 
 def _upgrade_audit_events(connection) -> None:
+    """Convert audit_events to RANGE-partitioned (monthly on occurred_at).
+
+    Schema mirrors shared/models.py:AuditEvent exactly — id, org_id,
+    tenant_id, actor_*, action, resource_*, outcome, job_id, snapshot_id,
+    details, occurred_at. Partition key MUST be in the primary key, so
+    the PK becomes (id, occurred_at). The data copy uses
+    ``INSERT INTO ... SELECT *`` which only succeeds when the column
+    list matches — any drift between the new shell and the old table
+    is therefore caught at copy time rather than silently dropped.
+    """
     from datetime import datetime, timedelta
 
     op.execute(
         """
         CREATE TABLE audit_events_new (
             id uuid NOT NULL,
+            org_id uuid,
             tenant_id uuid,
-            user_id uuid,
+            actor_id uuid,
+            actor_email varchar,
+            actor_type varchar DEFAULT 'SYSTEM',
             action varchar NOT NULL,
-            resource_type varchar,
             resource_id uuid,
-            details json,
-            ip_address varchar,
-            user_agent varchar,
-            outcome varchar NOT NULL,
-            error_message varchar,
-            created_at timestamp DEFAULT NOW() NOT NULL,
-            PRIMARY KEY (id, created_at)
-        ) PARTITION BY RANGE (created_at)
+            resource_type varchar,
+            resource_name varchar,
+            outcome varchar DEFAULT 'SUCCESS',
+            job_id uuid,
+            snapshot_id uuid,
+            details json DEFAULT '{}'::json,
+            occurred_at timestamp DEFAULT NOW() NOT NULL,
+            PRIMARY KEY (id, occurred_at)
+        ) PARTITION BY RANGE (occurred_at)
         """
     )
-    op.execute("CREATE INDEX ON audit_events_new (tenant_id, created_at)")
-    op.execute("CREATE INDEX ON audit_events_new (action, created_at)")
+    # Indexes mirror models.py ``index=True`` decls: org_id, tenant_id,
+    # action, occurred_at. Composite (tenant_id, occurred_at) gives
+    # partition pruning + range scan in one shot for the dashboard's
+    # "audit history for tenant X over last 30 days" query.
+    op.execute("CREATE INDEX ON audit_events_new (org_id)")
+    op.execute("CREATE INDEX ON audit_events_new (tenant_id, occurred_at)")
+    op.execute("CREATE INDEX ON audit_events_new (action, occurred_at)")
     op.execute("CREATE INDEX ON audit_events_new (resource_id)")
+    op.execute("CREATE INDEX ON audit_events_new (occurred_at)")
 
     # Seed monthly partitions from EARLIEST_AUDIT_MONTH through today+6mo.
     start = datetime.strptime(EARLIEST_AUDIT_MONTH, "%Y-%m-%d")
@@ -331,15 +355,44 @@ def _upgrade_audit_events(connection) -> None:
         cur = nxt
 
     # Catch-all default for events that fall outside seeded months
-    # (e.g. a bug that backdates created_at). Easier to detect than
+    # (e.g. a bug that backdates occurred_at). Easier to detect than
     # to lose rows to constraint violations.
     op.execute(
         "CREATE TABLE audit_events_default PARTITION OF audit_events_new DEFAULT"
     )
 
-    op.execute("INSERT INTO audit_events_new SELECT * FROM audit_events")
+    # Copy data. INSERT...SELECT requires column compatibility; using
+    # an explicit column list so a future model addition that hasn't
+    # been migrated yet fails LOUDLY rather than silently dropping
+    # the column.
+    op.execute(
+        """
+        INSERT INTO audit_events_new (
+            id, org_id, tenant_id, actor_id, actor_email, actor_type,
+            action, resource_id, resource_type, resource_name, outcome,
+            job_id, snapshot_id, details, occurred_at
+        )
+        SELECT
+            id, org_id, tenant_id, actor_id, actor_email, actor_type,
+            action, resource_id, resource_type, resource_name, outcome,
+            job_id, snapshot_id, details, occurred_at
+        FROM audit_events
+        """
+    )
     op.execute("DROP TABLE audit_events CASCADE")
     op.execute("ALTER TABLE audit_events_new RENAME TO audit_events")
+
+    # Recreate FKs that the partition-shell create couldn't carry.
+    op.execute(
+        "ALTER TABLE audit_events "
+        "ADD CONSTRAINT audit_events_org_id_fkey "
+        "FOREIGN KEY (org_id) REFERENCES organizations(id)"
+    )
+    op.execute(
+        "ALTER TABLE audit_events "
+        "ADD CONSTRAINT audit_events_tenant_id_fkey "
+        "FOREIGN KEY (tenant_id) REFERENCES tenants(id)"
+    )
 
 
 def _downgrade_audit_events() -> None:
@@ -352,7 +405,10 @@ def _downgrade_audit_events() -> None:
     op.execute("DROP TABLE audit_events CASCADE")
     op.execute("ALTER TABLE audit_events_old RENAME TO audit_events")
     op.execute("ALTER TABLE audit_events ADD PRIMARY KEY (id)")
-    op.execute("CREATE INDEX ON audit_events (tenant_id, created_at)")
+    op.execute("CREATE INDEX ON audit_events (org_id)")
+    op.execute("CREATE INDEX ON audit_events (tenant_id)")
+    op.execute("CREATE INDEX ON audit_events (action)")
+    op.execute("CREATE INDEX ON audit_events (occurred_at)")
 
 
 # ────────────────────────────────────────────────────────────────────

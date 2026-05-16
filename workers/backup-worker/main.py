@@ -18494,43 +18494,62 @@ class BackupWorker:
             duration = (now - snapshot.started_at).total_seconds()
             snapshot.duration_secs = int(duration)
 
+        # Capture metric values BEFORE merge/commit. After merge the
+        # original snapshot instance becomes detached + expired, and
+        # reading a column attribute (e.g. resource_id) would either
+        # trigger a lazy-load against a closed session or raise
+        # DetachedInstanceError. Hoisting these reads also keeps the
+        # critical-section short.
+        _metric_snap_type = (
+            snapshot.type.value if hasattr(snapshot.type, "value") else str(snapshot.type)
+        )
+        _metric_status = (
+            snapshot.status.value if hasattr(snapshot.status, "value") else str(snapshot.status)
+        )
+        _metric_bytes = int(snapshot.bytes_added or 0)
+        _metric_duration = int(snapshot.duration_secs or 0)
+        _metric_resource_id = snapshot.resource_id
+
         # merge() handles detached instances (snapshot was created in a separate session)
         await session.merge(snapshot)
         await session.commit()
 
         # Emit observability + operational cost telemetry. Safe no-op when
-        # prometheus_client missing. Tenant + backend labels resolved from
-        # the snapshot's own join, so multi-tenant readiness comes for free.
+        # prometheus_client missing. Wrapped in try/except so a metrics
+        # bug never blocks backup completion.
         try:
             from shared import core_metrics as _cm
             from shared.storage.router import router as _router
-            _snap_type = snapshot.type.value if hasattr(snapshot.type, "value") else str(snapshot.type)
-            _status = snapshot.status.value if hasattr(snapshot.status, "value") else str(snapshot.status)
-            _bytes = int(snapshot.bytes_added or 0)
             _tenant_id = ""
             try:
-                _res = await session.get(Resource, snapshot.resource_id)
+                _res = await session.get(Resource, _metric_resource_id)
                 _tenant_id = str(_res.tenant_id) if _res else ""
             except Exception:
                 pass
             _backend_name = "unknown"
             try:
                 _store = _router.get_active_store()
-                _backend_name = getattr(_store, "name", None) or getattr(_store, "kind", None) or "unknown"
+                _backend_name = (
+                    getattr(_store, "name", None)
+                    or getattr(_store, "kind", None) or "unknown"
+                )
             except Exception:
                 pass
-            _cm.inc_snapshot(_snap_type, _status)
-            if snapshot.duration_secs:
-                _cm.observe_backup_duration(_snap_type, _status, float(snapshot.duration_secs))
-            if _bytes > 0:
-                _cm.add_backup_bytes(_snap_type, _backend_name, _bytes)
+            _cm.inc_snapshot(_metric_snap_type, _metric_status)
+            if _metric_duration > 0:
+                _cm.observe_backup_duration(
+                    _metric_snap_type, _metric_status, float(_metric_duration),
+                )
+            if _metric_bytes > 0:
+                _cm.add_backup_bytes(_metric_snap_type, _backend_name, _metric_bytes)
                 if _tenant_id:
-                    _cm.add_cost_storage(_tenant_id, _backend_name, _snap_type, _bytes)
+                    _cm.add_cost_storage(
+                        _tenant_id, _backend_name, _metric_snap_type, _metric_bytes,
+                    )
                     if _backend_name and "seaweed" in _backend_name.lower():
-                        _cm.add_cost_seaweed_write(_tenant_id, _backend_name, _bytes)
-                    _cm.add_cost_egress(_tenant_id, "from_graph", _bytes)
+                        _cm.add_cost_seaweed_write(_tenant_id, _backend_name, _metric_bytes)
+                    _cm.add_cost_egress(_tenant_id, "from_graph", _metric_bytes)
         except Exception:
-            # Metrics never block backup completion.
             pass
 
         # Persist delta token on resource for incremental backups
