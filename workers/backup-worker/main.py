@@ -122,6 +122,17 @@ class SnapshotVanishedError(Exception):
     abort the resource cleanly, and let the outer worker move on."""
 
 
+class PoisonMessageError(Exception):
+    """Raised by process_backup_message when the envelope is structurally
+    invalid (missing jobId AND no recognised partition messageType).
+    consume_queue catches this and rejects the message with
+    requeue=False so it lands in the DLQ instead of looping forever.
+    Classic queues don't auto-increment x-delivery-count on plain
+    requeue, so the existing max-retries gate never trips for such
+    messages — without an explicit poison signal a single malformed
+    payload pins a consumer indefinitely (2026-05-16 incident)."""
+
+
 async def _bulk_upsert_snapshot_items(
     session, rows: List[Dict[str, Any]],
 ) -> int:
@@ -1737,6 +1748,18 @@ class BackupWorker:
                     with graph_priority(queue_priority):
                         await self.process_backup_message(body)
                     await message.ack()
+                except PoisonMessageError as e:
+                    # Structurally invalid envelope — never retryable.
+                    # Skip the delivery-count gate and route straight
+                    # to DLQ so one bad payload can't pin a consumer.
+                    print(
+                        f"[{self.worker_id}] poison message ({e}) — "
+                        f"routing to DLQ without retry"
+                    )
+                    try:
+                        await message.reject(requeue=False)
+                    except Exception:
+                        pass
                 except Exception as e:
                     print(f"[{self.worker_id}] Error: {e}")
                     import traceback
@@ -2121,6 +2144,33 @@ class BackupWorker:
         if message.get("messageType") == "BACKUP_SHAREPOINT_PARTITION":
             await self._process_sharepoint_partition_message(message)
             return
+
+        # Defensive: a malformed envelope (no recognised messageType AND
+        # no jobId) used to crash this dispatcher with KeyError, get
+        # nack'd with requeue=True, and loop forever because
+        # `x-delivery-count` is not auto-incremented on a plain requeue
+        # in classic queues. The result was a single poison message
+        # pinning one consumer's CPU and flooding logs (2026-05-16
+        # incident — worker-9f90b1b2 looped on a no-jobId payload that
+        # all queues briefly held at depth 1).
+        #
+        # Treat missing jobId as terminally malformed: log a fingerprint
+        # of the payload, route to DLQ via reject(requeue=False), and
+        # return cleanly. consume_queue's catch is bypassed so the
+        # outer message.ack/reject is left to its existing branch — we
+        # raise a sentinel that the caller already handles.
+        if "jobId" not in message:
+            try:
+                import json as _json
+                preview = _json.dumps(message, default=str)[:600]
+            except Exception:
+                preview = repr(message)[:600]
+            print(
+                f"[{self.worker_id}] [POISON] backup envelope missing 'jobId' "
+                f"and no recognised messageType — routing to DLQ. "
+                f"payload_preview={preview}"
+            )
+            raise PoisonMessageError("missing jobId")
 
         job_id = uuid.UUID(message["jobId"])
         resource_ids = message.get("resourceIds", [])
