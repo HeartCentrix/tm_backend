@@ -1265,7 +1265,16 @@ async def read_encryption_scope_state(
 # reconcile cadence without forcing every call to re-open KV.
 _KV_VERSION_CACHE: Dict[Tuple[str, str], Tuple[str, float]] = {}
 _KV_VERSION_CACHE_TTL_S = 300.0
-_KV_VERSION_CACHE_LOCK = asyncio.Lock()
+# Lazy-init so module import outside an event loop (alembic CLI,
+# test collection on older Python) doesn't warn / fail.
+_KV_VERSION_CACHE_LOCK: Optional[asyncio.Lock] = None
+
+
+def _kv_version_cache_lock() -> asyncio.Lock:
+    global _KV_VERSION_CACHE_LOCK
+    if _KV_VERSION_CACHE_LOCK is None:
+        _KV_VERSION_CACHE_LOCK = asyncio.Lock()
+    return _KV_VERSION_CACHE_LOCK
 
 
 async def resolve_key_vault_latest_version(
@@ -1334,7 +1343,7 @@ async def resolve_key_vault_latest_version(
                             "[KV] key %s/%s rotation detected: %s → %s",
                             key_vault_uri, key_name, cached[0], new_version,
                         )
-                    async with _KV_VERSION_CACHE_LOCK:
+                    async with _kv_version_cache_lock():
                         _KV_VERSION_CACHE[cache_key] = (new_version, now)
                     return new_version
         except HttpResponseError as exc:

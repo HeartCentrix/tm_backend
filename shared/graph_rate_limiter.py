@@ -90,11 +90,17 @@ class _LocalTokenBucket:
         self._lock = asyncio.Lock()
 
     async def acquire(self, n: float = 1.0) -> float:
-        async with self._lock:
-            waited = 0.0
-            while True:
+        waited = 0.0
+        # Sleep MUST be outside the lock or we serialise every Graph
+        # caller in the worker — one task sleeping would block every
+        # other caller from observing the bucket state. Hold the lock
+        # only during the refill + decrement math, release before
+        # awaiting refill time. Concurrent callers may take a token
+        # out of order under burst (no strict FIFO), but the long-run
+        # rate is still exactly self.rate.
+        while True:
+            async with self._lock:
                 now = time.monotonic()
-                # Refill since last check
                 elapsed = now - self._last
                 if elapsed > 0:
                     self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
@@ -102,18 +108,10 @@ class _LocalTokenBucket:
                 if self._tokens >= n:
                     self._tokens -= n
                     return waited
-                # Not enough tokens — sleep just long enough to refill.
-                # Release the lock while sleeping so other awaiters can
-                # observe the bucket state when they wake.
                 deficit = n - self._tokens
                 sleep_s = deficit / self.rate
                 waited += sleep_s
-                # We release+reacquire by yielding to the loop.
-                # asyncio.Lock doesn't have a wait-condition primitive
-                # so we sleep inside the lock for fairness — the lock
-                # serialises acquires, which is what we want for
-                # strict ordering under burst.
-                await asyncio.sleep(sleep_s)
+            await asyncio.sleep(sleep_s)
 
 
 class _RedisTokenBucket:
