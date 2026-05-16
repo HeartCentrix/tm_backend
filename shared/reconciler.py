@@ -330,48 +330,47 @@ async def sweep_orphans(session) -> SweepStats:
     #
     # Idempotent: only writes when the derived status differs from the
     # stored status, and only for snapshots that have partition rows.
+    # Single GROUP BY pass — cheaper than 4 correlated subqueries per
+    # candidate at 5k-user prod scale (~30k snapshots/batch). Filters
+    # out partitions that are still pending and snapshots already in
+    # the right state inside the same statement.
     snap_integrity_rows = (
         await session.execute(
             text(
                 """
+                WITH part_agg AS (
+                    SELECT sp.snapshot_id,
+                           COUNT(*)                                      AS n,
+                           bool_or(sp.status IN ('QUEUED','IN_PROGRESS')) AS any_pending,
+                           bool_and(sp.status = 'COMPLETED')             AS all_completed,
+                           bool_and(sp.status = 'FAILED')                AS all_failed,
+                           bool_or(sp.status = 'FAILED')                 AS any_failed
+                      FROM snapshot_partitions sp
+                     GROUP BY sp.snapshot_id
+                )
                 UPDATE snapshots s
-                   SET status = derived.derived_status,
+                   SET status = CASE
+                           WHEN pa.all_completed THEN 'COMPLETED'::snapshotstatus
+                           WHEN pa.all_failed    THEN 'FAILED'::snapshotstatus
+                           WHEN pa.any_failed    THEN 'PARTIAL'::snapshotstatus
+                           ELSE s.status
+                       END,
                        lease_owner_id   = NULL,
                        lease_expires_at = NULL,
                        lease_token      = s.lease_token + 1
-                  FROM (
-                      SELECT s2.id AS sid,
-                             CASE
-                                 WHEN (SELECT bool_and(sp.status = 'COMPLETED')
-                                         FROM snapshot_partitions sp
-                                        WHERE sp.snapshot_id = s2.id)
-                                     THEN 'COMPLETED'::snapshotstatus
-                                 WHEN (SELECT bool_and(sp.status = 'FAILED')
-                                         FROM snapshot_partitions sp
-                                        WHERE sp.snapshot_id = s2.id)
-                                     THEN 'FAILED'::snapshotstatus
-                                 WHEN (SELECT bool_or(sp.status = 'FAILED')
-                                         FROM snapshot_partitions sp
-                                        WHERE sp.snapshot_id = s2.id)
-                                     THEN 'PARTIAL'::snapshotstatus
-                                 ELSE s2.status
-                             END AS derived_status
-                        FROM snapshots s2
-                       WHERE s2.status IN ('COMPLETED'::snapshotstatus,
-                                           'PARTIAL'::snapshotstatus,
-                                           'FAILED'::snapshotstatus)
-                         AND EXISTS (
-                             SELECT 1 FROM snapshot_partitions sp
-                              WHERE sp.snapshot_id = s2.id
-                         )
-                         AND NOT EXISTS (
-                             SELECT 1 FROM snapshot_partitions sp
-                              WHERE sp.snapshot_id = s2.id
-                                AND sp.status IN ('QUEUED','IN_PROGRESS')
-                         )
-                  ) derived
-                 WHERE s.id = derived.sid
-                   AND s.status != derived.derived_status
+                  FROM part_agg pa
+                 WHERE s.id = pa.snapshot_id
+                   AND pa.n > 0
+                   AND NOT pa.any_pending
+                   AND s.status IN ('COMPLETED'::snapshotstatus,
+                                    'PARTIAL'::snapshotstatus,
+                                    'FAILED'::snapshotstatus)
+                   AND s.status != (CASE
+                           WHEN pa.all_completed THEN 'COMPLETED'::snapshotstatus
+                           WHEN pa.all_failed    THEN 'FAILED'::snapshotstatus
+                           WHEN pa.any_failed    THEN 'PARTIAL'::snapshotstatus
+                           ELSE s.status
+                       END)
                 RETURNING s.id, s.status::text AS new_status
                 """
             ),

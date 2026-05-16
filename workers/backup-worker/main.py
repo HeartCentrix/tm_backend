@@ -18004,6 +18004,22 @@ class BackupWorker:
         """
         from sqlalchemy.exc import IntegrityError as _IntegrityError
         async with async_session_factory() as session:
+            # Serialize SELECT+INSERT against the same (job, resource)
+            # so concurrent partition consumers / per-resource handlers
+            # can't both find no prior and both INSERT. The partial
+            # unique index would normally block the second INSERT, but
+            # the 2026-05-16 Vinay incident produced two IN_PROGRESS
+            # snapshots for the same (job, resource) anyway — the only
+            # remaining explanation is the SELECT+INSERT race racing
+            # AROUND the index on different sessions with overlapping
+            # MVCC snapshots. xact-scoped advisory lock keyed on the
+            # (job_id, resource_id) hash makes the check-and-insert
+            # atomic per-pair without serialising the whole table.
+            _lock_key = hash((str(job_id), str(resource.id))) & 0x7fffffffffffffff
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:k)"),
+                {"k": _lock_key},
+            )
             existing = await session.execute(
                 select(Snapshot).where(
                     Snapshot.job_id == job_id,
