@@ -91,15 +91,75 @@ def _drain_check_query() -> str:
     )
 
 
-def _ensure_drained(connection) -> None:
+def _preflight(connection) -> None:
+    """Multi-gate pre-flight. Each check is independently skippable
+    via env so demo / dev workflows can override, but every gate must
+    pass (or be explicitly skipped) before the destructive DDL runs.
+
+    Gates:
+      - ALEMBIC_FORCE_PARTITIONING=1
+            global escape hatch — skips ALL gates. Use for greenfield
+            empty-DB demo where there's nothing to lose.
+
+      - ALEMBIC_DRAIN_CHECK_SKIP=1
+            skip the worker-drain check. Caller asserts no jobs
+            RUNNING/RETRYING. Default: enforced.
+
+      - ALEMBIC_BACKUP_TAKEN=1
+            asserts a recent pg_dump exists. Operator MUST set this
+            after running ``scripts/pg_dump_pre_migration.sh``.
+            Without it, the migration aborts to prevent a destructive
+            DDL with no recovery path.
+
+      - ALEMBIC_DISK_HEADROOM_OK=1
+            asserts free disk >= 2 × sum(snapshot_items +
+            chat_thread_messages + audit_events). Migration creates
+            new shells alongside originals before dropping the old
+            ones. Run ``scripts/pre_migration_check.py`` to compute.
+
+      - ALEMBIC_WAL_TUNED=1
+            asserts max_wal_size >= 16 GB. Without WAL headroom the
+            INSERT…SELECT stalls on checkpoint.
+    """
     if os.environ.get("ALEMBIC_FORCE_PARTITIONING") == "1":
+        # Greenfield / demo escape. Skip everything.
         return
-    row = connection.execute(sa.text(_drain_check_query())).first()
-    n = int(row[0] or 0)
-    if n > 0:
+
+    # 1. Worker drain
+    if os.environ.get("ALEMBIC_DRAIN_CHECK_SKIP") != "1":
+        row = connection.execute(sa.text(_drain_check_query())).first()
+        n = int(row[0] or 0)
+        if n > 0:
+            raise RuntimeError(
+                f"BLOCK: {n} jobs RUNNING/RETRYING — drain workers first, "
+                "or set ALEMBIC_DRAIN_CHECK_SKIP=1"
+            )
+
+    # 2. Backup taken
+    if os.environ.get("ALEMBIC_BACKUP_TAKEN") != "1":
         raise RuntimeError(
-            f"refuses to partition while {n} jobs are RUNNING/RETRYING — "
-            "stop workers, drain queues, or set ALEMBIC_FORCE_PARTITIONING=1"
+            "BLOCK: ALEMBIC_BACKUP_TAKEN=1 not set. Take a pg_dump first "
+            "(scripts/pg_dump_pre_migration.sh), then export "
+            "ALEMBIC_BACKUP_TAKEN=1 to acknowledge. This gate is the "
+            "ONLY thing standing between a bug in this migration and "
+            "an unrecoverable production DB."
+        )
+
+    # 3. Disk headroom
+    if os.environ.get("ALEMBIC_DISK_HEADROOM_OK") != "1":
+        raise RuntimeError(
+            "BLOCK: ALEMBIC_DISK_HEADROOM_OK=1 not set. Confirm free "
+            "disk >= 2 × current table sizes via "
+            "`python3 scripts/pre_migration_check.py`, then export "
+            "ALEMBIC_DISK_HEADROOM_OK=1."
+        )
+
+    # 4. WAL tuned
+    if os.environ.get("ALEMBIC_WAL_TUNED") != "1":
+        raise RuntimeError(
+            "BLOCK: ALEMBIC_WAL_TUNED=1 not set. Confirm "
+            "max_wal_size >= 16 GB (ALTER SYSTEM SET max_wal_size = '16GB'; "
+            "SELECT pg_reload_conf();), then export ALEMBIC_WAL_TUNED=1."
         )
 
 
@@ -418,7 +478,7 @@ def _downgrade_audit_events() -> None:
 
 def upgrade() -> None:
     bind = op.get_bind()
-    _ensure_drained(bind)
+    _preflight(bind)
     _upgrade_snapshot_items(bind)
     _upgrade_chat_thread_messages(bind)
     _upgrade_audit_events(bind)
