@@ -48,6 +48,22 @@ class RollupCounts:
     parts_pending: int
     missing_t2: int
     expected_total: int = 0
+    # Tier-1 vs Tier-2 split for the weighted progress bar. The data
+    # volume between the two tiers is wildly skewed: a Tier-1
+    # ENTRA_USER snapshot is ~1 KB of metadata, while one Tier-2
+    # workload (Mail / OneDrive / Chats / Calendar / Contacts) routinely
+    # carries multiple GB of mailbox or drive content. Weighting Tier-1
+    # at 10 % and Tier-2 at 90 % of the bar keeps the displayed
+    # percentage proportional to actual work done (2026-05-16 user
+    # report: "user entra id info is just 1 % data but as soon as that
+    # happens it shows 99 % complete which is wrong"). Without this
+    # split the bar jumps to 99 % after Tier-1 finishes, then collapses
+    # back to ~30 % once Tier-2 discovery spawns its real children —
+    # the exact non-monotone behaviour we're fixing.
+    tier1_total: int = 0
+    tier1_terminal: int = 0
+    tier2_total: int = 0
+    tier2_terminal: int = 0
     # True while *any* user in this batch is still WAITING_DISCOVERY in
     # ``batch_pending_users``. Without this gate, a batch whose Tier-1
     # jobs finished before Tier-2 gap-fill discovery completes briefly
@@ -344,6 +360,68 @@ def build_batch_rollup_query(
         GROUP BY 1
         HAVING COUNT(*) = 1
     ),
+    tier_split AS (
+        -- Split per-batch snapshot terminal counts by tier so
+        -- ``shape_batch_row`` can weight the progress bar
+        -- (Tier-1 = 10 %, Tier-2 = 90 %). Tier-1 = ENTRA_USER
+        -- metadata snapshot (~1 KB); Tier-2 = the heavy workloads
+        -- under each user.
+        --
+        -- ``tier1_total`` comes from the click-time scope so it's
+        -- stable as Tier-2 jobs spawn (mirrors the rationale on
+        -- ``total_expected`` below). ``tier2_total`` falls back to
+        -- a per-user × workloads estimate while discovery is still
+        -- running — without this fallback the denominator would be
+        -- zero between Tier-1 completion and Tier-2 discovery, the
+        -- bar would briefly read 100 %, then collapse when the real
+        -- children land.
+        SELECT
+            b.batch_id,
+            COALESCE(array_length(ts.scope_ids, 1), 0)    AS tier1_total,
+            COUNT(*) FILTER (
+                WHERE r.type::text = 'ENTRA_USER'
+                  AND s.status::text IN ('COMPLETED','PARTIAL','FAILED')
+            )                                              AS tier1_terminal,
+            -- Tier-2 expected count: must always be ≥
+            -- (terminal + in_flight) so the progress fraction
+            -- can't exceed 1.0. Previously this used only
+            -- ``GREATEST(expected_t2_count, users × 5)`` as a
+            -- pre-discovery floor — but the worker spawns more
+            -- Tier-2 snapshots than the canonical 5 per user when
+            -- it issues retries OR when a workload type is split
+            -- across multiple snapshots (e.g. shared mailbox, extra
+            -- OneDrives). Result (2026-05-16): denom stuck at 45
+            -- while terminal hit 68 → bar overshoots and gets
+            -- clamped to 99 % when only ~80 % of the work is done.
+            --
+            -- Fix: bound the denominator below by the actual count
+            -- of Tier-2 snapshots ever observed (terminal +
+            -- in_flight). Keeps the bar honest: it can only hit
+            -- 100 % once every Tier-2 snapshot is terminal.
+            GREATEST(
+                COALESCE((
+                    SELECT COUNT(*) FROM expected_t2 e
+                     WHERE e.batch_id = b.batch_id
+                ), 0),
+                COALESCE(array_length(ts.scope_ids, 1), 0) * 5,
+                COUNT(*) FILTER (
+                    WHERE r.type::text IN (
+                        'USER_MAIL','USER_ONEDRIVE','USER_CHATS',
+                        'USER_CALENDAR','USER_CONTACTS')
+                )
+            )                                              AS tier2_total,
+            COUNT(*) FILTER (
+                WHERE r.type::text IN (
+                    'USER_MAIL','USER_ONEDRIVE','USER_CHATS',
+                    'USER_CALENDAR','USER_CONTACTS')
+                  AND s.status::text IN ('COMPLETED','PARTIAL','FAILED')
+            )                                              AS tier2_terminal
+        FROM batches b
+        LEFT JOIN tier1_scope ts ON ts.batch_id = b.batch_id
+        LEFT JOIN snapshots s    ON s.job_id = ANY(b.job_ids)
+        LEFT JOIN resources r    ON r.id = s.resource_id
+        GROUP BY b.batch_id, ts.scope_ids
+    ),
     total_expected AS (
         -- Stable progress denominator. Computed from click-time scope
         -- so it doesn't drift as Tier-2 jobs land:
@@ -427,6 +505,10 @@ def build_batch_rollup_query(
         COALESCE(f.missing_t2, 0)           AS missing_t2,
         COALESCE(te.expected_count, 0)      AS expected_count,
         COALESCE(dp.pending, FALSE)         AS discovery_pending,
+        COALESCE(tsp.tier1_total, 0)        AS tier1_total,
+        COALESCE(tsp.tier1_terminal, 0)     AS tier1_terminal,
+        COALESCE(tsp.tier2_total, 0)        AS tier2_total,
+        COALESCE(tsp.tier2_terminal, 0)     AS tier2_terminal,
         sres.single_resource_name           AS single_resource_name,
         sres.single_resource_type           AS single_resource_type,
         eo.entra_user_name                  AS entra_user_name,
@@ -440,6 +522,7 @@ def build_batch_rollup_query(
     LEFT JOIN entra_one   eo ON eo.batch_id = b.batch_id
     LEFT JOIN total_expected te ON te.batch_id = b.batch_id
     LEFT JOIN discovery_pending_cte dp ON dp.batch_id = b.batch_id
+    LEFT JOIN tier_split tsp ON tsp.batch_id = b.batch_id
     ORDER BY b.started_at DESC NULLS LAST
     LIMIT :size OFFSET :off
     """
@@ -476,6 +559,10 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
         missing_t2=int(row.missing_t2 or 0),
         expected_total=int(getattr(row, "expected_count", 0) or 0),
         discovery_pending=bool(getattr(row, "discovery_pending", False)),
+        tier1_total=int(getattr(row, "tier1_total", 0) or 0),
+        tier1_terminal=int(getattr(row, "tier1_terminal", 0) or 0),
+        tier2_total=int(getattr(row, "tier2_total", 0) or 0),
+        tier2_terminal=int(getattr(row, "tier2_terminal", 0) or 0),
     )
     status, warnings = derive_batch_status(counts)
 
@@ -550,19 +637,47 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
     # also handles the Tier-1→Tier-2 handoff (``missing_t2`` keeps
     # status="In Progress" until Tier-2 Jobs spawn).
     bytes_added = int(row.bytes_added or 0)
-    denom = counts.expected_total if counts.expected_total > 0 else counts.snap_total
-    if denom > 0:
-        terminal = counts.snap_done + counts.snap_partial + counts.snap_failed
-        progress_pct = min(100, int(100 * terminal / denom))
-    else:
-        progress_pct = 0
+    # Weighted progress: Tier-1 = 10 % of bar, Tier-2 = 90 %. See the
+    # RollupCounts comment for rationale (data volume between the two
+    # tiers is ~1 : 100, so a per-snapshot count overweights Tier-1).
+    #
+    # Three batch shapes to handle:
+    #   (1) Tier-1 + Tier-2 (the M365 user click) — both terms apply.
+    #   (2) Tier-1-only (e.g. ENTRA discovery without thenBackup) —
+    #       no Tier-2 expected, scale Tier-1 to 100 %.
+    #   (3) Tier-2-only (PREEMPTIVE per-resource trigger) — no Tier-1,
+    #       scale Tier-2 to 100 %.
+    # Fall back to ``expected_total`` / ``snap_total`` only when both
+    # tier counters are zero (legacy / edge-case batches).
     if status in ("Done", "Failed", "Canceled"):
         progress_pct = 100
-    elif progress_pct >= 100:
-        # Defensive: while still "In Progress", clamp below 100 so the
-        # status and percent agree. Can only fire if terminal snapshots
-        # exceed the click-time scope — possible if the operator re-runs
-        # the same batch_id (extremely rare) or the scope mid-resizes.
+    elif counts.tier1_total > 0 and counts.tier2_total > 0:
+        t1_frac = min(1.0, counts.tier1_terminal / counts.tier1_total)
+        t2_frac = min(1.0, counts.tier2_terminal / counts.tier2_total)
+        progress_pct = int(10 * t1_frac + 90 * t2_frac)
+    elif counts.tier1_total > 0:
+        t1_frac = min(1.0, counts.tier1_terminal / counts.tier1_total)
+        progress_pct = int(100 * t1_frac)
+    elif counts.tier2_total > 0:
+        t2_frac = min(1.0, counts.tier2_terminal / counts.tier2_total)
+        progress_pct = int(100 * t2_frac)
+    else:
+        # Legacy fallback: pre-tier-split batches OR truly empty
+        # batch (no snapshots yet). Mirrors the old denominator so
+        # behaviour is unchanged for callers that never populate the
+        # tier_split CTE (e.g. unit tests).
+        denom = counts.expected_total if counts.expected_total > 0 else counts.snap_total
+        if denom > 0:
+            terminal = counts.snap_done + counts.snap_partial + counts.snap_failed
+            progress_pct = min(100, int(100 * terminal / denom))
+        else:
+            progress_pct = 0
+    # Clamp below 100 while still "In Progress" so status and percent
+    # agree. The Tier-1=10/Tier-2=90 split makes the natural ceiling
+    # 99 (e.g. Tier-1 done + 98 / 99 Tier-2 children done = 10 + 89 = 99),
+    # but on rounding the int can hit 100 before the terminal status
+    # latches.
+    if status == "In Progress" and progress_pct >= 100:
         progress_pct = 99
 
     # Phase chip — v1 collapses to in_progress / done. Refining to

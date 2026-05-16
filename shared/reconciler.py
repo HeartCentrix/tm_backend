@@ -314,10 +314,32 @@ _PARTITION_QUEUE_BY_TYPE = {
 }
 
 
+# messageType the backup-worker's `process_backup_message` dispatcher
+# expects for each partition type. Without this key the worker can't
+# route to the matching ``_process_*_partition_message`` handler and
+# the message falls through to the generic backup-message path which
+# requires ``jobId`` — none of our partition payloads carry one, so
+# the message KeyError-crashes and (in classic queues) loops because
+# requeue doesn't bump x-delivery-count (2026-05-16 incident:
+# reconciler-requeued CHATS partitions poisoned worker-9f90b1b2).
+_MESSAGE_TYPE_BY_PARTITION_TYPE = {
+    "ONEDRIVE_FILES":     "BACKUP_ONEDRIVE_PARTITION",
+    "CHATS":              "BACKUP_CHATS_PARTITION",
+    "MAIL_FOLDERS":       "BACKUP_MAIL_PARTITION",
+    "SHAREPOINT_DRIVES":  "BACKUP_SHAREPOINT_PARTITION",
+}
+
+
 def _queue_for_partition_type(ptype: Optional[str]) -> Optional[str]:
     if not ptype:
         return None
     return _PARTITION_QUEUE_BY_TYPE.get(ptype)
+
+
+def _message_type_for_partition_type(ptype: Optional[str]) -> Optional[str]:
+    if not ptype:
+        return None
+    return _MESSAGE_TYPE_BY_PARTITION_TYPE.get(ptype)
 
 
 async def republish_partition_messages(
@@ -333,16 +355,26 @@ async def republish_partition_messages(
     published = 0
     for p in stats.requeue_payloads:
         queue = _queue_for_partition_type(p.get("partition_type"))
-        if queue is None:
+        msg_type = _message_type_for_partition_type(p.get("partition_type"))
+        if queue is None or msg_type is None:
             print(
-                f"[RECONCILER] no queue mapping for partition_type="
-                f"{p.get('partition_type')!r}; skipping {p['id']}"
+                f"[RECONCILER] no queue/messageType mapping for "
+                f"partition_type={p.get('partition_type')!r}; "
+                f"skipping {p['id']}"
             )
             continue
         try:
             await message_bus.publish(
                 queue,
                 {
+                    # messageType lets the backup-worker's
+                    # process_backup_message dispatcher route to the
+                    # right ``_process_*_partition_message`` handler.
+                    # Without it the worker falls through to the
+                    # generic path that requires jobId (which a bare
+                    # partition envelope lacks) and crash-loops on
+                    # the same message in classic queues.
+                    "messageType":    msg_type,
                     "snapshotId":     p["snapshot_id"],
                     "partitionId":    p["id"],
                     "partitionType":  p["partition_type"],
