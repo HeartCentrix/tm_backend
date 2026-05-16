@@ -1014,6 +1014,69 @@ async def get_job_logs(job_id: str, page: int = Query(1), size: int = Query(50),
     ]
 
 
+async def _route_single_trigger(
+    resource: Resource,
+    db: AsyncSession,
+    *,
+    full_backup: bool,
+    priority: int,
+    note: Optional[str] = None,
+    trigger_label: str = "MANUAL",
+) -> Optional[Dict]:
+    """Single-resource trigger with Tier-2 auto-discovery gap-fill.
+
+    For ENTRA_USER targets this mirrors the mass-backup flow's
+    classify_scope behaviour: existing live USER_* children are
+    included in the fan-out, and missing children get discovered +
+    backed up via the standard discovery.tier2 chain (thenBackup=True).
+
+    Returns the batch-result dict from _create_batch_backup_jobs when
+    routing through the bulk path, or None when the caller should
+    keep its legacy single-message publish (non-ENTRA_USER targets).
+    """
+    if resource.type != ResourceType.ENTRA_USER:
+        return None
+
+    excluded_statuses = [
+        ResourceStatus.INACCESSIBLE,
+        ResourceStatus.SUSPENDED,
+        ResourceStatus.PENDING_DELETION,
+    ]
+    child_stmt = select(Resource).where(
+        Resource.parent_resource_id == resource.id,
+        Resource.type.in_([
+            ResourceType.USER_MAIL,
+            ResourceType.USER_ONEDRIVE,
+            ResourceType.USER_CONTACTS,
+            ResourceType.USER_CALENDAR,
+            ResourceType.USER_CHATS,
+        ]),
+        Resource.status.notin_(excluded_statuses),
+        Resource.archived_at.is_(None),
+    )
+    children = (await db.execute(child_stmt)).scalars().all()
+
+    resources_map: Dict[str, Resource] = {str(resource.id): resource}
+    for child in children:
+        resources_map[str(child.id)] = child
+
+    print(
+        f"[JOB_SERVICE] single ENTRA_USER trigger via batch path: "
+        f"user={resource.id} children_live={len(children)} "
+        f"(tier-2 gap-fill {'skipped' if len(children) == 5 else 'will run'})"
+    )
+
+    return await _create_batch_backup_jobs(
+        resources_map=resources_map,
+        db=db,
+        full_backup=full_backup,
+        priority=priority,
+        note=note,
+        trigger_label=trigger_label,
+        batch_id=str(uuid4()),
+    )
+
+
 @app.post("/api/v1/backups/trigger", response_model=JobResponse)
 async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depends(get_db)):
     # Fetch resource to get tenant info
@@ -1050,6 +1113,40 @@ async def trigger_backup(request: TriggerBackupRequest, db: AsyncSession = Depen
         effective_full_backup = False
     else:
         print(f"[JOB_SERVICE] Resource {request.resourceId} first backup (last_backup_at={resource.last_backup_at}), fullBackup={effective_full_backup}")
+
+    # Tier-2 gap-fill for ENTRA_USER targets: existing children join the
+    # fan-out, missing ones get discovered + backed up via discovery.tier2.
+    # Mirrors the mass-backup classify_scope behaviour so a single-user
+    # click actually captures the user's mail/onedrive/calendar/contacts/
+    # chats — not just the user profile.
+    batched = await _route_single_trigger(
+        resource, db,
+        full_backup=effective_full_backup,
+        priority=request.priority or 1,
+        note=request.note,
+        trigger_label="MANUAL",
+    )
+    if batched:
+        # _create_batch_backup_jobs returns a list of BATCH-job dicts
+        # ({"jobId","status","resourceId":"BATCH",...}). Synthesize a
+        # JobResponse from the first BATCH job so /trigger's strict
+        # response_model still validates. The frontend keys on jobId
+        # for status polling, so the BATCH job id is what it needs to
+        # track — the per-resource fan-out lives under it.
+        first = batched[0] if isinstance(batched, list) and batched else None
+        if isinstance(first, dict) and first.get("jobId"):
+            now_iso = datetime.now(timezone.utc).isoformat()
+            return JobResponse(
+                id=str(first["jobId"]),
+                type="BACKUP",
+                status=str(first.get("status") or "QUEUED"),
+                progress=0,
+                resourceId=str(resource.id),
+                createdAt=now_iso,
+                updatedAt=now_iso,
+            )
+        # Fall through to legacy publish if the batch path returned an
+        # unexpected shape.
 
     job = Job(
         id=uuid4(), type=JobType.BACKUP,
@@ -1175,6 +1272,23 @@ async def trigger_bulk_backup(resource_id: str = None, request: TriggerBulkBacku
         # Determine fullBackup based on whether resource has been backed up before
         effective_full_backup = not (res.last_backup_at is not None)
         print(f"[JOB_SERVICE] Single resource backup for {resource_id}, fullBackup={effective_full_backup}")
+
+        # Tier-2 gap-fill for ENTRA_USER (same as /trigger).
+        batched = await _route_single_trigger(
+            res, db,
+            full_backup=effective_full_backup,
+            priority=1,
+            note=None,
+            trigger_label="MANUAL",
+        )
+        if batched:
+            first = batched[0] if isinstance(batched, list) and batched else None
+            if isinstance(first, dict) and first.get("jobId"):
+                return {
+                    "jobId": str(first["jobId"]),
+                    "status": str(first.get("status") or "QUEUED"),
+                    "resourceId": resource_id,
+                }
 
         job = Job(
             id=uuid4(), type=JobType.BACKUP,
