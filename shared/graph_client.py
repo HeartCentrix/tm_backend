@@ -5,7 +5,7 @@ import os
 import httpx
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import AsyncGenerator, AsyncIterator, Iterator, List, Optional, Dict, Any, Set, Tuple
+from typing import AsyncGenerator, AsyncIterator, Iterator, List, Optional, Dict, Any, Set, Tuple, Union
 from datetime import datetime, timedelta
 import hashlib
 import time
@@ -53,6 +53,17 @@ def graph_priority(priority: int) -> Iterator[None]:
 # Timeout constants — tuned for Graph API and token endpoint behavior
 _DEFAULT_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=10.0)
 _TOKEN_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+
+# Module-level cache of GraphClient instances keyed by (app_client_id,
+# tenant_id). Populated lazily by `get_messages_mime_concurrent` so a
+# 12-app rotation against one mailbox doesn't reopen 12 token exchanges
+# and httpx sessions on every call. Each cached client owns its own
+# persistent http session (HTTP/2 multiplexed if GRAPHCLIENT_HTTP2=true),
+# so 12 cached clients = 12 long-lived TCP connections to Graph,
+# multiplexing up to 4 streams each per the per-app per-mailbox limit.
+# Lifetime is process-scoped — clients are never evicted (12 × tenants
+# worth of sockets is bounded and tiny for a single-tenant deployment).
+_MULTI_APP_CLIENT_CACHE: Dict[Tuple[str, str], "GraphClient"] = {}
 
 
 def _parse_retry_after(resp: httpx.Response, default: float = 30.0, cap: float = 120.0) -> float:
@@ -130,14 +141,44 @@ class GraphClient:
             # multiplexes hundreds of in-flight requests on one TCP
             # connection → no per-request TLS handshake on the hot path.
             use_http2 = os.environ.get("GRAPHCLIENT_HTTP2", "false").lower() == "true"
+            # HTTP/2 needs the `h2` lib. It's pinned in every worker's
+            # requirements.txt — but if a custom image somehow lacks
+            # it, httpx raises ImportError at construct time. Detect
+            # and fall back to HTTP/1.1 with a loud warning so the
+            # worker keeps serving instead of crash-looping.
+            if use_http2:
+                try:
+                    import h2  # noqa: F401 — presence check only
+                except ImportError:
+                    print(
+                        "[GraphClient] WARN: GRAPHCLIENT_HTTP2=true but "
+                        "the `h2` package isn't installed. Falling back "
+                        "to HTTP/1.1. Add `h2>=4.1.0,<5.0` to this "
+                        "service's requirements.txt to enable multiplexing."
+                    )
+                    use_http2 = False
+            # Pool sizing rationale (validated against the worker's
+            # actual concurrency budget):
+            #   - HTTP/2 OFF (legacy): each Graph call needs its own
+            #     TCP socket; 50 keepalive covers 10 folders × 2-4
+            #     in-flight pages + headroom.
+            #   - HTTP/2 ON: one socket handles 100+ multiplexed
+            #     streams, so max_connections matters less — the cap
+            #     just bounds the number of distinct host:port pairs
+            #     we keep open (graph.microsoft.com, login.* for the
+            #     token service, plus the per-shard SharePoint hosts).
+            # Bumped to 200/100 to accommodate higher per-worker
+            # concurrency after the throughput overhaul (folder
+            # parallelism + multi-app concurrent MIME fetch). No prior
+            # commit documented a smaller value being load-bearing.
             self._http = httpx.AsyncClient(
                 http2=use_http2,
                 timeout=httpx.Timeout(
                     connect=30.0, read=600.0, write=300.0, pool=30.0,
                 ),
                 limits=httpx.Limits(
-                    max_connections=100,
-                    max_keepalive_connections=50,
+                    max_connections=200,
+                    max_keepalive_connections=100,
                     keepalive_expiry=300.0,
                 ),
                 # Several SharePoint/CDN download sites need 3xx
@@ -3535,6 +3576,165 @@ class GraphClient:
         if last_err is not None:
             raise last_err
         raise RuntimeError("get_message_mime_source: exhausted retries")
+
+    async def get_messages_mime_concurrent(
+        self,
+        user_id: str,
+        message_ids: List[str],
+        *,
+        per_app_concurrency: int = 4,
+    ) -> Dict[str, Union[bytes, Exception]]:
+        """Concurrently fetch RFC822 MIME bodies for many messages of ONE
+        mailbox, spreading load across the entire 12-app pool to escape
+        the per-mailbox-per-app concurrency ceiling.
+
+        Microsoft Graph enforces a hard limit of **4 concurrent requests
+        per mailbox per app** on Outlook endpoints (documented at
+        https://learn.microsoft.com/en-us/graph/throttling-limits). A
+        single GraphClient hitting `/messages/{id}/$value` for one mailbox
+        bottlenecks at ~4 in-flight no matter how much asyncio.gather()
+        fan-out the caller adds — every fifth request queues server-side.
+
+        BUT — and this is the unlock — the limit is **per-app**. With 12
+        registered apps in `multi_app_manager`, the same mailbox can sustain
+        12 × 4 = 48 truly parallel `/$value` GETs at once. That's the only
+        legal way to escape the per-mailbox ceiling without paying for
+        Microsoft 365 Backup Storage API or hitting tenant-wide aggregate
+        throttle.
+
+        Approach:
+          1. For each app in the pool, build (or reuse a cached) GraphClient.
+          2. Round-robin assign message_ids to apps.
+          3. Each app has its own asyncio.Semaphore capped at
+             `per_app_concurrency` (default 4 — Microsoft's hard limit).
+          4. Each fetch reuses the persistent single-call retry chain in
+             `get_message_mime_source` (handles 429 / 503 / transients).
+          5. Returns dict[msg_id, bytes | Exception]. Bulk caller decides
+             per-id whether to skip or surface the error — we don't raise
+             on partial failure, so 1 bad msg doesn't sink the batch.
+
+        Why this beats `$batch` for MIME:
+          - `$batch` on Outlook serializes 4 sub-requests-at-a-time PER
+            MAILBOX (documented at shared/graph_batch.py:9-12). So 20
+            sub-requests for the same mailbox = 5 serial waves of 4.
+            Wall-time equals 4-concurrent serial GETs ≈ no win over
+            asyncio.gather + 4 in-flight.
+          - This method instead exploits the per-APP scope of the
+            concurrency limit. With HTTP/2 enabled, each app's persistent
+            client multiplexes its 4 streams over ONE TCP connection
+            (negligible TLS overhead), and 12 apps = 12 connections =
+            48 streams in flight against ONE mailbox.
+
+        Caller guidance:
+          - Use ONLY for MIME fetches against a single mailbox per call.
+            Mixing mailboxes per-call breaks the per-mailbox isolation
+            model and risks burning all apps' quota on one user.
+          - For 100s of msg_ids, call in batches of 48-96 to bound
+            unwrapped task fan-out.
+          - Token refresh per-app happens inside each per-message retry
+            (existing get_message_mime_source logic) — no token storm.
+
+        Returns:
+          dict mapping each requested message_id to either the bytes of
+          its RFC822 MIME source on success, or the Exception that the
+          per-message retry chain ultimately raised on failure. Missing
+          msg_ids in the result indicate caller bug (we always populate
+          every requested id).
+        """
+        if not message_ids:
+            return {}
+        # Lazy import to avoid circular-import at module load.
+        from shared.multi_app_manager import multi_app_manager
+
+        apps = multi_app_manager.apps
+        # Single-app deployment (or test mocks) — fall back to the
+        # serial path through this same GraphClient. No semaphore games;
+        # at most 4 in-flight per Outlook's own rule.
+        if not apps or len(apps) <= 1:
+            return await self._fetch_mime_serial(
+                user_id, message_ids,
+                concurrency=per_app_concurrency,
+            )
+
+        # Per-app semaphores cap concurrency at Microsoft's documented
+        # ceiling. Going above 4 just queues server-side and burns
+        # cycles in retry loops — it does NOT increase throughput.
+        sem_per_app = max(1, min(per_app_concurrency, 4))
+        app_sems: Dict[str, asyncio.Semaphore] = {
+            app.client_id: asyncio.Semaphore(sem_per_app) for app in apps
+        }
+        # Cache per-app GraphClient for this tenant so we don't reopen
+        # token exchanges + http sessions per batch. Lifetime = caller
+        # scope; weak global cache below absorbs reuse across calls.
+        clients_by_app: Dict[str, GraphClient] = {}
+        for app in apps:
+            cached = _MULTI_APP_CLIENT_CACHE.get((app.client_id, self.tenant_id))
+            if cached is None:
+                cached = GraphClient(
+                    client_id=app.client_id,
+                    client_secret=app.client_secret,
+                    tenant_id=self.tenant_id,
+                )
+                _MULTI_APP_CLIENT_CACHE[(app.client_id, self.tenant_id)] = cached
+            clients_by_app[app.client_id] = cached
+
+        results: Dict[str, Union[bytes, Exception]] = {}
+
+        async def _one(msg_id: str, app_client_id: str) -> None:
+            client = clients_by_app[app_client_id]
+            sem = app_sems[app_client_id]
+            async with sem:
+                try:
+                    data = await client.get_message_mime_source(
+                        user_id, msg_id,
+                    )
+                    results[msg_id] = data
+                except Exception as e:
+                    # Don't raise — bulk semantics. Caller inspects per-id.
+                    results[msg_id] = e
+
+        # Round-robin distribution across apps. If 7 messages and 12 apps,
+        # apps 0-6 each handle one; apps 7-11 idle. With more messages,
+        # apps cycle: msg[12] goes back to app[0]'s semaphore, queueing
+        # behind whatever app[0] is doing.
+        tasks = []
+        for i, msg_id in enumerate(message_ids):
+            chosen_app = apps[i % len(apps)]
+            tasks.append(_one(msg_id, chosen_app.client_id))
+        # gather with return_exceptions=False — our _one() catches all
+        # exceptions and stuffs them into results, so gather always
+        # completes cleanly. (return_exceptions=True would swallow our
+        # already-caught errors twice and complicate the result map.)
+        await asyncio.gather(*tasks)
+        return results
+
+    async def _fetch_mime_serial(
+        self,
+        user_id: str,
+        message_ids: List[str],
+        *,
+        concurrency: int = 4,
+    ) -> Dict[str, Union[bytes, Exception]]:
+        """Single-app fallback for get_messages_mime_concurrent when only
+        one Graph app is configured. Caps in-flight at `concurrency`
+        (default 4 — Microsoft's per-mailbox-per-app limit). Same bulk
+        semantics: each msg_id maps to bytes or Exception, never raises."""
+        if not message_ids:
+            return {}
+        sem = asyncio.Semaphore(max(1, min(concurrency, 4)))
+        out: Dict[str, Union[bytes, Exception]] = {}
+
+        async def _one(msg_id: str) -> None:
+            async with sem:
+                try:
+                    out[msg_id] = await self.get_message_mime_source(
+                        user_id, msg_id,
+                    )
+                except Exception as e:
+                    out[msg_id] = e
+
+        await asyncio.gather(*(_one(mid) for mid in message_ids))
+        return out
 
     async def get_hosted_content(
         self, chat_id: str, message_id: str, hc_id: str, chunk_size: int = 1024 * 1024

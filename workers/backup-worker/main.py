@@ -6954,6 +6954,88 @@ class BackupWorker:
                 f"{type(be).__name__}: {be}; falling back to per-msg",
             )
 
+        # ── Multi-app concurrent MIME pre-fetch ──────────────────────
+        # Identify which messages have body cid: refs not covered by
+        # the attachment list, then bulk-fetch their RFC822 MIME via
+        # the 12-app pool in parallel. Without this, every cid:-bearing
+        # message would do a SERIAL /$value GET inside _one_message
+        # under sem=8, which was the documented 0.14 MiB/s bottleneck
+        # on heavy mailboxes — all 8 concurrent fetches piled onto
+        # ONE app's 4-concurrent-per-mailbox limit, queueing 4 deep
+        # server-side every wave.
+        #
+        # The new path uses 12 apps × 4 concurrent = 48 in-flight per
+        # mailbox (Microsoft's hard ceiling per
+        # https://learn.microsoft.com/en-us/graph/throttling-limits).
+        # With HTTP/2 enabled (GRAPHCLIENT_HTTP2=true) each app's 4
+        # streams multiplex over ONE TCP connection so there's no
+        # per-fetch TLS handshake either.
+        #
+        # We do this BEFORE the _one_message gather so the fetch can
+        # truly fan out across the 12-app pool. Doing it inside
+        # _one_message would serialise against sem=8 again (only 8
+        # concurrent invocations of get_messages_mime_concurrent, each
+        # asking for 1 msg — apps barely rotate).
+        mime_pre_map: Dict[str, Optional[bytes]] = {}
+        need_mime_msg_ids: List[str] = []
+        for _m in messages_with_attachments:
+            _mid = _m.get("id")
+            if not _mid:
+                continue
+            _body_html = (_m.get("body") or {}).get("content") or ""
+            if "cid:" not in _body_html and "CID:" not in _body_html:
+                continue
+            try:
+                _body_cids = _extract_cid_refs_from_body(_body_html)
+            except Exception:
+                continue
+            if not _body_cids:
+                continue
+            # Cross-check against the attachment list we just bulk-fetched.
+            # If every body cid is already covered by an attachment, MIME
+            # adds nothing — skip the fetch.
+            _atts = att_lists_cache.get(_mid) or []
+            _captured = {
+                ((a.get("contentId") or a.get("contentID") or "")
+                 .strip().strip("<>").strip().lower())
+                for a in _atts
+            }
+            if _body_cids - _captured - {""}:
+                need_mime_msg_ids.append(_mid)
+
+        if need_mime_msg_ids:
+            print(
+                f"[{self.worker_id}] [MIME-BULK] pre-fetching MIME for "
+                f"{len(need_mime_msg_ids)} msg(s) via {graph_client.__class__.__name__} "
+                f"multi-app pool",
+            )
+            try:
+                bulk_results = await graph_client.get_messages_mime_concurrent(
+                    user_id, need_mime_msg_ids,
+                )
+                _ok = 0
+                _fail = 0
+                for _mid, _r in bulk_results.items():
+                    if isinstance(_r, (bytes, bytearray)):
+                        mime_pre_map[_mid] = bytes(_r)
+                        _ok += 1
+                    else:
+                        mime_pre_map[_mid] = None
+                        _fail += 1
+                print(
+                    f"[{self.worker_id}] [MIME-BULK] result: "
+                    f"{_ok} ok, {_fail} fail of {len(need_mime_msg_ids)}",
+                )
+            except Exception as e:
+                # Hard failure on the bulk path — every msg falls back to
+                # the per-msg serial path inside _one_message. Logs the
+                # root cause for triage; the fallback keeps backups
+                # functional even if the new code path has a bug.
+                print(
+                    f"[{self.worker_id}] [MIME-BULK ERR] "
+                    f"{type(e).__name__}: {e}; falling back to per-msg",
+                )
+
         async def _one_message(msg: Dict[str, Any]) -> Tuple[List[SnapshotItem], int]:
             msg_id = msg.get("id")
             if not msg_id:
@@ -7109,21 +7191,37 @@ class BackupWorker:
                 unresolved = body_cids - already_captured - {""}
                 if unresolved:
                     mime_bytes: Optional[bytes] = None
-                    async with sem:
-                        try:
-                            mime_bytes = await graph_client.get_message_mime_source(
-                                user_id, msg_id,
-                            )
-                        except Exception as e:
-                            # 403 / 404 / size-cap are all silent — the
-                            # original email still reads, we just leave
-                            # the cid: refs broken (same as before this
-                            # fallback existed).
-                            print(
-                                f"[{self.worker_id}] [MIME-FETCH] msg {msg_id}: "
-                                f"{type(e).__name__}: {e}"
-                            )
-                            mime_bytes = None
+                    # Fast path: bulk pre-fetch already grabbed this
+                    # message's MIME via the 12-app concurrent fetcher.
+                    # `mime_pre_map` contains an entry per msg the
+                    # pre-fetch attempted: bytes on success, None on
+                    # failure. A missing key means the pre-fetch step
+                    # decided this msg didn't need MIME (or itself
+                    # failed entirely and skipped population).
+                    if msg_id in mime_pre_map:
+                        mime_bytes = mime_pre_map[msg_id]
+                    else:
+                        # Fallback path: bulk pre-fetch was bypassed
+                        # for this message (e.g. body cids were all
+                        # captured but the attachment list later
+                        # turned out to be incomplete, leaving cids
+                        # unresolved here). Serial single-msg fetch
+                        # under the existing sem=8 cap.
+                        async with sem:
+                            try:
+                                mime_bytes = await graph_client.get_message_mime_source(
+                                    user_id, msg_id,
+                                )
+                            except Exception as e:
+                                # 403 / 404 / size-cap are all silent —
+                                # the original email still reads, we just
+                                # leave the cid: refs broken (same as
+                                # before this fallback existed).
+                                print(
+                                    f"[{self.worker_id}] [MIME-FETCH] msg {msg_id}: "
+                                    f"{type(e).__name__}: {e}"
+                                )
+                                mime_bytes = None
 
                     if mime_bytes:
                         try:
