@@ -356,42 +356,38 @@ async def _create_batch_backup_jobs(
     # dedup query in _fanout_bulk_to_per_resource to catch the race
     # window between trigger and worker pickup.
     dedup_skipped: List[str] = []
+    # Run dedup inside a SAVEPOINT so any failure (schema drift, transient
+    # error) can be rolled back without poisoning the outer transaction —
+    # Postgres marks the entire tx aborted on the first statement error,
+    # and the downstream INSERT into jobs would then fail with
+    # InFailedSQLTransactionError. The schema qualifier is intentionally
+    # omitted; the connection's search_path already points at DB_SCHEMA
+    # (default "tm") so unqualified names resolve correctly in both local
+    # and Railway environments.
     try:
         requested_ids = list(resources_map.keys())
-        # Two-layer dedup against in-flight work for the same resource:
-        #   (a) IN_PROGRESS snapshots in last 1h — catches the case
-        #       where a worker has already created the per-resource
-        #       snapshot row;
-        #   (b) QUEUED / RUNNING jobs in this batch with overlapping
-        #       batch_resource_ids — catches the earlier window
-        #       *before* any snapshot exists, e.g. when the same
-        #       trigger-bulk request lands twice ~seconds apart from
-        #       a redelivered discovery.tier2 message (2026-05-16
-        #       incident — discovery_worker fired ``/trigger-bulk``
-        #       twice for the same batch, producing duplicate Tier-2
-        #       Jobs whose worker fan-out raced and left half-empty
-        #       snapshot rows in the Activity breakdown).
-        inflight_rows = (await db.execute(
-            text(
-                """
-                SELECT DISTINCT s.resource_id, s.job_id
-                FROM tm_vault.snapshots s
-                WHERE s.resource_id = ANY(:rids)
-                  AND s.status = 'IN_PROGRESS'
-                  AND s.started_at > NOW() - INTERVAL '1 hour'
-                UNION
-                SELECT DISTINCT bid AS resource_id, j.id AS job_id
-                  FROM tm_vault.jobs j
-                  CROSS JOIN LATERAL unnest(
-                      COALESCE(j.batch_resource_ids, ARRAY[]::uuid[])
-                  ) AS bid
-                 WHERE j.status::text IN ('QUEUED','RUNNING')
-                   AND bid = ANY(cast(:rids AS uuid[]))
-                   AND COALESCE(j.spec->>'batch_id', '') = COALESCE(:bid, '')
-                """
-            ),
-            {"rids": requested_ids, "bid": batch_id or ''},
-        )).all()
+        async with db.begin_nested():
+            inflight_rows = (await db.execute(
+                text(
+                    """
+                    SELECT DISTINCT s.resource_id, s.job_id
+                    FROM snapshots s
+                    WHERE s.resource_id = ANY(:rids)
+                      AND s.status = 'IN_PROGRESS'
+                      AND s.started_at > NOW() - INTERVAL '1 hour'
+                    UNION
+                    SELECT DISTINCT bid AS resource_id, j.id AS job_id
+                      FROM jobs j
+                      CROSS JOIN LATERAL unnest(
+                          COALESCE(j.batch_resource_ids, ARRAY[]::uuid[])
+                      ) AS bid
+                     WHERE j.status::text IN ('QUEUED','RUNNING')
+                       AND bid = ANY(cast(:rids AS uuid[]))
+                       AND COALESCE(j.spec->>'batch_id', '') = COALESCE(:bid, '')
+                    """
+                ),
+                {"rids": requested_ids, "bid": batch_id or ''},
+            )).all()
         if inflight_rows:
             inflight_resource_ids = {str(r[0]) for r in inflight_rows}
             inflight_job_ids = {str(r[1]) for r in inflight_rows if r[1]}

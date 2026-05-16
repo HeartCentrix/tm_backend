@@ -2951,7 +2951,7 @@ class BackupWorker:
                 rows = (await session.execute(
                     text("""
                         SELECT DISTINCT resource_id
-                        FROM tm_vault.snapshots
+                        FROM snapshots
                         WHERE resource_id = ANY(:rids)
                           AND status = 'IN_PROGRESS'
                           AND started_at > NOW() - INTERVAL '1 hour'
