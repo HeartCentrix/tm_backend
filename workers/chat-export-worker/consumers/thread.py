@@ -247,14 +247,48 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
             except OSError:
                 pass
 
-    ttl = getattr(settings, "chat_export_sas_ttl_hours", 168)
-    url = await shard.get_blob_sas_url(container, blob_path, valid_for_hours=ttl)
+    # Build the browser-facing download URL through api-gateway →
+    # job-service `/api/v1/jobs/export/{job_id}/download`. The endpoint
+    # already exists for restore-worker exports; it server-side fetches
+    # the blob from internal storage (SeaweedFS / Azure) and streams to
+    # the browser with the right Content-Disposition + audit logging.
+    #
+    # We deliberately drop the raw presigned URL approach:
+    #   - SeaweedFS isn't publicly reachable on Railway (the prior
+    #     `http://seaweedfs.railway.internal:8333/...` URL the browser
+    #     received was unopenable);
+    #   - A presigned URL leaks the bytes to anyone who has it — bad
+    #     for a backup product carrying customer chat history;
+    #   - Going through api-gateway puts the download behind the same
+    #     auth + tenant scoping + audit-log path every other download
+    #     uses, which is what the existing endpoint at
+    #     services/job-service/main.py:2039 already implements.
+    #
+    # `result.blob_path` + `result.container` mirror the field names the
+    # job-service endpoint reads (services/job-service/main.py:2089).
+    # Without them the endpoint 404s on the chat-export schema.
+    _api_base = (
+        os.environ.get("API_GATEWAY_PUBLIC_URL")
+        or (
+            "https://" + os.environ["RAILWAY_SERVICE_API_GATEWAY_URL"]
+            if os.environ.get("RAILWAY_SERVICE_API_GATEWAY_URL")
+            else None
+        )
+        or getattr(settings, "API_GATEWAY_PUBLIC_URL", None)
+        or ""
+    ).rstrip("/")
+    download_url = (
+        f"{_api_base}/api/v1/jobs/export/{job_id}/download"
+        if _api_base else f"/api/v1/jobs/export/{job_id}/download"
+    )
 
     await _update_job(
         sess, job_id, status=JobStatus.COMPLETED,
         result={
             "export_zip_blob_path": f"{account}/{container}/{blob_path}",
-            "signed_url": url,
+            "blob_path": blob_path,
+            "container": container,
+            "signed_url": download_url,
             "total_msgs": len(render_messages),
             "total_bytes": summary["total_bytes"],
             "sha256": summary["sha256"],
@@ -262,7 +296,7 @@ async def _run_pipeline(sess, job_id, spec, scope, job) -> None:
     )
     await publish(
         job_id, "complete",
-        {"url": url,
+        {"url": download_url,
          "sizeBytes": summary["total_bytes"],
          "sha256": summary["sha256"]},
     )
