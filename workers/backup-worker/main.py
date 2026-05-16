@@ -289,6 +289,28 @@ _CHAT_THREAD_DRAIN_FRESHNESS_S = int(
 )
 
 
+def _msg_likely_has_hosted_content(m: Dict[str, Any]) -> bool:
+    """Cheap, false-positive-tolerant pre-check for whether a Graph
+    chat message has inline hostedContents worth fetching.
+
+    Graph's HTML body always references inline images via a URL fragment
+    containing ``/hostedContents/`` (the IDs may be opaque base64 but the
+    path component is stable). Pure text messages — and messages whose
+    only attachments are file/loop/giphy cards — never contain it.
+
+    Used by ``_kick_hosted_content_for_chat`` to bound the cost of the
+    per-message ``/hostedContents`` GET we now have to do because the
+    page query no longer carries ``$expand=hostedContents`` (fix #2).
+    """
+    body = m.get("body") or {}
+    if body.get("contentType") != "html":
+        return False
+    content = body.get("content") or ""
+    if not isinstance(content, str) or not content:
+        return False
+    return "hostedContents" in content
+
+
 def _parse_iso_to_dt(s: Optional[str]) -> Optional[datetime]:
     """Parse a Graph ISO-8601 timestamp into a tz-aware ``datetime``.
 
@@ -367,10 +389,12 @@ async def _claim_or_load_chat_thread(
                 "    last_updated_at   = COALESCE(EXCLUDED.last_updated_at, chat_threads.last_updated_at), "
                 "    updated_at        = NOW() "
                 "  RETURNING id, drain_cursor, last_updated_at, drain_failure_state, "
-                "            last_drained_at, (xmax = 0) AS inserted "
+                "            last_drained_at, last_drained_msg_count, "
+                "            (xmax = 0) AS inserted "
                 ") "
                 "SELECT u.id, u.drain_cursor, u.last_updated_at, u.drain_failure_state, "
-                "       u.last_drained_at, u.inserted, p.prior_lu "
+                "       u.last_drained_at, u.last_drained_msg_count, u.inserted, "
+                "       p.prior_lu "
                 "  FROM upserted u "
                 "  LEFT JOIN prior p ON TRUE"
             ),
@@ -390,6 +414,7 @@ async def _claim_or_load_chat_thread(
                 "thread_id": None, "claimed": True,
                 "drain_cursor": None, "last_updated_at": None,
                 "drain_failure_state": {},
+                "last_drained_msg_count": 0,
             }
 
         thread_id = str(row.id)
@@ -475,6 +500,7 @@ async def _claim_or_load_chat_thread(
             "drain_cursor": prior_drain_cursor,
             "last_updated_at": prior_last_updated_at,
             "drain_failure_state": prior_failure if isinstance(prior_failure, dict) else {},
+            "last_drained_msg_count": int(row.last_drained_msg_count or 0),
         }
 
 
@@ -483,6 +509,7 @@ async def _mark_chat_thread_drained(
     thread_id: str,
     drain_cursor: Optional[str],
     failure_state: Optional[Dict[str, Any]],
+    msg_count: Optional[int] = None,
 ) -> None:
     """End-of-drain checkpoint. Bumps ``last_drained_at`` to NOW() and
     stores the new cursor + failure state.
@@ -493,6 +520,10 @@ async def _mark_chat_thread_drained(
       * ``failure_state=None``    → leave drain_failure_state untouched.
       * ``failure_state={}``      → clear (success after a prior failure).
       * ``failure_state={...}``   → record this failure.
+      * ``msg_count=None``        → leave last_drained_msg_count untouched.
+      * ``msg_count=N``           → record persisted-message count after
+                                    a successful drain. Used by the
+                                    completeness gate on subsequent runs.
     """
     if not thread_id:
         return
@@ -506,6 +537,9 @@ async def _mark_chat_thread_drained(
     if failure_state is not None:
         set_parts.append("drain_failure_state = CAST(:fs AS JSONB)")
         params["fs"] = json.dumps(failure_state)
+    if msg_count is not None:
+        set_parts.append("last_drained_msg_count = :mc")
+        params["mc"] = int(msg_count)
     # Plan P5 — this is the FINAL step in the drain chain and must
     # commit, because earlier steps (chat_thread_messages upsert,
     # snapshot_items pointer-write) already succeeded by the time we
@@ -4943,10 +4977,63 @@ class BackupWorker:
                         Counters and Phase-2-skip set are advisory —
                         safe under concurrent increments because the
                         Python `+=` on ints is a single-bytecode update
-                        under the asyncio event loop (no threads)."""
+                        under the asyncio event loop (no threads).
+
+                        Now that $expand=hostedContents is gone (fix #2),
+                        messages no longer carry an inlined hostedContents
+                        array. Detection has two paths:
+                          1. `m["hostedContents"]` populated (legacy /
+                             future inline path, or fallback) — use it
+                             directly.
+                          2. body HTML references "/hostedContents/" —
+                             fetch the list via /chats/{cid}/messages/{mid}/
+                             hostedContents and use what comes back.
+                        Plain text-only messages (~95%) skip both paths."""
                         nonlocal _hc_items_total, _hc_bytes_total
                         for m in msgs:
-                            if not m.get("hostedContents"):
+                            inline_hc = m.get("hostedContents")
+                            hc_values: List[Dict[str, Any]] = []
+                            if inline_hc:
+                                hc_values = list(inline_hc)
+                            elif _msg_likely_has_hosted_content(m):
+                                # Per-message fetch — only for messages
+                                # whose body actually references an
+                                # inline-image hostedContent. Bounds the
+                                # extra HTTP cost to the ~5% of messages
+                                # that need it.
+                                m_id_probe = m.get("id")
+                                m_chat_id_probe = (
+                                    m.get("chatId")
+                                    or (m.get("channelIdentity") or {}).get("channelId")
+                                    or cid
+                                )
+                                if not m_id_probe or not m_chat_id_probe:
+                                    continue
+                                try:
+                                    _hc_resp = await graph_client._get(
+                                        f"{graph_client.GRAPH_URL}/chats/"
+                                        f"{m_chat_id_probe}/messages/"
+                                        f"{m_id_probe}/hostedContents"
+                                    )
+                                    hc_values = list(
+                                        (_hc_resp or {}).get("value", []) or []
+                                    )
+                                    # Populate so the Phase-2 fallback
+                                    # path sees the values too if the
+                                    # interleave persist below fails.
+                                    if hc_values:
+                                        m["hostedContents"] = hc_values
+                                except Exception as _hc_fetch_err:
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"hc list fetch failed "
+                                        f"msg={str(m_id_probe)[:8]} "
+                                        f"chat={str(m_chat_id_probe)[:8]}: "
+                                        f"{type(_hc_fetch_err).__name__}: "
+                                        f"{_hc_fetch_err}"
+                                    )
+                                    continue
+                            if not hc_values:
                                 continue
                             m_id = m.get("id")
                             m_chat_id = (
@@ -4963,7 +5050,7 @@ class BackupWorker:
                                         user_id=user_id,
                                         chat_id=m_chat_id,
                                         message_id=m_id,
-                                        hosted_contents=m["hostedContents"],
+                                        hosted_contents=hc_values,
                                     )
                                     _hc_items_total += n
                                     _hc_bytes_total += b
@@ -5464,21 +5551,33 @@ class BackupWorker:
                                     )
                                 return cid, [], saved_cursor
                         url = f"{graph_client.GRAPH_URL}/chats/{cid}/messages"
-                        # $expand=hostedContents inlines each message's
-                        # hostedContents[] array (id + contentType per
-                        # inline image). Without it, Graph returns
-                        # messages with no hostedContents field, so the
-                        # interleave loop sees nothing and EVERY inline
-                        # image / logo / pasted screenshot ends up
-                        # un-backed-up — body HTML still references the
-                        # original graph.microsoft.com URL which the
-                        # browser can't load (401 + CORS), giving the
-                        # "refused to connect" broken-image you see in
-                        # Recovery UI. Bytes are then fetched per-item
-                        # via _userchats_backup_hosted_contents.
+                        # NOTE on hostedContents (fix #2 — chat partial-drain root cause):
+                        # We previously used $expand=hostedContents on the page
+                        # query so each message arrived with its inline-image
+                        # IDs inlined. The cost was hidden but severe — a single
+                        # malformed/orphaned hostedContent on any message in a
+                        # page returned a 400/500 for the WHOLE PAGE. Graph
+                        # surfaces this as a normal HTTP error, our retry block
+                        # consumed its budget on the same poisoned page, and
+                        # the drain bailed mid-chat ("kept N"). That's the
+                        # documented mechanism behind the 29k → 8k variance.
+                        #
+                        # New shape:
+                        #   * Page query: plain `/chats/{id}/messages?$top=50`
+                        #     — no $expand. Pages are independent of inline-
+                        #     image metadata health, so one bad message can no
+                        #     longer poison a whole page.
+                        #   * Per-message hostedContents fetch is deferred to
+                        #     the post-drain interleave path
+                        #     (_kick_hosted_for_chat → fetches
+                        #     /chats/{cid}/messages/{mid}/hostedContents only
+                        #     when the message body actually references one).
+                        #     Detection is via substring "hostedContents" in
+                        #     the HTML body — only ~5% of messages have any,
+                        #     so this is far cheaper than the surface-level
+                        #     "extra round-trip per msg" makes it sound.
                         params: Dict[str, str] = {
                             "$top": "50",
-                            "$expand": "hostedContents",
                         }
                         # If saved_cursor looks like a full URL (legacy
                         # nextLink/deltaLink), use it verbatim so resume
@@ -5761,6 +5860,72 @@ class BackupWorker:
                                     f"{persist_err}"
                                 )
 
+                        # Completeness gate (fix #3) — guards against the
+                        # silent-partial-drain failure mode where a transient
+                        # error consumes our retry budget mid-pagination and
+                        # we accept (kept N) as a successful drain.
+                        #
+                        # Applies ONLY to full drains (saved_cursor is None).
+                        # Incremental drains legitimately return small
+                        # message counts ("nothing changed since cursor")
+                        # and would false-positive the gate.
+                        #
+                        # The full-drain count we just fetched (len(msgs_local))
+                        # is compared against last_drained_msg_count from the
+                        # prior fully-successful run on this chat. If it
+                        # dropped by more than CHAT_DRAIN_COMPLETENESS_DROP_PCT
+                        # (default 50%), mark the drain failed so the cursor
+                        # is not advanced and the next backup re-runs from
+                        # the same starting point.
+                        if drain_succeeded and not saved_cursor:
+                            try:
+                                _prior_count_baseline = int(
+                                    _claim.get("last_drained_msg_count", 0) or 0
+                                )
+                                _drop_pct = float(
+                                    os.getenv(
+                                        "CHAT_DRAIN_COMPLETENESS_DROP_PCT",
+                                        "50",
+                                    )
+                                )
+                                if _prior_count_baseline > 0:
+                                    _threshold = int(
+                                        _prior_count_baseline
+                                        * (1.0 - _drop_pct / 100.0)
+                                    )
+                                    _got = len(msgs_local)
+                                    if _got < _threshold:
+                                        drain_succeeded = False
+                                        new_failures[cid] = {
+                                            **(_thread_failure_state or {}),
+                                            "count": _prior_count + 1,
+                                            "last_error": (
+                                                f"completeness gate: "
+                                                f"got {_got} < "
+                                                f"threshold {_threshold} "
+                                                f"(baseline "
+                                                f"{_prior_count_baseline}, "
+                                                f"drop_pct {_drop_pct})"
+                                            ),
+                                            "error_class": "TRANSIENT",
+                                            "last_failed_at":
+                                                datetime.utcnow().isoformat() + "Z",
+                                        }
+                                        print(
+                                            f"[{self.worker_id}] [USER_CHATS] "
+                                            f"chat {cid[:8]} completeness "
+                                            f"failed: got={_got} "
+                                            f"baseline={_prior_count_baseline} "
+                                            f"threshold={_threshold} "
+                                            f"— cursor preserved, will retry"
+                                        )
+                            except Exception as _cg_err:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"chat {cid[:8]} completeness check "
+                                    f"errored ({_cg_err}); treating as ok"
+                                )
+
                         # Resume checkpoint: write THIS chat's drain
                         # cursor + last_drained_at into chat_threads
                         # unconditionally — including failed drains where
@@ -5772,6 +5937,30 @@ class BackupWorker:
                         # Skip the cursor advancement when drain failed
                         # (drain_succeeded=False) but always bump
                         # last_drained_at + failure_state.
+                        #
+                        # On successful drain, also stamp last_drained_msg_
+                        # count so the next run's completeness gate has a
+                        # baseline. Use the LIVE table count (not msgs_local
+                        # length) — it captures both this drain's upserts
+                        # AND messages from any concurrent drain by another
+                        # user that we layered on top of.
+                        _final_msg_count: Optional[int] = None
+                        if drain_succeeded:
+                            try:
+                                async with async_session_factory() as _bs:
+                                    _bp = (await _bs.execute(
+                                        text(
+                                            "SELECT count(*) AS n "
+                                            "  FROM chat_thread_messages "
+                                            " WHERE chat_thread_id = :tid"
+                                        ),
+                                        {"tid": thread_id},
+                                    )).first()
+                                _final_msg_count = int(
+                                    (_bp.n if _bp else 0) or 0
+                                )
+                            except Exception:
+                                _final_msg_count = None
                         try:
                             await _mark_chat_thread_drained(
                                 thread_id=thread_id,
@@ -5779,6 +5968,7 @@ class BackupWorker:
                                     max_stamp if drain_succeeded else None
                                 ),
                                 failure_state=new_failures.get(cid),
+                                msg_count=_final_msg_count,
                             )
                         except Exception as _ck_err:
                             # Advisory checkpoint — a DB hiccup here
@@ -6431,11 +6621,24 @@ class BackupWorker:
                     # handler. Messages that FAILED the interleave stay
                     # unmarked and fall through to this phase as a
                     # natural retry path.
+                    # Two-tier filter for Phase-2 hostedContent retry (fix #2):
+                    #   * Tier A — interleave already attempted and populated
+                    #     m["hostedContents"] but the persist call failed; we
+                    #     retry here. `_hc_interleaved` stays unset on failure
+                    #     so this is the natural retry path.
+                    #   * Tier B — interleave was disabled OR the per-msg
+                    #     hostedContents GET hasn't been issued yet (e.g.
+                    #     interleave was off, or fetch is deferred). Detect
+                    #     via body-HTML substring and resolve the list here
+                    #     before handing to _userchats_backup_hosted_contents.
                     msgs_with_hc = [
                         extra.get("raw") for (_t, _n, _e, extra, *_rest) in items_data
                         if isinstance(extra, dict) and isinstance(extra.get("raw"), dict)
-                        and extra["raw"].get("hostedContents")
                         and not extra["raw"].get("_hc_interleaved")
+                        and (
+                            extra["raw"].get("hostedContents")
+                            or _msg_likely_has_hosted_content(extra["raw"])
+                        )
                     ]
                     if msgs_with_hc and user_id:
                         # Bind self so _one_msg can reach the BackupWorker
@@ -6471,13 +6674,42 @@ class BackupWorker:
                             )
                             if not m_chat_id or not message.get("id"):
                                 return 0, 0
+                            # Resolve hostedContents list — either already
+                            # populated (interleave or prior $expand path)
+                            # or fetch lazily because the body indicates
+                            # an inline image is present (fix #2).
+                            hc_values = message.get("hostedContents")
+                            if not hc_values:
+                                try:
+                                    _resp = await graph_client._get(
+                                        f"{graph_client.GRAPH_URL}/chats/"
+                                        f"{m_chat_id}/messages/"
+                                        f"{message['id']}/hostedContents"
+                                    )
+                                    hc_values = list(
+                                        (_resp or {}).get("value", []) or []
+                                    )
+                                    if hc_values:
+                                        message["hostedContents"] = hc_values
+                                except Exception as _fetch_err:
+                                    print(
+                                        f"[{bw_self.worker_id}] [USER_CHATS] "
+                                        f"Phase-2 hc fetch failed "
+                                        f"msg={str(message.get('id'))[:8]} "
+                                        f"chat={str(m_chat_id)[:8]}: "
+                                        f"{type(_fetch_err).__name__}: "
+                                        f"{_fetch_err}"
+                                    )
+                                    return 0, 0
+                            if not hc_values:
+                                return 0, 0
                             async with _msg_sem:
                                 return await bw_self._userchats_backup_hosted_contents(
                                     snapshot_id=snap_id_local,
                                     user_id=user_id_local,
                                     chat_id=m_chat_id,
                                     message_id=message["id"],
-                                    hosted_contents=message["hostedContents"],
+                                    hosted_contents=hc_values,
                                 )
 
                         hc_results = await asyncio.gather(

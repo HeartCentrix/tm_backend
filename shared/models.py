@@ -1236,6 +1236,13 @@ class ChatThread(Base):
     last_drained_at = Column(DateTime(timezone=True), nullable=True)   # when we last hit Graph
     drain_cursor = Column(Text, nullable=True)
     drain_failure_state = Column(JSONB, nullable=True)
+    # Count of messages persisted in chat_thread_messages after the most
+    # recent successful drain (across all users). Used by the post-drain
+    # completeness gate: if the next drain ends with significantly fewer
+    # messages than this baseline (and no purge/retention reason exists),
+    # we treat the drain as partial and DO NOT advance the cursor — see
+    # _CHAT_DRAIN_COMPLETENESS_DROP_PCT in backup-worker/main.py.
+    last_drained_msg_count = Column(Integer, nullable=True)
     archived_at = Column(DateTime(timezone=True), nullable=True)  # P2 soft delete
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
