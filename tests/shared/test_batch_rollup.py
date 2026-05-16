@@ -22,6 +22,7 @@ def _r(**kw):
         all_jobs_terminal=True, any_cancelled=False, any_job_failed=False,
         snap_total=0, snap_done=0, snap_partial=0, snap_failed=0,
         snap_pending=0, parts_pending=0, missing_t2=0,
+        expected_total=0, discovery_pending=False,
     )
     defaults.update(kw)
     return RollupCounts(**defaults)
@@ -101,6 +102,33 @@ def test_partial_only_no_clean_done_still_done_with_warnings():
     status, warnings = derive_batch_status(r)
     assert status == "Done"
     assert warnings == {"partial": 5, "failed": 0}
+
+
+def test_discovery_pending_keeps_batch_in_progress_even_when_tier1_done():
+    """The 2026-05-16 incident: 9 Tier-1 ENTRA_USERs all COMPLETED, no
+    Tier-2 children discovered yet, batch_pending_users still says
+    WAITING_DISCOVERY for some user. Without the discovery_pending gate
+    the rollup would compute missing_t2=0 (no Tier-2 resources exist
+    yet) and falsely flip to "Done"."""
+    r = _r(
+        all_jobs_terminal=True,
+        snap_done=9, snap_total=9,
+        snap_pending=0, parts_pending=0, missing_t2=0,
+        discovery_pending=True,
+    )
+    assert derive_batch_status(r) == ("In Progress", None)
+
+
+def test_discovery_complete_unblocks_done_branch():
+    """Mirror of the above: same state but discovery is finished. Now
+    the existing branches apply normally and we settle as Done."""
+    r = _r(
+        all_jobs_terminal=True,
+        snap_done=54, snap_total=54,
+        snap_pending=0, parts_pending=0, missing_t2=0,
+        discovery_pending=False,
+    )
+    assert derive_batch_status(r) == ("Done", None)
 
 
 # ─── SQL builder smoke ─────────────────────────────────────────────────

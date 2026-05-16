@@ -48,6 +48,15 @@ class RollupCounts:
     parts_pending: int
     missing_t2: int
     expected_total: int = 0
+    # True while *any* user in this batch is still WAITING_DISCOVERY in
+    # ``batch_pending_users``. Without this gate, a batch whose Tier-1
+    # jobs finished before Tier-2 gap-fill discovery completes briefly
+    # reports "Done 100%" — then flips back to "In Progress" once the
+    # newly-discovered Tier-2 resources spawn snapshots. The user-visible
+    # Done→InProgress→Done flicker confused operators (2026-05-16
+    # incident: 9-user backup briefly showed Done before Tier-2 work
+    # had even been published).
+    discovery_pending: bool = False
 
 
 def derive_batch_status(
@@ -65,15 +74,35 @@ def derive_batch_status(
 
         {"partial": N, "failed": M}
     """
-    # 1. Anything still moving → In Progress. ``missing_t2`` is the
-    # new gate: even if every CURRENT Job is terminal, if Tier-2
-    # children haven't been spawned yet for the Tier-1 ENTRA_USERs in
-    # this batch, we are still in the handoff window.
+    # 1. Anything still moving → In Progress.
+    #
+    # Four gates must ALL pass before we can declare the batch terminal:
+    #   (a) all_jobs_terminal      — every Job row in the batch finalized
+    #   (b) snap_pending == 0      — no snapshot row still IN_PROGRESS
+    #   (c) parts_pending == 0     — no snapshot_partition still in-flight
+    #   (d) missing_t2 == 0        — every expected Tier-2 child resource
+    #                                that has been discovered has either
+    #                                been snapshotted or has a backup job
+    #                                in batch_resource_ids
+    #   (e) discovery_pending == False — Tier-2 gap-fill discovery itself
+    #                                is complete for every user in the
+    #                                batch (no batch_pending_users row
+    #                                still in WAITING_DISCOVERY). This
+    #                                gate is what prevents the user-
+    #                                visible "Done → In Progress → Done"
+    #                                flicker: at T+30s after a click,
+    #                                Tier-1 backups finish but Tier-2
+    #                                discovery is still walking the Graph;
+    #                                without (e), missing_t2 would equal
+    #                                zero (Tier-2 resources don't exist
+    #                                in the DB yet) and the batch would
+    #                                falsely report Done.
     if (
         not r.all_jobs_terminal
         or r.snap_pending > 0
         or r.parts_pending > 0
         or r.missing_t2 > 0
+        or r.discovery_pending
     ):
         return ("In Progress", None)
 
@@ -333,6 +362,46 @@ def build_batch_rollup_query(
               AS expected_count
         FROM batches b
         LEFT JOIN tier1_scope ts ON ts.batch_id = b.batch_id
+    ),
+    discovery_pending_cte AS (
+        -- Tier-2 gap-fill discovery state. ``batch_pending_users`` is
+        -- populated at click time by job_service for every ENTRA_USER
+        -- in the batch; each row's ``state`` tracks the per-user
+        -- progress through Tier-2 discovery:
+        --   WAITING_DISCOVERY → discovery still running
+        --   NO_CONTENT         → user has no Tier-2 children
+        --   DISCOVERY_FAILED   → discovery errored (treated terminal)
+        --   BACKUP_ENQUEUED    → discovery complete, Tier-2 jobs spawned
+        -- If *any* user is still WAITING_DISCOVERY, the batch cannot
+        -- yet declare its child-set "known" — so the rollup must say
+        -- "In Progress" regardless of whatever current children show
+        -- up in the resources table. This is the fix for the 2026-05-16
+        -- "Done → In Progress → Done" flicker.
+        --
+        -- Legacy/single-resource batches (no batch_pending_users rows)
+        -- correctly evaluate to FALSE because EXISTS returns false on
+        -- an empty set — they keep the pre-existing missing_t2-only
+        -- behaviour.
+        --
+        -- Cast b.batch_id (text) → uuid for the JOIN. Wrapped in a
+        -- subquery so a malformed batch_id (single-Job legacy job id
+        -- that didn't actually originate from a backup_batches row)
+        -- doesn't crash the rollup — invalid uuids resolve to FALSE.
+        SELECT
+            b.batch_id,
+            CASE
+                WHEN b.batch_id IS NULL OR length(b.batch_id) < 32 THEN FALSE
+                ELSE COALESCE(
+                    (SELECT EXISTS (
+                        SELECT 1
+                          FROM batch_pending_users bpu
+                         WHERE bpu.batch_id = cast(b.batch_id AS uuid)
+                           AND bpu.state = 'WAITING_DISCOVERY'
+                    )),
+                    FALSE
+                )
+            END AS pending
+        FROM batches b
     )
     SELECT
         b.batch_id,
@@ -357,6 +426,7 @@ def build_batch_rollup_query(
         COALESCE(pr.parts_pending, 0)       AS parts_pending,
         COALESCE(f.missing_t2, 0)           AS missing_t2,
         COALESCE(te.expected_count, 0)      AS expected_count,
+        COALESCE(dp.pending, FALSE)         AS discovery_pending,
         sres.single_resource_name           AS single_resource_name,
         sres.single_resource_type           AS single_resource_type,
         eo.entra_user_name                  AS entra_user_name,
@@ -369,6 +439,7 @@ def build_batch_rollup_query(
     LEFT JOIN single_res  sres ON sres.batch_id = b.batch_id
     LEFT JOIN entra_one   eo ON eo.batch_id = b.batch_id
     LEFT JOIN total_expected te ON te.batch_id = b.batch_id
+    LEFT JOIN discovery_pending_cte dp ON dp.batch_id = b.batch_id
     ORDER BY b.started_at DESC NULLS LAST
     LIMIT :size OFFSET :off
     """
@@ -404,6 +475,7 @@ def shape_batch_row(row: Any) -> Dict[str, Any]:
         parts_pending=int(row.parts_pending or 0),
         missing_t2=int(row.missing_t2 or 0),
         expected_total=int(getattr(row, "expected_count", 0) or 0),
+        discovery_pending=bool(getattr(row, "discovery_pending", False)),
     )
     status, warnings = derive_batch_status(counts)
 
