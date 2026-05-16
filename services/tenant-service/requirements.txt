@@ -16,3 +16,6 @@ aiohttp>=3.9.0
 
 # Observability — Prometheus metrics scraped on CORE_METRICS_PORT (default 9103)
 prometheus_client>=0.20.0
+
+# Alembic for prod-safe schema migrations
+alembic>=1.13.0,<2

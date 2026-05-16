@@ -9724,6 +9724,46 @@ class BackupWorker:
             f"{persisted_bytes / (1024 * 1024):.1f} MB)"
         )
 
+        # Emit partitioned-snapshot metrics. Same shape as complete_snapshot
+        # so dashboards aggregate cleanly across partitioned and
+        # non-partitioned paths. Best-effort — never blocks finalize.
+        try:
+            from shared import core_metrics as _cm
+            from shared.storage.router import router as _router
+            _snap_type = "UNKNOWN"
+            _tenant_id = ""
+            try:
+                async with async_session_factory() as _s:
+                    _snap_row = await _s.get(Snapshot, snapshot_id)
+                    if _snap_row is not None:
+                        _snap_type = (
+                            _snap_row.type.value
+                            if hasattr(_snap_row.type, "value") else str(_snap_row.type)
+                        )
+                        _res = await _s.get(Resource, _snap_row.resource_id)
+                        _tenant_id = str(_res.tenant_id) if _res else ""
+            except Exception:
+                pass
+            _backend_name = "unknown"
+            try:
+                _store = _router.get_active_store()
+                _backend_name = (
+                    getattr(_store, "name", None)
+                    or getattr(_store, "kind", None) or "unknown"
+                )
+            except Exception:
+                pass
+            _cm.inc_snapshot(_snap_type, str(new_status))
+            if persisted_bytes > 0:
+                _cm.add_backup_bytes(_snap_type, _backend_name, int(persisted_bytes))
+                if _tenant_id:
+                    _cm.add_cost_storage(_tenant_id, _backend_name, _snap_type, int(persisted_bytes))
+                    if "seaweed" in _backend_name.lower():
+                        _cm.add_cost_seaweed_write(_tenant_id, _backend_name, int(persisted_bytes))
+                    _cm.add_cost_egress(_tenant_id, "from_graph", int(persisted_bytes))
+        except Exception:
+            pass
+
         # ---- backup_batches finalizer hook ----
         # When BATCH_ROW_REDESIGN_ENABLED, walk the Job's spec.batch_id
         # and try to flip the parent backup_batches row. Idempotent +
@@ -18457,6 +18497,41 @@ class BackupWorker:
         # merge() handles detached instances (snapshot was created in a separate session)
         await session.merge(snapshot)
         await session.commit()
+
+        # Emit observability + operational cost telemetry. Safe no-op when
+        # prometheus_client missing. Tenant + backend labels resolved from
+        # the snapshot's own join, so multi-tenant readiness comes for free.
+        try:
+            from shared import core_metrics as _cm
+            from shared.storage.router import router as _router
+            _snap_type = snapshot.type.value if hasattr(snapshot.type, "value") else str(snapshot.type)
+            _status = snapshot.status.value if hasattr(snapshot.status, "value") else str(snapshot.status)
+            _bytes = int(snapshot.bytes_added or 0)
+            _tenant_id = ""
+            try:
+                _res = await session.get(Resource, snapshot.resource_id)
+                _tenant_id = str(_res.tenant_id) if _res else ""
+            except Exception:
+                pass
+            _backend_name = "unknown"
+            try:
+                _store = _router.get_active_store()
+                _backend_name = getattr(_store, "name", None) or getattr(_store, "kind", None) or "unknown"
+            except Exception:
+                pass
+            _cm.inc_snapshot(_snap_type, _status)
+            if snapshot.duration_secs:
+                _cm.observe_backup_duration(_snap_type, _status, float(snapshot.duration_secs))
+            if _bytes > 0:
+                _cm.add_backup_bytes(_snap_type, _backend_name, _bytes)
+                if _tenant_id:
+                    _cm.add_cost_storage(_tenant_id, _backend_name, _snap_type, _bytes)
+                    if _backend_name and "seaweed" in _backend_name.lower():
+                        _cm.add_cost_seaweed_write(_tenant_id, _backend_name, _bytes)
+                    _cm.add_cost_egress(_tenant_id, "from_graph", _bytes)
+        except Exception:
+            # Metrics never block backup completion.
+            pass
 
         # Persist delta token on resource for incremental backups
         if result.get("new_delta_token"):

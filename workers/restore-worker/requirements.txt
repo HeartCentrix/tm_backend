@@ -24,3 +24,6 @@ azure-keyvault-secrets>=4.7
 azure-identity>=1.15
 # Observability — Prometheus metrics scraped on PST_METRICS_PORT (default 9100)
 prometheus-client>=0.20.0
+
+# Alembic for prod-safe schema migrations
+alembic>=1.13.0,<2
