@@ -377,6 +377,7 @@ class GraphClient:
         delta_link = None
         last_data = {}
 
+        from shared.graph_rate_limiter import graph_rate_limiter
         while next_url:
             try:
                 async with self._http_session() as client:
@@ -385,6 +386,7 @@ class GraphClient:
                         headers = {"Authorization": f"Bearer {token}", "ConsistencyLevel": "eventual"}
                     else:
                         headers = {"Authorization": f"Bearer {token}"}
+                    await graph_rate_limiter.acquire(reason="graph_get_legacy")
                     resp = await client.get(next_url, headers=headers, params=params if not next_url.startswith("http") else None)
 
                     # Handle 429 throttling
@@ -463,6 +465,7 @@ class GraphClient:
         delta_link: Optional[str] = None
         last_data: Dict[str, Any] = {}
 
+        from shared.graph_rate_limiter import graph_rate_limiter
         async with self._http_session() as client:
             while next_url:
                 prio = self._effective_priority()
@@ -476,6 +479,7 @@ class GraphClient:
                 else:
                     headers = {"Authorization": f"Bearer {token}"}
                 try:
+                    await graph_rate_limiter.acquire(reason="graph_get_hardened")
                     resp = await client.get(
                         next_url, headers=headers,
                         params=params if not next_url.startswith("http") else None,
@@ -3508,6 +3512,7 @@ class GraphClient:
         that email; at TM scale (heavy mailboxes + tenant-wide throttle)
         that meant most enterprise inline logos/signatures vanished.
         """
+        from shared.graph_rate_limiter import graph_rate_limiter
         url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}/$value"
         token = await self._get_token()
         max_attempts = 5
@@ -3516,6 +3521,7 @@ class GraphClient:
         for attempt in range(max_attempts):
             try:
                 async with self._http_session() as client:
+                    await graph_rate_limiter.acquire(reason="graph_mime_single")
                     resp = await client.get(
                         url, headers={"Authorization": f"Bearer {token}"},
                     )
@@ -5876,8 +5882,10 @@ class GraphClient:
         """Authenticated GET that returns the raw response body as bytes — for non-JSON
         endpoints like OneNote page content (text/html) or resource $value (binary).
         Follows 302 redirects implicitly via httpx."""
+        from shared.graph_rate_limiter import graph_rate_limiter
         token = await self._get_token()
         async with self._http_session() as client:
+            await graph_rate_limiter.acquire(reason="graph_get_bytes")
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
             return resp.content
