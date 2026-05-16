@@ -9181,12 +9181,19 @@ class BackupWorker:
                            worker_id     = :wid,
                            worker_region = :wregion,
                            started_at    = NOW(),
-                           lease_owner_id   = CASE
-                               WHEN :owner_uuid IS NULL THEN lease_owner_id
-                               ELSE cast(:owner_uuid AS uuid)
-                           END,
+                           -- COALESCE keeps the prior owner if the new
+                           -- one is NULL (heartbeat init failed); the
+                           -- explicit CAST gives asyncpg a concrete type
+                           -- for the parameter, otherwise prepare()
+                           -- errors with AmbiguousParameterError because
+                           -- the SQL `IS NULL` form leaves $N untyped.
+                           lease_owner_id   = COALESCE(
+                               CAST(:owner_uuid AS uuid),
+                               lease_owner_id
+                           ),
                            lease_expires_at = CASE
-                               WHEN :owner_uuid IS NULL THEN lease_expires_at
+                               WHEN CAST(:owner_uuid AS uuid) IS NULL
+                                   THEN lease_expires_at
                                ELSE NOW() + (:lease_ttl * INTERVAL '1 second')
                            END,
                            lease_token   = lease_token + 1
