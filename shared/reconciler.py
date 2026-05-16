@@ -162,6 +162,14 @@ async def sweep_orphans(session) -> SweepStats:
         await session.execute(
             text(
                 """
+                -- snapshot_partitions.status is plain VARCHAR (not an
+                -- enum) — the publisher writes 'QUEUED', workers flip
+                -- to 'IN_PROGRESS', then 'COMPLETED'/'FAILED'. No
+                -- 'CANCELLED' value is produced today, so we don't
+                -- match on it. (See shared/models.py SnapshotPartition.)
+                -- snapshotstatus enum: IN_PROGRESS, COMPLETED, FAILED,
+                -- PARTIAL, PENDING_DELETION. The CASE only produces
+                -- values that exist on snapshotstatus.
                 UPDATE snapshots s
                    SET status = CASE
                            WHEN NOT EXISTS (
@@ -174,7 +182,7 @@ async def sweep_orphans(session) -> SweepStats:
                                 WHERE sp.snapshot_id = s.id
                            ) THEN 'COMPLETED'::snapshotstatus
                            WHEN (
-                               SELECT bool_or(sp.status IN ('FAILED','CANCELLED'))
+                               SELECT bool_or(sp.status = 'FAILED')
                                  FROM snapshot_partitions sp
                                 WHERE sp.snapshot_id = s.id
                            ) THEN 'PARTIAL'::snapshotstatus
@@ -219,24 +227,24 @@ async def sweep_orphans(session) -> SweepStats:
         await session.execute(
             text(
                 """
+                -- jobstatus enum values: QUEUED, PENDING, RUNNING,
+                -- COMPLETED, FAILED, CANCELLED, CANCELLING, RETRYING.
+                -- *No* PARTIAL — that lives on snapshotstatus only.
+                -- Mixed-outcome roll-up is the batch row's job (see
+                -- shared.batch_rollup.derive_batch_status), so at the
+                -- job level we collapse to:
+                --   all snapshots COMPLETED               → COMPLETED
+                --   at least one COMPLETED + others mixed → COMPLETED
+                --   zero COMPLETED (all PARTIAL/FAILED)   → FAILED
+                -- snapshotstatus enum: IN_PROGRESS, COMPLETED, FAILED,
+                -- PARTIAL, PENDING_DELETION. No QUEUED, no CANCELLED.
                 UPDATE jobs j
                    SET status = CASE
-                           WHEN (
-                               SELECT bool_and(s.status = 'COMPLETED'::snapshotstatus)
-                                 FROM snapshots s
+                           WHEN EXISTS (
+                               SELECT 1 FROM snapshots s
                                 WHERE s.job_id = j.id
+                                  AND s.status = 'COMPLETED'::snapshotstatus
                            ) THEN 'COMPLETED'::jobstatus
-                           WHEN (
-                               SELECT bool_or(
-                                   s.status IN (
-                                       'PARTIAL'::snapshotstatus,
-                                       'FAILED'::snapshotstatus,
-                                       'CANCELLED'::snapshotstatus
-                                   )
-                               )
-                                 FROM snapshots s
-                                WHERE s.job_id = j.id
-                           ) THEN 'PARTIAL'::jobstatus
                            ELSE 'FAILED'::jobstatus
                        END,
                        completed_at     = NOW(),
@@ -256,10 +264,7 @@ async def sweep_orphans(session) -> SweepStats:
                    AND NOT EXISTS (
                        SELECT 1 FROM snapshots s
                         WHERE s.job_id = j.id
-                          AND s.status IN (
-                              'QUEUED'::snapshotstatus,
-                              'IN_PROGRESS'::snapshotstatus
-                          )
+                          AND s.status = 'IN_PROGRESS'::snapshotstatus
                    )
                    AND EXISTS (
                        SELECT 1 FROM snapshots s WHERE s.job_id = j.id
