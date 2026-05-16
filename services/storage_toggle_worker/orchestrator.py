@@ -56,12 +56,40 @@ async def _set_transition(db, state: str) -> None:
 
 
 async def _set_active(db, backend_id: str) -> None:
+    """Cutover: point system_config at ``backend_id``.
+
+    Does NOT set the cooldown — that's the success-path's job (see
+    Phase 8 below). Previously this function stamped cooldown_until
+    inside the same UPDATE, which meant a smoke-failure rollback that
+    calls ``_set_active(db, from_id)`` to revert the cutover would
+    re-stamp the cooldown — locking the operator out for 30 minutes
+    even though the flip had failed (2026-05-16 incident).
+    """
     await db.execute(
         "UPDATE system_config "
-        "SET active_backend_id=$1, last_toggle_at=NOW(), "
-        "    cooldown_until=NOW() + INTERVAL '30 minutes', updated_at=NOW() "
+        "SET active_backend_id=$1, last_toggle_at=NOW(), updated_at=NOW() "
         "WHERE id=1",
         backend_id,
+    )
+
+
+async def _set_cooldown(db, *, minutes: int = 30) -> None:
+    """Stamp the post-flip cooldown. Called only from the success path
+    (Phase 8) so a failed flip leaves the operator free to retry
+    immediately."""
+    await db.execute(
+        "UPDATE system_config "
+        "SET cooldown_until=NOW() + ($1 * INTERVAL '1 minute'), updated_at=NOW() "
+        "WHERE id=1",
+        minutes,
+    )
+
+
+async def _clear_cooldown(db) -> None:
+    """Wipe the cooldown — called from the smoke-failure rollback so a
+    failed flip doesn't strand the operator behind a 30-min wall."""
+    await db.execute(
+        "UPDATE system_config SET cooldown_until=NULL, updated_at=NOW() WHERE id=1"
     )
 
 
@@ -184,6 +212,14 @@ async def run_toggle(payload: dict) -> None:
                 await _set_active(db, from_id)
             except Exception as set_err:
                 log.error("revert active_backend_id failed: %s", set_err)
+            # Wipe the cooldown. A failed flip must not strand the
+            # operator behind the 30-min cooldown wall — otherwise
+            # they'll see "cooldown active until X" while staring at a
+            # failed event and have no way to retry.
+            try:
+                await _clear_cooldown(db)
+            except Exception as cc_err:
+                log.error("clear_cooldown failed: %s", cc_err)
             # Standard rollback path: clear transition_state and mark
             # the event row failed. ``rollback`` is idempotent w.r.t.
             # the _update_event we'd otherwise call directly.
@@ -207,8 +243,13 @@ async def run_toggle(payload: dict) -> None:
             return
 
         # Phase 8 — open
+        # Successful flip: stamp the post-flip cooldown so back-to-back
+        # toggles can't thrash the cluster. Cooldown is success-only —
+        # the smoke-failure branch above wipes cooldown_until so a
+        # failed flip is immediately retryable.
         log.info("phase 8: open")
         await _set_transition(db, "stable")
+        await _set_cooldown(db, minutes=30)
         await _update_event(
             db, event_id, status="completed",
             completed_at=datetime.now(timezone.utc),
