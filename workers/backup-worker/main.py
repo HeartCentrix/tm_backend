@@ -110,6 +110,94 @@ def _maybe_inline_attachment(content_bytes: Optional[bytes]) -> Optional[str]:
     return _b64.b64encode(content_bytes).decode("ascii")
 
 
+def _parse_mime_inline_parts(mime_bytes: bytes) -> List[Dict[str, Any]]:
+    """Walk an RFC822 MIME tree and return the inline parts keyed by
+    Content-ID. Used to recover cid:-referenced inline images that
+    Graph's /messages/{id}/attachments endpoint doesn't expose
+    (Teams activity notifications, OneDrive shares, Planner emails
+    are the common culprits).
+
+    Returns a list of dicts:
+        {
+          "content_id":   "abc123" (no angle brackets, lowercased),
+          "content_type": "image/jpeg",
+          "filename":     "image001.jpg" or None,
+          "payload":      <bytes>,
+        }
+
+    Decoding of base64 / quoted-printable transfer encodings is handled
+    by `email.message_from_bytes(...).get_payload(decode=True)`. Parts
+    without Content-ID, without a decodable payload, or whose payload
+    is empty are filtered out — the caller only wants real binary
+    inline parts.
+    """
+    import email as _email
+    from email.policy import default as _default_policy
+
+    try:
+        msg = _email.message_from_bytes(mime_bytes, policy=_default_policy)
+    except Exception:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for part in msg.walk():
+        try:
+            cid_header = part.get("Content-ID")
+        except Exception:
+            cid_header = None
+        if not cid_header:
+            continue
+        cid = str(cid_header).strip().strip("<>").strip().lower()
+        if not cid:
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            payload = None
+        if not payload:
+            continue
+        try:
+            ct = part.get_content_type()
+        except Exception:
+            ct = "application/octet-stream"
+        try:
+            fname = part.get_filename()
+        except Exception:
+            fname = None
+        out.append({
+            "content_id": cid,
+            "content_type": ct or "application/octet-stream",
+            "filename": fname,
+            "payload": payload,
+        })
+    return out
+
+
+def _extract_cid_refs_from_body(body_html: str) -> Set[str]:
+    """Pull every `cid:<id>` reference out of an HTML email body,
+    return as a set of lowercase ids (no angle brackets). Used to
+    compute which inline references the regular attachment fetch
+    didn't resolve, so the MIME fallback only does work for the
+    actual gaps.
+    """
+    if not body_html:
+        return set()
+    import re as _re
+    out: Set[str] = set()
+    # Matches src="cid:..." / src='cid:...' / src=cid:... with or
+    # without angle brackets. Reuses the same shape as the frontend
+    # rewrite regex (Recovery.tsx:215) so the worker and reader stay
+    # symmetric.
+    for m in _re.finditer(
+        r'(?:src|background)\s*=\s*["\']?cid:<?([^"\'>\s)]+?)>?["\']?',
+        body_html, _re.IGNORECASE,
+    ):
+        cid = m.group(1).strip().lower()
+        if cid:
+            out.add(cid)
+    return out
+
+
 class SnapshotVanishedError(Exception):
     """Raised by the snapshot_items bulk insert when the parent snapshot
     row was deleted out from under us — typically because cancel_job's
@@ -6974,6 +7062,130 @@ class BackupWorker:
                         "inline_b64": inline_b64,
                     },
                 ))
+
+            # ── MIME-source fallback for unresolved cid: refs ──
+            # Some emails (Teams activity notifications, OneDrive
+            # shares, Planner emails) reference inline images via
+            # `cid:` in the body but Graph never exposes them as
+            # Attachment objects. /messages/{id}/attachments returns
+            # an empty list and `hasAttachments` is false — but the
+            # bytes ARE present in the RFC822 envelope. Fetch
+            # /messages/{id}/$value (raw MIME), parse with the
+            # standard library, and back-fill EMAIL_ATTACHMENT rows
+            # for every Content-ID-tagged part the body still
+            # references.
+            body_html = (msg.get("body") or {}).get("content") or ""
+            if "cid:" in body_html or "CID:" in body_html:
+                body_cids = _extract_cid_refs_from_body(body_html)
+                already_captured = {
+                    (it.extra_data or {}).get("content_id", "")
+                    .strip().strip("<>").strip().lower()
+                    for it in local_items
+                    if (it.extra_data or {}).get("content_id")
+                }
+                unresolved = body_cids - already_captured - {""}
+                if unresolved:
+                    mime_bytes: Optional[bytes] = None
+                    async with sem:
+                        try:
+                            mime_bytes = await graph_client.get_message_mime_source(
+                                user_id, msg_id,
+                            )
+                        except Exception as e:
+                            # 403 / 404 / size-cap are all silent — the
+                            # original email still reads, we just leave
+                            # the cid: refs broken (same as before this
+                            # fallback existed).
+                            print(
+                                f"[{self.worker_id}] [MIME-FETCH] msg {msg_id}: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            mime_bytes = None
+
+                    if mime_bytes:
+                        try:
+                            mime_parts = _parse_mime_inline_parts(mime_bytes)
+                        except Exception as e:
+                            print(
+                                f"[{self.worker_id}] [MIME-PARSE] msg {msg_id}: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            mime_parts = []
+
+                        recovered = 0
+                        for p in mime_parts:
+                            cid = p["content_id"]
+                            if cid not in unresolved:
+                                # Body doesn't reference this part — skip.
+                                continue
+                            payload = p["payload"] or b""
+                            if not payload:
+                                continue
+                            p_ct = p["content_type"]
+                            p_fname = p["filename"] or (
+                                f"inline_{cid[:24]}." +
+                                (p_ct.split('/')[-1] if '/' in p_ct else "bin")
+                            )
+                            p_hash = hashlib.sha256(payload).hexdigest()
+                            p_size = len(payload)
+                            p_blob: Optional[str] = None
+                            p_inline_b64 = _maybe_inline_attachment(payload)
+                            if p_inline_b64 is None:
+                                try:
+                                    p_blob = await _upload_once_per_hash(
+                                        p_hash, payload,
+                                    )
+                                except Exception as e:
+                                    print(
+                                        f"[{self.worker_id}] [MIME-UPLOAD] "
+                                        f"msg {msg_id} cid {cid}: "
+                                        f"{type(e).__name__}: {e}"
+                                    )
+                                    p_blob = None
+                            p_resolved = (
+                                p_blob is not None or p_inline_b64 is not None
+                            )
+                            if p_resolved:
+                                local_bytes += p_size
+                                recovered += 1
+                            local_items.append(SnapshotItem(
+                                id=uuid.uuid4(),
+                                snapshot_id=snapshot.id,
+                                tenant_id=tenant.id,
+                                # Distinguishes MIME-recovered rows from
+                                # Graph-attachment rows so re-runs are
+                                # idempotent on the same (msg, cid) pair.
+                                external_id=f"{msg_id}::mime::{cid}",
+                                item_type="EMAIL_ATTACHMENT",
+                                name=p_fname[:255],
+                                folder_path=folder_path,
+                                content_hash=p_hash,
+                                content_size=p_size,
+                                blob_path=p_blob,
+                                content_checksum=p_hash,
+                                extra_data={
+                                    "parent_item_id": msg_id,
+                                    # "mime_inline" makes the source
+                                    # path obvious in logs / future
+                                    # diagnostics, distinct from
+                                    # Graph's #microsoft.graph.fileAttachment
+                                    # / itemAttachment / referenceAttachment.
+                                    "attachment_kind": "mime_inline",
+                                    "content_type": p_ct,
+                                    "is_inline": True,
+                                    "content_id": cid,
+                                    "source_url": None,
+                                    "resolved": p_resolved,
+                                    "inline_b64": p_inline_b64,
+                                },
+                            ))
+                        if recovered:
+                            print(
+                                f"[{self.worker_id}] [MIME-INLINE] "
+                                f"msg {msg_id}: recovered "
+                                f"{recovered}/{len(unresolved)} inline image(s)"
+                            )
+
             return local_items, local_bytes
 
         results = await asyncio.gather(

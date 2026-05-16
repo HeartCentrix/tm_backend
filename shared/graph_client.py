@@ -3379,6 +3379,28 @@ class GraphClient:
             resp.raise_for_status()
             return resp.content
 
+    async def get_message_mime_source(
+        self, user_id: str, message_id: str
+    ) -> bytes:
+        """Fetch a message as RFC822 MIME source bytes.
+
+        GET /v1.0/users/{user_id}/messages/{message_id}/$value
+
+        Used by the backup-worker's MIME inline-image fallback: for
+        emails whose body references inline images via cid: but whose
+        /attachments endpoint returns empty (Teams activity
+        notifications, OneDrive share emails, some Planner
+        notifications), the bytes only live in the RFC822 envelope.
+        Python's email.parser walks the multipart tree and recovers
+        each inline part keyed by Content-ID.
+        """
+        url = f"{self.GRAPH_URL}/users/{user_id}/messages/{message_id}/$value"
+        token = await self._get_token()
+        async with self._http_session() as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+            resp.raise_for_status()
+            return resp.content
+
     async def get_hosted_content(
         self, chat_id: str, message_id: str, hc_id: str, chunk_size: int = 1024 * 1024
     ) -> Tuple[AsyncGenerator[bytes, None], str, int]:
