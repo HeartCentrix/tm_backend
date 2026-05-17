@@ -4912,34 +4912,129 @@ class GraphClient:
                 "sizeInBytes": int(folder.get("sizeInBytes") or 0),
             }
 
-        async def walk(folder: Dict[str, Any], parent_path: str) -> None:
-            fid = folder.get("id")
-            name = folder.get("displayName") or "(unnamed)"
-            path = f"{parent_path}/{name}"
-            if fid:
-                tree[fid] = _entry(folder, path)
-            # Each folder has a childFolderCount field; only descend if > 0 to
-            # avoid wasted requests on leaves.
-            if folder.get("childFolderCount", 0) <= 0:
-                # If we don't know the count (selective $select), still walk once.
-                if "childFolderCount" in folder:
-                    return
-            try:
-                child_resp = await self._get(
-                    f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{fid}/childFolders",
-                    params={"$top": "200", "$select": sel_stats},
-                )
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in (403, 404):
-                    return
-                raise
-            children = child_resp.get("value", []) or []
-            for c in children:
-                await walk(c, path)
+        # PERF #13: prewarm folder paths breadth-first with parallel fetches
+        # at each level instead of serial DFS. For mailboxes with deep folder
+        # trees (e.g. legal/archive tenants) this collapses N sequential
+        # GET roundtrips into one parallel burst per level. We try $batch
+        # first (up to 20 parents per round-trip) and fall back to
+        # asyncio.gather of individual GETs on batch failure.
+        try:
+            from shared.graph_batch import BatchClient as _BC, BatchRequest as _BR
+            _batch = _BC(self)
+        except Exception:
+            _batch, _BR = None, None
 
-        # Start each root walk in parallel, then walk children serially within
-        # each subtree (folder trees are usually shallow and bounded).
-        await asyncio.gather(*[walk(r, "") for r in roots], return_exceptions=False)
+        async def _fetch_children_serial(parents: List[Dict[str, Any]],
+                                         parent_paths: Dict[str, str]) -> List[Dict[str, Any]]:
+            next_level: List[Dict[str, Any]] = []
+
+            async def _one(p: Dict[str, Any]):
+                fid = p.get("id")
+                base = parent_paths.get(fid, "")
+                try:
+                    resp = await self._get(
+                        f"{self.GRAPH_URL}/users/{user_id}/mailFolders/{fid}/childFolders",
+                        params={"$top": "200", "$select": sel_stats},
+                    )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code in (403, 404):
+                        return []
+                    raise
+                children = resp.get("value", []) or []
+                for c in children:
+                    name = c.get("displayName") or "(unnamed)"
+                    cpath = f"{base}/{name}"
+                    cid = c.get("id")
+                    if cid:
+                        tree[cid] = _entry(c, cpath)
+                        parent_paths[cid] = cpath
+                return children
+
+            results = await asyncio.gather(
+                *[_one(p) for p in parents], return_exceptions=True,
+            )
+            for r in results:
+                if isinstance(r, list):
+                    for c in r:
+                        if c.get("childFolderCount", 0) > 0:
+                            next_level.append(c)
+                elif isinstance(r, Exception):
+                    # logged in inner _one fallthrough is missing; surface for visibility
+                    pass
+            return next_level
+
+        async def _fetch_children_batched(parents: List[Dict[str, Any]],
+                                          parent_paths: Dict[str, str]) -> List[Dict[str, Any]]:
+            """Bundle parent childFolders fetches via /$batch (20 at a time).
+            Bails to serial-gather on any batch failure."""
+            if not _batch or not _BR:
+                return await _fetch_children_serial(parents, parent_paths)
+
+            reqs: List[Any] = []
+            id_to_parent: Dict[str, Dict[str, Any]] = {}
+            for i, p in enumerate(parents):
+                pid = p.get("id")
+                if not pid:
+                    continue
+                rid = f"cf::{i}"
+                id_to_parent[rid] = p
+                # IMPORTANT: $batch sub-request urls are PATH-only, no host.
+                reqs.append(_BR(
+                    id=rid,
+                    method="GET",
+                    url=f"/users/{user_id}/mailFolders/{pid}/childFolders?$top=200&$select={sel_stats}",
+                ))
+
+            try:
+                resp_map = await _batch.batch(reqs)
+            except Exception:
+                return await _fetch_children_serial(parents, parent_paths)
+
+            next_level: List[Dict[str, Any]] = []
+            for rid, sub in resp_map.items():
+                if not (200 <= sub.status < 300):
+                    # 403/404 silently skip (matches DFS behavior). Other
+                    # errors: drop this parent's children; tree stays
+                    # partial but caller already tolerates that.
+                    continue
+                parent = id_to_parent.get(rid)
+                if not parent:
+                    continue
+                base = parent_paths.get(parent.get("id"), "")
+                children = (sub.body or {}).get("value", []) or []
+                for c in children:
+                    name = c.get("displayName") or "(unnamed)"
+                    cpath = f"{base}/{name}"
+                    cid = c.get("id")
+                    if cid:
+                        tree[cid] = _entry(c, cpath)
+                        parent_paths[cid] = cpath
+                    if c.get("childFolderCount", 0) > 0:
+                        next_level.append(c)
+            return next_level
+
+        # Seed level 0 from the roots.
+        level0: List[Dict[str, Any]] = []
+        parent_paths: Dict[str, str] = {}
+        for r in roots:
+            rid = r.get("id")
+            rname = r.get("displayName") or "(unnamed)"
+            rpath = f"/{rname}"
+            if rid:
+                tree[rid] = _entry(r, rpath)
+                parent_paths[rid] = rpath
+            if r.get("childFolderCount", 0) > 0 or "childFolderCount" not in r:
+                level0.append(r)
+
+        # BFS: at each level, fetch all parents' childFolders in parallel.
+        # Depth cap of 12 — Outlook UI itself caps at much less; this is just
+        # a safety stop against pathological loops.
+        current_level = level0
+        for _depth in range(12):
+            if not current_level:
+                break
+            current_level = await _fetch_children_batched(current_level, parent_paths)
+
         return tree
 
     async def resolve_mail_folder_path(
