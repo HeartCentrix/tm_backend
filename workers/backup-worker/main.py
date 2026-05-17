@@ -4173,7 +4173,18 @@ class BackupWorker:
                                         snap.item_count = _mail_persisted_total
                                         snap.new_item_count = _mail_persisted_total
                                         snap.bytes_total = _mail_persisted_bytes
-                                        snap.bytes_added = _mail_persisted_bytes
+                                        # Do NOT touch bytes_added here.
+                                        # _mail_persisted_bytes accumulates body
+                                        # bytes of every message walked this run
+                                        # (including ON CONFLICT NO-OP re-walks
+                                        # of the freshness window). The audit-
+                                        # service Activity feed sums bytes_added
+                                        # for IN_PROGRESS snapshots; writing the
+                                        # full walked-bytes here surfaces a
+                                        # ghost "X MiB so far" on no-data
+                                        # incrementals. The settle path
+                                        # (_compute_snapshot_delta_from_prior)
+                                        # writes the proper delta later.
                                         await _s2.commit()
                             except Exception as _bump_err:
                                 print(
@@ -6498,7 +6509,18 @@ class BackupWorker:
                                             snap.item_count = _persisted_total
                                             snap.new_item_count = _persisted_total
                                             snap.bytes_total = _persisted_bytes
-                                            snap.bytes_added = _persisted_bytes
+                                            # Do NOT touch bytes_added here.
+                                            # _persisted_bytes counts every body
+                                            # the chat handler walked, including
+                                            # ON CONFLICT NO-OP re-walks via the
+                                            # 7h freshness window. The audit-
+                                            # service Activity feed sums
+                                            # bytes_added for IN_PROGRESS rows
+                                            # so writing walked-bytes surfaces
+                                            # a ghost size on no-data incrementals.
+                                            # The settle / partition finalize
+                                            # write the proper delta via
+                                            # _compute_snapshot_delta_from_prior.
                                             await _s2.commit()
                                 except Exception as _bump_err:
                                     # Progress bump is advisory — a DB
@@ -15525,7 +15547,16 @@ class BackupWorker:
                                             snap.item_count = totals["items"]
                                             snap.new_item_count = totals["items"]
                                             snap.bytes_total = totals["bytes"]
-                                            snap.bytes_added = totals["bytes"]
+                                            # Do NOT touch bytes_added here.
+                                            # totals["bytes"] is the walked-
+                                            # body sum (may include re-walk via
+                                            # folder fingerprint skip). The
+                                            # audit-service Activity feed sums
+                                            # bytes_added for IN_PROGRESS rows
+                                            # so writing walked-bytes surfaces
+                                            # a ghost size on no-data
+                                            # incrementals. The settle path
+                                            # writes the proper delta later.
                                             await _s2.commit()
                                 except Exception as bump_err:
                                     print(
@@ -15636,7 +15667,11 @@ class BackupWorker:
                                         snap.item_count = totals["items"]
                                         snap.new_item_count = totals["items"]
                                         snap.bytes_total = totals["bytes"]
-                                        snap.bytes_added = totals["bytes"]
+                                        # See note at the other MAILBOX live
+                                        # bump: bytes_added must be written by
+                                        # the settle path only, to keep the
+                                        # Activity feed from showing ghost
+                                        # bytes on no-data incrementals.
                                         await _s3.commit()
                             except Exception as bump_err:
                                 print(

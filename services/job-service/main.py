@@ -995,6 +995,81 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
                     f"[JOB_SERVICE] cancel finalized batch {batch_id} "
                     f"-> {new_status} (after job {job.id})"
                 )
+            else:
+                # Strict finalizer wouldn't flip because sibling jobs
+                # in the same batch are still IN_PROGRESS. But the user
+                # who clicked Cancel meant "stop this whole backup,"
+                # not "cancel one resource and let the rest run." A
+                # fanout-mass batch can have 30+ child jobs — the UI
+                # only exposes a single Cancel button, so a per-job
+                # cancel that leaves siblings running is observed by
+                # the user as "I clicked cancel, why is it still
+                # running?". Cascade-cancel every sibling job in the
+                # batch, then force-flip backup_batches.status to
+                # CANCELLED so the Activity feed reflects the user's
+                # intent on the next reload.
+                sib_rows = (await db.execute(
+                    text(
+                        "SELECT id FROM jobs "
+                        " WHERE COALESCE(spec::jsonb->>'batch_id','') = :bid "
+                        "   AND status IN ('QUEUED','RUNNING','RETRYING') "
+                        "   AND id <> :self_jid "
+                    ),
+                    {"bid": str(batch_id), "self_jid": job.id},
+                )).all()
+                sib_ids = [r.id for r in sib_rows]
+                if sib_ids:
+                    await db.execute(
+                        text(
+                            "UPDATE jobs "
+                            "   SET status = 'CANCELLED', "
+                            "       completed_at = NOW() "
+                            " WHERE id = ANY(:ids)"
+                        ),
+                        {"ids": sib_ids},
+                    )
+                    await db.execute(
+                        text(
+                            "UPDATE snapshots SET "
+                            "  status = 'FAILED'::snapshotstatus, "
+                            "  completed_at = NOW(), "
+                            "  duration_secs = EXTRACT(EPOCH FROM "
+                            "                  (NOW() - started_at))::int, "
+                            "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
+                            "               || jsonb_build_object( "
+                            "                   'cancelled_at', NOW(), "
+                            "                   'cancelled_by_batch_cascade', true, "
+                            "                   'cancel_phase', "
+                            "                   'flip_pending_sweep'))::json "
+                            " WHERE job_id = ANY(:ids) "
+                            "   AND status = 'IN_PROGRESS'"
+                        ),
+                        {"ids": sib_ids},
+                    )
+                    print(
+                        f"[JOB_SERVICE] cancel cascaded to "
+                        f"{len(sib_ids)} sibling job(s) in batch "
+                        f"{batch_id}"
+                    )
+                # Force-flip the batch row so the Activity feed
+                # reflects "Canceled" on the very next read. Idempotent
+                # (only flips if currently IN_PROGRESS, matching the
+                # _finalize_batch_if_complete safety semantics).
+                await db.execute(
+                    text(
+                        "UPDATE backup_batches "
+                        "   SET status = 'CANCELLED', "
+                        "       completed_at = NOW() "
+                        " WHERE id = cast(:bid AS uuid) "
+                        "   AND status = 'IN_PROGRESS'"
+                    ),
+                    {"bid": str(batch_id)},
+                )
+                await db.commit()
+                print(
+                    f"[JOB_SERVICE] cancel force-flipped batch "
+                    f"{batch_id} -> CANCELLED (user-initiated cascade)"
+                )
     except Exception as _be:
         print(
             f"[JOB_SERVICE] cancel batch finalize for job={job.id} "
