@@ -874,7 +874,85 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status not in (JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.RETRYING):
-        # Already terminal — nothing to cascade.
+        # The targeted job is already terminal, but the batch it belonged
+        # to may still be IN_PROGRESS because sibling jobs / partition
+        # consumers are still draining. The user clicking Cancel a second
+        # time (or clicking on an already-finished resource) is signalling
+        # "stop the whole backup," so we still need to attempt the batch-
+        # level cascade. Without this, repeat clicks on the same Activity
+        # row never flip backup_batches.status → the row stays "In Progress"
+        # on reload even though the user clearly asked for it to stop.
+        try:
+            batch_id_t = None
+            if isinstance(job.spec, dict):
+                batch_id_t = job.spec.get("batch_id")
+            if batch_id_t:
+                # Cascade-cancel every still-running sibling job in the batch
+                # and force-flip the batch row. Idempotent (`status =
+                # 'IN_PROGRESS'` guards).
+                sib_rows = (await db.execute(
+                    text(
+                        "SELECT id FROM jobs "
+                        " WHERE COALESCE(spec::jsonb->>'batch_id','') = :bid "
+                        "   AND status IN ('QUEUED','RUNNING','RETRYING') "
+                    ),
+                    {"bid": str(batch_id_t)},
+                )).all()
+                sib_ids = [r.id for r in sib_rows]
+                if sib_ids:
+                    await db.execute(
+                        text(
+                            "UPDATE jobs SET status = 'CANCELLED', "
+                            "                completed_at = NOW() "
+                            " WHERE id = ANY(:ids)"
+                        ),
+                        {"ids": sib_ids},
+                    )
+                    await db.execute(
+                        text(
+                            "UPDATE snapshots SET "
+                            "  status = 'FAILED'::snapshotstatus, "
+                            "  completed_at = NOW(), "
+                            "  duration_secs = EXTRACT(EPOCH FROM "
+                            "                  (NOW() - started_at))::int, "
+                            "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
+                            "               || jsonb_build_object( "
+                            "                   'cancelled_at', NOW(), "
+                            "                   'cancelled_by_batch_cascade', true, "
+                            "                   'cancel_phase', "
+                            "                   'flip_pending_sweep'))::json "
+                            " WHERE job_id = ANY(:ids) "
+                            "   AND status = 'IN_PROGRESS'"
+                        ),
+                        {"ids": sib_ids},
+                    )
+                    print(
+                        f"[JOB_SERVICE] cancel-on-terminal cascaded to "
+                        f"{len(sib_ids)} sibling job(s) in batch "
+                        f"{batch_id_t}"
+                    )
+                await db.execute(
+                    text(
+                        "UPDATE backup_batches "
+                        "   SET status = 'CANCELLED', "
+                        "       completed_at = NOW() "
+                        " WHERE id = cast(:bid AS uuid) "
+                        "   AND status = 'IN_PROGRESS'"
+                    ),
+                    {"bid": str(batch_id_t)},
+                )
+                await db.commit()
+                print(
+                    f"[JOB_SERVICE] cancel-on-terminal force-flipped batch "
+                    f"{batch_id_t} -> CANCELLED (job {job.id} was already "
+                    f"{job.status.value if hasattr(job.status, 'value') else job.status})"
+                )
+        except Exception as _be:
+            print(
+                f"[JOB_SERVICE] cancel-on-terminal batch flip for "
+                f"job={job.id} failed (non-fatal): "
+                f"{type(_be).__name__}: {_be}"
+            )
         return
 
     job.status = JobStatus.CANCELLED
