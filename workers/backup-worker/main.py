@@ -5149,53 +5149,87 @@ class BackupWorker:
                              future inline path, or fallback) — use it
                              directly.
                           2. body HTML references "/hostedContents/" —
-                             fetch the list via /chats/{cid}/messages/{mid}/
-                             hostedContents and use what comes back.
+                             pre-fetch hostedContents lists for ALL such
+                             msgs in this page in /v1.0/$batch bundles of
+                             20 (graph_client.batch handles chunking),
+                             then process each message's downloads
+                             concurrently below. Replaces the prior
+                             per-msg serial GET that dominated wall-time
+                             (~2.7s/msg × 207 msgs ≈ 9.5 min observed).
                         Plain text-only messages (~95%) skip both paths."""
                         nonlocal _hc_items_total, _hc_bytes_total
+
+                        # Phase 1: bulk-resolve hostedContents lists via
+                        # /v1.0/$batch for msgs that need them.
+                        from shared.graph_batch import BatchRequest
+                        fetch_targets: List[Tuple[Dict[str, Any], str, str]] = []
+                        for m in msgs:
+                            if m.get("hostedContents"):
+                                continue
+                            if not _msg_likely_has_hosted_content(m):
+                                continue
+                            m_id_probe = m.get("id")
+                            m_chat_id_probe = (
+                                m.get("chatId")
+                                or (m.get("channelIdentity") or {}).get("channelId")
+                                or cid
+                            )
+                            if not m_id_probe or not m_chat_id_probe:
+                                continue
+                            fetch_targets.append(
+                                (m, m_id_probe, m_chat_id_probe)
+                            )
+                        if fetch_targets:
+                            try:
+                                batch_reqs = [
+                                    BatchRequest(
+                                        id=f"hc_{i}",
+                                        method="GET",
+                                        url=(
+                                            f"/chats/{ch_id}/messages/"
+                                            f"{mid}/hostedContents"
+                                        ),
+                                    )
+                                    for i, (_m, mid, ch_id) in enumerate(
+                                        fetch_targets
+                                    )
+                                ]
+                                batch_result = await graph_client.batch(
+                                    batch_reqs
+                                )
+                                for i, (m_ref, _, _) in enumerate(
+                                    fetch_targets
+                                ):
+                                    resp = batch_result.get(f"hc_{i}")
+                                    if resp is None:
+                                        continue
+                                    if getattr(resp, "status", 0) == 200:
+                                        hc_vals = list(
+                                            (resp.body or {})
+                                            .get("value", []) or []
+                                        )
+                                        if hc_vals:
+                                            m_ref["hostedContents"] = hc_vals
+                                    # Non-200 (404/403/429-after-retries) —
+                                    # leave m_ref without hostedContents
+                                    # so the Phase-2 fallback can retry
+                                    # via its own per-msg path.
+                            except Exception as _hc_batch_err:
+                                print(
+                                    f"[{self.worker_id}] [USER_CHATS] "
+                                    f"hc batch list fetch failed: "
+                                    f"{type(_hc_batch_err).__name__}: "
+                                    f"{_hc_batch_err}; "
+                                    f"falling back to Phase-2 per-msg path"
+                                )
+
+                        # Phase 2: persist each msg's hostedContents
+                        # concurrently under the existing semaphore.
                         for m in msgs:
                             inline_hc = m.get("hostedContents")
-                            hc_values: List[Dict[str, Any]] = []
-                            if inline_hc:
-                                hc_values = list(inline_hc)
-                            elif _msg_likely_has_hosted_content(m):
-                                # Per-message fetch — only for messages
-                                # whose body actually references an
-                                # inline-image hostedContent. Bounds the
-                                # extra HTTP cost to the ~5% of messages
-                                # that need it.
-                                m_id_probe = m.get("id")
-                                m_chat_id_probe = (
-                                    m.get("chatId")
-                                    or (m.get("channelIdentity") or {}).get("channelId")
-                                    or cid
-                                )
-                                if not m_id_probe or not m_chat_id_probe:
-                                    continue
-                                try:
-                                    _hc_resp = await graph_client._get(
-                                        f"{graph_client.GRAPH_URL}/chats/"
-                                        f"{m_chat_id_probe}/messages/"
-                                        f"{m_id_probe}/hostedContents"
-                                    )
-                                    hc_values = list(
-                                        (_hc_resp or {}).get("value", []) or []
-                                    )
-                                    # Populate so the Phase-2 fallback
-                                    # path sees the values too if the
-                                    # interleave persist below fails.
-                                    if hc_values:
-                                        m["hostedContents"] = hc_values
-                                except Exception as _hc_fetch_err:
-                                    print(
-                                        f"[{self.worker_id}] [USER_CHATS] "
-                                        f"hc list fetch failed "
-                                        f"msg={str(m_id_probe)[:8]} "
-                                        f"chat={str(m_chat_id_probe)[:8]}: "
-                                        f"{type(_hc_fetch_err).__name__}: "
-                                        f"{_hc_fetch_err}"
-                                    )
-                                    continue
+                            hc_values: List[Dict[str, Any]] = (
+                                list(inline_hc) if inline_hc else []
+                            )
                             if not hc_values:
                                 continue
                             m_id = m.get("id")
