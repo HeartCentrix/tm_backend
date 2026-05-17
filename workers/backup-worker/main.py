@@ -276,6 +276,130 @@ async def _bulk_upsert_snapshot_items(
     return total
 
 
+# ==================== mail_message_bodies helpers (cross-user dedup) ====================
+#
+# Item B: Mirror of the chat_thread_messages dedup pattern, applied to
+# mail. Tenant-scoped table keyed by (tenant_id, fingerprint). Phase 1
+# is a write-only dual-write — the body still lands in
+# snapshot_items.extra_data['raw'] so restore paths don't change.
+# Future Phase 2 will JOIN here and stop the inline write.
+
+def _mail_message_fingerprint(msg: Dict[str, Any]) -> str:
+    """Stable per-tenant dedup key for a Graph message.
+
+    Outlook gives each mailbox its own message.id even for the same
+    logical email, so we can't dedup on Graph id. We hash a tuple
+    that is (in practice) unique per logical message:
+
+      from_addr | sent_iso | subject | content_size | first 64KB body sha256
+
+    sent_date_time is microsecond-precise on Graph payloads; combined
+    with from + subject it discriminates well past mailbox boundaries.
+    The body-prefix hash guards against the rare case where two
+    different replies have identical headers (Outlook generates
+    "Re:" + same minute + same sender + same subject when you reply
+    twice in 30 seconds with different bodies).
+    """
+    sender = ""
+    fr = (msg.get("from") or {}).get("emailAddress") or {}
+    if isinstance(fr, dict):
+        sender = (fr.get("address") or "").lower()
+    sent = str(msg.get("sentDateTime") or "")
+    subj = (msg.get("subject") or "")[:512]
+    body = (msg.get("body") or {})
+    body_text = body.get("content") if isinstance(body, dict) else ""
+    body_text = body_text or ""
+    body_size = len(body_text)
+    # First 64KB only — large attached HTML bodies don't need full hashing.
+    prefix_hash = hashlib.sha256(body_text[:65536].encode("utf-8", errors="replace")).hexdigest()
+    key = f"{sender}|{sent}|{subj}|{body_size}|{prefix_hash}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+async def _bulk_upsert_mail_message_bodies(
+    session, tenant_id, user_id: str, snapshot_id, messages: List[Dict[str, Any]],
+) -> int:
+    """Bulk-insert mail_message_bodies rows with ON CONFLICT DO NOTHING.
+
+    Phase 1 dual-write: caller still writes the full body to
+    snapshot_items.extra_data['raw']. This function adds a parallel
+    dedup record so we can measure the cross-user hit ratio in prod
+    before flipping reads in Phase 2.
+
+    Errors are caught and logged but do NOT abort the snapshot — this
+    is best-effort optimization metadata.
+    """
+    if not messages:
+        return 0
+    try:
+        from sqlalchemy.dialects.postgresql import insert as _pg_insert
+        from shared.models import MailMessageBody as _MMB
+        rows: List[Dict[str, Any]] = []
+        seen_fp: set = set()
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            try:
+                fp = _mail_message_fingerprint(m)
+            except Exception:
+                continue
+            if fp in seen_fp:
+                continue
+            seen_fp.add(fp)
+            body = (m.get("body") or {}) if isinstance(m.get("body"), dict) else {}
+            from_obj = (m.get("from") or {}).get("emailAddress") or {}
+            if not isinstance(from_obj, dict):
+                from_obj = {}
+            body_content = body.get("content")
+            body_type = body.get("contentType")
+            content_size = len((body_content or "").encode("utf-8", errors="replace")) if body_content else 0
+            content_hash = (
+                hashlib.sha256((body_content or "").encode("utf-8", errors="replace")).hexdigest()
+                if body_content else None
+            )
+            rows.append({
+                "id": uuid.uuid4(),
+                "tenant_id": tenant_id,
+                "fingerprint": fp,
+                "first_user_id": user_id,
+                "first_snapshot_id": snapshot_id,
+                "from_user_id": user_id,
+                "from_address": (from_obj.get("address") or "")[:256] or None,
+                "from_display_name": (from_obj.get("name") or "")[:256] or None,
+                "subject": m.get("subject"),
+                "sent_date_time": m.get("sentDateTime"),
+                "received_date_time": m.get("receivedDateTime"),
+                "body_content": body_content,
+                "body_content_type": (body_type or "")[:16] or None,
+                "has_attachments": m.get("hasAttachments"),
+                "metadata_raw": m,
+                "content_hash": content_hash,
+                "content_size": content_size,
+                "ref_count": 1,
+            })
+        if not rows:
+            return 0
+        # Chunked insert — same chunk size as snapshot_items for parity.
+        total = 0
+        for i in range(0, len(rows), _BULK_INSERT_CHUNK):
+            chunk = rows[i:i + _BULK_INSERT_CHUNK]
+            stmt = _pg_insert(_MMB).values(chunk).on_conflict_do_nothing(
+                index_elements=["tenant_id", "fingerprint"],
+            )
+            await session.execute(stmt)
+            total += len(chunk)
+        await session.commit()
+        return total
+    except Exception as e:
+        # Best-effort. Don't fail a snapshot over a dedup-table issue.
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        print(f"[MAIL_DEDUP] bulk upsert failed (continuing): {type(e).__name__}: {e}")
+        return 0
+
+
 # ==================== chat_threads helpers (cross-user dedup) ====================
 #
 # These helpers implement the tenant-singleton chat-thread store (see
@@ -3809,6 +3933,18 @@ class BackupWorker:
                             })
                         async with async_session_factory() as _sess:
                             await _bulk_upsert_snapshot_items(_sess, rows)
+                        # Item B Phase 1: dual-write to mail_message_bodies
+                        # for cross-user dedup. Best-effort; doesn't affect
+                        # the snapshot_items write above. Runs in its own
+                        # session so a constraint mismatch can't poison
+                        # the parent transaction.
+                        try:
+                            async with async_session_factory() as _mmb_sess:
+                                await _bulk_upsert_mail_message_bodies(
+                                    _mmb_sess, tenant.id, user_id, snapshot.id, folder_msgs,
+                                )
+                        except Exception as _mmb_e:
+                            print(f"[MAIL_DEDUP] dual-write skipped: {_mmb_e}")
                         return len(rows), local_bytes
 
                     async def _drain_one_folder(fid: Optional[str]) -> List:

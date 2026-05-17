@@ -1248,6 +1248,66 @@ class ChatThread(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
 
+class MailMessageBody(Base):
+    """Cross-user mail message body store (2026-05-17). Mirrors the
+    chat_thread_messages model: deduplicate the bytes of an email body
+    across all snapshots/users that reference it within one tenant.
+
+    Why this exists: in a typical enterprise mailbox the same email
+    thread is replicated across every recipient's mailbox AND every
+    sender's Sent folder. Today we serialize each copy's body into
+    snapshot_items.extra_data → 3-5× write amplification for big
+    distribution lists. This table caches the body once per
+    (tenant_id, fingerprint) and lets future reads JOIN here instead.
+
+    Dedup key: `fingerprint` = sha256(from + sentDateTime + subject +
+    body_size + body_first_64KB_hash). Not a hash collision risk in
+    practice — sentDateTime is microsecond-precise and the prefix
+    hash discriminates beyond what mailbox boundaries do.
+
+    Migration plan:
+      Phase 1 (this commit): write-only. Bodies live in BOTH
+        snapshot_items.extra_data AND mail_message_bodies. No restore
+        path changes — zero risk to existing reads.
+      Phase 2 (future): switch restore to JOIN this table; stop
+        writing body to snapshot_items.extra_data; reclaim disk.
+
+    Unique constraint: (tenant_id, fingerprint). ON CONFLICT DO
+    NOTHING makes the upsert idempotent under concurrent writers
+    from different users' drains.
+    """
+    __tablename__ = "mail_message_bodies"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=False, index=True)
+    fingerprint = Column(String(64), nullable=False)
+    # Provenance — the first user/snapshot to land this body. Useful for
+    # audit and for the "who got it first" tie-break in claim helpers.
+    first_user_id = Column(String(128), nullable=True)
+    first_snapshot_id = Column(UUID(as_uuid=True), nullable=True)
+    # Mail-specific fields lifted out of body so reads don't need JSON
+    # extraction. Identical role to ChatThreadMessage's from_*.
+    from_user_id = Column(String(128), nullable=True)
+    from_address = Column(String(256), nullable=True)
+    from_display_name = Column(String(256), nullable=True)
+    subject = Column(Text, nullable=True)
+    sent_date_time = Column(DateTime(timezone=True), nullable=True)
+    received_date_time = Column(DateTime(timezone=True), nullable=True)
+    body_content = Column(Text, nullable=True)
+    body_content_type = Column(String(16), nullable=True)
+    has_attachments = Column(Boolean, nullable=True)
+    # Full Graph payload — same shape backup-worker writes to
+    # snapshot_items.extra_data['raw'] today. Phase-2 reads JOIN here.
+    metadata_raw = Column(JSONB, nullable=True)
+    content_hash = Column(String(64), nullable=True)
+    content_size = Column(BigInteger, nullable=True)
+    # How many distinct snapshot_items rows currently point at this
+    # body. Bumped on every dedup hit. The post-retention purge walks
+    # bodies with ref_count=0 + last_referenced_at older than the cap.
+    ref_count = Column(Integer, nullable=False, default=1)
+    last_referenced_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 class ChatThreadMessage(Base):
     """Tenant-scoped, drained-once-per-batch chat message store.
 

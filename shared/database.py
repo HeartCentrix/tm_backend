@@ -51,6 +51,9 @@ REQUIRED_TABLES = (
     "chat_url_cache",
     "chat_threads",
     "chat_thread_messages",
+    # Cross-user mail dedup (2026-05-17). Required so the backup-worker
+    # waits for init_db before issuing its first mail-body upsert.
+    "mail_message_bodies",
     # OneDrive per-file retry queue (2026-05-17). Producer + consumer
     # both expect the table to exist before issuing their INSERT /
     # SELECT FOR UPDATE SKIP LOCKED.
@@ -867,6 +870,36 @@ async def init_db() -> None:
             UNIQUE (chat_thread_id, message_external_id)
         )
         """,
+        # Cross-user mail dedup. Same role chat_thread_messages plays
+        # for chats: one row per logical message body, shared across
+        # every user whose mailbox contained that email. snapshot_items
+        # carries thin pointer rows that JOIN here at read time once
+        # Phase 2 lands. See MailMessageBody in shared/models.py.
+        """
+        CREATE TABLE IF NOT EXISTS mail_message_bodies (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+            fingerprint CHAR(64) NOT NULL,
+            first_user_id VARCHAR(128),
+            first_snapshot_id UUID,
+            from_user_id VARCHAR(128),
+            from_address VARCHAR(256),
+            from_display_name VARCHAR(256),
+            subject TEXT,
+            sent_date_time TIMESTAMPTZ,
+            received_date_time TIMESTAMPTZ,
+            body_content TEXT,
+            body_content_type VARCHAR(16),
+            has_attachments BOOLEAN,
+            metadata_raw JSONB,
+            content_hash CHAR(64),
+            content_size BIGINT,
+            ref_count INTEGER NOT NULL DEFAULT 1,
+            last_referenced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (tenant_id, fingerprint)
+        )
+        """,
         # snapshot_partitions — cross-replica OneDrive partition split.
         # One row per shard of a partitioned USER_ONEDRIVE snapshot;
         # multiple backup_worker replicas drain one drive in parallel.
@@ -1122,6 +1155,16 @@ async def init_db() -> None:
         # Hot read path: hydrate a chat thread newest-first.
         "CREATE INDEX IF NOT EXISTS ix_chat_thread_messages_thread_time "
         "ON chat_thread_messages (chat_thread_id, created_date_time DESC)",
+        # Cross-user mail dedup — tenant-scoped fingerprint lookup is the
+        # hot upsert key. UNIQUE (tenant_id, fingerprint) is enforced
+        # at the DDL level; this index also covers the dedup-ratio
+        # rollup query (count by tenant_id).
+        "CREATE INDEX IF NOT EXISTS ix_mail_message_bodies_tenant_fp "
+        "ON mail_message_bodies (tenant_id, fingerprint)",
+        # Purge worker: find unreferenced bodies older than retention.
+        "CREATE INDEX IF NOT EXISTS ix_mail_message_bodies_purge "
+        "ON mail_message_bodies (last_referenced_at) "
+        "WHERE ref_count <= 0",
         # OneDrive file-retry queue — consumer scans for PENDING rows
         # whose next_retry_at has elapsed; partial index keeps the
         # scan O(eligible) instead of O(table). Filtering on status
