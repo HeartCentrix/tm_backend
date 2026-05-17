@@ -1913,28 +1913,46 @@ class BackupWorker:
         if settings.ONEDRIVE_PARTITION_ENABLED:
             queues.append(("backup.onedrive_partition", 2))
         # Chats partition lane — I/O-light, higher prefetch is fine.
+        # Bumped 4 → 8 (perf #D 2026-05-17): now that consume_queue
+        # actually runs handlers concurrently up to the prefetch budget
+        # (previously serialized inside the iterator), an 8-way lane lets
+        # each replica drain 8 chat-partition shards in parallel. With
+        # 6 replicas that's 48 concurrent shards cluster-wide — enough
+        # to cover 9 users × 4 shards = 36 in one wave.
         if getattr(settings, "CHATS_PARTITION_ENABLED", False):
-            queues.append(("backup.chats_partition", 4))
+            queues.append(("backup.chats_partition", int(
+                os.getenv("BACKUP_CHATS_PARTITION_PREFETCH", "8"),
+            )))
         # Mail partition lane — many small folder drains per shard.
-        # Prefetch=2 mirrors OneDrive: a shard can fan out to ~20+
-        # folder drains inside, so one in-flight is plenty.
+        # Bumped 2 → 4 (perf #D): same reason as chats. Mail shards are
+        # small-IO so a few in-flight per replica is fine.
         if getattr(settings, "MAIL_PARTITION_ENABLED", False):
-            queues.append(("backup.mail_partition", 2))
+            queues.append(("backup.mail_partition", int(
+                os.getenv("BACKUP_MAIL_PARTITION_PREFETCH", "4"),
+            )))
         # SharePoint partition lane — drive shards are I/O-heavy.
+        # Kept at 2: SP drives can be many GB per shard, OOM risk if we
+        # stack too many on one replica.
         if getattr(settings, "SP_PARTITION_ENABLED", False):
-            queues.append(("backup.sharepoint_partition", 2))
+            queues.append(("backup.sharepoint_partition", int(
+                os.getenv("BACKUP_SP_PARTITION_PREFETCH", "2"),
+            )))
         # Groups (Teams channels) partition lane — fat-team channel
         # shards. Channels carry message + reply payloads but most are
-        # smaller per-shard than SP drives; prefetch=2 keeps a replica
-        # from monopolizing more than two shards at once.
+        # smaller per-shard than SP drives.
+        # Bumped 2 → 4 (perf #D).
         if getattr(settings, "GROUPS_PARTITION_ENABLED", False):
-            queues.append(("backup.groups_partition", 2))
+            queues.append(("backup.groups_partition", int(
+                os.getenv("BACKUP_GROUPS_PARTITION_PREFETCH", "4"),
+            )))
         # Entra directory partition lane — directory-category shards.
         # Most categories are I/O-light (one Graph page each) but the
-        # Groups category fans out to per-group owner+member calls
-        # which can dominate. Prefetch=2 keeps replicas balanced.
+        # Groups category fans out to per-group owner+member calls.
+        # Bumped 2 → 4 (perf #D).
         if getattr(settings, "ENTRA_PARTITION_ENABLED", False):
-            queues.append(("backup.entra_partition", 2))
+            queues.append(("backup.entra_partition", int(
+                os.getenv("BACKUP_ENTRA_PARTITION_PREFETCH", "4"),
+            )))
 
         tasks = []
         for queue_name, prefetch in queues:
@@ -2049,42 +2067,107 @@ class BackupWorker:
         from shared.graph_priority import priority_for_queue
         queue_priority = priority_for_queue(queue_name)
 
+        # Concurrent-handler refactor (perf #user-chats 2026-05-17):
+        # The previous shape — `async for message: await process; await ack` —
+        # serialized message processing within ONE consumer. Even though we
+        # told the broker prefetch=N, we awaited each handler before
+        # pulling the next message from the iterator, so each replica
+        # effectively ran one message at a time per queue.
+        #
+        # Observable symptom: USER_CHATS shards ran user-by-user on each
+        # replica (Hemant → Gajraj → Rashmi …) instead of in parallel,
+        # leaving the prefetch budget idle and the chat-partition queue
+        # under-utilised.
+        #
+        # New shape: each delivery is dispatched to a detached
+        # asyncio.Task. A semaphore equal to prefetch_count caps concurrent
+        # in-flight tasks so the iterator naturally pauses when full;
+        # aio_pika's broker-level prefetch already limits unacked messages
+        # to the same number, so we match the two budgets exactly.
+        # ack/reject still happens inside each task; idempotency on crash
+        # is unchanged (RMQ redelivers any unacked message).
+        handler_sem = asyncio.Semaphore(max(1, prefetch_count))
+        in_flight: "set[asyncio.Task]" = set()
+
+        async def _handle_one(message) -> None:
+            try:
+                try:
+                    body = json.loads(message.body.decode())
+                    with graph_priority(queue_priority):
+                        await self.process_backup_message(body)
+                    await message.ack()
+                except PoisonMessageError as e:
+                    # Structurally invalid envelope — never retryable.
+                    # Skip the delivery-count gate and route straight to
+                    # DLQ so one bad payload can't pin a consumer.
+                    print(
+                        f"[{self.worker_id}] poison message ({e}) — "
+                        f"routing to DLQ without retry"
+                    )
+                    try:
+                        await message.reject(requeue=False)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"[{self.worker_id}] Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    try:
+                        # Check delivery count to prevent infinite requeue
+                        headers = message.headers or {}
+                        delivery_count = headers.get("x-delivery-count", 0)
+                        if delivery_count < settings.MAX_RETRIES:
+                            await message.reject(requeue=True)
+                        else:
+                            print(
+                                f"[{self.worker_id}] Message exceeded "
+                                f"max retries ({settings.MAX_RETRIES}), "
+                                f"routing to DLQ"
+                            )
+                            await message.reject(requeue=False)
+                    except Exception:
+                        pass
+            finally:
+                handler_sem.release()
+
         try:
             async with queue.iterator() as queue_iter:
                 async for message in queue_iter:
-                    try:
-                        body = json.loads(message.body.decode())
-                        with graph_priority(queue_priority):
-                            await self.process_backup_message(body)
-                        await message.ack()
-                    except PoisonMessageError as e:
-                        # Structurally invalid envelope — never retryable.
-                        # Skip the delivery-count gate and route straight
-                        # to DLQ so one bad payload can't pin a consumer.
-                        print(
-                            f"[{self.worker_id}] poison message ({e}) — "
-                            f"routing to DLQ without retry"
-                        )
-                        try:
-                            await message.reject(requeue=False)
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        print(f"[{self.worker_id}] Error: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        try:
-                            # Check delivery count to prevent infinite requeue
-                            headers = message.headers or {}
-                            delivery_count = headers.get("x-delivery-count", 0)
-                            if delivery_count < settings.MAX_RETRIES:
-                                await message.reject(requeue=True)
-                            else:
-                                print(f"[{self.worker_id}] Message exceeded max retries ({settings.MAX_RETRIES}), routing to DLQ")
-                                await message.reject(requeue=False)
-                        except Exception:
-                            pass
+                    # Block here only when we already have prefetch_count
+                    # handlers running. As soon as one finishes (acks /
+                    # rejects), the sem releases and we pick up the next
+                    # message immediately.
+                    await handler_sem.acquire()
+                    task = asyncio.create_task(_handle_one(message))
+                    in_flight.add(task)
+                    task.add_done_callback(in_flight.discard)
+                    if len(in_flight) >= max(2, prefetch_count // 2):
+                        # Periodic visibility: log only when concurrent
+                        # in-flight count crosses the half-prefetch mark
+                        # so steady-state at low load stays quiet but a
+                        # saturated worker is observable.
+                        if len(in_flight) % max(1, prefetch_count // 4) == 0:
+                            print(
+                                f"[{self.worker_id}] [PERF] {queue_name} "
+                                f"in_flight={len(in_flight)}/{prefetch_count}"
+                            )
         finally:
+            # Drain any still-running handlers so they get a chance to
+            # ack/reject before the channel closes. Without this an in-
+            # flight task could be killed mid-execute, leaving the
+            # message unacked AND the channel torn down so we can't
+            # reject it cleanly — RMQ would redeliver via delivery-
+            # count, but draining is the polite shutdown.
+            if in_flight:
+                try:
+                    print(
+                        f"[{self.worker_id}] consume_queue({queue_name}) "
+                        f"draining {len(in_flight)} in-flight handler(s) "
+                        f"before channel close"
+                    )
+                    await asyncio.gather(*in_flight, return_exceptions=True)
+                except Exception:
+                    pass
             # Close the per-queue channel on supervisor restart so we
             # don't leak channels each time the iterator exits. Connection
             # stays open (shared by message_bus for publishes).
