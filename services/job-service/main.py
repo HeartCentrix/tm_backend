@@ -969,6 +969,38 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
 
     await db.flush()
 
+    # Bug fix (2026-05-17): cancel used to leave backup_batches.status
+    # stuck at IN_PROGRESS — the Activity feed reads that column directly
+    # (audit-service /api/v1/activity), so a user-cancelled batch kept
+    # showing "In Progress" on page reload. The previous code path only
+    # touched jobs + snapshots; nothing called the batch finalizer.
+    #
+    # Now: after the snapshot flip above, derive the batch_id from
+    # job.spec and call _finalize_batch_if_complete(). With every snapshot
+    # for this job already FAILED (gate-2 terminal), the finalizer will
+    # mark the batch terminal if and only if every other sibling job in
+    # the same batch is also terminal — which is the correct semantics
+    # for partial cancels in multi-job batches. Best-effort: an exception
+    # here must not 500 the cancel endpoint, the rest of the work (job
+    # flip, audit log, blob cleanup) already succeeded.
+    try:
+        batch_id = None
+        if isinstance(job.spec, dict):
+            batch_id = job.spec.get("batch_id")
+        if batch_id:
+            from shared.batch_rollup import _finalize_batch_if_complete
+            new_status = await _finalize_batch_if_complete(batch_id, db)
+            if new_status:
+                print(
+                    f"[JOB_SERVICE] cancel finalized batch {batch_id} "
+                    f"-> {new_status} (after job {job.id})"
+                )
+    except Exception as _be:
+        print(
+            f"[JOB_SERVICE] cancel batch finalize for job={job.id} "
+            f"failed (non-fatal): {type(_be).__name__}: {_be}"
+        )
+
     # Audit trail — emit a CANCELLED event whose action mirrors the
     # job kind so the Audit feed groups restore vs backup correctly.
     # Details now include the revert summary so the Activity drill-down
