@@ -16974,38 +16974,40 @@ class BackupWorker:
         manual_actions: List[str] = []
         unsupported_artifacts: List[str] = []
 
-        for artifact_key, artifact in current_artifacts.items():
-            previous_item = previous_items.get(artifact_key)
-            should_materialize = snapshot_type == SnapshotType.FULL or self._power_bi_artifact_changed(previous_item, artifact)
-            if not should_materialize:
-                continue
+        # PERF #11: parallelize per-artifact payload build + upload via gather under sem(8).
+        # Each artifact does an independent Power BI REST call + blob upload, so
+        # serial wait was leaving the worker idle. Counters are merged after.
+        _pbi_sem = asyncio.Semaphore(8)
+        _t0_pbi = time.time()
 
-            payload, blob_bytes = await self._build_power_bi_artifact_payload(
-                power_bi_client,
-                workspace_id,
-                artifact,
-            )
-            content_hash = hashlib.sha256(blob_bytes).hexdigest()
-            previous_checksum = getattr(previous_item, "content_checksum", None) if previous_item else None
-            if previous_checksum and previous_checksum == content_hash:
-                continue
+        async def _process_artifact(artifact_key: str, artifact: Dict):
+            async with _pbi_sem:
+                previous_item = previous_items.get(artifact_key)
+                should_materialize = snapshot_type == SnapshotType.FULL or self._power_bi_artifact_changed(previous_item, artifact)
+                if not should_materialize:
+                    return None
 
-            if not payload["restore_supported"]:
-                unsupported_artifacts.append(f"{artifact['item_type']}:{artifact['name']}")
-            manual_actions.extend(payload["manual_actions"])
+                payload, blob_bytes = await self._build_power_bi_artifact_payload(
+                    power_bi_client,
+                    workspace_id,
+                    artifact,
+                )
+                content_hash = hashlib.sha256(blob_bytes).hexdigest()
+                previous_checksum = getattr(previous_item, "content_checksum", None) if previous_item else None
+                if previous_checksum and previous_checksum == content_hash:
+                    return None
 
-            blob_path = azure_storage_manager.build_blob_path(
-                str(tenant.id),
-                str(resource.id),
-                str(snapshot.id),
-                artifact["blob_id"],
-            )
-            result = await upload_blob_with_retry(container, blob_path, blob_bytes, shard)
-            if not result.get("success"):
-                raise RuntimeError(f"Failed to upload Power BI artifact {artifact['name']}: {result.get('error')}")
+                blob_path = azure_storage_manager.build_blob_path(
+                    str(tenant.id),
+                    str(resource.id),
+                    str(snapshot.id),
+                    artifact["blob_id"],
+                )
+                result = await upload_blob_with_retry(container, blob_path, blob_bytes, shard)
+                if not result.get("success"):
+                    raise RuntimeError(f"Failed to upload Power BI artifact {artifact['name']}: {result.get('error')}")
 
-            db_items.append(
-                SnapshotItem(
+                item = SnapshotItem(
                     snapshot_id=snapshot.id,
                     tenant_id=tenant.id,
                     external_id=artifact["external_id"],
@@ -17019,8 +17021,33 @@ class BackupWorker:
                     extra_data=payload["summary"],
                     is_deleted=False,
                 )
+                return {
+                    "item": item,
+                    "bytes": len(blob_bytes),
+                    "unsupported_label": (f"{artifact['item_type']}:{artifact['name']}"
+                                          if not payload["restore_supported"] else None),
+                    "manual_actions": payload["manual_actions"],
+                }
+
+        if current_artifacts:
+            _pbi_results = await asyncio.gather(
+                *[_process_artifact(k, a) for k, a in current_artifacts.items()],
+                return_exceptions=True,
             )
-            bytes_added += len(blob_bytes)
+            for _r in _pbi_results:
+                if isinstance(_r, Exception):
+                    # Preserve fail-fast semantics: an artifact upload failure
+                    # was previously a raise — re-raise to abort the snapshot.
+                    raise _r
+                if _r is None:
+                    continue
+                db_items.append(_r["item"])
+                bytes_added += _r["bytes"]
+                if _r["unsupported_label"]:
+                    unsupported_artifacts.append(_r["unsupported_label"])
+                manual_actions.extend(_r["manual_actions"])
+            if len(current_artifacts) >= 4:
+                print(f"[PERF][POWERBI] processed {len(current_artifacts)} artifacts in {time.time()-_t0_pbi:.2f}s")
 
         if snapshot_type == SnapshotType.INCREMENTAL:
             for artifact_key, previous_item in previous_items.items():
