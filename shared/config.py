@@ -444,14 +444,25 @@ class Settings:
         self.CHATS_PARTITION_ENABLED = os.getenv(
             "CHATS_PARTITION_ENABLED", "true",
         ).lower() in ("true", "1", "yes")
+        # 2026-05-17 prod tuning: lowered 100 → 25 so medium-chat users
+        # (e.g. 30-99 chats — the long tail of regular employees) also
+        # get the partition treatment. With the 8-light replica fleet this
+        # means ~4750 of 5K users fan out to 1-2 shards each, parallelising
+        # across the backup.chats_partition lane instead of crowding
+        # backup.high serially. Tiny users (<25 chats) still run inline
+        # to avoid the per-shard publish overhead.
         self.CHATS_PARTITION_MIN_CHATS = int(os.getenv(
-            "CHATS_PARTITION_MIN_CHATS", "100",
+            "CHATS_PARTITION_MIN_CHATS", "25",
         ))
         self.CHATS_PARTITION_TARGET_CHATS_PER_SHARD = int(os.getenv(
             "CHATS_PARTITION_TARGET_CHATS_PER_SHARD", "50",
         ))
+        # 2026-05-17 prod tuning: 4 → 6 so power users (executives with
+        # 500+ chats) drain ~33% faster. The 8-light × 12-prefetch =
+        # 96-shard cluster budget for backup.chats_partition still
+        # comfortably absorbs the new shard count.
         self.CHATS_PARTITION_MAX_SHARDS = int(os.getenv(
-            "CHATS_PARTITION_MAX_SHARDS", "4",
+            "CHATS_PARTITION_MAX_SHARDS", "6",
         ))
 
         # ── Phase 3.2: Mail partition (covers USER_MAIL / MAILBOX /

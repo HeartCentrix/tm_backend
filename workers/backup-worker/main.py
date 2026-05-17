@@ -2022,11 +2022,34 @@ class BackupWorker:
                 f"consuming ONLY {self._backup_queue_name}"
             )
         else:
+            # Per-queue prefetch defaults (2026-05-17 prod tuning,
+            # sized for the 8-light + 4-heavy Railway Pro fleet):
+            #
+            # backup.urgent (1 → 8): manual user-triggered backups.
+            #   Original prefetch=1 was set to keep one slow chat from
+            #   starving the others. That rationale is obsolete now that
+            #   consume_queue (faa67e1) dispatches each delivery to its
+            #   own task — a slow user no longer pins the replica.
+            #   With 8 light replicas this lands 64 concurrent (8×8),
+            #   comfortably covering a 50-user manual burst with ~25%
+            #   headroom. Per-replica memory at 8 concurrent USER_CHATS:
+            #   ~8 × 800 MB peak = 6-8 GB out of Railway Pro's 32 GB.
+            #
+            # backup.high (5 → 10): scheduled bulk triggers. Across
+            #   8 light replicas = 80 concurrent. Handles a fleet-wide
+            #   5K-user scheduled run as ~63 waves of 80, well within
+            #   the 8h window.
+            #
+            # backup.low (50 → 50): unchanged — already amply sized;
+            #   this lane is for retention sweeps where latency is fine.
+            #
+            # Each value still env-overridable; production may further
+            # raise via BACKUP_URGENT_PREFETCH / BACKUP_HIGH_PREFETCH.
             queues = [
-                ("backup.urgent", 1),
-                ("backup.high", 5),
-                (self._backup_queue_name, 20),
-                ("backup.low", 50),
+                ("backup.urgent", int(os.getenv("BACKUP_URGENT_PREFETCH", "8"))),
+                ("backup.high", int(os.getenv("BACKUP_HIGH_PREFETCH", "10"))),
+                (self._backup_queue_name, int(os.getenv("BACKUP_NORMAL_PREFETCH", "20"))),
+                ("backup.low", int(os.getenv("BACKUP_LOW_PREFETCH", "50"))),
             ]
         # OneDrive partition lane — both the light and heavy pools
         # subscribe so any free replica can drain a shard. Prefetch=2
@@ -2044,8 +2067,13 @@ class BackupWorker:
         # 6 replicas that's 48 concurrent shards cluster-wide — enough
         # to cover 9 users × 4 shards = 36 in one wave.
         if getattr(settings, "CHATS_PARTITION_ENABLED", False):
+            # 8 → 12 (2026-05-17 prod tuning). With 8 light replicas
+            # this gives 96 concurrent partition shards cluster-wide.
+            # A 5K-user run at MIN_CHATS=25 generates ~9.5K shards
+            # (avg 2 shards/user) → ~99 waves of 96, well inside the
+            # 8h window even at 90s/shard.
             queues.append(("backup.chats_partition", int(
-                os.getenv("BACKUP_CHATS_PARTITION_PREFETCH", "8"),
+                os.getenv("BACKUP_CHATS_PARTITION_PREFETCH", "12"),
             )))
         # Mail partition lane — many small folder drains per shard.
         # Bumped 2 → 4 (perf #D): same reason as chats. Mail shards are
@@ -6668,8 +6696,14 @@ class BackupWorker:
                     # through the Phase-2 fall-through. That's safe
                     # because _userchats_backup_hosted_contents uses
                     # ON CONFLICT DO NOTHING semantics on persist.
+                    # Default ON (2026-05-17 prod tuning): frees the
+                    # consumer slot ~30-60s sooner per user so the
+                    # backup.urgent / backup.high prefetch bumps actually
+                    # translate into faster cluster-wide throughput.
+                    # Restore paths gate on snapshot.hc_drain_status so
+                    # PENDING snapshots can't be restored mid-drain.
                     _hc_detached = os.getenv(
-                        "USER_CHATS_HC_BARRIER_DETACHED", "false",
+                        "USER_CHATS_HC_BARRIER_DETACHED", "true",
                     ).lower() in ("true", "1", "yes")
 
                     if _hc_detached and (
