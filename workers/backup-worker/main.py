@@ -5182,12 +5182,15 @@ class BackupWorker:
                     _interleave_hc = os.getenv(
                         "USER_CHATS_INTERLEAVE_HOSTED_CONTENT", "true",
                     ).lower() in ("true", "1", "yes")
-                    # Bumped 8 -> 12 to keep up with the higher chat fan-out
-                    # (USER_CHATS_PARALLEL_CHATS=32). Each parallel chat may
-                    # have ~1 msg with inline images at any moment, so this
-                    # cap should scale roughly with chat_fanout / 3.
+                    # Bumped 12 -> 32 (Option B 2026-05-17): with $expand=
+                    # hostedContents re-enabled (fix #5) most messages carry
+                    # their HC ids inline, so the post-drain barrier mostly
+                    # does cheap /value byte fetches. Pushing this higher
+                    # collapses the barrier wall-clock — the per-app Graph
+                    # rate-limiter caps actual RPS, so this is a ceiling not
+                    # a floor.
                     _hc_concurrency = int(os.getenv(
-                        "CHAT_HOSTED_CONTENT_CONCURRENCY", "12",
+                        "CHAT_HOSTED_CONTENT_CONCURRENCY", "32",
                     ))
                     _hc_sem: Optional[asyncio.Semaphore] = (
                         asyncio.Semaphore(_hc_concurrency) if _interleave_hc else None
@@ -5211,7 +5214,7 @@ class BackupWorker:
                     # UPLOAD_CONCURRENCY); the outer cap prevents N parallel
                     # kicks from blowing past the multi-app Graph RPS budget.
                     _att_chat_concurrency = int(os.getenv(
-                        "USER_CHATS_INTERLEAVE_ATTACHMENT_CONCURRENCY", "12",
+                        "USER_CHATS_INTERLEAVE_ATTACHMENT_CONCURRENCY", "24",
                     ))
                     _att_chat_sem: Optional[asyncio.Semaphore] = (
                         asyncio.Semaphore(_att_chat_concurrency) if _interleave_att else None
@@ -5258,20 +5261,22 @@ class BackupWorker:
                         Python `+=` on ints is a single-bytecode update
                         under the asyncio event loop (no threads).
 
-                        Now that $expand=hostedContents is gone (fix #2),
-                        messages no longer carry an inlined hostedContents
-                        array. Detection has two paths:
-                          1. `m["hostedContents"]` populated (legacy /
-                             future inline path, or fallback) — use it
-                             directly.
-                          2. body HTML references "/hostedContents/" —
-                             pre-fetch hostedContents lists for ALL such
-                             msgs in this page in /v1.0/$batch bundles of
-                             20 (graph_client.batch handles chunking),
-                             then process each message's downloads
-                             concurrently below. Replaces the prior
-                             per-msg serial GET that dominated wall-time
-                             (~2.7s/msg × 207 msgs ≈ 9.5 min observed).
+                        With fix #5 (Option C hybrid) the page query
+                        runs with $expand=hostedContents on the fast path,
+                        so for ~95% of inline-image msgs the array is
+                        already inline and we just download bytes. The
+                        per-msg fetch path below is the SLOW fallback
+                        used only for messages whose page hit the 400/500
+                        $expand-strip retry (poisoned page). Detection:
+                          1. `m["hostedContents"]` populated — fast path,
+                             use it directly. No extra Graph call.
+                          2. body HTML references "/hostedContents/" but
+                             `m["hostedContents"]` is empty (rescued page
+                             after $expand strip) — pre-fetch hostedContents
+                             lists for ALL such msgs in this page via
+                             /v1.0/$batch bundles of 20 (graph_client.
+                             batch handles chunking), then process each
+                             message's downloads concurrently below.
                         Plain text-only messages (~95%) skip both paths."""
                         nonlocal _hc_items_total, _hc_bytes_total
 
@@ -5864,33 +5869,29 @@ class BackupWorker:
                                     )
                                 return cid, [], saved_cursor
                         url = f"{graph_client.GRAPH_URL}/chats/{cid}/messages"
-                        # NOTE on hostedContents (fix #2 — chat partial-drain root cause):
-                        # We previously used $expand=hostedContents on the page
-                        # query so each message arrived with its inline-image
-                        # IDs inlined. The cost was hidden but severe — a single
-                        # malformed/orphaned hostedContent on any message in a
-                        # page returned a 400/500 for the WHOLE PAGE. Graph
-                        # surfaces this as a normal HTTP error, our retry block
-                        # consumed its budget on the same poisoned page, and
-                        # the drain bailed mid-chat ("kept N"). That's the
-                        # documented mechanism behind the 29k → 8k variance.
+                        # hostedContents strategy (fix #5 — Option C, hybrid):
+                        # Pre-fix-#2 we always used $expand=hostedContents and
+                        # a single poisoned HC id on any message in the page
+                        # 400/500'd the WHOLE page → 29k → 8k variance.
+                        # Fix #2 removed $expand entirely; that fixed the
+                        # variance but added 2 Graph round-trips per inline-
+                        # image message in the post-drain barrier (observed:
+                        # 7-9 min HC-interleave wall on chat-heavy users).
                         #
-                        # New shape:
-                        #   * Page query: plain `/chats/{id}/messages?$top=50`
-                        #     — no $expand. Pages are independent of inline-
-                        #     image metadata health, so one bad message can no
-                        #     longer poison a whole page.
-                        #   * Per-message hostedContents fetch is deferred to
-                        #     the post-drain interleave path
-                        #     (_kick_hosted_for_chat → fetches
-                        #     /chats/{cid}/messages/{mid}/hostedContents only
-                        #     when the message body actually references one).
-                        #     Detection is via substring "hostedContents" in
-                        #     the HTML body — only ~5% of messages have any,
-                        #     so this is far cheaper than the surface-level
-                        #     "extra round-trip per msg" makes it sound.
+                        # Fix #5 reinstates $expand=hostedContents on the
+                        # fast path AND adds a one-shot fallback in the
+                        # HTTPStatusError arm of the retry loop below: on
+                        # 400/500 we strip $expand from `last_params` /
+                        # `last_next_url` and retry the same page. The
+                        # retry returns plain messages; the per-msg
+                        # /hostedContents fetch in _kick_hosted_content_
+                        # for_chat picks up the inline-image bytes lazily
+                        # (using the existing HTML-body URL detector).
+                        # Net effect: fast path on healthy pages, identical-
+                        # to-fix-#2 path on poisoned pages, no variance.
                         params: Dict[str, str] = {
                             "$top": "50",
+                            "$expand": "hostedContents",
                         }
                         # If saved_cursor looks like a full URL (legacy
                         # nextLink/deltaLink), use it verbatim so resume
@@ -5939,6 +5940,13 @@ class BackupWorker:
                             os.getenv("CHAT_DRAIN_RETRIES", "4")
                         )
                         chat_backoff_s = 2.0
+                        # One-shot $expand=hostedContents strip on 400/500
+                        # (fix #5). See the comment block above the params
+                        # dict. Flips True the first time we fall back and
+                        # stays True for the rest of this chat's drain so a
+                        # second poisoned page later in the same chat
+                        # doesn't loop us back to the fast path.
+                        _expand_stripped = False
                         # _shard_client computed above (pre-skip) — reused here.
                         while True:
                             try:
@@ -5976,6 +5984,57 @@ class BackupWorker:
                                     he.response.status_code
                                     if he.response is not None else 0
                                 )
+                                # Page-poison fallback (fix #5): when
+                                # $expand=hostedContents was sent and Graph
+                                # returns 400/500 because one HC id on any
+                                # message in this page is malformed, strip
+                                # $expand from `last_params` / `last_next_
+                                # url` and retry the SAME page. Per-msg
+                                # HC fetch in the post-drain interleave
+                                # picks up the inline-image bytes for the
+                                # rescued pages. One-shot per chat — sets
+                                # _expand_stripped True so we don't loop.
+                                # Doesn't decrement chat_retries_left
+                                # because this is a structural retry, not
+                                # a transient one.
+                                if (
+                                    status in (400, 500)
+                                    and not _expand_stripped
+                                    and last_next_url
+                                ):
+                                    _expand_stripped = True
+                                    if last_params and "$expand" in last_params:
+                                        last_params = {
+                                            k: v for k, v in last_params.items()
+                                            if k != "$expand"
+                                        }
+                                    if last_next_url and "$expand" in last_next_url:
+                                        from urllib.parse import (
+                                            urlparse as _up,
+                                            parse_qsl as _pqsl,
+                                            urlencode as _ue,
+                                            urlunparse as _uup,
+                                        )
+                                        _p = _up(last_next_url)
+                                        _q = [
+                                            (k, v) for k, v in _pqsl(
+                                                _p.query, keep_blank_values=True,
+                                            )
+                                            if k != "$expand"
+                                        ]
+                                        last_next_url = _uup(
+                                            _p._replace(query=_ue(_q, safe="$"))
+                                        )
+                                    print(
+                                        f"[{self.worker_id}] [USER_CHATS] "
+                                        f"chat {cid[:8]} {status} on page "
+                                        f"with $expand=hostedContents "
+                                        f"(kept {len(msgs_local)} so far); "
+                                        f"stripping $expand and retrying — "
+                                        f"inline images will be fetched "
+                                        f"per-msg in post-drain interleave"
+                                    )
+                                    continue
                                 if (
                                     status in (502, 503, 504)
                                     and chat_retries_left > 0
