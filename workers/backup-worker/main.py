@@ -17680,32 +17680,17 @@ class BackupWorker:
         plan_list = plans.get("value", [])
         print(f"[{self.worker_id}]   [PLANNER] {len(plan_list)} plans found")
 
-        for plan in plan_list:
-            plan_id = plan.get("id", str(uuid.uuid4()))
-            content_bytes = json.dumps(plan).encode()
-            content_hash = hashlib.sha256(content_bytes).hexdigest()
-            blob_path = azure_storage_manager.build_blob_path(
-                str(tenant.id), str(resource.id), str(snapshot.id), f"plan_{plan_id}"
-            )
-            r = await upload_blob_with_retry(container, blob_path, content_bytes, shard)
-            if r.get("success"):
-                db_items.append(SnapshotItem(
-                    snapshot_id=snapshot.id, tenant_id=tenant.id,
-                    external_id=plan_id, item_type="PLANNER_PLAN",
-                    name=plan.get("title", plan_id),
-                    content_hash=content_hash, content_size=len(content_bytes),
-                    blob_path=blob_path, extra_data={"raw": plan}, content_checksum=content_hash,
-                ))
-                bytes_added += len(content_bytes)
+        # PERF #10: parallelize plans (sem 4) and within each plan tasks (sem 8).
+        # Per-task details fetch + upload also parallel inside the task gather.
+        _plan_sem = asyncio.Semaphore(4)
+        _task_sem = asyncio.Semaphore(8)
+        _t0_planner = time.time()
 
-            try:
-                tasks = await graph_client.get_planner_tasks(plan_id=plan_id)
-            except Exception as e:
-                files_failed += 1
-                print(f"[{self.worker_id}]   [PLANNER] Tasks list failed for plan {plan_id}: {e}")
-                continue
-
-            for task in tasks.get("value", []):
+        async def _process_task(plan_id: str, task: Dict):
+            async with _task_sem:
+                _items: List[SnapshotItem] = []
+                _bytes = 0
+                _failed = 0
                 task_id = task.get("id", str(uuid.uuid4()))
                 tb = json.dumps(task).encode()
                 th = hashlib.sha256(tb).hexdigest()
@@ -17714,7 +17699,7 @@ class BackupWorker:
                 )
                 tr = await upload_blob_with_retry(container, tp, tb, shard)
                 if tr.get("success"):
-                    db_items.append(SnapshotItem(
+                    _items.append(SnapshotItem(
                         snapshot_id=snapshot.id, tenant_id=tenant.id,
                         external_id=task_id, item_type="PLANNER_TASK",
                         name=task.get("title", task_id),
@@ -17722,15 +17707,14 @@ class BackupWorker:
                         blob_path=tp, extra_data={"raw": task, "planId": plan_id},
                         content_checksum=th,
                     ))
-                    bytes_added += len(tb)
+                    _bytes += len(tb)
 
-                # Fetch task details (description, checklist, references) — separate endpoint
                 try:
                     details = await graph_client.get_planner_task_details(task_id)
                 except Exception as e:
-                    files_failed += 1
+                    _failed += 1
                     print(f"[{self.worker_id}]   [PLANNER] Task details failed for {task_id}: {e}")
-                    continue
+                    return _items, _bytes, _failed
 
                 if details:
                     db = json.dumps(details).encode()
@@ -17740,7 +17724,7 @@ class BackupWorker:
                     )
                     dr = await upload_blob_with_retry(container, dp, db, shard)
                     if dr.get("success"):
-                        db_items.append(SnapshotItem(
+                        _items.append(SnapshotItem(
                             snapshot_id=snapshot.id, tenant_id=tenant.id,
                             external_id=f"{task_id}:details", item_type="PLANNER_TASK_DETAILS",
                             name=(task.get("title") or task_id) + " (details)",
@@ -17748,7 +17732,69 @@ class BackupWorker:
                             blob_path=dp, extra_data={"taskId": task_id, "planId": plan_id},
                             content_checksum=dh,
                         ))
-                        bytes_added += len(db)
+                        _bytes += len(db)
+                return _items, _bytes, _failed
+
+        async def _process_plan(plan: Dict):
+            async with _plan_sem:
+                _items: List[SnapshotItem] = []
+                _bytes = 0
+                _failed = 0
+                plan_id = plan.get("id", str(uuid.uuid4()))
+                content_bytes = json.dumps(plan).encode()
+                content_hash = hashlib.sha256(content_bytes).hexdigest()
+                blob_path = azure_storage_manager.build_blob_path(
+                    str(tenant.id), str(resource.id), str(snapshot.id), f"plan_{plan_id}"
+                )
+                r = await upload_blob_with_retry(container, blob_path, content_bytes, shard)
+                if r.get("success"):
+                    _items.append(SnapshotItem(
+                        snapshot_id=snapshot.id, tenant_id=tenant.id,
+                        external_id=plan_id, item_type="PLANNER_PLAN",
+                        name=plan.get("title", plan_id),
+                        content_hash=content_hash, content_size=len(content_bytes),
+                        blob_path=blob_path, extra_data={"raw": plan}, content_checksum=content_hash,
+                    ))
+                    _bytes += len(content_bytes)
+
+                try:
+                    tasks = await graph_client.get_planner_tasks(plan_id=plan_id)
+                except Exception as e:
+                    _failed += 1
+                    print(f"[{self.worker_id}]   [PLANNER] Tasks list failed for plan {plan_id}: {e}")
+                    return _items, _bytes, _failed
+
+                _task_list = tasks.get("value", []) or []
+                if _task_list:
+                    _task_results = await asyncio.gather(
+                        *[_process_task(plan_id, t) for t in _task_list],
+                        return_exceptions=True,
+                    )
+                    for _tr in _task_results:
+                        if isinstance(_tr, tuple):
+                            _items.extend(_tr[0])
+                            _bytes += _tr[1]
+                            _failed += _tr[2]
+                        else:
+                            _failed += 1
+                            print(f"[{self.worker_id}]   [PLANNER] Task task error: {_tr}")
+                return _items, _bytes, _failed
+
+        if plan_list:
+            _plan_results = await asyncio.gather(
+                *[_process_plan(p) for p in plan_list],
+                return_exceptions=True,
+            )
+            for _pr in _plan_results:
+                if isinstance(_pr, tuple):
+                    db_items.extend(_pr[0])
+                    bytes_added += _pr[1]
+                    files_failed += _pr[2]
+                else:
+                    files_failed += 1
+                    print(f"[{self.worker_id}]   [PLANNER] Plan task error: {_pr}")
+            if len(plan_list) >= 2:
+                print(f"[PERF][PLANNER] processed {len(plan_list)} plans in {time.time()-_t0_planner:.2f}s")
 
         if db_items:
             async with async_session_factory() as session:
