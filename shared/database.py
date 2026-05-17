@@ -51,6 +51,10 @@ REQUIRED_TABLES = (
     "chat_url_cache",
     "chat_threads",
     "chat_thread_messages",
+    # OneDrive per-file retry queue (2026-05-17). Producer + consumer
+    # both expect the table to exist before issuing their INSERT /
+    # SELECT FOR UPDATE SKIP LOCKED.
+    "onedrive_file_retries",
 )
 
 REQUIRED_COLUMNS = {
@@ -1005,6 +1009,36 @@ async def init_db() -> None:
             created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """,
+        # onedrive_file_retries — per-file retry queue for OneDrive
+        # downloads that exhaust their inline resume budget. The main
+        # gather no longer blocks on slow/throttled files; instead it
+        # INSERTs a row here and lets the snapshot complete. A separate
+        # consumer drains this table, retrying each file individually
+        # with exponential backoff (next_retry_at gates pickup). On
+        # success the file is upserted into snapshot_items pointing at
+        # the original snapshot; on exhaustion it's marked
+        # FAILED_PERMANENT for the audit trail.
+        """
+        CREATE TABLE IF NOT EXISTS onedrive_file_retries (
+            id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id                UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            resource_id              UUID NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+            snapshot_id              UUID NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+            file_external_id         VARCHAR(256) NOT NULL,
+            file_name                TEXT,
+            drive_id                 TEXT,
+            file_payload             JSONB NOT NULL,
+            attempt_count            INTEGER NOT NULL DEFAULT 0,
+            last_error               TEXT,
+            last_error_class         VARCHAR(32),
+            next_retry_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            status                   VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+            rescued_snapshot_item_id UUID,
+            created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (snapshot_id, file_external_id)
+        )
+        """,
     ]
 
     index_statements = [
@@ -1088,6 +1122,17 @@ async def init_db() -> None:
         # Hot read path: hydrate a chat thread newest-first.
         "CREATE INDEX IF NOT EXISTS ix_chat_thread_messages_thread_time "
         "ON chat_thread_messages (chat_thread_id, created_date_time DESC)",
+        # OneDrive file-retry queue — consumer scans for PENDING rows
+        # whose next_retry_at has elapsed; partial index keeps the
+        # scan O(eligible) instead of O(table). Filtering on status
+        # in (PENDING, IN_PROGRESS) keeps the IN_PROGRESS reaper fast
+        # too (rescued/permanent terminal rows are not scanned).
+        "CREATE INDEX IF NOT EXISTS ix_onedrive_file_retries_ready "
+        "ON onedrive_file_retries (next_retry_at) "
+        "WHERE status IN ('PENDING', 'IN_PROGRESS')",
+        # Per-snapshot lookup for the finalizer's pending-retry count.
+        "CREATE INDEX IF NOT EXISTS ix_onedrive_file_retries_snapshot "
+        "ON onedrive_file_retries (snapshot_id, status)",
         # snapshot_partitions — finalizer + stale-sweep hot paths.
         # Finalizer: SELECT WHERE snapshot_id=... AND status=...
         # Sweep: oldest enqueued non-terminal first.

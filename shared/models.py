@@ -1274,3 +1274,35 @@ class ChatThreadMessage(Base):
     content_size = Column(BigInteger, nullable=True)
     archived_at = Column(DateTime(timezone=True), nullable=True)  # P2 soft delete
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+# OneDrive per-file retry queue (2026-05-17).
+# A file that exhausts its inline resume budget no longer blocks
+# snapshot completion. The main gather records a row here; a separate
+# consumer drains it at its own pace. On success the rescued bytes
+# are upserted into snapshot_items pointing at the ORIGINAL snapshot
+# (UPSERT on (snapshot_id, external_id, item_type) is idempotent —
+# the snapshot's rollup query re-derives counters from the table).
+class OneDriveFileRetry(Base):
+    __tablename__ = "onedrive_file_retries"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    resource_id = Column(UUID(as_uuid=True), ForeignKey("resources.id", ondelete="CASCADE"), nullable=False, index=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False, index=True)
+    file_external_id = Column(String(256), nullable=False)
+    file_name = Column(Text, nullable=True)
+    drive_id = Column(Text, nullable=True)
+    # The full Graph file dict — same shape backup_single_file expects.
+    file_payload = Column(JSONB, nullable=False)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    # "throttle" | "stream_drop" | "permanent" | "unknown"
+    last_error_class = Column(String(32), nullable=True)
+    next_retry_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    # PENDING | IN_PROGRESS | RESCUED | FAILED_PERMANENT
+    status = Column(String(16), nullable=False, default="PENDING")
+    rescued_snapshot_item_id = Column(UUID(as_uuid=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+    # UNIQUE(snapshot_id, file_external_id) enforced via the table
+    # DDL in shared/database.py; mirrored here is not necessary.
