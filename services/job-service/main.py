@@ -944,17 +944,24 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
         # the row immediately. extra_data.cancelled_at is the durable
         # marker the reaper keys on; extra_data.cancelled_by_job_id
         # gives operators a clean trail back to the cancel event.
+        #
+        # Cast through ::jsonb so the `||` concat operator works even
+        # though the column is plain JSON in the model
+        # (shared/models.py:216). The trailing ::json coerces the
+        # jsonb result back to the column type so UPDATE doesn't trip
+        # an implicit-cast warning. Same idea is used by the reaper
+        # SQL in backup-scheduler.
         await db.execute(
             text(
                 "UPDATE snapshots SET "
                 "  status = 'FAILED'::snapshotstatus, "
                 "  completed_at = NOW(), "
                 "  duration_secs = EXTRACT(EPOCH FROM (NOW() - started_at))::int, "
-                "  extra_data = COALESCE(extra_data, '{}'::jsonb) "
+                "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
                 "               || jsonb_build_object( "
                 "                   'cancelled_at', NOW(), "
                 "                   'cancelled_by_job_id', :jid::text, "
-                "                   'cancel_phase', 'flip_pending_sweep') "
+                "                   'cancel_phase', 'flip_pending_sweep'))::json "
                 " WHERE job_id = :jid AND status = 'IN_PROGRESS'"
             ),
             {"jid": str(job.id)},

@@ -1024,19 +1024,26 @@ async def startup():
                 # Find candidates first — keep the destructive work
                 # OUT of a long transaction so one slow blob delete
                 # doesn't block the next batch.
+                # NOTE: snapshots.extra_data is plain JSON (not JSONB) per the
+                # model definition (shared/models.py:216). The `?` key-exists
+                # operator is JSONB-only — using it on a JSON column raises
+                # ``operator does not exist: json ? unknown``. We use
+                # ``(extra_data::jsonb ->> 'cancelled_at') IS NOT NULL``
+                # instead which works regardless of the underlying type
+                # (the cast is a no-op when the column is already jsonb).
                 candidates = (await session.execute(text("""
                     SELECT s.id AS sid, s.resource_id, s.started_at,
                            s.extra_data,
                            r.type::text   AS resource_type,
                            r.tenant_id::text AS tenant_id,
                            j.status::text   AS job_status,
-                           (s.extra_data->>'cancelled_at') AS cancelled_at
+                           (s.extra_data::jsonb ->> 'cancelled_at') AS cancelled_at
                       FROM snapshots s
                       LEFT JOIN resources r ON r.id = s.resource_id
                       LEFT JOIN jobs j      ON j.id = s.job_id
                      WHERE (
                             -- Population A + C: explicit cancellation marker.
-                            (s.extra_data ? 'cancelled_at')
+                            (s.extra_data::jsonb ->> 'cancelled_at') IS NOT NULL
                           ) OR (
                             -- Population B: late-arrival orphans.
                             s.status = 'IN_PROGRESS'
@@ -1114,7 +1121,7 @@ async def startup():
                                 " USING jobs j "
                                 " WHERE s.id = :sid "
                                 "   AND s.job_id = j.id "
-                                "   AND ( (s.extra_data ? 'cancelled_at') "
+                                "   AND ( (s.extra_data::jsonb ->> 'cancelled_at') IS NOT NULL "
                                 "         OR (s.status = 'FAILED' "
                                 "             AND j.status IN ('CANCELLED','FAILED')) "
                                 "         OR (s.status = 'IN_PROGRESS' "
