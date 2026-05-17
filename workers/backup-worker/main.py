@@ -1815,17 +1815,17 @@ class BackupWorker:
         """Start consuming from all backup queues"""
         await self.initialize()
 
-        # Override the channel-wide prefetch (set to 50 by message_bus). With
-        # 50, a single worker grabs all queued messages and the other replicas
-        # sit idle while it processes them serially. Setting prefetch=2 gives
-        # each replica one in-flight + one ready, so 3 replicas cover ~6 jobs
-        # at once and fair distribution is enforced by the broker.
-        if message_bus.channel:
-            try:
-                await message_bus.channel.set_qos(prefetch_count=2)
-                print(f"[{self.worker_id}] Set channel prefetch_count=2 for fair work distribution")
-            except Exception as exc:
-                print(f"[{self.worker_id}] Could not adjust prefetch_count: {exc}")
+        # NOTE: prefetch is now applied per-queue inside consume_queue() by
+        # opening a dedicated channel per queue and calling set_qos on it.
+        # The previous global override here (set_qos(prefetch_count=2) on
+        # the shared publishing channel) silently capped every queue at
+        # prefetch=2 because aio_pika's default global_=False makes set_qos
+        # apply per-consumer-on-the-channel — and we had one consumer per
+        # queue on one shared channel, so each queue got 2. Cluster-wide
+        # this paced parent-job throughput at (replicas × 2) regardless of
+        # the per-queue values listed below. Per-queue channels let
+        # urgent/high/normal/low/heavy/partition lanes each carry their
+        # intended prefetch independently. See consume_queue() below.
 
         # Per-queue prefetch.
         # Urgent = manually triggered backups (Teams chats, mailboxes). Each
@@ -1969,11 +1969,29 @@ class BackupWorker:
                 await asyncio.sleep(1)
 
     async def consume_queue(self, queue_name: str, prefetch_count: int):
-        if not message_bus.channel:
+        if not message_bus.connection or message_bus.connection.is_closed:
             return
 
-        queue = await message_bus.channel.get_queue(queue_name)
-        print(f"[{self.worker_id}] Listening on {queue_name}...")
+        # Per-queue channel so set_qos(prefetch_count=N) actually scopes to
+        # this consumer only. A shared channel forces every consumer to the
+        # last set_qos call (because aio_pika defaults global_=False — "per
+        # consumer on this channel"), which made the per-queue prefetch
+        # values dead code. With one channel per queue:
+        #   urgent      → prefetch=1   (fairness, slow user-initiated jobs)
+        #   high        → prefetch=5
+        #   dedicated   → prefetch=20  (was effectively 2 before this fix)
+        #   low         → prefetch=50
+        #   *_partition → prefetch=2/4 per partition lane comments above
+        # That lifts the per-replica in-flight cap on the dedicated lane
+        # from 2 → 20 (10× headroom), unblocking parent-job parallelism on
+        # both light and heavy pools.
+        channel = await message_bus.connection.channel()
+        await channel.set_qos(prefetch_count=prefetch_count)
+        queue = await channel.get_queue(queue_name)
+        print(
+            f"[{self.worker_id}] Listening on {queue_name} "
+            f"(prefetch={prefetch_count})..."
+        )
 
         # Graph-rate-limit priority is derived from the queue: a single
         # backup-worker handles backup.urgent (HIGH) + backup.normal
@@ -1984,40 +2002,50 @@ class BackupWorker:
         from shared.graph_priority import priority_for_queue
         queue_priority = priority_for_queue(queue_name)
 
-        async with queue.iterator() as queue_iter:
-            async for message in queue_iter:
-                try:
-                    body = json.loads(message.body.decode())
-                    with graph_priority(queue_priority):
-                        await self.process_backup_message(body)
-                    await message.ack()
-                except PoisonMessageError as e:
-                    # Structurally invalid envelope — never retryable.
-                    # Skip the delivery-count gate and route straight
-                    # to DLQ so one bad payload can't pin a consumer.
-                    print(
-                        f"[{self.worker_id}] poison message ({e}) — "
-                        f"routing to DLQ without retry"
-                    )
+        try:
+            async with queue.iterator() as queue_iter:
+                async for message in queue_iter:
                     try:
-                        await message.reject(requeue=False)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    print(f"[{self.worker_id}] Error: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    try:
-                        # Check delivery count to prevent infinite requeue
-                        headers = message.headers or {}
-                        delivery_count = headers.get("x-delivery-count", 0)
-                        if delivery_count < settings.MAX_RETRIES:
-                            await message.reject(requeue=True)
-                        else:
-                            print(f"[{self.worker_id}] Message exceeded max retries ({settings.MAX_RETRIES}), routing to DLQ")
+                        body = json.loads(message.body.decode())
+                        with graph_priority(queue_priority):
+                            await self.process_backup_message(body)
+                        await message.ack()
+                    except PoisonMessageError as e:
+                        # Structurally invalid envelope — never retryable.
+                        # Skip the delivery-count gate and route straight
+                        # to DLQ so one bad payload can't pin a consumer.
+                        print(
+                            f"[{self.worker_id}] poison message ({e}) — "
+                            f"routing to DLQ without retry"
+                        )
+                        try:
                             await message.reject(requeue=False)
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"[{self.worker_id}] Error: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        try:
+                            # Check delivery count to prevent infinite requeue
+                            headers = message.headers or {}
+                            delivery_count = headers.get("x-delivery-count", 0)
+                            if delivery_count < settings.MAX_RETRIES:
+                                await message.reject(requeue=True)
+                            else:
+                                print(f"[{self.worker_id}] Message exceeded max retries ({settings.MAX_RETRIES}), routing to DLQ")
+                                await message.reject(requeue=False)
+                        except Exception:
+                            pass
+        finally:
+            # Close the per-queue channel on supervisor restart so we
+            # don't leak channels each time the iterator exits. Connection
+            # stays open (shared by message_bus for publishes).
+            try:
+                if not channel.is_closed:
+                    await channel.close()
+            except Exception:
+                pass
 
     async def _emit_backup_audit(
         self,
@@ -4443,7 +4471,16 @@ class BackupWorker:
                             f"{graph_client.GRAPH_URL}/users/{user_id}/chats",
                             params={
                                 "$top": "200",
-                                "$select": "id,topic,chatType,lastUpdatedDateTime",
+                                # tenantId included so we can pre-filter
+                                # cross-tenant meeting chats (19:meeting_…
+                                # @thread.v2 invitations from other tenants)
+                                # before calling /messages — Graph returns
+                                # 403 AclCheckFailed on those with no path
+                                # to read; our app's app-only Chat.Read.All
+                                # doesn't cross tenant boundaries. Without
+                                # the pre-filter each external chat burns
+                                # ~5 retry attempts in _iter_pages.
+                                "$select": "id,topic,chatType,lastUpdatedDateTime,tenantId",
                                 "$expand": "members",
                             },
                         )
@@ -4465,7 +4502,7 @@ class BackupWorker:
                                     "$top": "200",
                                     "$select": (
                                         "id,topic,chatType,"
-                                        "lastUpdatedDateTime"
+                                        "lastUpdatedDateTime,tenantId"
                                     ),
                                 },
                             )
@@ -4473,6 +4510,38 @@ class BackupWorker:
                         except Exception as e:
                             print(f"[{self.worker_id}] [USER_CHATS] chats list failed for {user_id}: {e}")
                             chats_raw = []
+
+                    # ─── Cross-tenant filter ────────────────────────────
+                    # Drop chats whose tenantId differs from ours. These
+                    # are meeting invitations (19:meeting_…@thread.v2) or
+                    # external 1:1s/groups where the chat resource lives
+                    # in another tenant. Graph returns the chat in our
+                    # user's list (because they're a member) but our app-
+                    # only token can't read /chats/{id}/messages — every
+                    # attempt is a deterministic 403 AclCheckFailed.
+                    # Pre-filtering here avoids ~5 wasted Graph calls per
+                    # external chat per backup run (observed: 20+ such
+                    # chats per run pre-fix).
+                    _our_tenant_id = getattr(tenant, "external_tenant_id", None)
+                    if _our_tenant_id:
+                        _our_tenant_id_norm = str(_our_tenant_id).lower().strip()
+                        _kept: List[Dict[str, Any]] = []
+                        _dropped_external: List[str] = []
+                        for _c in chats_raw:
+                            _c_tid = _c.get("tenantId")
+                            if _c_tid and str(_c_tid).lower().strip() != _our_tenant_id_norm:
+                                _dropped_external.append(_c.get("id") or "?")
+                                continue
+                            _kept.append(_c)
+                        if _dropped_external:
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] dropped "
+                                f"{len(_dropped_external)} cross-tenant chat(s) "
+                                f"for {user_id} (e.g. "
+                                f"{_dropped_external[0][:32]}); /messages "
+                                f"would 403 with Tenant Id mismatch."
+                            )
+                        chats_raw = _kept
 
                     # ─── Incremental skip-by-activity (Layer A) ────────────
                     # Skip member-batch + display-name rebuild for chats
@@ -7839,6 +7908,24 @@ class BackupWorker:
             att_dedup = _ChatAttDedup()
         url_cache = att_dedup.url_cache
         url_tasks = att_dedup.url_tasks
+        # Bulk-pre-resolved driveItems keyed by source URL. Populated
+        # below — just before the per-message gather — by a single
+        # /v1.0/$batch fan-out resolving up to 20 share-URLs per HTTP
+        # call (vs the prior path of one Graph round-trip per URL,
+        # rate-limit-queued behind every other Graph call the worker
+        # is running). `_go` checks this map BEFORE the resolve_sem
+        # path so when the pre-resolver has the driveItem we skip the
+        # per-URL Graph call entirely.
+        #
+        # Sentinel semantics:
+        #   missing key    — not pre-resolved (e.g. arrived after the
+        #                    batch fired); fall through to single-URL
+        #                    resolve_share_to_drive_item
+        #   value == None  — pre-resolved and confirmed unreachable
+        #                    (permanent 4xx); treat as known-broken
+        #                    without re-hitting Graph
+        #   value == dict  — driveItem ready to download
+        pre_resolved_di: Dict[str, Optional[Dict[str, Any]]] = {}
 
         # driveItem.id-keyed download dedup. A forwarded SharePoint /
         # OneDrive file generates a NEW sharing URL each time it's
@@ -8092,17 +8179,43 @@ class BackupWorker:
                             tenant_cache_stats["hits"] += 1
                         return cached
 
-                    # Layer 3: live Graph resolve.
-                    try:
-                        async with resolve_sem:
-                            drive_item = await graph_client.resolve_share_to_drive_item(u)
-                    except Exception as e:
-                        print(
-                            f"[{self.worker_id}] [CHAT-ATT] "
-                            f"resolve fail {ctx}: "
-                            f"{type(e).__name__}: {e}"
-                        )
-                        return _CachedAttachmentResult()
+                    # Layer 2.5: bulk-pre-resolved driveItem map from
+                    # the /$batch fan-out fired at the top of this
+                    # phase. When present, this path skips both the
+                    # resolve_sem and the Graph round-trip — the
+                    # batch already paid that cost amortized 20:1.
+                    # Sentinel handling matches the existing tenant
+                    # cache: None == known-broken, dict == ready.
+                    if u in pre_resolved_di:
+                        _pre = pre_resolved_di[u]
+                        if _pre is None:
+                            # Same contract as Layer 3's permanent-4xx
+                            # path below: stamp the tenant cache so
+                            # future runs skip without a fresh batch.
+                            await _write_tenant_url_cache(
+                                u_sha, drive_item_id=None,
+                                content_hash=None, blob_path=None,
+                                content_size=0, inline_b64=None,
+                                unreachable=True,
+                            )
+                            return _CachedAttachmentResult(unreachable=True)
+                        drive_item = _pre
+                    else:
+                        # Layer 3: live Graph resolve (fallback path
+                        # for URLs that arrived after the bulk batch
+                        # — partition shards, late-fan-out messages,
+                        # or the rare batch transient that didn't
+                        # surface this URL).
+                        try:
+                            async with resolve_sem:
+                                drive_item = await graph_client.resolve_share_to_drive_item(u)
+                        except Exception as e:
+                            print(
+                                f"[{self.worker_id}] [CHAT-ATT] "
+                                f"resolve fail {ctx}: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            return _CachedAttachmentResult()
                     if drive_item is None:
                         # Permanent: resolve_share_to_drive_item only
                         # returns None for "known-broken" (403/404/410).
@@ -8381,6 +8494,68 @@ class BackupWorker:
                         f"{type(r).__name__}: {r}"
                     )
             return local_items, local_bytes
+
+        # ── Bulk pre-resolve attachment share-URLs via /$batch ────
+        # Mirrors the OneDrive ``url pre-fetch`` pattern: instead of
+        # paying one Graph round-trip per attachment in the per-msg
+        # gather below, fire a single /v1.0/$batch wave (chunked
+        # 20-per-call by graph_batch) that resolves up to N share-URLs
+        # → driveItems in parallel.
+        #
+        # Why this beats raising resolve_sem: the bottleneck wasn't
+        # local concurrency (sem was already 16 deep), it was the
+        # per-app Graph rate-limit budget — every resolve queued
+        # against the multi-app pool. $batch amortizes 20 resolves
+        # into one HTTP call against that budget, so a 37-URL
+        # resolve drops from ~35s wall to ~3-5s.
+        #
+        # Skipped URLs:
+        #   * already in url_cache (snapshot-wide hit)
+        #   * already in driveitem_tasks (in-flight from another chat)
+        #   * blank / non-reference attachments
+        # Any URL absent from the bulk-resolved map after the batch
+        # falls through to the Layer-3 single-URL path inside ``_go``.
+        try:
+            _bulk_urls: List[str] = []
+            _seen: set = set()
+            for _m in messages_with_attachments:
+                for _a in (_m.get("attachments") or []):
+                    if not isinstance(_a, dict):
+                        continue
+                    _ct = (_a.get("contentType") or "").strip()
+                    if _ct not in REFERENCE_TYPES and not (
+                        _ct and _ct not in POINTER_TYPES
+                        and not _ct.startswith("application/vnd.microsoft.card")
+                    ):
+                        continue
+                    _u = _a.get("contentUrl")
+                    if not _u or _u in _seen or _u in url_cache:
+                        continue
+                    _seen.add(_u)
+                    _bulk_urls.append(_u)
+            if _bulk_urls:
+                _t0 = time.monotonic()
+                pre_resolved_di = await graph_client.resolve_shares_batch(
+                    _bulk_urls,
+                )
+                _hits = sum(1 for v in pre_resolved_di.values() if isinstance(v, dict))
+                _misses = sum(1 for v in pre_resolved_di.values() if v is None)
+                _absent = len(_bulk_urls) - len(pre_resolved_di)
+                print(
+                    f"[{self.worker_id}] [CHAT-ATT] bulk pre-resolved "
+                    f"{_hits}/{len(_bulk_urls)} share-URLs via $batch "
+                    f"({_misses} unreachable, {_absent} deferred to "
+                    f"single-URL) in {time.monotonic() - _t0:.1f}s"
+                )
+        except Exception as _bulk_exc:
+            # Fall back to the single-URL path for everything — same
+            # behaviour as before this fix.
+            print(
+                f"[{self.worker_id}] [CHAT-ATT] bulk pre-resolve "
+                f"failed (falling back to single-URL): "
+                f"{type(_bulk_exc).__name__}: {_bulk_exc}"
+            )
+            pre_resolved_di = {}
 
         results = await asyncio.gather(
             *[_one_message(m) for m in messages_with_attachments],
@@ -11811,11 +11986,21 @@ class BackupWorker:
             # behind every chat message). Firing batches concurrently
             # under a bounded semaphore lets pre-fetch claim its fair
             # share of the Graph budget and finish in ~30-60s even with
-            # chats running. Cap is env-tunable; default sized for the
-            # per-app 10 RPS ceiling (6 concurrent batches × ~1s wire
-            # = headroom for other resources).
+            # chats running.
+            #
+            # Default raised from 6 to 16: the original 6 assumed a
+            # single Graph app's 10 RPS ceiling. With the multi-app
+            # pool (12 apps observed rotating in prod) the per-tenant
+            # effective ceiling is ~40+ RPS, so 16 concurrent batches
+            # × ~1s wire still leaves headroom for the chats handler
+            # to fan out in parallel. Field measurement showed fast
+            # tenants saturating at 22 URL/s with concurrency=14;
+            # bumping to 16 captures that headroom for the median
+            # tenant. Throttled tenants are bounded by Graph budget
+            # not local concurrency — they'll see no harm. Operators
+            # can still tune via ONEDRIVE_PREFETCH_CONCURRENCY.
             prefetch_concurrency = int(os.getenv(
-                "ONEDRIVE_PREFETCH_CONCURRENCY", "6"
+                "ONEDRIVE_PREFETCH_CONCURRENCY", "16"
             ))
             sem = asyncio.Semaphore(prefetch_concurrency)
             _prefetch_t0 = time.monotonic()
@@ -13371,7 +13556,20 @@ class BackupWorker:
                             # immediately and the file was lost.
                             if resp.status_code in (429, 503):
                                 body = await resp.aread()
-                                retry_secs = 10.0
+                                # Default backoff: exponential per resume
+                                # attempt (2s, 4s, 8s, 16s — cap 30s).
+                                # Replaces the prior fixed 10s default,
+                                # which made transient single-file SP
+                                # glitches gate the whole snapshot on
+                                # ~40s of sleep per slow file even when
+                                # SP would have served on retry-1 at 2s.
+                                # The header-supplied Retry-After /
+                                # retryAfterSeconds path overrides this
+                                # — SharePoint speaking authoritatively
+                                # about its own backoff wins, our
+                                # heuristic only fills the gap when SP
+                                # returns 429/503 with no advisory.
+                                retry_secs = float(min(30, 2 ** (resume_attempt + 1)))
                                 ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
                                 if ra:
                                     try:

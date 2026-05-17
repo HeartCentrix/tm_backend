@@ -3940,6 +3940,111 @@ class GraphClient:
         except Exception:
             return None
 
+    async def resolve_shares_batch(
+        self, source_urls: List[str],
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Bulk variant of resolve_share_to_drive_item via /v1.0/$batch.
+
+        Mirrors the OneDrive ``get_download_urls_batch`` pattern: bundle
+        up to 20 GET /shares/{u!base64}/driveItem requests per HTTP call
+        instead of issuing N serial round-trips against the per-app
+        rate-limit budget. On the chat-attachment path, a single user
+        with 37 unique attachment URLs was observed taking 35s of pure
+        resolve wall-time; bulked, that becomes ~3-5s (one batch wave
+        of two chunks).
+
+        Returns a map ``{source_url: driveItem|None}``.
+          * ``dict``  — driveItem resolved (caller should download bytes)
+          * ``None``  — permanent 4xx (400/401/403/404/410/423) OR the
+                       URL was already in the unreachable cache; caller
+                       should treat as a known-broken reference.
+
+        URLs absent from the returned map indicate a transient batch
+        failure (network, 5xx after retries). Callers should fall back
+        to the single-URL ``resolve_share_to_drive_item`` path for
+        anything missing — that path's own retry budget will absorb
+        the transient, and per-URL failures don't leak into the bulk
+        unreachable cache (only true permanent 4xx do).
+        """
+        from shared.graph_batch import BatchRequest
+        import base64 as _b64
+        out: Dict[str, Optional[Dict[str, Any]]] = {}
+        if not source_urls:
+            return out
+
+        # Pre-filter URLs already known-broken — those are deterministic
+        # Nones and don't deserve a batch slot.
+        url_by_id: Dict[str, str] = {}
+        reqs: List[BatchRequest] = []
+        for u in source_urls:
+            if not u:
+                continue
+            if self._is_url_unreachable(u):
+                out[u] = None
+                continue
+            try:
+                share_id = (
+                    "u!"
+                    + _b64.urlsafe_b64encode(u.encode("utf-8"))
+                    .decode("ascii")
+                    .rstrip("=")
+                )
+            except Exception:
+                out[u] = None
+                continue
+            # Batch sub-request id must be unique within the batch and
+            # short. Hash the URL to keep it bounded — collision chance
+            # at 20-per-batch with sha256[:16] is astronomical.
+            req_id = hashlib.sha256(u.encode("utf-8")).hexdigest()[:16]
+            url_by_id[req_id] = u
+            reqs.append(
+                BatchRequest(
+                    id=req_id,
+                    method="GET",
+                    # $batch sub-request URLs are root-relative (no host).
+                    url=f"/shares/{share_id}/driveItem",
+                )
+            )
+
+        if not reqs:
+            return out
+
+        try:
+            responses = await self.batch(reqs)
+        except Exception as exc:
+            # Whole-batch failure is rare — graph_batch already retries
+            # 429/503 internally with the Retry-After header honored.
+            # If we still bubble out here, surface nothing so callers
+            # fall back to the single-URL path rather than incorrectly
+            # caching every URL as broken.
+            print(
+                f"[GraphClient] resolve_shares_batch failed for "
+                f"{len(reqs)} URLs: {type(exc).__name__}: {exc}"
+            )
+            return out
+
+        for req_id, resp in responses.items():
+            u = url_by_id.get(req_id)
+            if not u:
+                continue
+            status = getattr(resp, "status", 0)
+            body = getattr(resp, "body", None) or {}
+            if status == 200 and isinstance(body, dict) and body.get("id"):
+                out[u] = body
+            elif status in (400, 401, 403, 404, 410, 423):
+                # Same permanent-4xx contract as the single-URL path —
+                # cache the failure so future runs short-circuit.
+                self._mark_url_unreachable(u)
+                out[u] = None
+            else:
+                # 429/503 after graph_batch's own retry budget, network
+                # errors, or unexpected 5xx — leave URL absent so the
+                # caller falls back to the single-URL path with its own
+                # retry policy.
+                continue
+
+        return out
+
     async def download_drive_item_bytes(
         self,
         drive_item: Dict[str, Any],
