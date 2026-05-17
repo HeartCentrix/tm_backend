@@ -3901,9 +3901,14 @@ class GraphClient:
         max_attempts = 5
         backoff_s = 2.0
         last_err: Optional[Exception] = None
+        # PERF (Item A): route streaming HC fetch through the SHARED httpx
+        # client (HTTP/2 + persistent pool). Previously each HC fetch built
+        # a per-request AsyncClient → fresh TCP + TLS handshake on every
+        # inline image. With HTTP/2 on (GRAPHCLIENT_HTTP2=true) multiple
+        # HC streams now multiplex on the same connection.
         for attempt in range(max_attempts):
-            client_cm = httpx.AsyncClient(timeout=300.0, follow_redirects=True)
-            client = await client_cm.__aenter__()
+            client = await self._get_shared_http()
+            client_cm = None  # shared client must NOT be closed per-request
             stream_cm = None
             resp = None
             try:
@@ -3922,7 +3927,8 @@ class GraphClient:
                     except Exception:
                         pass
                     await stream_cm.__aexit__(None, None, None)
-                    await client_cm.__aexit__(None, None, None)
+                    if client_cm is not None:
+                        await client_cm.__aexit__(None, None, None)
                     if attempt < max_attempts - 1:
                         await asyncio.sleep(retry_after)
                         token = await self._get_token()
@@ -3939,7 +3945,8 @@ class GraphClient:
                 # Permanent 4xx — no retry.
                 if stream_cm is not None:
                     await stream_cm.__aexit__(None, None, None)
-                await client_cm.__aexit__(None, None, None)
+                if client_cm is not None:
+                    await client_cm.__aexit__(None, None, None)
                 status = he.response.status_code if he.response is not None else 0
                 if status in (400, 401, 403, 404, 410, 423):
                     raise
@@ -3958,7 +3965,8 @@ class GraphClient:
             ) as e:
                 if stream_cm is not None:
                     await stream_cm.__aexit__(None, None, None)
-                await client_cm.__aexit__(None, None, None)
+                if client_cm is not None:
+                    await client_cm.__aexit__(None, None, None)
                 last_err = e
                 if attempt < max_attempts - 1:
                     await asyncio.sleep(backoff_s)
@@ -3969,7 +3977,8 @@ class GraphClient:
             except BaseException:
                 if stream_cm is not None:
                     await stream_cm.__aexit__(None, None, None)
-                await client_cm.__aexit__(None, None, None)
+                if client_cm is not None:
+                    await client_cm.__aexit__(None, None, None)
                 raise
 
             try:
@@ -3984,7 +3993,8 @@ class GraphClient:
 
             # Capture context managers in the closure so they outlive this
             # function. The caller MUST fully consume / aclose() the
-            # generator to release them.
+            # generator to release them. With the shared client we no
+            # longer own client_cm — only the stream needs tearing down.
             _stream_cm = stream_cm
             _client_cm = client_cm
             _resp = resp
@@ -3995,7 +4005,8 @@ class GraphClient:
                         yield chunk
                 finally:
                     await _stream_cm.__aexit__(None, None, None)
-                    await _client_cm.__aexit__(None, None, None)
+                    if _client_cm is not None:
+                        await _client_cm.__aexit__(None, None, None)
 
             return _iter(), ctype, size
 

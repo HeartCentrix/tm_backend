@@ -197,11 +197,26 @@ class BatchClient:
                 for r in chunk
             ]
         }
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        # PERF (Item A): route /$batch through the SHARED httpx client so
+        # batch POSTs ride the same HTTP/2 connection as the per-sub-request
+        # GETs. The previous per-call httpx.AsyncClient() forced a fresh
+        # TCP+TLS handshake on every batch — adding 80-150ms per batch on
+        # WAN. With HTTP/2 the batch is just one more multiplexed stream.
+        try:
+            client = await self._gc._get_shared_http()
             resp = await client.post(
                 GRAPH_BATCH_URL, json=payload,
                 headers={"Authorization": f"Bearer {token}"},
+                timeout=60.0,
             )
+        except AttributeError:
+            # _gc didn't expose the shared http (unusual — only stubs in
+            # tests). Fall back to a fresh client so the batch still goes.
+            async with httpx.AsyncClient(timeout=60.0) as _fallback:
+                resp = await _fallback.post(
+                    GRAPH_BATCH_URL, json=payload,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
         if resp.status_code != 200:
             # Outer batch itself rejected — e.g., whole app throttled.
             # Treat as 429 on every sub-request so the retry loop handles it.
