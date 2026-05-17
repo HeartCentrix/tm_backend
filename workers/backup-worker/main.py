@@ -1375,7 +1375,7 @@ async def _update_job_pct(job_id, pct: int) -> None:
 import aio_pika
 from aio_pika import IncomingMessage
 import httpx
-from sqlalchemy import select, and_, func, text, desc
+from sqlalchemy import select, and_, or_, func, text, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -20626,6 +20626,20 @@ class BackupWorker:
             Snapshot.status.in_(
                 [SnapshotStatus.COMPLETED, SnapshotStatus.PARTIAL]
             ),
+            # Skip ghost prior snapshots — empty COMPLETED rows from
+            # partition coordinators, aborted handlers, or chat-fanout
+            # outer snapshots that flipped terminal before any work
+            # landed. Picking one of those as the "prior" makes the next
+            # incremental look like a full re-backup because
+            # delta = current - 0 = full inventory. Observed 2026-05-18:
+            # Hemant's chats showed "+4685 items / +80 MB added" on a
+            # no-new-data incremental because the most recent prior
+            # COMPLETED snapshot was an item_count=0 ghost from 38s
+            # earlier. Underlying blobs were idempotently deduped — the
+            # number was a display bug. By requiring the prior to have
+            # actually persisted something, we pick the next-most-recent
+            # snapshot that holds real inventory.
+            or_(Snapshot.item_count > 0, Snapshot.bytes_total > 0),
         ]
         if current_job_id is not None:
             filters.append(Snapshot.job_id != current_job_id)
