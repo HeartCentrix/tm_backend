@@ -6779,6 +6779,19 @@ class BackupWorker:
                         _detached_att_tasks = list(_att_tasks)
                         _snap_id_for_finalize = snapshot.id
                         _worker_id_for_finalize = self.worker_id
+                        # Baseline of the nonlocals at detach time. The
+                        # snapshot finalize block (~line 7513) reads these
+                        # synchronously and writes snap.bytes_total before
+                        # the detached gather completes — so any HC/att
+                        # bytes that land AFTER detach are missing from
+                        # the persisted aggregate. We diff against this
+                        # baseline once the gather finishes and fold the
+                        # delta back in atomically. Pre-fix: Amit Mishra
+                        # 3.4 GB → 2.9 GB regression (2026-05-17).
+                        _hc_bytes_baseline = _hc_bytes_total
+                        _hc_items_baseline = _hc_items_total
+                        _att_bytes_baseline = _att_bytes_total
+                        _att_items_baseline = _att_items_total_count
 
                         async def _hc_drain_finalizer():
                             status = "COMPLETE"
@@ -6811,15 +6824,58 @@ class BackupWorker:
                                     f"[{_worker_id_for_finalize}] [HC_FINALIZER] "
                                     f"snap={_snap_id_for_finalize} crashed: {_e}"
                                 )
+                            # Compute deltas the detached tasks produced
+                            # after the snapshot finalize ran. Closure refs
+                            # _hc_bytes_total / _att_bytes_total are the
+                            # SAME nonlocals the kick tasks mutate, so by
+                            # gather() return they hold the final values.
+                            _hc_bytes_delta = max(
+                                0, _hc_bytes_total - _hc_bytes_baseline,
+                            )
+                            _hc_items_delta = max(
+                                0, _hc_items_total - _hc_items_baseline,
+                            )
+                            _att_bytes_delta = max(
+                                0, _att_bytes_total - _att_bytes_baseline,
+                            )
+                            _att_items_delta = max(
+                                0, _att_items_total_count - _att_items_baseline,
+                            )
+                            _bytes_delta = _hc_bytes_delta + _att_bytes_delta
+                            _items_delta = _hc_items_delta + _att_items_delta
                             try:
                                 async with async_session_factory() as _fin_sess:
                                     from sqlalchemy import update as _sa_update
+                                    _values: Dict[str, Any] = {
+                                        "hc_drain_status": status,
+                                    }
+                                    if _bytes_delta or _items_delta:
+                                        # Atomic fold-back so the displayed
+                                        # Backup size matches the data that
+                                        # was actually persisted to blob.
+                                        _values["bytes_total"] = (
+                                            Snapshot.bytes_total + _bytes_delta
+                                        )
+                                        _values["bytes_added"] = (
+                                            Snapshot.bytes_added + _bytes_delta
+                                        )
+                                        _values["item_count"] = (
+                                            Snapshot.item_count + _items_delta
+                                        )
                                     await _fin_sess.execute(
                                         _sa_update(Snapshot)
                                         .where(Snapshot.id == _snap_id_for_finalize)
-                                        .values(hc_drain_status=status)
+                                        .values(**_values)
                                     )
                                     await _fin_sess.commit()
+                                if _bytes_delta or _items_delta:
+                                    print(
+                                        f"[{_worker_id_for_finalize}] [HC_FINALIZER] "
+                                        f"snap={_snap_id_for_finalize} "
+                                        f"folded back +{_items_delta} items / "
+                                        f"+{_bytes_delta} bytes "
+                                        f"(hc={_hc_bytes_delta} att={_att_bytes_delta})"
+                                    )
                             except Exception as _e:
                                 print(
                                     f"[{_worker_id_for_finalize}] [HC_FINALIZER] "
