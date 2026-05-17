@@ -7659,10 +7659,19 @@ class BackupWorker:
             local_bytes = 0
             folder_path = msg.get("_full_folder_path") or msg.get("parentFolderName") or None
 
-            for att in attachments:
+            # Per-attachment processing (perf #1 2026-05-17):
+            # Was a serial `for att in attachments` loop — multi-attachment
+            # emails serialized the Graph content fetch + Azure blob upload
+            # one-att-at-a-time. asyncio.gather processes them concurrently;
+            # the outer `sem` (shared with other in-flight messages) still
+            # caps per-mailbox Graph RPS so this is a wall-clock win without
+            # raising the throttle budget.
+            async def _process_att(
+                att: Dict[str, Any],
+            ) -> Tuple[Optional[SnapshotItem], int]:
                 att_id = att.get("id")
                 if not att_id:
-                    continue
+                    return None, 0
                 att_kind = att.get("@odata.type", "")
                 att_name = att.get("name") or att_id
                 content_type = att.get("contentType")
@@ -7684,7 +7693,7 @@ class BackupWorker:
                                 content_bytes = await graph_client.get_message_attachment_content(user_id, msg_id, att_id)
                         except Exception as e:
                             print(f"[{self.worker_id}] [ATT-FAIL] {att_name} (file) on {msg_id}: {type(e).__name__}: {e}")
-                            continue
+                            return None, 0
                 elif att_kind.endswith("itemAttachment"):
                     # Nested Outlook item — serialize to JSON so it's
                     # downloadable as a .json file and restorable later.
@@ -7707,6 +7716,7 @@ class BackupWorker:
                 content_hash: Optional[str] = None
                 size = declared_size
                 inline_b64: Optional[str] = None
+                bytes_added = 0
 
                 if content_bytes is not None:
                     content_hash = hashlib.sha256(content_bytes).hexdigest()
@@ -7719,7 +7729,7 @@ class BackupWorker:
                     # mailboxes.
                     inline_b64 = _maybe_inline_attachment(content_bytes)
                     if inline_b64 is not None:
-                        local_bytes += size
+                        bytes_added = size
                     else:
                         # Blob path: above threshold. Route through
                         # `_upload_once_per_hash` — identical content
@@ -7732,7 +7742,7 @@ class BackupWorker:
                             )
                             if resolved_path:
                                 blob_path = resolved_path
-                                local_bytes += size
+                                bytes_added = size
                             else:
                                 blob_path = None
                                 content_hash = None
@@ -7742,35 +7752,62 @@ class BackupWorker:
                             content_hash = None
 
                 resolved = (blob_path is not None) or (inline_b64 is not None)
-                local_items.append(SnapshotItem(
-                    id=uuid.uuid4(),
-                    snapshot_id=snapshot.id,
-                    tenant_id=tenant.id,
-                    external_id=f"{msg_id}::{att_id}",
-                    item_type="EMAIL_ATTACHMENT",
-                    name=(att_name or "")[:255],
-                    folder_path=folder_path,
-                    content_hash=content_hash,
-                    content_size=size,
-                    blob_path=blob_path,
-                    content_checksum=content_hash,
-                    extra_data={
-                        "parent_item_id": msg_id,
-                        "attachment_kind": att_kind,
-                        "content_type": content_type,
-                        "is_inline": att.get("isInline", False),
-                        # Preserve original Content-ID so inline images
-                        # restored via MIME resolve against the body's
-                        # cid:xxx references.
-                        "content_id": att.get("contentId") or att.get("contentID"),
-                        "source_url": att.get("sourceUrl"),
-                        "resolved": resolved,
-                        # When inline_b64 is set, restore/download paths
-                        # decode this instead of fetching from blob_path.
-                        # blob_path stays None for inline rows.
-                        "inline_b64": inline_b64,
-                    },
-                ))
+                return (
+                    SnapshotItem(
+                        id=uuid.uuid4(),
+                        snapshot_id=snapshot.id,
+                        tenant_id=tenant.id,
+                        external_id=f"{msg_id}::{att_id}",
+                        item_type="EMAIL_ATTACHMENT",
+                        name=(att_name or "")[:255],
+                        folder_path=folder_path,
+                        content_hash=content_hash,
+                        content_size=size,
+                        blob_path=blob_path,
+                        content_checksum=content_hash,
+                        extra_data={
+                            "parent_item_id": msg_id,
+                            "attachment_kind": att_kind,
+                            "content_type": content_type,
+                            "is_inline": att.get("isInline", False),
+                            # Preserve original Content-ID so inline images
+                            # restored via MIME resolve against the body's
+                            # cid:xxx references.
+                            "content_id": att.get("contentId") or att.get("contentID"),
+                            "source_url": att.get("sourceUrl"),
+                            "resolved": resolved,
+                            # When inline_b64 is set, restore/download paths
+                            # decode this instead of fetching from blob_path.
+                            # blob_path stays None for inline rows.
+                            "inline_b64": inline_b64,
+                        },
+                    ),
+                    bytes_added,
+                )
+
+            if attachments:
+                _att_t0 = time.monotonic()
+                _att_results = await asyncio.gather(
+                    *(_process_att(a) for a in attachments),
+                    return_exceptions=True,
+                )
+                for _r in _att_results:
+                    if isinstance(_r, Exception):
+                        print(
+                            f"[{self.worker_id}] [ATT-TASK] msg {msg_id} "
+                            f"task raised: {type(_r).__name__}: {_r}"
+                        )
+                        continue
+                    _item, _b = _r
+                    if _item is not None:
+                        local_items.append(_item)
+                        local_bytes += _b
+                if len(attachments) >= 4:
+                    print(
+                        f"[{self.worker_id}] [PERF] msg {msg_id[:16]} "
+                        f"{len(attachments)} atts processed in "
+                        f"{time.monotonic() - _att_t0:.2f}s"
+                    )
 
             # ── MIME-source fallback for unresolved cid: refs ──
             # Some emails (Teams activity notifications, OneDrive
