@@ -18460,12 +18460,85 @@ class BackupWorker:
         #    Recovery right-pane can render them without N×M refetches.
         if "GROUPS" in _ep_categories:
             groups = await _safe_fetch(f"{base}/groups", {"$top": "999", "$select": "id,displayName,mail,description,groupTypes,securityEnabled,mailEnabled,visibility,membershipRule,createdDateTime"})
+            # Bulk-resolve owners + members via /v1.0/$batch (perf #6
+            # 2026-05-17): was 2 serial Graph calls per group (N groups
+            # = 2N round-trips). graph_client.batch chunks at
+            # GRAPH_BATCH_MAX_SIZE internally, so a tenant with 200
+            # groups goes from 400 sequential calls to ~20 $batch posts.
+            from shared.graph_batch import BatchRequest as _BReq
+            _gids = [g.get("id") for g in groups if g.get("id")]
+            _gowners_by_gid: Dict[str, List[Dict[str, Any]]] = {}
+            _gmembers_by_gid: Dict[str, List[Dict[str, Any]]] = {}
+            if _gids:
+                _gbt0 = time.monotonic()
+                _g_reqs: List[_BReq] = []
+                for _gid in _gids:
+                    _g_reqs.append(_BReq(
+                        id=f"own::{_gid}", method="GET",
+                        url=(
+                            f"/groups/{_gid}/owners?$top=50"
+                            f"&$select=id,displayName,userPrincipalName,mail"
+                        ),
+                    ))
+                    _g_reqs.append(_BReq(
+                        id=f"mem::{_gid}", method="GET",
+                        url=(
+                            f"/groups/{_gid}/members?$top=50"
+                            f"&$select=id,displayName,userPrincipalName,mail"
+                        ),
+                    ))
+                try:
+                    _g_resp = await graph_client.batch(_g_reqs)
+                    for _rid, _r in _g_resp.items():
+                        if not (200 <= _r.status < 300):
+                            continue
+                        _vals = ((_r.body or {}).get("value") or [])
+                        if _rid.startswith("own::"):
+                            _gowners_by_gid[_rid[5:]] = _vals
+                        elif _rid.startswith("mem::"):
+                            _gmembers_by_gid[_rid[5:]] = _vals
+                    print(
+                        f"[{self.worker_id}] [PERF] entra groups owners+"
+                        f"members $batch: {len(_gids)} groups in "
+                        f"{time.monotonic() - _gbt0:.2f}s"
+                    )
+                except Exception as _ge:
+                    logger.warning(
+                        "[%s] [ENTRA_DIR] groups $batch owners/members "
+                        "failed (%s) — falling back to parallel per-group "
+                        "(asyncio.gather sem=8)",
+                        self.worker_id, _ge,
+                    )
+                    _gsem = asyncio.Semaphore(8)
+
+                    async def _one_gid(_gid: str):
+                        async with _gsem:
+                            _o = await _safe_fetch(
+                                f"{base}/groups/{_gid}/owners",
+                                {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"},
+                            )
+                            _m = await _safe_fetch(
+                                f"{base}/groups/{_gid}/members",
+                                {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"},
+                            )
+                            return _gid, _o, _m
+
+                    _g_par_results = await asyncio.gather(
+                        *(_one_gid(_g) for _g in _gids),
+                        return_exceptions=True,
+                    )
+                    for _r in _g_par_results:
+                        if isinstance(_r, tuple):
+                            _gid, _o, _m = _r
+                            _gowners_by_gid[_gid] = _o
+                            _gmembers_by_gid[_gid] = _m
+
             for g in groups:
                 gid = g.get("id")
                 if not gid:
                     continue
-                owners = await _safe_fetch(f"{base}/groups/{gid}/owners", {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"})
-                members = await _safe_fetch(f"{base}/groups/{gid}/members", {"$top": "50", "$select": "id,displayName,userPrincipalName,mail"})
+                owners = _gowners_by_gid.get(gid, [])
+                members = _gmembers_by_gid.get(gid, [])
                 g["_owners"] = owners
                 g["_members"] = members
                 g["_memberCount"] = len(members)
@@ -18546,14 +18619,71 @@ class BackupWorker:
             entra_devices = await _safe_fetch(f"{base}/devices", {"$top": "500", "$select": "id,displayName,accountEnabled,operatingSystem,operatingSystemVersion,trustType,registrationDateTime,isCompliant,isManaged"})
             for d in entra_devices:
                 d["_intune_bucket"] = "Devices"
-                # Owner lookup — first registered user per device.
+
+            # Bulk-resolve device owners via /v1.0/$batch (perf #7
+            # 2026-05-17): was 1 serial Graph call per device (N
+            # devices = N round-trips). graph_client.batch chunks
+            # at GRAPH_BATCH_MAX_SIZE internally; a tenant with 500
+            # devices goes from 500 sequential calls to ~25 \$batch
+            # posts. We only need the first registered owner per
+            # device for the "_owner_display" / "_owner_upn" hints.
+            from shared.graph_batch import BatchRequest as _BReq
+            _dids = [d.get("id") for d in entra_devices if d.get("id")]
+            _downers_by_did: Dict[str, List[Dict[str, Any]]] = {}
+            if _dids:
+                _dbt0 = time.monotonic()
+                _d_reqs = [
+                    _BReq(
+                        id=_did, method="GET",
+                        url=(
+                            f"/devices/{_did}/registeredOwners?$top=1"
+                            f"&$select=id,displayName,userPrincipalName"
+                        ),
+                    )
+                    for _did in _dids
+                ]
                 try:
-                    owners = await _safe_fetch(f"{base}/devices/{d.get('id')}/registeredOwners", {"$top": "1", "$select": "id,displayName,userPrincipalName"})
-                    if owners:
-                        d["_owner_display"] = owners[0].get("displayName")
-                        d["_owner_upn"] = owners[0].get("userPrincipalName")
-                except Exception:
-                    pass
+                    _d_resp = await graph_client.batch(_d_reqs)
+                    for _did, _r in _d_resp.items():
+                        if 200 <= _r.status < 300:
+                            _downers_by_did[_did] = (
+                                (_r.body or {}).get("value") or []
+                            )
+                    print(
+                        f"[{self.worker_id}] [PERF] entra devices owners "
+                        f"$batch: {len(_dids)} devices in "
+                        f"{time.monotonic() - _dbt0:.2f}s"
+                    )
+                except Exception as _de:
+                    logger.warning(
+                        "[%s] [ENTRA_DIR] devices $batch owners failed "
+                        "(%s) — falling back to parallel per-device "
+                        "(asyncio.gather sem=8)",
+                        self.worker_id, _de,
+                    )
+                    _dsem = asyncio.Semaphore(8)
+
+                    async def _one_did(_did: str):
+                        async with _dsem:
+                            return _did, await _safe_fetch(
+                                f"{base}/devices/{_did}/registeredOwners",
+                                {"$top": "1", "$select": "id,displayName,userPrincipalName"},
+                            )
+
+                    _d_par_results = await asyncio.gather(
+                        *(_one_did(_d) for _d in _dids),
+                        return_exceptions=True,
+                    )
+                    for _r in _d_par_results:
+                        if isinstance(_r, tuple):
+                            _did, _o = _r
+                            _downers_by_did[_did] = _o
+
+            for d in entra_devices:
+                owners = _downers_by_did.get(d.get("id"), [])
+                if owners:
+                    d["_owner_display"] = owners[0].get("displayName")
+                    d["_owner_upn"] = owners[0].get("userPrincipalName")
             comp_policies = await _safe_fetch(f"{base}/deviceManagement/deviceCompliancePolicies", {"$top": "500"})
             for c in comp_policies:
                 c["_intune_bucket"] = "Compliance Policies"
