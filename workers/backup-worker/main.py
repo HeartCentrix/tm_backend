@@ -20978,32 +20978,64 @@ class BackupWorker:
             if not reqs:
                 return
             try:
+                _gb_t0 = time.monotonic()
                 responses = await graph_client.batch(reqs)
+                if len(reqs) >= 5:
+                    print(
+                        f"[{self.worker_id}] [PERF] group threads "
+                        f"$batch posts: {len(reqs)} threads in "
+                        f"{time.monotonic() - _gb_t0:.2f}s"
+                    )
             except Exception as e:
                 logger.warning(
                     "[%s] [GROUP_MAILBOX] $batch posts failed for %s: "
-                    "%s — retrying per-thread",
+                    "%s — retrying per-thread (parallel)",
                     self.worker_id, resource.display_name, e,
                 )
-                # Per-thread fallback so one bad thread doesn't poison
-                # the whole batch.
+                # Per-thread fallback (perf #5 2026-05-17): was serial,
+                # now bounded-parallel via asyncio.gather + sem(8). Same
+                # idempotency — one bad thread returns None without
+                # poisoning the rest.
                 responses = {}
-                for t in batch_threads:
-                    tid = t.get("id")
-                    if not tid:
-                        continue
-                    try:
-                        resp_body = await graph_client.get_group_thread_posts(group_id, tid)
-                        class _R: status = 200; body = resp_body  # noqa: E701,E702
-                        responses[tid] = _R()
-                    except httpx.HTTPStatusError as exc:
-                        if exc.response.status_code == 404:
-                            continue
-                        logger.warning(
-                            "[%s] [GROUP_MAILBOX] posts fallback "
-                            "failed for %s: %s",
-                            self.worker_id, tid, exc,
-                        )
+                _fb_sem = asyncio.Semaphore(8)
+                _fb_tids = [
+                    t.get("id") for t in batch_threads if t.get("id")
+                ]
+
+                async def _fb_one(tid: str):
+                    async with _fb_sem:
+                        try:
+                            resp_body = await graph_client.get_group_thread_posts(
+                                group_id, tid,
+                            )
+                            class _R: status = 200; body = resp_body  # noqa: E701,E702
+                            return tid, _R()
+                        except httpx.HTTPStatusError as exc:
+                            if exc.response.status_code == 404:
+                                return tid, None
+                            logger.warning(
+                                "[%s] [GROUP_MAILBOX] posts fallback "
+                                "failed for %s: %s",
+                                self.worker_id, tid, exc,
+                            )
+                            return tid, None
+                        except Exception as exc:
+                            logger.warning(
+                                "[%s] [GROUP_MAILBOX] posts fallback "
+                                "task raised for %s: %s",
+                                self.worker_id, tid, exc,
+                            )
+                            return tid, None
+
+                _fb_results = await asyncio.gather(
+                    *(_fb_one(tid) for tid in _fb_tids),
+                    return_exceptions=True,
+                )
+                for _r in _fb_results:
+                    if isinstance(_r, tuple):
+                        _tid, _resp = _r
+                        if _resp is not None:
+                            responses[_tid] = _resp
 
             post_rows: List[Dict[str, Any]] = []
             post_uploads: List[Tuple[str, str, bytes]] = []
