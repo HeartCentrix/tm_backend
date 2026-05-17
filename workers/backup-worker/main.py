@@ -17968,34 +17968,59 @@ class BackupWorker:
                     local_bytes += len(html)
 
                 # 3. inline resources (images / attachments) — dedupe URLs per page
+                # PERF #8: parallelize resource fetches with bounded sem(8)
                 try:
                     urls: List[str] = []
                     for m in resource_url_re.finditer(html.decode("utf-8", errors="replace")):
                         u = m.group(1) or m.group(2)
                         if u and u not in urls:
                             urls.append(u)
-                    for u in urls:
-                        try:
-                            data = await graph_client.get_onenote_resource(u)
-                            rid_match = re.search(r"resources/([^/?]+)", u)
-                            rid = rid_match.group(1) if rid_match else hashlib.md5(u.encode()).hexdigest()[:16]
-                            rhash = hashlib.sha256(data).hexdigest()
-                            rpath = azure_storage_manager.build_blob_path(
-                                str(tenant.id), str(resource.id), str(snapshot.id), f"resource_{rid}"
-                            )
-                            if await _upload(rpath, data):
-                                local_items.append(SnapshotItem(
-                                    snapshot_id=snapshot.id, tenant_id=tenant.id,
-                                    external_id=rid, item_type="ONENOTE_RESOURCE",
-                                    name=rid,
-                                    content_hash=rhash, content_size=len(data), blob_path=rpath,
-                                    extra_data={"pageId": pg_id, "sourceUrl": u},
-                                    content_checksum=rhash,
-                                ))
-                                local_bytes += len(data)
-                        except Exception as e:
-                            files_failed += 1
-                            print(f"[{self.worker_id}]   [ONENOTE] Resource fetch failed for {u}: {e}")
+
+                    _res_sem = asyncio.Semaphore(8)
+                    _t0_res = time.time()
+
+                    async def _process_resource(u: str):
+                        async with _res_sem:
+                            try:
+                                data = await graph_client.get_onenote_resource(u)
+                                rid_match = re.search(r"resources/([^/?]+)", u)
+                                rid = rid_match.group(1) if rid_match else hashlib.md5(u.encode()).hexdigest()[:16]
+                                rhash = hashlib.sha256(data).hexdigest()
+                                rpath = azure_storage_manager.build_blob_path(
+                                    str(tenant.id), str(resource.id), str(snapshot.id), f"resource_{rid}"
+                                )
+                                if await _upload(rpath, data):
+                                    return (SnapshotItem(
+                                        snapshot_id=snapshot.id, tenant_id=tenant.id,
+                                        external_id=rid, item_type="ONENOTE_RESOURCE",
+                                        name=rid,
+                                        content_hash=rhash, content_size=len(data), blob_path=rpath,
+                                        extra_data={"pageId": pg_id, "sourceUrl": u},
+                                        content_checksum=rhash,
+                                    ), len(data), False)
+                                return (None, 0, False)
+                            except Exception as e:
+                                print(f"[{self.worker_id}]   [ONENOTE] Resource fetch failed for {u}: {e}")
+                                return (None, 0, True)
+
+                    if urls:
+                        _res_results = await asyncio.gather(
+                            *[_process_resource(u) for u in urls],
+                            return_exceptions=True,
+                        )
+                        for _r in _res_results:
+                            if isinstance(_r, tuple):
+                                _it, _sz, _failed = _r
+                                if _it is not None:
+                                    local_items.append(_it)
+                                    local_bytes += _sz
+                                if _failed:
+                                    files_failed += 1
+                            else:
+                                files_failed += 1
+                                print(f"[{self.worker_id}]   [ONENOTE] Resource task error: {_r}")
+                        if len(urls) >= 5:
+                            print(f"[PERF][ONENOTE-RES] page={pg_id} fetched {len(urls)} resources in {time.time()-_t0_res:.2f}s")
                 except Exception as e:
                     print(f"[{self.worker_id}]   [ONENOTE] Resource parse failed for {pg_id}: {e}")
 
@@ -18027,37 +18052,60 @@ class BackupWorker:
                 print(f"[{self.worker_id}]   [ONENOTE] Sections fetch failed for notebook {nb_id}: {e}")
                 return local_items, local_bytes
 
-            for sec in sections.get("value", []):
-                sec_id = sec.get("id", str(uuid.uuid4()))
-                sb = json.dumps(sec).encode()
-                sh = hashlib.sha256(sb).hexdigest()
-                sp = azure_storage_manager.build_blob_path(
-                    str(tenant.id), str(resource.id), str(snapshot.id), f"section_{sec_id}"
-                )
-                if await _upload(sp, sb):
-                    local_items.append(SnapshotItem(
-                        snapshot_id=snapshot.id, tenant_id=tenant.id,
-                        external_id=sec_id, item_type="ONENOTE_SECTION",
-                        name=sec.get("displayName", sec_id),
-                        content_hash=sh, content_size=len(sb), blob_path=sp,
-                        extra_data={"raw": sec, "notebookId": nb_id}, content_checksum=sh,
-                    ))
-                    local_bytes += len(sb)
+            # PERF #9: parallelize section processing with bounded sem(4)
+            _sec_sem = asyncio.Semaphore(4)
+            _sec_list = sections.get("value", []) or []
+            _t0_sec = time.time()
 
-                try:
-                    pages = await graph_client.get_onenote_pages(obj_id, sec_id)
-                    page_results = await asyncio.gather(
-                        *[backup_page(obj_id, pg, nb_id, sec_id) for pg in pages.get("value", [])],
-                        return_exceptions=True,
+            async def _process_section(sec: Dict):
+                async with _sec_sem:
+                    _local_items: List[SnapshotItem] = []
+                    _local_bytes = 0
+                    sec_id = sec.get("id", str(uuid.uuid4()))
+                    sb = json.dumps(sec).encode()
+                    sh = hashlib.sha256(sb).hexdigest()
+                    sp = azure_storage_manager.build_blob_path(
+                        str(tenant.id), str(resource.id), str(snapshot.id), f"section_{sec_id}"
                     )
-                    for pr in page_results:
-                        if isinstance(pr, tuple):
-                            local_items.extend(pr[0])
-                            local_bytes += pr[1]
-                        else:
-                            print(f"[{self.worker_id}]   [ONENOTE] Page task error: {pr}")
-                except Exception as e:
-                    print(f"[{self.worker_id}]   [ONENOTE] Pages fetch failed for section {sec_id}: {e}")
+                    if await _upload(sp, sb):
+                        _local_items.append(SnapshotItem(
+                            snapshot_id=snapshot.id, tenant_id=tenant.id,
+                            external_id=sec_id, item_type="ONENOTE_SECTION",
+                            name=sec.get("displayName", sec_id),
+                            content_hash=sh, content_size=len(sb), blob_path=sp,
+                            extra_data={"raw": sec, "notebookId": nb_id}, content_checksum=sh,
+                        ))
+                        _local_bytes += len(sb)
+
+                    try:
+                        pages = await graph_client.get_onenote_pages(obj_id, sec_id)
+                        page_results = await asyncio.gather(
+                            *[backup_page(obj_id, pg, nb_id, sec_id) for pg in pages.get("value", [])],
+                            return_exceptions=True,
+                        )
+                        for pr in page_results:
+                            if isinstance(pr, tuple):
+                                _local_items.extend(pr[0])
+                                _local_bytes += pr[1]
+                            else:
+                                print(f"[{self.worker_id}]   [ONENOTE] Page task error: {pr}")
+                    except Exception as e:
+                        print(f"[{self.worker_id}]   [ONENOTE] Pages fetch failed for section {sec_id}: {e}")
+                    return _local_items, _local_bytes
+
+            if _sec_list:
+                _sec_results = await asyncio.gather(
+                    *[_process_section(sec) for sec in _sec_list],
+                    return_exceptions=True,
+                )
+                for _sr in _sec_results:
+                    if isinstance(_sr, tuple):
+                        local_items.extend(_sr[0])
+                        local_bytes += _sr[1]
+                    else:
+                        print(f"[{self.worker_id}]   [ONENOTE] Section task error: {_sr}")
+                if len(_sec_list) >= 3:
+                    print(f"[PERF][ONENOTE-SEC] notebook={nb_id} processed {len(_sec_list)} sections in {time.time()-_t0_sec:.2f}s")
 
             return local_items, local_bytes
 
