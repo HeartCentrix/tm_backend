@@ -4775,8 +4775,19 @@ class BackupWorker:
                         # downstream doesn't fire BACKUP_COMPLETED.
                         return []
 
+                    # Per-user parallel chat drains. Each chat costs ~1 req/sec
+                    # on average (paginated /messages + light per-msg
+                    # /hostedContents). With 6 concurrent backup_workers and
+                    # 12-app multi-rotation, 32 chats per user keeps per-app
+                    # load at ~16 rps (well under the per-app-per-mailbox cap)
+                    # while staying below the tenant-aggregate ceiling
+                    # observed in field (~250-400 rps before 429s). If 429
+                    # rate grows, drop USER_CHATS_PARALLEL_CHATS in env to
+                    # 24 or 20. The multi-app rotation also throttles
+                    # automatically: throttled apps drop out of the shard
+                    # pool so this limit is a ceiling, not a floor.
                     chat_fanout = int(
-                        os.getenv("USER_CHATS_PARALLEL_CHATS", "20"),
+                        os.getenv("USER_CHATS_PARALLEL_CHATS", "32"),
                     )
                     chats_timeout_s = int(
                         os.getenv("USER_CHATS_TIMEOUT_S", "43200"),
@@ -4907,8 +4918,12 @@ class BackupWorker:
                     _interleave_hc = os.getenv(
                         "USER_CHATS_INTERLEAVE_HOSTED_CONTENT", "true",
                     ).lower() in ("true", "1", "yes")
+                    # Bumped 8 -> 12 to keep up with the higher chat fan-out
+                    # (USER_CHATS_PARALLEL_CHATS=32). Each parallel chat may
+                    # have ~1 msg with inline images at any moment, so this
+                    # cap should scale roughly with chat_fanout / 3.
                     _hc_concurrency = int(os.getenv(
-                        "CHAT_HOSTED_CONTENT_CONCURRENCY", "8",
+                        "CHAT_HOSTED_CONTENT_CONCURRENCY", "12",
                     ))
                     _hc_sem: Optional[asyncio.Semaphore] = (
                         asyncio.Semaphore(_hc_concurrency) if _interleave_hc else None
