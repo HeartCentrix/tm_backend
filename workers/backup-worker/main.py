@@ -5107,19 +5107,32 @@ class BackupWorker:
                     # whether to retry a previously-403'd chat without
                     # making an extra Graph call per chat. One query per
                     # shard app per backup; result cached on the GraphClient.
+                    # Parallel scope-fingerprint warmup (perf #12 2026-05-17):
+                    # was a serial `for sh in shards: await sh.fp()` loop —
+                    # with 12 shards × ~200ms per call this stole ~2.4s of
+                    # wall-clock from every USER_CHATS start. asyncio.gather
+                    # collapses to ~200ms.
                     _shard_scope_fps: Dict[str, str] = {}
-                    for _sh in _chat_shards:
-                        try:
-                            _shard_scope_fps[_sh.client_id] = (
-                                await _sh.get_granted_scope_fingerprint()
-                            )
-                        except Exception as _fp_err:
+                    _fp_t0 = time.monotonic()
+                    _fp_results = await asyncio.gather(
+                        *(_sh.get_granted_scope_fingerprint() for _sh in _chat_shards),
+                        return_exceptions=True,
+                    )
+                    for _sh, _fp in zip(_chat_shards, _fp_results):
+                        if isinstance(_fp, Exception):
                             print(
                                 f"[{self.worker_id}] [USER_CHATS] scope "
                                 f"fingerprint fetch failed for app "
-                                f"{_sh.client_id[:8]}: {_fp_err}"
+                                f"{_sh.client_id[:8]}: {_fp}"
                             )
                             _shard_scope_fps[_sh.client_id] = ""
+                        else:
+                            _shard_scope_fps[_sh.client_id] = _fp or ""
+                    print(
+                        f"[{self.worker_id}] [USER_CHATS] [PERF] scope "
+                        f"fingerprint warmup: {len(_chat_shards)} shards "
+                        f"in {time.monotonic() - _fp_t0:.2f}s"
+                    )
 
                     cancel_check_every = int(os.getenv(
                         "USER_CHATS_CANCEL_CHECK_EVERY_CHATS", "10",
