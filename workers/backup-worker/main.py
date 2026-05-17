@@ -6656,37 +6656,150 @@ class BackupWorker:
                             f"(kept {len(all_msgs)})"
                         )
 
-                    # Drain barrier reached — all chats' messages are
-                    # in all_msgs + persisted. If interleaved hc tasks
-                    # are still in flight, wait for them now so Phase 2
-                    # sees a consistent _hc_interleaved_msg_ids set
-                    # before deciding what to skip.
-                    if _interleave_hc and _hc_tasks:
-                        hc_started_mono = time.monotonic()
-                        await asyncio.gather(*_hc_tasks, return_exceptions=True)
-                        hc_elapsed = time.monotonic() - hc_started_mono
-                        print(
-                            f"[{self.worker_id}] [USER_CHATS] hc interleave "
-                            f"drained {len(_hc_interleaved_msg_ids)} msgs "
-                            f"({_hc_items_total} items, "
-                            f"{_hc_bytes_total} bytes) in {hc_elapsed:.1f}s "
-                            f"(overlapped with drain phase)"
-                        )
+                    # Item C: HC barrier overlap with next user's drain.
+                    # When USER_CHATS_HC_BARRIER_DETACHED=true the handler
+                    # spawns a finalize-task that awaits the gathers in
+                    # the background and updates snapshot.hc_drain_status
+                    # to COMPLETE/FAILED. Phase 2 still inspects the
+                    # interleaved-msg sets here — those are mutated in
+                    # the kick tasks BEFORE this point only for messages
+                    # the kicks have already finished, so detaching
+                    # means a small set of HC msgs may double-process
+                    # through the Phase-2 fall-through. That's safe
+                    # because _userchats_backup_hosted_contents uses
+                    # ON CONFLICT DO NOTHING semantics on persist.
+                    _hc_detached = os.getenv(
+                        "USER_CHATS_HC_BARRIER_DETACHED", "false",
+                    ).lower() in ("true", "1", "yes")
 
-                    # Same barrier for file-attachment interleave so Phase 2
-                    # sees consistent _att_interleaved_msg_ids and the
-                    # accumulated items list before it computes the fall-through.
-                    if _interleave_att and _att_tasks:
-                        att_started_mono = time.monotonic()
-                        await asyncio.gather(*_att_tasks, return_exceptions=True)
-                        att_elapsed = time.monotonic() - att_started_mono
-                        print(
-                            f"[{self.worker_id}] [USER_CHATS] att interleave "
-                            f"drained {len(_att_interleaved_msg_ids)} msgs "
-                            f"({_att_items_total_count} items, "
-                            f"{_att_bytes_total} bytes) in {att_elapsed:.1f}s "
-                            f"(overlapped with drain phase, persisted in-task)"
-                        )
+                    if _hc_detached and (
+                        (_interleave_hc and _hc_tasks)
+                        or (_interleave_att and _att_tasks)
+                    ):
+                        # Mark snapshot as HC-pending so restore paths
+                        # refuse it until the background drain settles.
+                        try:
+                            async with async_session_factory() as _hc_sess:
+                                from sqlalchemy import update as _sa_update
+                                await _hc_sess.execute(
+                                    _sa_update(Snapshot)
+                                    .where(Snapshot.id == snapshot.id)
+                                    .values(hc_drain_status="PENDING")
+                                )
+                                await _hc_sess.commit()
+                        except Exception as _e:
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] failed to "
+                                f"mark hc_drain_status=PENDING (continuing "
+                                f"with attached barrier): {_e}"
+                            )
+                            _hc_detached = False
+
+                    if _hc_detached and (
+                        (_interleave_hc and _hc_tasks)
+                        or (_interleave_att and _att_tasks)
+                    ):
+                        # Fire-and-forget. Worker can return to consumer
+                        # loop and dispatch the next user's queue message
+                        # while this finalizer runs.
+                        _detached_hc_tasks = list(_hc_tasks)
+                        _detached_att_tasks = list(_att_tasks)
+                        _snap_id_for_finalize = snapshot.id
+                        _worker_id_for_finalize = self.worker_id
+
+                        async def _hc_drain_finalizer():
+                            status = "COMPLETE"
+                            try:
+                                t0 = time.monotonic()
+                                if _detached_hc_tasks:
+                                    results = await asyncio.gather(
+                                        *_detached_hc_tasks, return_exceptions=True,
+                                    )
+                                    for r in results:
+                                        if isinstance(r, Exception):
+                                            status = "FAILED"
+                                if _detached_att_tasks:
+                                    results = await asyncio.gather(
+                                        *_detached_att_tasks, return_exceptions=True,
+                                    )
+                                    for r in results:
+                                        if isinstance(r, Exception):
+                                            status = "FAILED"
+                                elapsed = time.monotonic() - t0
+                                print(
+                                    f"[{_worker_id_for_finalize}] [HC_FINALIZER] "
+                                    f"snap={_snap_id_for_finalize} settled "
+                                    f"status={status} elapsed={elapsed:.1f}s "
+                                    f"(overlapped with next user's drain)"
+                                )
+                            except Exception as _e:
+                                status = "FAILED"
+                                print(
+                                    f"[{_worker_id_for_finalize}] [HC_FINALIZER] "
+                                    f"snap={_snap_id_for_finalize} crashed: {_e}"
+                                )
+                            try:
+                                async with async_session_factory() as _fin_sess:
+                                    from sqlalchemy import update as _sa_update
+                                    await _fin_sess.execute(
+                                        _sa_update(Snapshot)
+                                        .where(Snapshot.id == _snap_id_for_finalize)
+                                        .values(hc_drain_status=status)
+                                    )
+                                    await _fin_sess.commit()
+                            except Exception as _e:
+                                print(
+                                    f"[{_worker_id_for_finalize}] [HC_FINALIZER] "
+                                    f"failed to update hc_drain_status "
+                                    f"for {_snap_id_for_finalize}: {_e}"
+                                )
+
+                        # Spawn as a top-level task so it isn't gc'd when
+                        # the parent handler returns. Reference is held
+                        # by the worker-lifetime list below.
+                        if not hasattr(self, "_detached_hc_finalizers"):
+                            self._detached_hc_finalizers = []
+                        _det_t = asyncio.create_task(_hc_drain_finalizer())
+                        self._detached_hc_finalizers.append(_det_t)
+                        # Best-effort GC of completed finalizers so the
+                        # list doesn't grow unbounded across thousands
+                        # of users.
+                        self._detached_hc_finalizers = [
+                            t for t in self._detached_hc_finalizers
+                            if not t.done()
+                        ]
+                    else:
+                        # Drain barrier reached — all chats' messages are
+                        # in all_msgs + persisted. If interleaved hc tasks
+                        # are still in flight, wait for them now so Phase 2
+                        # sees a consistent _hc_interleaved_msg_ids set
+                        # before deciding what to skip.
+                        if _interleave_hc and _hc_tasks:
+                            hc_started_mono = time.monotonic()
+                            await asyncio.gather(*_hc_tasks, return_exceptions=True)
+                            hc_elapsed = time.monotonic() - hc_started_mono
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] hc interleave "
+                                f"drained {len(_hc_interleaved_msg_ids)} msgs "
+                                f"({_hc_items_total} items, "
+                                f"{_hc_bytes_total} bytes) in {hc_elapsed:.1f}s "
+                                f"(overlapped with drain phase)"
+                            )
+
+                        # Same barrier for file-attachment interleave so Phase 2
+                        # sees consistent _att_interleaved_msg_ids and the
+                        # accumulated items list before it computes the fall-through.
+                        if _interleave_att and _att_tasks:
+                            att_started_mono = time.monotonic()
+                            await asyncio.gather(*_att_tasks, return_exceptions=True)
+                            att_elapsed = time.monotonic() - att_started_mono
+                            print(
+                                f"[{self.worker_id}] [USER_CHATS] att interleave "
+                                f"drained {len(_att_interleaved_msg_ids)} msgs "
+                                f"({_att_items_total_count} items, "
+                                f"{_att_bytes_total} bytes) in {att_elapsed:.1f}s "
+                                f"(overlapped with drain phase, persisted in-task)"
+                            )
 
                     elapsed = time.monotonic() - chats_start_mono
                     rate = (len(all_msgs) / elapsed) if elapsed > 0 else 0

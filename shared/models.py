@@ -1,6 +1,7 @@
 """Shared database models"""
 import uuid
 from datetime import datetime, timezone
+from typing import Tuple
 from sqlalchemy import (
     Column, String, DateTime, Boolean, Integer, BigInteger,
     Text, ForeignKey, Enum as SAEnum, JSON, ARRAY, func, LargeBinary,
@@ -555,6 +556,22 @@ class Snapshot(Base):
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     lease_token = Column(BigInteger, nullable=False, default=0)
     requeue_count = Column(Integer, nullable=False, default=0)
+    # Item C: HC drain overlap (2026-05-17).
+    # USER_CHATS snapshots fire hostedContent (inline images) downloads
+    # as background tasks. Previously the handler waited at a barrier
+    # before returning — blocking the consumer slot until HC drained.
+    # With USER_CHATS_HC_BARRIER_DETACHED=true the handler returns
+    # immediately after persisting message bodies; HC drains in the
+    # background and flips this column to COMPLETE when done. Restore
+    # paths MUST refuse to restore a snapshot whose hc_drain_status is
+    # PENDING — the HC items haven't all written yet.
+    #
+    # Values:
+    #   "NOT_APPLICABLE" — non-chat snapshot, or HC interleave disabled
+    #   "PENDING"        — drain started, items still streaming in
+    #   "COMPLETE"       — every kicked task settled with no exception
+    #   "FAILED"         — at least one task raised; restore disallowed
+    hc_drain_status = Column(String(16), nullable=False, default="NOT_APPLICABLE")
     created_at = Column(DateTime, default=utcnow)
 
     __table_args__ = (
@@ -1366,3 +1383,24 @@ class OneDriveFileRetry(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
     # UNIQUE(snapshot_id, file_external_id) enforced via the table
     # DDL in shared/database.py; mirrored here is not necessary.
+
+
+def snapshot_is_restore_ready(snapshot: "Snapshot") -> Tuple[bool, str]:
+    """Return (is_ready, reason). Restore paths should call this and
+    refuse to proceed when is_ready is False.
+
+    Currently checks Item-C's hc_drain_status:
+      - NOT_APPLICABLE / COMPLETE → ready.
+      - PENDING → background HC drain still in flight; reject with a
+        retryable error so callers can poll-and-retry.
+      - FAILED → at least one HC task raised; restore is unsafe because
+        inline images may be missing. Caller should surface to the user.
+    """
+    status = getattr(snapshot, "hc_drain_status", "NOT_APPLICABLE") or "NOT_APPLICABLE"
+    if status in ("NOT_APPLICABLE", "COMPLETE"):
+        return True, ""
+    if status == "PENDING":
+        return False, "hc_drain_status=PENDING — hostedContent drain still in flight; retry later"
+    if status == "FAILED":
+        return False, "hc_drain_status=FAILED — at least one hostedContent task raised; restore unsafe"
+    return False, f"unknown hc_drain_status={status!r}"

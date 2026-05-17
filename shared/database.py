@@ -1229,6 +1229,20 @@ async def init_db() -> None:
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
         "ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
         "ALTER TABLE chat_thread_messages ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
+        # Item C — HC drain overlap (2026-05-17). Tracks whether a
+        # USER_CHATS snapshot's hostedContent download is still in
+        # flight. Restore paths must check this column before allowing
+        # a restore — see Snapshot.hc_drain_status doc in shared/models.
+        # Idempotent ADD COLUMN IF NOT EXISTS heals existing prod DBs
+        # on next boot without alembic. Default 'NOT_APPLICABLE' so
+        # every pre-existing row is restore-ready.
+        "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS "
+        "hc_drain_status VARCHAR(16) NOT NULL DEFAULT 'NOT_APPLICABLE';",
+        # Hot read path for the post-drain monitor that polls for
+        # PENDING snapshots and emits a warning if any are stuck.
+        "CREATE INDEX IF NOT EXISTS ix_snapshots_hc_pending "
+        "ON snapshots (hc_drain_status) "
+        "WHERE hc_drain_status = 'PENDING';",
         # Drain-completeness baseline for the chat partial-drain gate
         # (workers/backup-worker/main.py). NULL = "no baseline yet, skip gate".
         # Idempotent ADD COLUMN IF NOT EXISTS so existing prod DBs heal on
