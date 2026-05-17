@@ -837,6 +837,7 @@ async def init_db() -> None:
             drain_cursor TEXT,
             drain_failure_state JSONB,
             archived_at TIMESTAMPTZ,
+            last_drained_msg_count INTEGER,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (tenant_id, chat_id)
@@ -1140,6 +1141,11 @@ async def init_db() -> None:
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
         "ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
         "ALTER TABLE chat_thread_messages ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;",
+        # Drain-completeness baseline for the chat partial-drain gate
+        # (workers/backup-worker/main.py). NULL = "no baseline yet, skip gate".
+        # Idempotent ADD COLUMN IF NOT EXISTS so existing prod DBs heal on
+        # next service boot without an explicit alembic step.
+        "ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS last_drained_msg_count INTEGER;",
         # Chat export v1 — link CHAT_ATTACHMENT / CHAT_HOSTED_CONTENT rows to
         # their parent message without scanning the metadata JSONB.
         "ALTER TABLE snapshot_items ADD COLUMN IF NOT EXISTS parent_external_id VARCHAR;",

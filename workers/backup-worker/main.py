@@ -1442,12 +1442,33 @@ def _message_to_contact_shape(msg: dict) -> dict:
     return shape
 
 
-async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int = 999):
+async def _backup_contacts_for_user(
+    graph_client, user_id: str, item_limit: int = 999,
+    prior_deltas: Optional[Dict[str, str]] = None,
+):
     """Aggregate a user's contacts from /contactFolders + (optionally)
     Deleted Items + Recoverable Items folders.
 
-    Returns row tuples in the shape the caller previously built inline:
-    (item_type, name, external_id, payload_dict, folder_name)
+    Delta semantics (fix for "contacts re-fetched every backup"):
+      * ``prior_deltas`` is a dict ``{source_key -> deltaLink_url}`` from
+        the previous backup. ``source_key`` is ``"__root__"`` for the
+        top-level /users/{uid}/contacts/delta stream, or a folder id
+        for /contactFolders/{fid}/contacts/delta.
+      * On a fresh user (no prior_deltas) we walk the delta endpoint
+        from scratch — Graph returns the full contact list followed
+        by an ``@odata.deltaLink`` on the terminal page. We persist
+        that link so subsequent runs only fetch CHANGED contacts.
+      * On incremental runs we use the saved deltaLink directly as
+        ``next_url``; Graph treats it as "give me changes since X."
+      * Deleted contacts come back as ``{"@removed": {"reason":...}}``
+        objects with just an ``id`` field — we surface those to the
+        caller too so it can mark snapshot_items deleted.
+
+    Returns ``(row_tuples, new_deltas)``:
+      * ``row_tuples`` — list of
+        ``(item_type, name, external_id, payload_dict, folder_name)``.
+      * ``new_deltas`` — fresh ``{source_key -> deltaLink}`` to persist
+        in ``resource.extra_data['contacts_deltas']`` for the next run.
     """
     from shared.config import settings
 
@@ -1456,6 +1477,9 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
         "businessPhones,mobilePhone,homePhones,parentFolderId,categories,"
         "imAddresses,personalNotes,birthday"
     )
+
+    prior_deltas = prior_deltas or {}
+    new_deltas: Dict[str, str] = {}
 
     folder_map: dict = {}
     folder_ids: list = []
@@ -1473,6 +1497,9 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
         pass
 
     async def _fetch_contacts(url):
+        """Plain (non-delta) page walk — preserved for the Deleted-
+        Items and Recoverable-Items folders below which don't have a
+        delta endpoint."""
         all_rows = []
         next_url = url
         params = {"$top": str(item_limit), "$select": select_fields}
@@ -1486,6 +1513,51 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
             all_rows.extend(page_data.get("value", []) or [])
             next_url = page_data.get("@odata.nextLink")
             params = None
+            pages += 1
+        return all_rows
+
+    async def _fetch_contacts_delta(source_key: str, initial_url: str):
+        """Walk the /contacts/delta endpoint and capture the terminal
+        ``@odata.deltaLink`` into ``new_deltas[source_key]``. Resumes
+        from ``prior_deltas[source_key]`` when present — Graph returns
+        ONLY changes since that token, including ``@removed`` tombstones.
+
+        Returns the list of value rows (changed contacts + tombstones)."""
+        all_rows: List[Dict[str, Any]] = []
+        prior = prior_deltas.get(source_key)
+        if prior:
+            # Resume — pass the saved deltaLink verbatim. It encodes
+            # its own $deltatoken so we drop our own params.
+            next_url = prior
+            params = None
+        else:
+            next_url = initial_url
+            params = {"$top": str(item_limit), "$select": select_fields}
+        pages = 0
+        while next_url and pages < 100:
+            try:
+                page_data = await graph_client._get(next_url, params=params)
+            except Exception as exc:
+                logger.warning(
+                    "Contact delta fetch failed on %s: %s",
+                    next_url[:120], exc,
+                )
+                # On error we deliberately DO NOT update new_deltas[key]
+                # — the caller will fall back to prior_deltas (or full
+                # fetch on next run if there was none), which is the
+                # correct durability guarantee.
+                return all_rows
+            all_rows.extend(page_data.get("value", []) or [])
+            params = None
+            # @odata.nextLink continues paging; @odata.deltaLink marks
+            # the terminal page and gives us the cursor for next time.
+            nlink = page_data.get("@odata.nextLink")
+            dlink = page_data.get("@odata.deltaLink")
+            if dlink:
+                new_deltas[source_key] = dlink
+                next_url = None
+            else:
+                next_url = nlink
             pages += 1
         return all_rows
 
@@ -1506,17 +1578,41 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
 
     aggregated: dict = {}
     folder_override: dict = {}
+    tombstone_ids: List[str] = []
 
-    for c in await _fetch_contacts(f"{graph_client.GRAPH_URL}/users/{user_id}/contacts"):
+    def _ingest_delta_row(c: Dict[str, Any]) -> None:
+        """Apply one row from a /contacts/delta page to ``aggregated``.
+
+        Graph delta encodes deletes as ``{"@removed": {...}, "id": "..."}``
+        rather than returning a normal contact. We collect those ids
+        into ``tombstone_ids`` so the caller can surface them as
+        deletion events (snapshot_items.deleted_at marking happens at
+        the upsert layer downstream)."""
         cid = c.get("id")
-        if cid and cid not in aggregated:
+        if not cid:
+            return
+        if c.get("@removed"):
+            tombstone_ids.append(cid)
+            return
+        if cid not in aggregated:
             aggregated[cid] = c
+
+    # Top-level /contacts/delta — covers contacts not nested in a custom
+    # folder. On first run returns everything + a deltaLink; subsequent
+    # runs return only changes since the last cursor.
+    root_url = f"{graph_client.GRAPH_URL}/users/{user_id}/contacts/delta"
+    for c in await _fetch_contacts_delta("__root__", root_url):
+        _ingest_delta_row(c)
+    # Per-folder /contactFolders/{fid}/contacts/delta — same shape,
+    # one cursor per folder so adding/removing a folder doesn't reset
+    # the others.
     for fid in folder_ids:
-        url = f"{graph_client.GRAPH_URL}/users/{user_id}/contactFolders/{fid}/contacts"
-        for c in await _fetch_contacts(url):
-            cid = c.get("id")
-            if cid and cid not in aggregated:
-                aggregated[cid] = c
+        f_url = (
+            f"{graph_client.GRAPH_URL}/users/{user_id}"
+            f"/contactFolders/{fid}/contacts/delta"
+        )
+        for c in await _fetch_contacts_delta(fid, f_url):
+            _ingest_delta_row(c)
 
     # itemClass isn't a native property of microsoft.graph.message, so
     # filtering by it returns 400. Contact items live in mail folders with
@@ -1578,7 +1674,16 @@ async def _backup_contacts_for_user(graph_client, user_id: str, item_limit: int 
             or "(unnamed)"
         )
         out_rows.append(("USER_CONTACT", name, cid, {"raw": c}, folder_name))
-    return out_rows
+    # Tombstones — surface as DELETED rows so the snapshot_items diff
+    # layer can mark them removed. payload carries the bare id so the
+    # downstream upsert path can locate the existing row.
+    for tid in tombstone_ids:
+        out_rows.append((
+            "USER_CONTACT", "(deleted)", tid,
+            {"raw": {"id": tid, "@removed": True}},
+            "Contacts",
+        ))
+    return out_rows, new_deltas
 
 
 class AuditLogger:
@@ -4072,13 +4177,52 @@ class BackupWorker:
                     return out
 
                 if kind == "USER_CONTACTS":
-                    out_rows = await _backup_contacts_for_user(
-                        graph_client, user_id, item_limit=ITEM_LIMIT
+                    # Incremental contacts via /contacts/delta — load
+                    # prior cursors from resource.extra_data so subsequent
+                    # runs fetch ONLY changes since the last successful
+                    # drain (cuts per-user contact Graph traffic from
+                    # O(total_contacts) to O(changes_since_last)).
+                    _prior_ed = dict(resource.extra_data or {})
+                    _prior_contact_deltas = (
+                        _prior_ed.get("contacts_deltas") or {}
+                    )
+                    out_rows, _new_contact_deltas = await _backup_contacts_for_user(
+                        graph_client, user_id, item_limit=ITEM_LIMIT,
+                        prior_deltas=_prior_contact_deltas,
                     )
                     folder_names = sorted({r[4] for r in out_rows})
+                    # Persist new delta links on the resource — only the
+                    # ones the helper successfully captured a deltaLink
+                    # for. Folders that hit pagination errors retain
+                    # their prior cursor (or stay unset, forcing the
+                    # next run to do a fresh delta walk for that folder
+                    # only).
+                    if _new_contact_deltas:
+                        try:
+                            merged = dict(_prior_contact_deltas)
+                            merged.update(_new_contact_deltas)
+                            _prior_ed["contacts_deltas"] = merged
+                            async with async_session_factory() as _cs:
+                                _res = await _cs.get(Resource, resource.id)
+                                if _res is not None:
+                                    _res.extra_data = _prior_ed
+                                    await _cs.commit()
+                        except Exception as _ed_err:
+                            print(
+                                f"[{self.worker_id}] [USER_CONTACTS] "
+                                f"persist deltas failed: "
+                                f"{type(_ed_err).__name__}: {_ed_err}"
+                            )
+                    _new_count = sum(
+                        1 for r in out_rows
+                        if not (r[3] or {}).get("raw", {}).get("@removed")
+                    )
+                    _del_count = len(out_rows) - _new_count
+                    _mode = "incremental" if _prior_contact_deltas else "full-first"
                     print(
                         f"[{self.worker_id}]   [USER_CONTACTS] {user_id}: "
-                        f"{len(out_rows)} contacts, folders={folder_names}"
+                        f"{_new_count} contacts ({_del_count} deletion(s)), "
+                        f"folders={folder_names} mode={_mode}"
                     )
                     return out_rows
 
