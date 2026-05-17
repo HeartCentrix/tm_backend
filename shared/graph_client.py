@@ -134,13 +134,17 @@ class GraphClient:
             # max_keepalive_connections=50 sized so a worker with 10
             # parallel folder drains × 2-4 in-flight pages each fits
             # without recycling sockets.
-            # HTTP/2: opt-in via GRAPHCLIENT_HTTP2=true. h2 is in requirements
-            # but disabled by default until rolled out behind the flag — flip
-            # the env var to true on one replica first and watch for stream
-            # reset / connection errors before enabling fleet-wide. HTTP/2
-            # multiplexes hundreds of in-flight requests on one TCP
-            # connection → no per-request TLS handshake on the hot path.
-            use_http2 = os.environ.get("GRAPHCLIENT_HTTP2", "false").lower() == "true"
+            # HTTP/2: default ON (2026-05-17 prod tuning). The `h2` lib is
+            # pinned in every worker's requirements.txt; if a custom image
+            # lacks it the ImportError path below falls back to HTTP/1.1
+            # with a warning so the worker keeps serving. HTTP/2 multiplexes
+            # hundreds of in-flight requests on one TCP connection → no
+            # per-request TLS handshake on the hot path. Critical for the
+            # 12-replica × 20-app fleet where each replica may have
+            # 8 concurrent USER_CHATS handlers × 32 in-flight HC fetches
+            # = 256 concurrent Graph requests; HTTP/1.1 would force 256
+            # parallel sockets per replica, blowing the pool budget.
+            use_http2 = os.environ.get("GRAPHCLIENT_HTTP2", "true").lower() == "true"
             # HTTP/2 needs the `h2` lib. It's pinned in every worker's
             # requirements.txt — but if a custom image somehow lacks
             # it, httpx raises ImportError at construct time. Detect
