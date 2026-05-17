@@ -15818,16 +15818,27 @@ class BackupWorker:
 
             local_items: List[dict] = []
             local_bytes = 0
-            for att in attachments:
+
+            # Per-event-attachment processing (perf #4 2026-05-17):
+            # mirrors the mail-attachment fix — was a serial
+            # `for att in attachments: await get_event_attachment_content(...)`
+            # loop. Now runs in parallel under the same outer `sem` so
+            # Azure Blob uploads and Graph fetches overlap. Multi-
+            # attachment calendar events (large meeting decks) used to
+            # take N x ~300ms; now O(longest single att).
+            async def _process_event_att(
+                att: Dict[str, Any],
+            ) -> Tuple[Optional[Dict[str, Any]], int]:
                 att_id = att.get("id")
                 if not att_id:
-                    continue
+                    return None, 0
                 att_kind = att.get("@odata.type", "")
                 att_name = att.get("name") or att_id
                 att_size = att.get("size") or 0
                 content_bytes: Optional[bytes] = None
                 blob_path: Optional[str] = None
                 content_hash: Optional[str] = None
+                bytes_added_local = 0
 
                 if att_kind.endswith("fileAttachment"):
                     raw_b64 = att.get("contentBytes")
@@ -15845,10 +15856,10 @@ class BackupWorker:
                                 )
                         except Exception as e:
                             print(f"[{self.worker_id}]   [EVENT ATT FAIL] {att_name} on event {event_id}: {type(e).__name__}: {e}")
-                            continue
+                            return None, 0
 
                     if content_bytes is None:
-                        continue
+                        return None, 0
                     content_hash = hashlib.sha256(content_bytes).hexdigest()
                     blob_path = azure_storage_manager.build_blob_path(
                         str(tenant.id), str(resource.id), str(snapshot.id),
@@ -15858,10 +15869,10 @@ class BackupWorker:
                         container, blob_path, content_bytes, shard, max_retries=3,
                     )
                     if not (isinstance(upload_result, dict) and upload_result.get("success")):
-                        continue
-                    local_bytes += len(content_bytes)
+                        return None, 0
+                    bytes_added_local = len(content_bytes)
 
-                local_items.append({
+                row = {
                     "snapshot_id": snapshot.id,
                     "tenant_id": tenant.id,
                     "external_id": f"{event_id}::{att_id}",
@@ -15879,7 +15890,32 @@ class BackupWorker:
                         "content_id": att.get("contentId") or att.get("contentID"),
                         "source_url": att.get("sourceUrl"),
                     },
-                })
+                }
+                return row, bytes_added_local
+
+            if attachments:
+                _ev_t0 = time.monotonic()
+                _ev_results = await asyncio.gather(
+                    *(_process_event_att(a) for a in attachments),
+                    return_exceptions=True,
+                )
+                for _r in _ev_results:
+                    if isinstance(_r, Exception):
+                        print(
+                            f"[{self.worker_id}] [EVENT-ATT-TASK] event "
+                            f"{event_id} task raised: {type(_r).__name__}: {_r}"
+                        )
+                        continue
+                    _row, _b = _r
+                    if _row is not None:
+                        local_items.append(_row)
+                        local_bytes += _b
+                if len(attachments) >= 3:
+                    print(
+                        f"[{self.worker_id}] [PERF] event {event_id[:16]} "
+                        f"{len(attachments)} atts processed in "
+                        f"{time.monotonic() - _ev_t0:.2f}s"
+                    )
             return local_items, local_bytes
 
         results = await asyncio.gather(
