@@ -8,6 +8,7 @@ Apply only after every gate below passes. The migration is destructive on the th
 python3 scripts/audit_schema.py --tables snapshot_items chat_thread_messages audit_events
 ```
 
+
 Exit code must be `0`. Any drift means the migration's INSERT…SELECT will fail or silently drop data. Resolve drift first (manual ALTER, or skip the migration for that table).
 
 ## Step 1 — Test the rollback path against a clone
