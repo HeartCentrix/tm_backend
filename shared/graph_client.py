@@ -3910,6 +3910,16 @@ class GraphClient:
         # a per-request AsyncClient → fresh TCP + TLS handshake on every
         # inline image. With HTTP/2 on (GRAPHCLIENT_HTTP2=true) multiple
         # HC streams now multiplex on the same connection.
+        #
+        # Item A-followup (2026-05-17): on 429/503, try to migrate to a
+        # healthy app's token BEFORE sleeping Retry-After. Without this,
+        # all 5 retries hit the same throttled app and one transient
+        # 429-storm on app X drops one inline image. With 20 apps and
+        # the BatchClient pattern (see _send_chunk_with_retry), one
+        # app's 429 should swap to another app's bucket immediately.
+        # Caught in prod: "hc interleave failed msg=17751087 chat=19:6d29d:
+        # HTTPStatusError: throttled after 5 attempts".
+        current_app_id: str = self.client_id
         for attempt in range(max_attempts):
             client = await self._get_shared_http()
             client_cm = None  # shared client must NOT be closed per-request
@@ -3926,7 +3936,7 @@ class GraphClient:
                     try:
                         from shared.multi_app_manager import multi_app_manager
                         multi_app_manager.mark_throttled(
-                            self.client_id, int(retry_after),
+                            current_app_id, int(retry_after),
                         )
                     except Exception:
                         pass
@@ -3934,6 +3944,14 @@ class GraphClient:
                     if client_cm is not None:
                         await client_cm.__aexit__(None, None, None)
                     if attempt < max_attempts - 1:
+                        # Try app migration FIRST — no sleep needed if we
+                        # find a healthy alt. Matches BatchClient retry.
+                        new_token, new_app = await self._try_migrate_app(current_app_id)
+                        if new_token and new_app:
+                            token = new_token
+                            current_app_id = new_app
+                            continue
+                        # No healthy app available → fall back to sleep.
                         await asyncio.sleep(retry_after)
                         token = await self._get_token()
                         continue
