@@ -877,6 +877,16 @@ async def _revert_snapshot_storage(db: AsyncSession, snapshot) -> dict:
 async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
     """Cancel a job and fully revert any partial work.
 
+    Concurrency model: the UI fires Cancel POSTs for every sibling job
+    in a batch via Promise.all. Without serialization, three concurrent
+    cancels race for locks on the same backup_batches / jobs / snapshots
+    rows and deadlock (observed 2026-05-18). Take a Postgres advisory
+    lock keyed on batch_id at function entry — only one cancel per
+    batch can run at a time; the rest wait at most a few hundred ms
+    and proceed sequentially. Locks are transaction-scoped
+    (pg_advisory_xact_lock) so they release automatically on commit
+    /rollback / connection drop. Cheap (~100 ns) and Postgres-native.
+
     Cancel is a *revert*, not a soft-close — to keep backing storage
     consistent with the DB and to avoid ghost bytes piling up on
     SeaweedFS / Azure. See `_revert_snapshot_storage` for the per-
@@ -894,6 +904,32 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
     job = (await db.execute(select(Job).where(Job.id == _parse_uuid(job_id, "job_id")))).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # Take a transaction-scoped advisory lock keyed on batch_id so
+    # concurrent cancels for sibling jobs in the same batch serialize.
+    # hashtext() collapses the UUID string to a 32-bit int for
+    # pg_advisory_xact_lock; collisions across different batches are
+    # acceptable (worst case: cancels for unrelated batches wait a few
+    # ms for each other, instead of deadlocking the DB). Lock auto-
+    # releases on commit/rollback. If there is no batch_id (e.g. an
+    # ancient pre-batch-redesign job), we lock on the job id itself
+    # which still avoids self-races but doesn't serialize siblings —
+    # those legacy jobs predate the deadlock pattern anyway.
+    _lock_key = None
+    if isinstance(job.spec, dict):
+        _lock_key = job.spec.get("batch_id")
+    if not _lock_key:
+        _lock_key = str(job.id)
+    try:
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+            {"k": str(_lock_key)},
+        )
+    except Exception as _le:
+        # Lock acquisition is best-effort — falling through without it
+        # is safer than 500-ing the cancel button.
+        print(f"[JOB_SERVICE] cancel advisory_xact_lock failed (continuing): {_le}")
+
     if job.status not in (JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.RETRYING):
         # The targeted job is already terminal, but the batch it belonged
         # to may still be IN_PROGRESS because sibling jobs / partition
