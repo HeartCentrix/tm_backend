@@ -332,6 +332,69 @@ class GraphClient:
                 print(f"[GraphClient] Token fetch timeout (attempt {attempt}/3), retry in {wait}s: {e}")
                 await asyncio.sleep(wait)
         raise RuntimeError(f"Could not acquire token after 3 attempts: {last_exc}")
+
+    async def _try_migrate_app(
+        self, throttled_app_id: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Pick a healthy alternate app and fetch a fresh token for it.
+
+        Called by 429/503 retry sites to swap apps **instead of sleeping**.
+        With N apps registered (currently 20), most 429s only apply to the
+        app that just sent the request — the other N-1 apps still have full
+        per-app budget. Burning 30s of Retry-After sleep is pure waste when
+        we could immediately retry on a different app's token.
+
+        The migration cost is one token-fetch round-trip (~150-300ms)
+        amortized against avoiding the Retry-After sleep (~5-60s). Net win
+        in 100% of cases where at least one other app is healthy.
+
+        Args:
+            throttled_app_id: the client_id whose request just hit 429/503.
+                Used to ensure we don't migrate back to the same app.
+
+        Returns:
+            (token, new_app_id) — caller uses this token in retry's
+            Authorization header and reports mark_success against new_app_id.
+            (None, None) when no other healthy app is available
+            (single-app deployment OR all apps throttled simultaneously);
+            caller should fall back to sleep+retry-on-same-app.
+
+        Tokens are NOT cached here; the migration is rare and the multi_app
+        manager already does adaptive ban-ladder bookkeeping. Caching would
+        invite stale-token bugs on the slow path.
+        """
+        from shared.multi_app_manager import multi_app_manager
+        if multi_app_manager.app_count <= 1:
+            return None, None
+        # get_next_app() applies round-robin admission filtered by
+        # throttle state; it returns the chosen AppRegistry even when all
+        # apps are throttled (least-loaded fallback) so we double-check
+        # is_throttled + client_id distinct here.
+        pick = multi_app_manager.get_next_app()
+        if not pick or pick.client_id == throttled_app_id or pick.is_throttled:
+            return None, None
+        try:
+            async with self._http_session() as client:
+                resp = await client.post(
+                    self.TOKEN_URL.format(tenant_id=pick.tenant_id),
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": pick.client_id,
+                        "client_secret": pick.client_secret,
+                        "scope": "https://graph.microsoft.com/.default",
+                    },
+                )
+                resp.raise_for_status()
+                token = resp.json().get("access_token")
+                if not token:
+                    return None, None
+                return token, pick.client_id
+        except Exception as exc:
+            print(
+                f"[GraphClient] migration token fetch failed "
+                f"({pick.client_id[:8]}): {type(exc).__name__}: {exc}"
+            )
+            return None, None
     
     @property
     def _policy(self) -> RateLimitPolicy:
@@ -370,6 +433,10 @@ class GraphClient:
     async def _get_legacy(self, url: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         """Pre-hardening _get — preserved verbatim as the kill-switch path."""
         token = await self._get_token()
+        # Track which app's token is currently in use. Starts as self
+        # but may migrate on 429 to a healthier app — see _try_migrate_app
+        # docstring for why this beats sleep+retry-on-same-app.
+        current_app_id = self.client_id
         all_items = []
         next_url = url
         max_retries = 5
@@ -393,9 +460,25 @@ class GraphClient:
                     if resp.status_code == 429:
                         retry_after = int(resp.headers.get("Retry-After", "30"))
                         from shared.multi_app_manager import multi_app_manager
-                        multi_app_manager.mark_throttled(self.client_id, retry_after)
+                        multi_app_manager.mark_throttled(current_app_id, retry_after)
                         if retry_count < max_retries:
                             retry_count += 1
+                            # Try to swap to a different healthy app FIRST.
+                            # If one's available, immediate retry — no
+                            # sleep, no wasted minutes burning through
+                            # Retry-After when 19 other apps could serve.
+                            new_token, new_app = await self._try_migrate_app(current_app_id)
+                            if new_token and new_app:
+                                token = new_token
+                                current_app_id = new_app
+                                # Skip the Retry-After sleep entirely;
+                                # the new app's per-app budget hasn't
+                                # been throttled — Graph's per-app caps
+                                # are independent.
+                                continue
+                            # All other apps throttled (or single-app
+                            # deployment) — fall back to honoring
+                            # Retry-After on the same app.
                             await __import__('asyncio').sleep(retry_after)
                             continue
                         resp.raise_for_status()
@@ -407,7 +490,9 @@ class GraphClient:
                     try:
                         from shared.multi_app_manager import multi_app_manager
                         _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
-                        multi_app_manager.mark_success(self.client_id, _lat_ms)
+                        # Credit the app that actually served the request
+                        # (may have migrated from self.client_id on prior 429).
+                        multi_app_manager.mark_success(current_app_id, _lat_ms)
                     except Exception:
                         pass
                     data = resp.json()
@@ -509,6 +594,22 @@ class GraphClient:
                     multi_app_manager.mark_throttled(
                         self.client_id, int(action.sleep_seconds),
                     )
+                    # Multi-app rotation: same reasoning as the legacy
+                    # path — sleeping ~30s of Retry-After is wasteful
+                    # when other apps have full budget. We don't track
+                    # `current_app` locally here because the hardened
+                    # `_get` is a single-URL call (not paginated); the
+                    # next iteration of this while-loop just retries
+                    # next_url with the swapped token.
+                    new_token, _new_app = await self._try_migrate_app(self.client_id)
+                    if new_token:
+                        token = new_token
+                        print(
+                            f"[GraphClient/hardened] {resp.status_code} on "
+                            f"{next_url[:80]} — migrating app "
+                            f"(skipping {action.sleep_seconds:.1f}s sleep)"
+                        )
+                        continue
                     print(f"[GraphClient/hardened] {resp.status_code} on "
                           f"{next_url[:80]} — {action.reason}")
                     await asyncio.sleep(action.sleep_seconds)
@@ -581,9 +682,14 @@ class GraphClient:
         # this the legacy path silently breaks incremental backups (every
         # run re-fetches full history because the token is never stored).
         self._last_delta_link: Optional[str] = None
+        # Tracks which app's token is currently in use for this stream;
+        # migrates on 429 (see _try_migrate_app). Streams stay on the
+        # failover app for the remainder of pagination — re-pinning to
+        # self.client_id every page would defeat the migration.
+        token = await self._get_token()
+        current_app_id = self.client_id
 
         while next_url:
-            token = await self._get_token()
             try:
                 async with self._http_session() as client:
                     if params and params.get("$count") == "true":
@@ -597,13 +703,24 @@ class GraphClient:
                     if resp.status_code == 429:
                         retry_after = int(resp.headers.get("Retry-After", "30"))
                         from shared.multi_app_manager import multi_app_manager
-                        multi_app_manager.mark_throttled(self.client_id, retry_after)
-                        print(
-                            f"[GraphClient] 429 on {next_url[:100]} — sleeping {retry_after}s "
-                            f"(attempt {retry_count + 1}/{max_retries})"
-                        )
+                        multi_app_manager.mark_throttled(current_app_id, retry_after)
                         if retry_count < max_retries:
                             retry_count += 1
+                            # Try app migration before falling back to sleep.
+                            new_token, new_app = await self._try_migrate_app(current_app_id)
+                            if new_token and new_app:
+                                print(
+                                    f"[GraphClient] 429 on {next_url[:80]} — "
+                                    f"migrating app {current_app_id[:8]} → "
+                                    f"{new_app[:8]} (attempt {retry_count}/{max_retries})"
+                                )
+                                token = new_token
+                                current_app_id = new_app
+                                continue
+                            print(
+                                f"[GraphClient] 429 on {next_url[:100]} — sleeping {retry_after}s "
+                                f"(attempt {retry_count}/{max_retries}, no healthy alt-app)"
+                            )
                             await asyncio.sleep(retry_after)
                             continue
                         resp.raise_for_status()
@@ -613,7 +730,7 @@ class GraphClient:
                     try:
                         from shared.multi_app_manager import multi_app_manager as _mam
                         _lat_ms = float(resp.elapsed.total_seconds() * 1000) if getattr(resp, "elapsed", None) else 0.0
-                        _mam.mark_success(self.client_id, _lat_ms)
+                        _mam.mark_success(current_app_id, _lat_ms)
                     except Exception:
                         pass
                     data = resp.json()
@@ -706,16 +823,27 @@ class GraphClient:
                     multi_app_manager.mark_throttled(
                         current_app, int(action.sleep_seconds),
                     )
-                    # Migrate to next healthy app.
-                    try:
-                        pick = multi_app_manager.get_next_app()
-                        if pick and pick.client_id != current_app:
-                            current_app = pick.client_id
-                            pages_on_failover = 0
-                            print(f"[GraphClient/hardened iter] migrating "
-                                  f"{resp.status_code} -> app={current_app}")
-                    except Exception:
-                        pass
+                    # Try to migrate AND obtain a fresh token for the
+                    # new app. If successful, skip the sleep entirely —
+                    # the new app's per-app budget is independent of
+                    # the throttled one. The prior implementation
+                    # migrated `current_app` but kept the OLD token,
+                    # so the retry still hit the throttled app's
+                    # tenant-wide cap; this version actually swaps the
+                    # token used for the next request.
+                    new_token, new_app = await self._try_migrate_app(current_app)
+                    if new_token and new_app:
+                        token = new_token
+                        current_app = new_app
+                        pages_on_failover = 0
+                        print(
+                            f"[GraphClient/hardened iter] migrating "
+                            f"{resp.status_code} -> app={current_app[:8]} "
+                            f"(skipping {action.sleep_seconds:.1f}s sleep)"
+                        )
+                        # Skip the Retry-After sleep and the post-
+                        # throttle brake; the new app needs no cooldown.
+                        continue
                     await asyncio.sleep(action.sleep_seconds)
                     if s.GRAPH_POST_THROTTLE_BRAKE_MS > 0:
                         await asyncio.sleep(

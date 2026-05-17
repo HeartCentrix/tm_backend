@@ -6658,7 +6658,7 @@ class BackupWorker:
                         _is_partitioned = False
                     if _is_partitioned:
                         print(
-                            f"[{self.worker_id}] [USER_CHATS] "
+                            f"[{self.worker_id}] [{resource.type.value}] "
                             f"{resource.display_name or resource.id}: "
                             f"partitioned — coordinator returning, "
                             f"awaiting partition consumers."
@@ -8495,6 +8495,93 @@ class BackupWorker:
                     )
             return local_items, local_bytes
 
+        # ── Pre-warm url_cache from persisted tenant cache ───────
+        # Single bulk SELECT against chat_url_cache before the $batch
+        # resolve. Hits are stored into url_cache so the very first
+        # check in _fetch_url_deduped short-circuits with no Graph
+        # round-trip and no CDN download. Phases where every
+        # attachment is a cross-snapshot duplicate (~68% of phases
+        # in 2026-05-17 telemetry) now skip the $batch resolve
+        # entirely — the bulk SQL is one round-trip vs ceil(N/20)
+        # /$batch HTTPs.
+        _cand_urls: List[str] = []
+        _cand_seen: set = set()
+        _url_by_sha: Dict[str, str] = {}
+        for _m in messages_with_attachments:
+            for _a in (_m.get("attachments") or []):
+                if not isinstance(_a, dict):
+                    continue
+                _ct = (_a.get("contentType") or "").strip()
+                if _ct not in REFERENCE_TYPES and not (
+                    _ct and _ct not in POINTER_TYPES
+                    and not _ct.startswith("application/vnd.microsoft.card")
+                ):
+                    continue
+                _u = _a.get("contentUrl")
+                if not _u or _u in _cand_seen or _u in url_cache:
+                    continue
+                _cand_seen.add(_u)
+                _cand_urls.append(_u)
+                _url_by_sha[hashlib.sha256(_u.encode("utf-8")).hexdigest()] = _u
+        if _cand_urls:
+            _t0 = time.monotonic()
+            try:
+                async with async_session_factory() as s:
+                    _rows = (await s.execute(
+                        text(
+                            "UPDATE chat_url_cache "
+                            "   SET last_used_at = NOW() "
+                            " WHERE tenant_id = :t "
+                            "   AND url_sha256 = ANY(:shas) "
+                            "   AND last_used_at > NOW() - (:d || ' days')::interval "
+                            "RETURNING url_sha256, drive_item_id, content_hash, "
+                            "          blob_path, content_size, inline_b64, unreachable"
+                        ),
+                        {
+                            "t": tenant_id_str,
+                            "shas": list(_url_by_sha.keys()),
+                            "d": str(url_cache_ttl_days),
+                        },
+                    )).all()
+                    await s.commit()
+                _bulk_hits = 0
+                _bulk_unreachable = 0
+                for _row in _rows:
+                    _hit_url = _url_by_sha.get(_row.url_sha256)
+                    if not _hit_url:
+                        continue
+                    if _row.unreachable:
+                        url_cache[_hit_url] = _CachedAttachmentResult(
+                            unreachable=True,
+                        )
+                        _bulk_unreachable += 1
+                    elif _row.content_hash and (
+                        _row.blob_path or _row.inline_b64
+                    ):
+                        url_cache[_hit_url] = _CachedAttachmentResult(
+                            content_hash=_row.content_hash,
+                            blob_path=_row.blob_path,
+                            inline_b64=_row.inline_b64,
+                            content_size=_row.content_size or 0,
+                        )
+                        _bulk_hits += 1
+                tenant_cache_stats["hits"] += _bulk_hits
+                tenant_cache_stats["unreachable_skip"] += _bulk_unreachable
+                print(
+                    f"[{self.worker_id}] [CHAT-ATT] tenant-cache "
+                    f"bulk pre-warm: {_bulk_hits} hits, "
+                    f"{_bulk_unreachable} unreachable, "
+                    f"{len(_cand_urls) - _bulk_hits - _bulk_unreachable} "
+                    f"misses (will resolve) in "
+                    f"{time.monotonic() - _t0:.2f}s"
+                )
+            except Exception as _e:
+                # Best-effort — fall through to the $batch resolve.
+                print(
+                    f"[{self.worker_id}] [CHAT-ATT] tenant-cache bulk "
+                    f"pre-warm failed: {type(_e).__name__}: {_e}"
+                )
+
         # ── Bulk pre-resolve attachment share-URLs via /$batch ────
         # Mirrors the OneDrive ``url pre-fetch`` pattern: instead of
         # paying one Graph round-trip per attachment in the per-msg
@@ -8510,7 +8597,8 @@ class BackupWorker:
         # resolve drops from ~35s wall to ~3-5s.
         #
         # Skipped URLs:
-        #   * already in url_cache (snapshot-wide hit)
+        #   * already in url_cache (snapshot-wide hit OR
+        #     tenant-cache pre-warm hit above)
         #   * already in driveitem_tasks (in-flight from another chat)
         #   * blank / non-reference attachments
         # Any URL absent from the bulk-resolved map after the batch
