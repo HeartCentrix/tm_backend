@@ -899,23 +899,66 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
             text("UPDATE resources SET last_backup_status = 'CANCELLED', last_backup_job_id = :jid WHERE id = ANY(:ids)"),
             {"jid": job.id, "ids": resource_ids},
         )
-        # Fully revert every IN_PROGRESS snapshot this job owned:
-        # delete the blobs from storage, then the DB rows. This is how
-        # we stop partial-upload bytes from accumulating on SeaweedFS /
-        # Azure. The audit event below carries a summary of what went.
-        in_flight_snaps = (await db.execute(
-            select(Snapshot).where(
-                Snapshot.job_id == job.id,
-                Snapshot.status == SnapshotStatus.IN_PROGRESS,
-            )
-        )).scalars().all()
-        for snap in in_flight_snaps:
-            summary = await _revert_snapshot_storage(db, snap)
-            revert_totals["items_reverted"] += summary["items_reverted"]
-            revert_totals["bytes_reverted"] += summary["bytes_reverted"]
-            revert_totals["blobs_deleted"] += summary["blobs_deleted"]
-            revert_totals["blob_errors"] += summary["blob_errors"]
-        revert_totals["snapshots_reverted"] = len(in_flight_snaps)
+        # Atomic flip — was destructive delete, caused two real prod
+        # incidents:
+        #
+        #   1. ForeignKeyViolationError on `snapshot_items_snapshot_id_fkey`
+        #      when a backup_worker inserted a NEW snapshot_items row
+        #      BETWEEN this endpoint's "DELETE FROM snapshot_items" and
+        #      "DELETE FROM snapshots" — the second delete failed with
+        #      FK-violation → 500 to the UI cancel button.
+        #   2. DeadlockDetectedError when two concurrent cancels (or
+        #      cancel + worker insert) collide on the same snapshot row.
+        #
+        # New strategy: atomically flip every in-flight snapshot to
+        # FAILED with ``extra_data.cancelled_at`` set. No deletes here —
+        # FK violations are impossible because no row vanishes. Async
+        # blob + row teardown is owned by ``_sweep_cancelled_snapshots``
+        # in backup-scheduler (runs every 30s, idempotent).
+        #
+        # We still need the *summary* (item/byte counts) for the audit
+        # event below, so we snapshot the aggregate before the flip.
+        # Reads only — concurrent worker inserts after this point land
+        # in the post-cancel reaper's hands, not ours.
+        agg = (await db.execute(
+            text(
+                "SELECT count(s.id) AS n_snaps, "
+                "       COALESCE(SUM(si.n),  0)::bigint AS n_items, "
+                "       COALESCE(SUM(si.b),  0)::bigint AS n_bytes "
+                "  FROM snapshots s "
+                "  LEFT JOIN LATERAL ( "
+                "    SELECT count(*) AS n, "
+                "           COALESCE(SUM(content_size),0)::bigint AS b "
+                "      FROM snapshot_items "
+                "     WHERE snapshot_id = s.id "
+                "  ) si ON TRUE "
+                " WHERE s.job_id = :jid AND s.status = 'IN_PROGRESS'"
+            ),
+            {"jid": job.id},
+        )).first()
+        revert_totals["snapshots_reverted"] = int(agg.n_snaps or 0) if agg else 0
+        revert_totals["items_reverted"] = int(agg.n_items or 0) if agg else 0
+        revert_totals["bytes_reverted"] = int(agg.n_bytes or 0) if agg else 0
+        # The atomic flip itself — single UPDATE, no per-row Python.
+        # status=FAILED so the UI's IN_PROGRESS filter stops showing
+        # the row immediately. extra_data.cancelled_at is the durable
+        # marker the reaper keys on; extra_data.cancelled_by_job_id
+        # gives operators a clean trail back to the cancel event.
+        await db.execute(
+            text(
+                "UPDATE snapshots SET "
+                "  status = 'FAILED'::snapshotstatus, "
+                "  completed_at = NOW(), "
+                "  duration_secs = EXTRACT(EPOCH FROM (NOW() - started_at))::int, "
+                "  extra_data = COALESCE(extra_data, '{}'::jsonb) "
+                "               || jsonb_build_object( "
+                "                   'cancelled_at', NOW(), "
+                "                   'cancelled_by_job_id', :jid::text, "
+                "                   'cancel_phase', 'flip_pending_sweep') "
+                " WHERE job_id = :jid AND status = 'IN_PROGRESS'"
+            ),
+            {"jid": str(job.id)},
+        )
 
     await db.flush()
 

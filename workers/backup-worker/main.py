@@ -19867,7 +19867,15 @@ class BackupWorker:
                 return winner
 
     async def fail_snapshot(self, session: AsyncSession, snapshot: Snapshot, error: Exception):
-        """Mark snapshot as FAILED with error details so it leaves IN_PROGRESS state."""
+        """Mark snapshot as FAILED with error details so it leaves IN_PROGRESS state.
+
+        Distinguishes "cancelled mid-flight" from "genuinely failed" so the
+        backup-scheduler reaper (``_sweep_cancelled_snapshots``) can free
+        the blobs + delete the row asynchronously. Without this marker, a
+        late-arrival snapshot created right after the user clicked Cancel
+        gets stuck FAILED in the DB forever (no reaper key, retention
+        treats it as a normal failed run).
+        """
         now = datetime.utcnow()
         snapshot.status = SnapshotStatus.FAILED
         snapshot.completed_at = now
@@ -19875,6 +19883,13 @@ class BackupWorker:
             snapshot.duration_secs = int((now - snapshot.started_at).total_seconds())
         existing = dict(snapshot.extra_data or {})
         existing["error"] = str(error)[:2000]
+        # Self-mark cancellation when the handler exited via the
+        # JobCancelledMidFlight signal (and the belt-and-braces case
+        # where the exception message indicates a cancel even when
+        # it's wrapped). Matched by the scheduler's reaper SQL.
+        if isinstance(error, JobCancelledMidFlight) or "cancelled mid-flight" in str(error).lower():
+            existing["cancelled_at"] = now.isoformat() + "Z"
+            existing["cancel_phase"] = "worker_self_flip"
         snapshot.extra_data = existing
         await session.merge(snapshot)
         await session.commit()
