@@ -192,7 +192,28 @@ async def _create_batch_backup_jobs(
         try:
             sample_res = next(iter(resources_map.values()))
             tenant_for_batch = sample_res.tenant_id
-            scope_ids = [r.id for r in resources_map.values()]
+            # scope_user_ids represents the OPERATOR'S intent — what the
+            # user/operator clicked. Tier-2 child rows (USER_MAIL /
+            # USER_CHATS / USER_ONEDRIVE / USER_CALENDAR / USER_CONTACTS)
+            # are discovered automatically as children of ENTRA_USER and
+            # MUST NOT appear in the scope: putting them in inflates
+            # array_length(scope_user_ids,1) so the UI Activity row says
+            # "54 users" when in reality 9 ENTRA_USER + 45 Tier-2 children
+            # are present. The batch finalizer gate-1 already expands
+            # ENTRA_USER scope entries into Tier-2 children at check
+            # time (shared/batch_rollup.py:_finalize_batch_if_complete),
+            # so excluding them here doesn't lose coverage.
+            _T2_EXCLUDE = {
+                ResourceType.USER_MAIL,
+                ResourceType.USER_CALENDAR,
+                ResourceType.USER_CONTACTS,
+                ResourceType.USER_ONEDRIVE,
+                ResourceType.USER_CHATS,
+            }
+            scope_ids = [
+                r.id for r in resources_map.values()
+                if r.type not in _T2_EXCLUDE
+            ]
             await db.execute(text("""
                 INSERT INTO backup_batches
                     (id, tenant_id, source, scope_user_ids, status, created_at)
