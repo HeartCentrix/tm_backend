@@ -18,6 +18,7 @@ Architecture:
 """
 import asyncio
 import json
+import re
 import uuid
 import hashlib
 import logging
@@ -289,18 +290,21 @@ _CHAT_THREAD_DRAIN_FRESHNESS_S = int(
 )
 
 
+_HOSTED_CONTENT_URL_RE = re.compile(
+    r"/messages/[^/\"'<>\s]+/hostedContents/[^/\"'<>\s]+/\$value"
+)
+
+
 def _msg_likely_has_hosted_content(m: Dict[str, Any]) -> bool:
-    """Cheap, false-positive-tolerant pre-check for whether a Graph
-    chat message has inline hostedContents worth fetching.
+    """Strict pre-check for whether a Graph chat message has inline
+    hostedContents worth fetching.
 
-    Graph's HTML body always references inline images via a URL fragment
-    containing ``/hostedContents/`` (the IDs may be opaque base64 but the
-    path component is stable). Pure text messages — and messages whose
-    only attachments are file/loop/giphy cards — never contain it.
-
-    Used by ``_kick_hosted_content_for_chat`` to bound the cost of the
-    per-message ``/hostedContents`` GET we now have to do because the
-    page query no longer carries ``$expand=hostedContents`` (fix #2).
+    Only inline-image refs in a message's HTML body match the canonical
+    Graph URL shape ``/messages/{mid}/hostedContents/{hid}/$value``.
+    Quoted-reply HTML that merely echoes the substring "hostedContents"
+    from a parent message does NOT match, avoiding a stampede of empty
+    per-msg ``/hostedContents`` GETs that produced the slowdown after
+    fix #2.
     """
     body = m.get("body") or {}
     if body.get("contentType") != "html":
@@ -308,7 +312,7 @@ def _msg_likely_has_hosted_content(m: Dict[str, Any]) -> bool:
     content = body.get("content") or ""
     if not isinstance(content, str) or not content:
         return False
-    return "hostedContents" in content
+    return bool(_HOSTED_CONTENT_URL_RE.search(content))
 
 
 def _parse_iso_to_dt(s: Optional[str]) -> Optional[datetime]:
@@ -6097,29 +6101,16 @@ class BackupWorker:
                         # (drain_succeeded=False) but always bump
                         # last_drained_at + failure_state.
                         #
-                        # On successful drain, also stamp last_drained_msg_
-                        # count so the next run's completeness gate has a
-                        # baseline. Use the LIVE table count (not msgs_local
-                        # length) — it captures both this drain's upserts
-                        # AND messages from any concurrent drain by another
-                        # user that we layered on top of.
-                        _final_msg_count: Optional[int] = None
-                        if drain_succeeded:
-                            try:
-                                async with async_session_factory() as _bs:
-                                    _bp = (await _bs.execute(
-                                        text(
-                                            "SELECT count(*) AS n "
-                                            "  FROM chat_thread_messages "
-                                            " WHERE chat_thread_id = :tid"
-                                        ),
-                                        {"tid": thread_id},
-                                    )).first()
-                                _final_msg_count = int(
-                                    (_bp.n if _bp else 0) or 0
-                                )
-                            except Exception:
-                                _final_msg_count = None
+                        # On successful drain, stamp last_drained_msg_count
+                        # so the next run's completeness gate has a baseline.
+                        # Uses len(msgs_local) (this drain's page-fetched
+                        # count) instead of a live SELECT count(*) — the
+                        # extra DB roundtrip per chat was costing more than
+                        # the gate's precision is worth. False-positive risk
+                        # is bounded by the 50% drop threshold.
+                        _final_msg_count: Optional[int] = (
+                            len(msgs_local) if drain_succeeded else None
+                        )
                         try:
                             await _mark_chat_thread_drained(
                                 thread_id=thread_id,
