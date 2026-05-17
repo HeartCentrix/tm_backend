@@ -16037,6 +16037,67 @@ class BackupWorker:
                 item_metas = []
                 reply_msg_ids = set()  # Track which message IDs are replies
 
+                # Bulk-resolve replies via /v1.0/$batch (perf #2 2026-05-17):
+                # Was a serial `for msg in msg_list: await get_channel_
+                # messages_replies(team, ch, msg_id)` — N msgs with
+                # replies = N serial Graph calls. /$batch bundles up to
+                # 20 per call (graph_client.batch handles chunking).
+                from shared.graph_batch import BatchRequest as _BReq
+                _reply_targets = [
+                    m for m in msg_list
+                    if (m.get("replyCount") or 0) > 0 and m.get("id")
+                ]
+                _replies_by_msg: Dict[str, List[Dict[str, Any]]] = {}
+                if _reply_targets:
+                    _rt0 = time.monotonic()
+                    _reply_reqs = [
+                        _BReq(
+                            id=m["id"], method="GET",
+                            url=(
+                                f"/teams/{team_id}/channels/{ch_id}/"
+                                f"messages/{m['id']}/replies"
+                            ),
+                        )
+                        for m in _reply_targets
+                    ]
+                    try:
+                        _reply_batch = await graph_client.batch(_reply_reqs)
+                        for _mid, _resp in _reply_batch.items():
+                            if 200 <= _resp.status < 300:
+                                _replies_by_msg[_mid] = (
+                                    (_resp.body or {}).get("value") or []
+                                )
+                            else:
+                                print(
+                                    f"[{self.worker_id}]   [CHANNEL_REPLY] "
+                                    f"batch sub-response {_mid[:24]} "
+                                    f"status={_resp.status}"
+                                )
+                    except Exception as e:
+                        print(
+                            f"[{self.worker_id}]   [CHANNEL_REPLY] $batch "
+                            f"failed ({type(e).__name__}: {e}); falling "
+                            f"back to per-msg serial"
+                        )
+                        for _m in _reply_targets:
+                            try:
+                                _rs = await graph_client.get_channel_messages_replies(
+                                    team_id, ch_id, _m["id"],
+                                )
+                                _replies_by_msg[_m["id"]] = _rs.get("value", []) or []
+                            except Exception as _ex:
+                                print(
+                                    f"[{self.worker_id}]   [CHANNEL_REPLY] "
+                                    f"per-msg fallback failed for "
+                                    f"{_m['id']}: {_ex}"
+                                )
+                    print(
+                        f"[{self.worker_id}] [PERF] channel {ch_name} "
+                        f"replies: {len(_reply_targets)} msg(s) batched "
+                        f"in {time.monotonic() - _rt0:.2f}s "
+                        f"({sum(len(v) for v in _replies_by_msg.values())} replies)"
+                    )
+
                 for msg in msg_list:
                     msg_id = msg.get("id", str(uuid.uuid4()))
                     content_bytes = json.dumps(msg).encode()
@@ -16047,25 +16108,20 @@ class BackupWorker:
                     upload_tasks.append(upload_blob_with_retry(container, bp, content_bytes, shard))
                     item_metas.append((msg_id, msg, content_bytes, content_hash, bp, ch_id, ch_name))
 
-                    # Fetch replies for this message (if it has replies)
-                    reply_count = msg.get("replyCount", 0)
-                    if reply_count > 0:
-                        try:
-                            replies = await graph_client.get_channel_messages_replies(team_id, ch_id, msg_id)
-                            reply_list = replies.get("value", [])
-                            for reply in reply_list:
-                                reply_id = reply.get("id", str(uuid.uuid4()))
-                                reply_content_bytes = json.dumps(reply).encode()
-                                reply_content_hash = hashlib.sha256(reply_content_bytes).hexdigest()
-                                reply_bp = azure_storage_manager.build_blob_path(
-                                    str(tenant.id), str(resource.id), str(snapshot.id),
-                                    f"ch_{ch_id}_msg_{msg_id}_reply_{reply_id}"
-                                )
-                                upload_tasks.append(upload_blob_with_retry(container, reply_bp, reply_content_bytes, shard))
-                                item_metas.append((reply_id, reply, reply_content_bytes, reply_content_hash, reply_bp, ch_id, ch_name))
-                                reply_msg_ids.add(reply_id)
-                        except Exception as e:
-                            print(f"[{self.worker_id}]   [CHANNEL_REPLY] Failed to fetch replies for {msg_id}: {e}")
+                    # Replies were pre-batched above; this loop now only
+                    # builds the upload + meta records from the result.
+                    reply_list = _replies_by_msg.get(msg_id) or []
+                    for reply in reply_list:
+                        reply_id = reply.get("id", str(uuid.uuid4()))
+                        reply_content_bytes = json.dumps(reply).encode()
+                        reply_content_hash = hashlib.sha256(reply_content_bytes).hexdigest()
+                        reply_bp = azure_storage_manager.build_blob_path(
+                            str(tenant.id), str(resource.id), str(snapshot.id),
+                            f"ch_{ch_id}_msg_{msg_id}_reply_{reply_id}"
+                        )
+                        upload_tasks.append(upload_blob_with_retry(container, reply_bp, reply_content_bytes, shard))
+                        item_metas.append((reply_id, reply, reply_content_bytes, reply_content_hash, reply_bp, ch_id, ch_name))
+                        reply_msg_ids.add(reply_id)
 
                 upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
 
@@ -16268,6 +16324,64 @@ class BackupWorker:
             upload_tasks = []
             item_metas = []
             reply_ids: set = set()
+
+            # Bulk-resolve replies via /v1.0/$batch (perf #2 2026-05-17,
+            # second occurrence — mirrors the channel-MSG path above).
+            from shared.graph_batch import BatchRequest as _BReq
+            _reply_targets2 = [
+                m for m in msg_list
+                if (m.get("replyCount") or 0) > 0 and m.get("id")
+            ]
+            _replies_by_msg2: Dict[str, List[Dict[str, Any]]] = {}
+            if _reply_targets2:
+                _rt0 = time.monotonic()
+                _reply_reqs2 = [
+                    _BReq(
+                        id=m["id"], method="GET",
+                        url=(
+                            f"/teams/{team_id}/channels/{ch_id}/"
+                            f"messages/{m['id']}/replies"
+                        ),
+                    )
+                    for m in _reply_targets2
+                ]
+                try:
+                    _reply_batch2 = await graph_client.batch(_reply_reqs2)
+                    for _mid, _resp in _reply_batch2.items():
+                        if 200 <= _resp.status < 300:
+                            _replies_by_msg2[_mid] = (
+                                (_resp.body or {}).get("value") or []
+                            )
+                        else:
+                            print(
+                                f"[{self.worker_id}]   [CHANNEL_REPLY] "
+                                f"batch sub-response {_mid[:24]} "
+                                f"status={_resp.status}"
+                            )
+                except Exception as exc:
+                    print(
+                        f"[{self.worker_id}]   [CHANNEL_REPLY] $batch "
+                        f"failed ({type(exc).__name__}: {exc}); falling "
+                        f"back to per-msg serial"
+                    )
+                    for _m in _reply_targets2:
+                        try:
+                            _rs = await graph_client.get_channel_messages_replies(
+                                team_id, ch_id, _m["id"],
+                            )
+                            _replies_by_msg2[_m["id"]] = _rs.get("value", []) or []
+                        except Exception as _ex:
+                            print(
+                                f"[{self.worker_id}]   [CHANNEL_REPLY FAIL] "
+                                f"{ch_name}/{_m['id']}: {_ex}"
+                            )
+                print(
+                    f"[{self.worker_id}] [PERF] channel {ch_name} "
+                    f"replies: {len(_reply_targets2)} msg(s) batched "
+                    f"in {time.monotonic() - _rt0:.2f}s "
+                    f"({sum(len(v) for v in _replies_by_msg2.values())} replies)"
+                )
+
             for msg in msg_list:
                 msg_id = msg.get("id", str(uuid.uuid4()))
                 cb = json.dumps(msg).encode()
@@ -16278,22 +16392,19 @@ class BackupWorker:
                 upload_tasks.append(upload_blob_with_retry(container, bp, cb, shard))
                 item_metas.append((msg_id, msg, cb, ch_content_hash, bp, ch_id, ch_name))
 
-                if (msg.get("replyCount") or 0) > 0:
-                    try:
-                        replies = await graph_client.get_channel_messages_replies(team_id, ch_id, msg_id)
-                        for r in (replies.get("value") or []):
-                            rid = r.get("id", str(uuid.uuid4()))
-                            rb = json.dumps(r).encode()
-                            rh = hashlib.sha256(rb).hexdigest()
-                            rbp = azure_storage_manager.build_blob_path(
-                                str(tenant.id), str(resource.id), str(snapshot.id),
-                                f"ch_{ch_id}_msg_{msg_id}_reply_{rid}"
-                            )
-                            upload_tasks.append(upload_blob_with_retry(container, rbp, rb, shard))
-                            item_metas.append((rid, r, rb, rh, rbp, ch_id, ch_name))
-                            reply_ids.add(rid)
-                    except Exception as exc:
-                        print(f"[{self.worker_id}]   [CHANNEL_REPLY FAIL] {ch_name}/{msg_id}: {exc}")
+                # Replies were pre-batched above (or single-fetched in
+                # the fallback path).
+                for r in _replies_by_msg2.get(msg_id) or []:
+                    rid = r.get("id", str(uuid.uuid4()))
+                    rb = json.dumps(r).encode()
+                    rh = hashlib.sha256(rb).hexdigest()
+                    rbp = azure_storage_manager.build_blob_path(
+                        str(tenant.id), str(resource.id), str(snapshot.id),
+                        f"ch_{ch_id}_msg_{msg_id}_reply_{rid}"
+                    )
+                    upload_tasks.append(upload_blob_with_retry(container, rbp, rb, shard))
+                    item_metas.append((rid, r, rb, rh, rbp, ch_id, ch_name))
+                    reply_ids.add(rid)
 
             upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
             local_items = 0
