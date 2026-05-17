@@ -7957,15 +7957,22 @@ class BackupWorker:
                             )
                             mime_parts = []
 
-                        recovered = 0
-                        for p in mime_parts:
+                        # Per-MIME-part processing (perf #3 2026-05-17):
+                        # Was a serial `for p in mime_parts: await
+                        # _upload_once_per_hash(...)` loop — each inline
+                        # image in the RFC822 envelope waited on its
+                        # predecessor's Azure Blob commit (~200-500ms
+                        # each). asyncio.gather collapses N MIME parts
+                        # into one wall-clock barrier.
+                        async def _process_mime_part(
+                            p: Dict[str, Any],
+                        ) -> Tuple[Optional[SnapshotItem], int, bool]:
                             cid = p["content_id"]
                             if cid not in unresolved:
-                                # Body doesn't reference this part — skip.
-                                continue
+                                return None, 0, False
                             payload = p["payload"] or b""
                             if not payload:
-                                continue
+                                return None, 0, False
                             p_ct = p["content_type"]
                             p_fname = p["filename"] or (
                                 f"inline_{cid[:24]}." +
@@ -7990,40 +7997,74 @@ class BackupWorker:
                             p_resolved = (
                                 p_blob is not None or p_inline_b64 is not None
                             )
-                            if p_resolved:
-                                local_bytes += p_size
-                                recovered += 1
-                            local_items.append(SnapshotItem(
-                                id=uuid.uuid4(),
-                                snapshot_id=snapshot.id,
-                                tenant_id=tenant.id,
-                                # Distinguishes MIME-recovered rows from
-                                # Graph-attachment rows so re-runs are
-                                # idempotent on the same (msg, cid) pair.
-                                external_id=f"{msg_id}::mime::{cid}",
-                                item_type="EMAIL_ATTACHMENT",
-                                name=p_fname[:255],
-                                folder_path=folder_path,
-                                content_hash=p_hash,
-                                content_size=p_size,
-                                blob_path=p_blob,
-                                content_checksum=p_hash,
-                                extra_data={
-                                    "parent_item_id": msg_id,
-                                    # "mime_inline" makes the source
-                                    # path obvious in logs / future
-                                    # diagnostics, distinct from
-                                    # Graph's #microsoft.graph.fileAttachment
-                                    # / itemAttachment / referenceAttachment.
-                                    "attachment_kind": "mime_inline",
-                                    "content_type": p_ct,
-                                    "is_inline": True,
-                                    "content_id": cid,
-                                    "source_url": None,
-                                    "resolved": p_resolved,
-                                    "inline_b64": p_inline_b64,
-                                },
-                            ))
+                            return (
+                                SnapshotItem(
+                                    id=uuid.uuid4(),
+                                    snapshot_id=snapshot.id,
+                                    tenant_id=tenant.id,
+                                    # Distinguishes MIME-recovered rows
+                                    # from Graph-attachment rows so re-
+                                    # runs are idempotent on the same
+                                    # (msg, cid) pair.
+                                    external_id=f"{msg_id}::mime::{cid}",
+                                    item_type="EMAIL_ATTACHMENT",
+                                    name=p_fname[:255],
+                                    folder_path=folder_path,
+                                    content_hash=p_hash,
+                                    content_size=p_size,
+                                    blob_path=p_blob,
+                                    content_checksum=p_hash,
+                                    extra_data={
+                                        "parent_item_id": msg_id,
+                                        # "mime_inline" makes the source
+                                        # path obvious in logs / future
+                                        # diagnostics, distinct from
+                                        # Graph's
+                                        # #microsoft.graph.fileAttachment
+                                        # / itemAttachment /
+                                        # referenceAttachment.
+                                        "attachment_kind": "mime_inline",
+                                        "content_type": p_ct,
+                                        "is_inline": True,
+                                        "content_id": cid,
+                                        "source_url": None,
+                                        "resolved": p_resolved,
+                                        "inline_b64": p_inline_b64,
+                                    },
+                                ),
+                                p_size,
+                                p_resolved,
+                            )
+
+                        recovered = 0
+                        if mime_parts:
+                            _mp_t0 = time.monotonic()
+                            _mime_results = await asyncio.gather(
+                                *(_process_mime_part(p) for p in mime_parts),
+                                return_exceptions=True,
+                            )
+                            for _mr in _mime_results:
+                                if isinstance(_mr, Exception):
+                                    print(
+                                        f"[{self.worker_id}] [MIME-TASK] "
+                                        f"msg {msg_id} task raised: "
+                                        f"{type(_mr).__name__}: {_mr}"
+                                    )
+                                    continue
+                                _mitem, _msize, _mres = _mr
+                                if _mitem is None:
+                                    continue
+                                local_items.append(_mitem)
+                                if _mres:
+                                    local_bytes += _msize
+                                    recovered += 1
+                            if len(mime_parts) >= 3:
+                                print(
+                                    f"[{self.worker_id}] [PERF] msg "
+                                    f"{msg_id[:16]} {len(mime_parts)} "
+                                    f"MIME parts processed in "
+                                    f"{time.monotonic() - _mp_t0:.2f}s"
+                                )
                         if recovered:
                             print(
                                 f"[{self.worker_id}] [MIME-INLINE] "
