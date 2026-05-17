@@ -1038,9 +1038,9 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
                 "  extra_data = (COALESCE(extra_data::jsonb, '{}'::jsonb) "
                 "               || jsonb_build_object( "
                 "                   'cancelled_at', NOW(), "
-                "                   'cancelled_by_job_id', :jid::text, "
+                "                   'cancelled_by_job_id', cast(:jid AS text), "
                 "                   'cancel_phase', 'flip_pending_sweep'))::json "
-                " WHERE job_id = :jid AND status = 'IN_PROGRESS'"
+                " WHERE job_id = cast(:jid AS uuid) AND status = 'IN_PROGRESS'"
             ),
             {"jid": str(job.id)},
         )
