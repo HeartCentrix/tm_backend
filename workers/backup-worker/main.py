@@ -316,6 +316,42 @@ def _mail_message_fingerprint(msg: Dict[str, Any]) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
+def _parse_graph_iso_dt(s) -> Optional[datetime]:
+    """Convert Graph API ISO-8601 timestamp string to datetime.datetime.
+
+    Graph returns strings like ``2025-03-10T04:32:42Z`` or
+    ``2025-03-10T04:32:42.1234567Z``. asyncpg requires a real datetime
+    object for TIMESTAMPTZ columns. Returns None on parse failure so
+    the dedup-table insert can still proceed with a NULL timestamp
+    rather than aborting the whole row.
+    """
+    if s is None:
+        return None
+    if isinstance(s, datetime):
+        return s
+    if not isinstance(s, str):
+        return None
+    raw = s.strip()
+    if not raw:
+        return None
+    try:
+        # Python 3.11+ fromisoformat handles trailing Z and fractional
+        # seconds with up to 6 digits. Truncate >6-digit fractions
+        # (Graph occasionally emits 7) which would otherwise raise.
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        # Cap fractional seconds at 6 digits (Python's max for datetime).
+        if "." in raw and "+" in raw:
+            base, tz = raw.rsplit("+", 1)
+            if "." in base:
+                head, frac = base.rsplit(".", 1)
+                base = head + "." + frac[:6]
+            raw = base + "+" + tz
+        return datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+
+
 async def _bulk_upsert_mail_message_bodies(
     session, tenant_id, user_id: str, snapshot_id, messages: List[Dict[str, Any]],
 ) -> int:
@@ -367,8 +403,11 @@ async def _bulk_upsert_mail_message_bodies(
                 "from_address": (from_obj.get("address") or "")[:256] or None,
                 "from_display_name": (from_obj.get("name") or "")[:256] or None,
                 "subject": m.get("subject"),
-                "sent_date_time": m.get("sentDateTime"),
-                "received_date_time": m.get("receivedDateTime"),
+                # Graph returns ISO-8601 strings; asyncpg requires datetime
+                # objects for TIMESTAMPTZ columns. Parse on insert, NULL on
+                # parse failure (better than the whole batch failing).
+                "sent_date_time": _parse_graph_iso_dt(m.get("sentDateTime")),
+                "received_date_time": _parse_graph_iso_dt(m.get("receivedDateTime")),
                 "body_content": body_content,
                 "body_content_type": (body_type or "")[:16] or None,
                 "has_attachments": m.get("hasAttachments"),
